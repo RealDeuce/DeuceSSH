@@ -95,5 +95,5 @@ jobs:
 
       - name: Test
         run: |
-          ctest --test-dir build --parallel 2 --timeout 120 \
+          ctest --test-dir build --parallel 1 --timeout 120 \
             --output-on-failure --no-tests=error

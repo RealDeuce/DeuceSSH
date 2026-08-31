@@ -12,8 +12,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
-    name: Tests (${{ matrix.crypto }})
+  linux:
+    name: Linux tests (${{ matrix.crypto }})
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
@@ -97,3 +97,60 @@ jobs:
         run: |
           ctest --test-dir build --parallel 1 --timeout 120 \
             --output-on-failure --no-tests=error
+
+  macos:
+    name: macOS tests (OpenSSL)
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Install build dependencies
+        run: brew install ninja openssl@3
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DDEUCESSH_BUILD_TESTS=ON \
+            -DDEUCESSH_CRYPTO_BACKEND=OpenSSL \
+            -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)" \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Warm test key cache
+        run: |
+          ctest --test-dir build \
+            --tests-regex '^dssh_transport(_rsa)?$' \
+            --parallel 1 --timeout 120 \
+            --output-on-failure --no-tests=error
+
+      - name: Test
+        run: |
+          ctest --test-dir build --parallel 1 --timeout 120 \
+            --output-on-failure --no-tests=error
+
+  windows:
+    name: Windows build (OpenSSL)
+    runs-on: windows-2022
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Install OpenSSL
+        run: vcpkg install openssl:x64-windows
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build -A x64
+          -DDEUCESSH_BUILD_TESTS=OFF
+          -DDEUCESSH_CRYPTO_BACKEND=OpenSSL
+          -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+
+      - name: Build
+        run: cmake --build build --config Release --parallel

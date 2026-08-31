@@ -142,8 +142,30 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v5
 
+      - name: Detect vcpkg revision
+        id: vcpkg-version
+        run: >-
+          "commit=$(git -C $env:VCPKG_INSTALLATION_ROOT rev-parse HEAD)" |
+          Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Restore vcpkg binary cache
+        id: cache-vcpkg
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ runner.temp }}\vcpkg-cache
+          key: vcpkg-${{ runner.os }}-${{ runner.arch }}-${{ steps.vcpkg-version.outputs.commit }}-openssl-x64-windows
+
       - name: Install OpenSSL
+        env:
+          VCPKG_BINARY_SOURCES: 'clear;files,${{ runner.temp }}\vcpkg-cache,readwrite'
         run: vcpkg install openssl:x64-windows
+
+      - name: Save vcpkg binary cache
+        if: steps.cache-vcpkg.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ runner.temp }}\vcpkg-cache
+          key: vcpkg-${{ runner.os }}-${{ runner.arch }}-${{ steps.vcpkg-version.outputs.commit }}-openssl-x64-windows
 
       - name: Configure
         run: >-

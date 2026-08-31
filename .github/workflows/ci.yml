@@ -40,10 +40,10 @@ jobs:
             ca-certificates curl g++ libssl-dev make ninja-build \
             pkg-config python3 xz-utils
 
-      - name: Cache Botan
+      - name: Restore Botan
         if: matrix.crypto == 'Botan'
         id: cache-botan
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v5
         with:
           path: ${{ env.BOTAN_PREFIX }}
           key: botan-${{ runner.os }}-24.04-${{ runner.arch }}-${{ env.BOTAN_VERSION }}-shared
@@ -65,6 +65,13 @@ jobs:
           make --jobs="$(nproc)"
           make install
 
+      - name: Save Botan
+        if: matrix.crypto == 'Botan' && steps.cache-botan.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ env.BOTAN_PREFIX }}
+          key: botan-${{ runner.os }}-24.04-${{ runner.arch }}-${{ env.BOTAN_VERSION }}-shared
+
       - name: Verify Botan
         if: matrix.crypto == 'Botan'
         run: pkg-config --modversion botan-3
@@ -79,7 +86,14 @@ jobs:
       - name: Build
         run: cmake --build build --parallel
 
+      - name: Warm test key cache
+        run: |
+          ctest --test-dir build \
+            --tests-regex '^dssh_transport(_rsa)?$' \
+            --parallel 1 --timeout 120 \
+            --output-on-failure --no-tests=error
+
       - name: Test
         run: |
-          ctest --test-dir build --parallel 4 --timeout 120 \
+          ctest --test-dir build --parallel 2 --timeout 120 \
             --output-on-failure --no-tests=error

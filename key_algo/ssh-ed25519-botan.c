@@ -44,5 +44,10 @@ dssh_register_ssh_ed25519(void)
 	ka->ctx      = NULL;
 	ka->flags    = DSSH_KEY_ALGO_FLAG_SIGNATURE_CAPABLE;
 	memcpy(ka->name, ED25519_NAME, ED25519_NAME_LEN + 1);
-	return dssh_transport_register_key_algo(ka);
+
+	int ret = dssh_transport_register_key_algo(ka);
+
+	if (ret < 0)
+		free(ka);
+	return ret;
 }

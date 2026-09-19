@@ -39,5 +39,10 @@ dssh_register_none_enc(void)
 	enc->blocksize     = 1;
 	enc->key_size      = 0;
 	memcpy(enc->name, name, sizeof(name));
-	return dssh_transport_register_enc(enc);
+
+	int ret = dssh_transport_register_enc(enc);
+
+	if (ret < 0)
+		free(enc);
+	return ret;
 }

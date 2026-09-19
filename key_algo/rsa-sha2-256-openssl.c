@@ -687,5 +687,10 @@ dssh_register_rsa_sha2_256(void)
 	ka->ctx      = NULL;
 	ka->flags    = DSSH_KEY_ALGO_FLAG_SIGNATURE_CAPABLE;
 	memcpy(ka->name, RSA_SHA2_256_NAME, RSA_SHA2_256_NAME_LEN + 1);
-	return dssh_transport_register_key_algo(ka);
+
+	int ret = dssh_transport_register_key_algo(ka);
+
+	if (ret < 0)
+		free(ka);
+	return ret;
 }

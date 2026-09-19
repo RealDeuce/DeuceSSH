@@ -34,5 +34,10 @@ dssh_register_none_comp(void)
 	comp->uncompress = uncompress;
 	comp->cleanup    = cleanup;
 	memcpy(comp->name, name, sizeof(name));
-	return dssh_transport_register_comp(comp);
+
+	int ret = dssh_transport_register_comp(comp);
+
+	if (ret < 0)
+		free(comp);
+	return ret;
 }

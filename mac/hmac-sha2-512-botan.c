@@ -32,5 +32,10 @@ dssh_register_hmac_sha2_512(void)
 	mac->digest_size = HMAC_SHA2_512_DIGEST_SIZE;
 	mac->key_size    = HMAC_SHA2_512_KEY_SIZE;
 	memcpy(mac->name, name, sizeof(name));
-	return dssh_transport_register_mac(mac);
+
+	int ret = dssh_transport_register_mac(mac);
+
+	if (ret < 0)
+		free(mac);
+	return ret;
 }

@@ -200,5 +200,10 @@ dssh_register_sntrup761x25519_sha512(void)
 	kex->hash_name = "SHA-512";
 	kex->ctx       = NULL;
 	memcpy(kex->name, KEX_NAME, KEX_NAME_LEN + 1);
-	return dssh_transport_register_kex(kex);
+
+	int ret = dssh_transport_register_kex(kex);
+
+	if (ret < 0)
+		free(kex);
+	return ret;
 }

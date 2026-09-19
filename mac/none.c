@@ -30,5 +30,10 @@ dssh_register_none_mac(void)
 	mac->digest_size = 0;
 	mac->key_size    = 0;
 	memcpy(mac->name, name, sizeof(name));
-	return dssh_transport_register_mac(mac);
+
+	int ret = dssh_transport_register_mac(mac);
+
+	if (ret < 0)
+		free(mac);
+	return ret;
 }

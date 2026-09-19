@@ -27,5 +27,10 @@ dssh_register_curve25519_sha256(void)
 	kex->hash_name = "SHA-256";
 	kex->ctx       = NULL;
 	memcpy(kex->name, C25519_KEX_NAME, C25519_KEX_NAME_LEN + 1);
-	return dssh_transport_register_kex(kex);
+
+	int ret = dssh_transport_register_kex(kex);
+
+	if (ret < 0)
+		free(kex);
+	return ret;
 }

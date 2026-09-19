@@ -2912,7 +2912,10 @@ encode_k_wire(const uint8_t *raw, size_t raw_sz, bool k_as_string, uint8_t **out
 	DSSH_PUT_U32((uint32_t)k_data_len, buf, &pos);
 	if (!k_as_string && k_data_len > raw_sz)
 		buf[pos++] = 0; /* mpint sign-bit padding */
-	memcpy(&buf[pos], raw, raw_sz);
+	/* raw is NULL for an empty K; memcpy with a null source is
+	 * undefined even when the length is zero (C17 7.24.1p2). */
+	if (raw_sz > 0)
+		memcpy(&buf[pos], raw, raw_sz);
 
 	*out    = buf;
 	*out_sz = k_wire_len;

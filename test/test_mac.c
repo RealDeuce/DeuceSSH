@@ -103,7 +103,12 @@ register_test_mac(void)
 	mac->digest_size = TEST_MAC_DIGEST_SIZE;
 	mac->key_size = TEST_MAC_KEY_SIZE;
 	memcpy(mac->name, name, sizeof(name));
-	return dssh_transport_register_mac(mac);
+
+	int ret = dssh_transport_register_mac(mac);
+
+	if (ret < 0)
+		free(mac);
+	return ret;
 }
 
 #define TEST_MAC_OVERSIZED_DIGEST 128
@@ -123,5 +128,10 @@ register_test_mac_oversized(void)
 	mac->digest_size = TEST_MAC_OVERSIZED_DIGEST;
 	mac->key_size = TEST_MAC_KEY_SIZE;
 	memcpy(mac->name, name, sizeof(name));
-	return dssh_transport_register_mac(mac);
+
+	int ret = dssh_transport_register_mac(mac);
+
+	if (ret < 0)
+		free(mac);
+	return ret;
 }

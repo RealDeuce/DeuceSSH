@@ -111,5 +111,10 @@ register_test_enc(void)
 	enc->blocksize = TEST_ENC_BLOCK_SIZE;
 	enc->key_size = TEST_ENC_KEY_SIZE;
 	memcpy(enc->name, name, sizeof(name));
-	return dssh_transport_register_enc(enc);
+
+	int ret = dssh_transport_register_enc(enc);
+
+	if (ret < 0)
+		free(enc);
+	return ret;
 }

@@ -107,27 +107,43 @@ socket_tx(uint8_t *buf, size_t bufsz, dssh_session sess, void *cbdata)
 	run_callback_probe(sess, CALLBACK_PROBE_TX);
 	int fd = *(int *)cbdata;
 	size_t sent = 0;
-	while (sent < bufsz) {
-		if (socket_wait(fd, POLLOUT, sess) < 0)
-			return -1;
-		ssize_t n = send(fd, buf + sent, bufsz - sent, 0);
-		if (n < 0 && errno == EINTR)
-			continue;
-		if (n <= 0)
-			return -1;
-		sent += (size_t)n;
-	}
+	bool   delay_this_packet = false;
+
+	/* Claim the delay slot and publish delayed_tx_seen BEFORE the bytes
+	 * go out: the peer that reads them may assert on the flag as soon as
+	 * they arrive, which is ahead of anything this thread does after
+	 * send().  The delay itself still happens after the packet is on the
+	 * socket, which is what opens the race window under test. */
 	if (sess == delayed_tx_sess && atomic_load(&delayed_tx_countdown) > 0) {
 		int previous = atomic_fetch_sub(&delayed_tx_countdown, 1);
 
 		if (previous == 1) {
+			delay_this_packet = true;
 			atomic_store(&delayed_tx_seen, true);
-			struct timespec ts = { .tv_sec = 0, .tv_nsec = 100000000 };
-
-			thrd_sleep(&ts, NULL);
 		}
 	}
+	while (sent < bufsz) {
+		if (socket_wait(fd, POLLOUT, sess) < 0)
+			goto fail;
+		ssize_t n = send(fd, buf + sent, bufsz - sent, 0);
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0)
+			goto fail;
+		sent += (size_t)n;
+	}
+	if (delay_this_packet) {
+		struct timespec ts = { .tv_sec = 0, .tv_nsec = 100000000 };
+
+		thrd_sleep(&ts, NULL);
+	}
 	return 0;
+fail:
+	/* The packet never reached the socket, so the window was never
+	 * opened; take the marker back rather than report a delay. */
+	if (delay_this_packet)
+		atomic_store(&delayed_tx_seen, false);
+	return -1;
 }
 
 static int
@@ -2880,13 +2896,18 @@ test_self_chan_send_break(void)
 	if (selftest_setup(&ctx) < 0)
 		return TEST_FAIL;
 
+	/* Set while the test thread is the only one running: socket_tx
+	 * reads this from the demux thread that session_start creates, and
+	 * the pointer is not atomic. */
+	delayed_tx_sess = ctx.server;
+	atomic_store(&delayed_tx_seen, false);
+
 	ASSERT_OK(dssh_session_start(ctx.client));
 	ASSERT_OK(dssh_session_start(ctx.server));
 
 	struct server_echo_arg sarg = { .ctx = &ctx };
+
 	ASSERT_OK(selftest_start_thread(&ctx, server_echo_thread, &sarg));
-	delayed_tx_sess = ctx.server;
-	atomic_store(&delayed_tx_seen, false);
 	/* Server sends OPEN_CONFIRMATION, then CHANNEL_SUCCESS.  Delay the
 	 * latter in the real TX callback so the demux can receive BREAK while
 	 * the setup reply is still unwinding. */

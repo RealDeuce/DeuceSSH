@@ -40,6 +40,12 @@ typedef struct dssh_enc_s {
 	char               name[];
 } *dssh_enc;
 
+/*
+ * Add an entry to the global algorithm registry.  On success the library
+ * keeps the pointer for the life of the process and never frees it, so the
+ * struct must stay valid.  On error the registry keeps no reference and the
+ * caller still owns the struct.
+ */
 DSSH_PUBLIC int dssh_transport_register_enc(dssh_enc enc);
 
 #ifdef __cplusplus

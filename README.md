@@ -793,7 +793,10 @@ int register_my_enc(void)
     enc->blocksize = 16;  /* cipher block size in bytes */
     enc->key_size = 32;   /* key size in bytes */
     memcpy(enc->name, name, sizeof(name));
-    return dssh_transport_register_enc(enc);
+    int ret = dssh_transport_register_enc(enc);
+    if (ret < 0)
+        free(enc);  /* on error the registry keeps no reference */
+    return ret;
 }
 ```
 
@@ -834,7 +837,10 @@ int register_my_mac(void)
     mac->digest_size = 32;  /* output tag size in bytes */
     mac->key_size = 32;     /* key size in bytes */
     memcpy(mac->name, name, sizeof(name));
-    return dssh_transport_register_mac(mac);
+    int ret = dssh_transport_register_mac(mac);
+    if (ret < 0)
+        free(mac);  /* on error the registry keeps no reference */
+    return ret;
 }
 ```
 
@@ -867,7 +873,10 @@ int register_my_comp(void)
     comp->uncompress = my_uncompress;
     comp->cleanup = my_comp_cleanup;
     memcpy(comp->name, name, sizeof(name));
-    return dssh_transport_register_comp(comp);
+    int ret = dssh_transport_register_comp(comp);
+    if (ret < 0)
+        free(comp);  /* on error the registry keeps no reference */
+    return ret;
 }
 ```
 
@@ -936,7 +945,10 @@ int register_my_key_algo(void)
     ka->ctx = NULL;     /* set by generate/load */
     ka->flags = DSSH_KEY_ALGO_FLAG_SIGNATURE_CAPABLE;
     memcpy(ka->name, name, sizeof(name));
-    return dssh_transport_register_key_algo(ka);
+    int ret = dssh_transport_register_key_algo(ka);
+    if (ret < 0)
+        free(ka);  /* on error the registry keeps no reference */
+    return ret;
 }
 ```
 
@@ -991,7 +1003,10 @@ int register_my_kex(void)
     kex->flags = DSSH_KEX_FLAG_NEEDS_SIGNATURE_CAPABLE;
     kex->hash_name = "SHA256";  /* OpenSSL digest name for key derivation */
     memcpy(kex->name, name, sizeof(name));
-    return dssh_transport_register_kex(kex);
+    int ret = dssh_transport_register_kex(kex);
+    if (ret < 0)
+        free(kex);  /* on error the registry keeps no reference */
+    return ret;
 }
 ```
 

@@ -514,6 +514,11 @@ elseif(DEUCESSH_CRYPTO_BACKEND STREQUAL "Botan")
 	target_link_libraries(dssh_test_algo_key PRIVATE PkgConfig::BOTAN3)
 endif()
 add_test(NAME dssh_unit_algo_key COMMAND dssh_test_algo_key)
+dssh_add_test(key_wire test_key_wire.c)
+foreach(part IN ITEMS known_answers ed_metadata rsa_metadata rsa_framing metadata_allocations callback_parameters bit_limits)
+	add_test(NAME dssh_key_wire_${part} COMMAND dssh_test_key_wire --exact ${part})
+	set_tests_properties(dssh_key_wire_${part} PROPERTIES TIMEOUT 120)
+endforeach()
 set_tests_properties(dssh_unit_algo_key PROPERTIES COST 20
 	ENVIRONMENT "${DSSH_TEST_KEY_ENV}")
 add_test(NAME dssh_targeted_dhgex_null_ka

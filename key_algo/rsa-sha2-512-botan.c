@@ -7,6 +7,7 @@
 
 #include "deucessh-key-algo.h"
 #include "deucessh.h"
+#include "key-wire.h"
 
 #define RSA_SHA2_512_NAME     "rsa-sha2-512"
 #define RSA_SHA2_512_NAME_LEN 12
@@ -22,45 +23,10 @@ extern void dssh_botan_rsa512_cleanup(dssh_key_algo_ctx *ctx);
 static unsigned int
 key_bits(const uint8_t *key_blob, size_t key_blob_len)
 {
-	size_t   kp = 0;
-	uint32_t slen;
-
-	/* Skip algorithm name */
-	if (dssh_parse_uint32(&key_blob[kp], key_blob_len, &slen) < 4
-	    || !dssh_buffer_has(key_blob_len, kp + 4, slen))
+	struct dssh_rsa_wire_key key;
+	if (dssh_key_wire_rsa(key_blob, key_blob_len, &key) < 0)
 		return 0;
-	kp += 4 + slen;
-
-	/* Skip e (public exponent) */
-	if (dssh_parse_uint32(&key_blob[kp], key_blob_len - kp, &slen) < 4
-	    || !dssh_buffer_has(key_blob_len, kp + 4, slen))
-		return 0;
-	kp += 4 + slen;
-
-	/* Parse n (modulus) length */
-	if (dssh_parse_uint32(&key_blob[kp], key_blob_len - kp, &slen) < 4
-	    || !dssh_buffer_has(key_blob_len, kp + 4, slen))
-		return 0;
-	kp += 4;
-
-	const uint8_t *n     = &key_blob[kp];
-	uint32_t       n_len = slen;
-
-	while (n_len > 0 && n[0] == 0) {
-		n++;
-		n_len--;
-	}
-	if (n_len == 0)
-		return 0;
-
-	unsigned int bits = (n_len - 1) * 8;
-	uint8_t      msb  = n[0];
-
-	while (msb) {
-		bits++;
-		msb >>= 1;
-	}
-	return bits;
+	return dssh_key_wire_bits(key.modulus, UINT_MAX);
 }
 
 DSSH_PUBLIC int

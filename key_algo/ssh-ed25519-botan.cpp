@@ -22,6 +22,7 @@
 #include "deucessh.h"
 #include "private-key-file.h"
 #include "key-context-botan.h"
+#include "key-wire.h"
 
 struct dssh_key_algo_ctx;
 
@@ -153,49 +154,21 @@ extern "C" int
 dssh_botan_ed25519_verify(const uint8_t *key_blob, size_t key_blob_len, const uint8_t *sig_blob,
     size_t sig_blob_len, const uint8_t *data, size_t data_len)
 {
-	size_t   kp = 0;
-	uint32_t algo_len;
-	if (dssh_parse_uint32(&key_blob[kp], key_blob_len, &algo_len) < 4
-	    || !dssh_buffer_has(key_blob_len, kp + 4, algo_len))
-		return DSSH_ERROR_PARSE;
-	kp += 4;
-	if (algo_len != ED25519_NAME_LEN || memcmp(&key_blob[kp], ED25519_NAME, ED25519_NAME_LEN) != 0)
+	struct dssh_bytes key, signature;
+	int ret;
+	if (data == NULL && data_len != 0)
 		return DSSH_ERROR_INVALID;
-	kp += algo_len;
-	uint32_t raw_pub_len;
-	if (dssh_parse_uint32(&key_blob[kp], key_blob_len - kp, &raw_pub_len) < 4
-	    || !dssh_buffer_has(key_blob_len, kp + 4, raw_pub_len))
-		return DSSH_ERROR_PARSE;
-	kp += 4;
-	const uint8_t *raw_pub = &key_blob[kp];
-	kp += raw_pub_len;
-
-	if (raw_pub_len != ED25519_RAW_PUB_LEN)
+	ret = dssh_key_wire_ed25519(key_blob, key_blob_len, &key);
+	if (ret < 0)
+		return ret;
+	ret = dssh_key_wire_blob(sig_blob, sig_blob_len, ED25519_NAME, ED25519_NAME_LEN, &signature);
+	if (ret < 0)
+		return ret;
+	if (signature.len != ED25519_RAW_SIG_LEN)
 		return DSSH_ERROR_INVALID;
-	if (kp != key_blob_len)
-		return DSSH_ERROR_PARSE;
-
-	size_t   sp = 0;
-	uint32_t sig_algo_len;
-	if (dssh_parse_uint32(&sig_blob[sp], sig_blob_len, &sig_algo_len) < 4
-	    || !dssh_buffer_has(sig_blob_len, sp + 4, sig_algo_len))
-		return DSSH_ERROR_PARSE;
-	sp += 4;
-	if (sig_algo_len != ED25519_NAME_LEN || memcmp(&sig_blob[sp], ED25519_NAME, ED25519_NAME_LEN) != 0)
-		return DSSH_ERROR_INVALID;
-	sp += sig_algo_len;
-	uint32_t raw_sig_len;
-	if (dssh_parse_uint32(&sig_blob[sp], sig_blob_len - sp, &raw_sig_len) < 4
-	    || !dssh_buffer_has(sig_blob_len, sp + 4, raw_sig_len))
-		return DSSH_ERROR_PARSE;
-	sp += 4;
-	const uint8_t *raw_sig = &sig_blob[sp];
-	sp += raw_sig_len;
-
-	if (raw_sig_len != ED25519_RAW_SIG_LEN)
-		return DSSH_ERROR_INVALID;
-	if (sp != sig_blob_len)
-		return DSSH_ERROR_PARSE;
+	const uint8_t *raw_pub = key.data;
+	const uint8_t *raw_sig = signature.data;
+	size_t raw_sig_len = signature.len;
 
 	try {
 		Botan::Ed25519_PublicKey pubkey_h(std::span<const uint8_t>(raw_pub, ED25519_RAW_PUB_LEN));

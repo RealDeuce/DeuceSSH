@@ -25,6 +25,7 @@
 #include "deucessh.h"
 #include "private-key-file.h"
 #include "key-context-botan.h"
+#include "key-wire.h"
 
 struct dssh_key_algo_ctx;
 
@@ -206,62 +207,26 @@ extern "C" int
 dssh_botan_rsa256_verify(const uint8_t *key_blob, size_t key_blob_len, const uint8_t *sig_blob,
     size_t sig_blob_len, const uint8_t *data, size_t data_len)
 {
-	/* Parse public key from key_blob */
-	size_t   kp = 0;
-	uint32_t slen;
-
-	/* Validate algorithm name ("ssh-rsa") */
-	if (dssh_parse_uint32(&key_blob[kp], key_blob_len - kp, &slen) < 4
-	    || !dssh_buffer_has(key_blob_len, kp + 4, slen))
-		return DSSH_ERROR_PARSE;
-	kp += 4;
-	if (slen != RSA_KEY_TYPE_NAME_LEN || memcmp(&key_blob[kp], RSA_KEY_TYPE_NAME, RSA_KEY_TYPE_NAME_LEN) != 0)
+	struct dssh_rsa_wire_key key;
+	struct dssh_bytes signature;
+	int ret;
+	if (data == NULL && data_len != 0)
 		return DSSH_ERROR_INVALID;
-	kp += slen;
-
-	/* e (public exponent) */
-	if (dssh_parse_uint32(&key_blob[kp], key_blob_len - kp, &slen) < 4
-	    || !dssh_buffer_has(key_blob_len, kp + 4, slen))
-		return DSSH_ERROR_PARSE;
-	kp += 4;
-	const uint8_t *e_bytes = &key_blob[kp];
-	size_t         e_len   = slen;
-	kp += slen;
-
-	/* n (modulus) */
-	if (dssh_parse_uint32(&key_blob[kp], key_blob_len - kp, &slen) < 4
-	    || !dssh_buffer_has(key_blob_len, kp + 4, slen))
-		return DSSH_ERROR_PARSE;
-	kp += 4;
-	const uint8_t *n_bytes = &key_blob[kp];
-	size_t         n_len   = slen;
-	kp += slen;
-
-	if (kp != key_blob_len)
-		return DSSH_ERROR_PARSE;
-
-	/* Parse signature from sig_blob */
-	size_t sp = 0;
-
-	/* Validate algorithm name ("rsa-sha2-256") */
-	if (dssh_parse_uint32(&sig_blob[sp], sig_blob_len - sp, &slen) < 4
-	    || !dssh_buffer_has(sig_blob_len, sp + 4, slen))
-		return DSSH_ERROR_PARSE;
-	sp += 4;
-	if (slen != RSA_SHA2_256_NAME_LEN || memcmp(&sig_blob[sp], RSA_SHA2_256_NAME, RSA_SHA2_256_NAME_LEN) != 0)
+	ret = dssh_key_wire_rsa(key_blob, key_blob_len, &key);
+	if (ret < 0)
+		return ret;
+	ret = dssh_key_wire_blob(sig_blob, sig_blob_len, RSA_SHA2_256_NAME,
+	    RSA_SHA2_256_NAME_LEN, &signature);
+	if (ret < 0)
+		return ret;
+	if (signature.len == 0)
 		return DSSH_ERROR_INVALID;
-	sp += slen;
-
-	/* Raw signature bytes */
-	uint32_t raw_sig_len;
-	if (dssh_parse_uint32(&sig_blob[sp], sig_blob_len - sp, &raw_sig_len) < 4
-	    || !dssh_buffer_has(sig_blob_len, sp + 4, raw_sig_len))
-		return DSSH_ERROR_PARSE;
-	sp += 4;
-	const uint8_t *raw_sig = &sig_blob[sp];
-	sp += raw_sig_len;
-	if (sp != sig_blob_len)
-		return DSSH_ERROR_PARSE;
+	const uint8_t *e_bytes = key.exponent.data;
+	size_t e_len = key.exponent.len;
+	const uint8_t *n_bytes = key.modulus.data;
+	size_t n_len = key.modulus.len;
+	const uint8_t *raw_sig = signature.data;
+	size_t raw_sig_len = signature.len;
 
 	try {
 		Botan::BigInt        e_bn = Botan::BigInt::from_bytes(std::span<const uint8_t>(e_bytes, e_len));

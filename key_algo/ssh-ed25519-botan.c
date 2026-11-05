@@ -7,6 +7,7 @@
 
 #include "deucessh-key-algo.h"
 #include "deucessh.h"
+#include "key-wire.h"
 
 #define ED25519_NAME     "ssh-ed25519"
 #define ED25519_NAME_LEN 11
@@ -23,8 +24,9 @@ extern void dssh_botan_ed25519_cleanup(dssh_key_algo_ctx *ctx);
 static unsigned int
 key_bits(const uint8_t *key_blob, size_t key_blob_len)
 {
-	(void)key_blob;
-	(void)key_blob_len;
+	struct dssh_bytes key;
+	if (dssh_key_wire_ed25519(key_blob, key_blob_len, &key) < 0)
+		return 0;
 	return 256;
 }
 

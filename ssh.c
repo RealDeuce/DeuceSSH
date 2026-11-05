@@ -64,6 +64,15 @@ session_scope_active(struct dssh_session_s *sess)
 	return false;
 }
 
+/* Public handshake/authentication entries are serialized before start. An
+ * outer operation or initialized connection layer excludes another receiver,
+ * including a stopped worker whose resources still await the owned join. */
+DSSH_PRIVATE bool
+session_receive_api_conflict(struct dssh_session_s *sess)
+{
+	return session_scope_active(sess) || sess->conn_initialized;
+}
+
 /* I/O callback validation is performed by the public lifecycle wrappers. */
 DSSH_PRIVATE bool
 session_lifecycle_begin(struct dssh_session_s *sess)

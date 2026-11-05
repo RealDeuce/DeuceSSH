@@ -42,6 +42,7 @@ receive_entry_check(dssh_session sess, unsigned kind, bool scoped)
 	size_t size = sizeof(username);
 	uint32_t sequence = sess->trans.tx_seq;
 	bool connected = sess->conn_initialized;
+	bool terminated = dssh_session_is_terminated(sess);
 	bool scope_valid = session_scope_active(sess) == scoped;
 	struct dssh_auth_server_cbs cbs = {.methods_str = "", .none_cb = receive_entry_none};
 	int ret = DSSH_ERROR_INIT;
@@ -78,7 +79,7 @@ receive_entry_check(dssh_session sess, unsigned kind, bool scoped)
 	bool valid = ret == DSSH_ERROR_INVALID && io.tx_calls == 0 && io.rx_calls == 0
 	    && native_calls == 0 && sequence == sess->trans.tx_seq
 	    && connected == sess->conn_initialized && size == sizeof(username)
-	    && !dssh_session_is_terminated(sess) && scope_valid;
+	    && dssh_session_is_terminated(sess) == terminated && scope_valid;
 	for (size_t i = 0; i < sizeof(username); i++)
 		valid = valid && username[i] == 0x5a && methods[i] == 0x5a;
 	if (!valid)
@@ -478,6 +479,41 @@ test_receive_entry_demux(void)
 		}
 	}
 	printf("receive entry demux: %u/12 role/API cases passed with real auth/receiver/cleanup\n", passed);
+	ASSERT_EQ_U(passed, 12);
+	return TEST_PASS;
+}
+
+static int
+test_receive_entry_joinable(void)
+{
+	unsigned passed = 0;
+	for (unsigned role = 0; role < 2; role++) {
+		struct handshake_ctx ctx;
+		if (handshake_setup(&ctx) < 0) {
+			handshake_cleanup(&ctx);
+			return TEST_FAIL;
+		}
+		struct receive_entry_auth auth = {.pair = &ctx, .banner_target = ctx.client, .server_result = -1};
+		bool valid = receive_entry_authenticate(&auth)
+		    && dssh_session_start(ctx.client) == 0 && dssh_session_start(ctx.server) == 0;
+		mock_io_close_c2s(&ctx.io);
+		mock_io_close_s2c(&ctx.io);
+		if (valid)
+			valid = dssh_test_wait_bool(&ctx.client->demux_running, false)
+			    && dssh_test_wait_bool(&ctx.server->demux_running, false)
+			    && ctx.client->conn_initialized && ctx.server->conn_initialized;
+		dssh_session target = role == 0 ? ctx.client : ctx.server;
+		for (unsigned kind = 0; kind < 6 && valid; kind++) {
+			bool checked = receive_entry_check(target, kind, false);
+			if (checked)
+				passed++;
+		}
+		/* No test consumes the worker handle. Library cleanup must still
+		 * join that actual completed worker and retire its resources. */
+		handshake_cleanup(&ctx);
+		ASSERT_TRUE(valid);
+	}
+	printf("receive entry joinable: %u/12 role/API cases, completed owned workers retained until cleanup\n", passed);
 	ASSERT_EQ_U(passed, 12);
 	return TEST_PASS;
 }

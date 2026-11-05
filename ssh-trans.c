@@ -457,6 +457,8 @@ dssh_transport_handshake(struct dssh_session_s *sess)
 		return DSSH_ERROR_INVALID;
 	if (dssh_io_callback_active(sess) || dssh_setup_callback_active(sess))
 		return DSSH_ERROR_INVALID;
+	if (session_receive_api_conflict(sess))
+		return DSSH_ERROR_INVALID;
 	struct dssh_session_scope scope;
 
 	session_scope_enter(&scope, sess);

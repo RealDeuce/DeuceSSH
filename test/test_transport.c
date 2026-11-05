@@ -9498,6 +9498,7 @@ static struct dssh_test_entry tests[] = {
 	{ "receive_entry/hostkey", test_receive_entry_hostkey },
 	{ "receive_entry/nested", test_receive_entry_nested },
 	{ "receive_entry/demux", test_receive_entry_demux },
+	{ "receive_entry/joinable", test_receive_entry_joinable },
 	{ "key_material/encoding", test_key_material_encoding },
 	{ "key_material/bounds", test_key_material_bounds },
 	{ "key_material/zero_output", test_key_material_zero_output },

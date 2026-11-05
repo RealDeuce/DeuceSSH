@@ -1127,6 +1127,8 @@ dssh_auth_server(struct dssh_session_s *sess, const struct dssh_auth_server_cbs 
 	if ((cbs == NULL) || (sess == NULL) || (cbs->methods_str == NULL)
 	    || ((username_out == NULL) != (username_out_len == NULL)))
 		return DSSH_ERROR_INVALID;
+	if (session_receive_api_conflict(sess))
+		return DSSH_ERROR_INVALID;
 	struct dssh_session_scope scope;
 
 	session_scope_enter(&scope, sess);
@@ -1351,6 +1353,8 @@ dssh_auth_get_methods(struct dssh_session_s *sess, const char *username, char *m
 		return DSSH_ERROR_INVALID;
 	if ((methods == NULL) || (username == NULL) || (sess == NULL))
 		return DSSH_ERROR_INIT;
+	if (session_receive_api_conflict(sess))
+		return DSSH_ERROR_INVALID;
 	struct dssh_session_scope scope;
 
 	session_scope_enter(&scope, sess);
@@ -1489,6 +1493,8 @@ dssh_auth_password(struct dssh_session_s *sess, const char *username, const char
 	if (sess != NULL && (dssh_io_callback_active(sess) || dssh_setup_callback_active(sess)))
 		return DSSH_ERROR_INVALID;
 	if ((password == NULL) || (username == NULL) || (sess == NULL))
+		return DSSH_ERROR_INVALID;
+	if (session_receive_api_conflict(sess))
 		return DSSH_ERROR_INVALID;
 	struct dssh_session_scope scope;
 
@@ -1688,6 +1694,8 @@ dssh_auth_keyboard_interactive(struct dssh_session_s *sess, const char *username
 		return DSSH_ERROR_INVALID;
 	if ((prompt_cb == NULL) || (username == NULL) || (sess == NULL))
 		return DSSH_ERROR_INVALID;
+	if (session_receive_api_conflict(sess))
+		return DSSH_ERROR_INVALID;
 	struct dssh_session_scope scope;
 
 	session_scope_enter(&scope, sess);
@@ -1866,6 +1874,8 @@ dssh_auth_publickey(struct dssh_session_s *sess, const char *username, const cha
 	if (sess != NULL && (dssh_io_callback_active(sess) || dssh_setup_callback_active(sess)))
 		return DSSH_ERROR_INVALID;
 	if ((algo_name == NULL) || (username == NULL) || (sess == NULL))
+		return DSSH_ERROR_INVALID;
+	if (session_receive_api_conflict(sess))
 		return DSSH_ERROR_INVALID;
 	struct dssh_session_scope scope;
 

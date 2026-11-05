@@ -2746,7 +2746,7 @@ dssh_session_start(struct dssh_session_s *sess)
 {
 	if (sess == NULL)
 		return DSSH_ERROR_INVALID;
-	if (connection_api_forbidden(sess))
+	if (connection_api_forbidden(sess) || session_scope_active(sess))
 		return DSSH_ERROR_INVALID;
 	if (sess->conn_initialized) {
 		DSSH_LOGF(sess, DSSH_LOG_ERROR, DSSH_ERROR_INIT, "Session connection layer is already started");

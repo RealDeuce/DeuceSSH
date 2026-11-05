@@ -175,6 +175,7 @@ struct dssh_session_scope {
 DSSH_PRIVATE void session_scope_enter(struct dssh_session_scope *scope, struct dssh_session_s *sess);
 DSSH_PRIVATE void session_scope_leave(struct dssh_session_scope *scope);
 DSSH_PRIVATE bool session_scope_active(struct dssh_session_s *sess);
+DSSH_PRIVATE bool session_receive_api_conflict(struct dssh_session_s *sess);
 DSSH_PRIVATE bool session_lifecycle_begin(struct dssh_session_s *sess);
 DSSH_PRIVATE void session_stop_inner(struct dssh_session_s *sess);
 DSSH_PRIVATE bool session_on_demux_thread(struct dssh_session_s *sess);

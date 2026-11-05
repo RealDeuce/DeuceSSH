@@ -583,7 +583,7 @@ foreach(part IN ITEMS group_selection group_validation peer_validation mpint_val
 		PASS_REGULAR_EXPRESSION "1 tests: 1 passed, 0 failed, 0 skipped")
 endforeach()
 dssh_add_variant_tests(dssh_transport dssh_test_transport)
-foreach(part IN ITEMS notifications auth_callbacks hostkey nested demux)
+foreach(part IN ITEMS notifications auth_callbacks hostkey nested demux joinable)
 	add_test(NAME dssh_transport_receive_entry_${part}
 		COMMAND dssh_test_transport --exact receive_entry/${part})
 	set_tests_properties(dssh_transport_receive_entry_${part} PROPERTIES

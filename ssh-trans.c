@@ -3101,6 +3101,10 @@ DSSH_TESTABLE int
 derive_key(const char *hash_name, const uint8_t *shared_secret, size_t shared_secret_sz, const uint8_t *hash,
     size_t hash_sz, uint8_t letter, const uint8_t *session_id, size_t session_id_sz, uint8_t *out, size_t needed)
 {
+	/* Stateless algorithms request no output. Do not allocate/hash or require
+	 * an output address for an empty derived key. */
+	if (needed == 0)
+		return 0;
 	dssh_hash_ctx *ctx = NULL;
 	size_t         md_len;
 	int            res = dssh_hash_init(&ctx, hash_name, &md_len);
@@ -3164,23 +3168,35 @@ cleanup:
  *
  * Most KEX methods encode K as mpint (RFC 4253 s7):
  *   uint32 length, sign-padded big-endian integer.
- * Hybrid post-quantum methods encode K as string (fixed-length,
- * no sign padding) per draft-josefsson-ntruprime-ssh-02.
+ * Hybrid methods opt into opaque string encoding through their registration.
  *
  * On success, *out is a malloc'd buffer and *out_sz is its size.
  */
 DSSH_TESTABLE int
 encode_k_wire(const uint8_t *raw, size_t raw_sz, bool k_as_string, uint8_t **out, size_t *out_sz)
 {
-	size_t k_data_len;
-
-	if (k_as_string) {
-		k_data_len = raw_sz;
+	/* kex() enforces the same raw result bound. Check before inspecting its
+	 * bytes; only integer K may discard redundant leading zeroes. */
+#if SIZE_MAX > UINT32_MAX
+	if (raw_sz > UINT32_MAX)
+		return DSSH_ERROR_INVALID;
+#endif
+	if (!k_as_string) {
+		while (raw_sz > 0 && raw[0] == 0) {
+			raw++;
+			raw_sz--;
+		}
 	}
-	else {
-		bool need_pad = (raw_sz > 0 && (raw[0] & DSSH_MPINT_SIGN_BIT));
-		k_data_len    = raw_sz + (need_pad ? 1 : 0);
-	}
+	bool need_pad = !k_as_string && raw_sz > 0 && (raw[0] & DSSH_MPINT_SIGN_BIT) != 0;
+	size_t padding = need_pad ? 1 : 0;
+	if (raw_sz > SIZE_MAX - 4 - padding)
+		return DSSH_ERROR_INVALID;
+	size_t k_data_len = raw_sz + padding;
+#if SIZE_MAX > UINT32_MAX
+	if (k_data_len > UINT32_MAX)
+		return DSSH_ERROR_INVALID;
+#endif
+	uint32_t wire_data_len = (uint32_t)k_data_len;
 
 	size_t   k_wire_len = 4 + k_data_len;
 	uint8_t *buf        = malloc(k_wire_len);
@@ -3190,10 +3206,11 @@ encode_k_wire(const uint8_t *raw, size_t raw_sz, bool k_as_string, uint8_t **out
 
 	size_t pos = 0;
 
-	DSSH_PUT_U32((uint32_t)k_data_len, buf, &pos);
-	if (!k_as_string && k_data_len > raw_sz)
+	DSSH_PUT_U32(wire_data_len, buf, &pos);
+	if (need_pad)
 		buf[pos++] = 0; /* mpint sign-bit padding */
-	memcpy(&buf[pos], raw, raw_sz);
+	if (raw_sz > 0)
+		memcpy(&buf[pos], raw, raw_sz);
 
 	*out    = buf;
 	*out_sz = k_wire_len;
@@ -3393,8 +3410,8 @@ derive_and_apply_keys(struct dssh_session_s *sess, const uint8_t *k_mpint, size_
 	uint8_t    *integ_s2c   = NULL;
 	int         res;
 
-	iv_c2s    = malloc(enc_bs_c2s);
-	iv_s2c    = malloc(enc_bs_s2c);
+	iv_c2s    = malloc(enc_bs_c2s > 0 ? enc_bs_c2s : 1);
+	iv_s2c    = malloc(enc_bs_s2c > 0 ? enc_bs_s2c : 1);
 	key_c2s   = malloc(enc_key_c2s > 0 ? enc_key_c2s : 1);
 	key_s2c   = malloc(enc_key_s2c > 0 ? enc_key_s2c : 1);
 	integ_c2s = calloc(1, mac_key_c2s > 0 ? mac_key_c2s : 1);

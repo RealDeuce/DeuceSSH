@@ -583,6 +583,12 @@ foreach(part IN ITEMS group_selection group_validation peer_validation mpint_val
 		PASS_REGULAR_EXPRESSION "1 tests: 1 passed, 0 failed, 0 skipped")
 endforeach()
 dssh_add_variant_tests(dssh_transport dssh_test_transport)
+add_test(NAME dssh_transport_key_material
+	COMMAND dssh_test_transport key_material/)
+set_tests_properties(dssh_transport_key_material PROPERTIES
+	ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys
+	PASS_REGULAR_EXPRESSION "7 tests: 7 passed, 0 failed, 0 skipped"
+	TIMEOUT 180)
 foreach(provider IN ITEMS none test-growth zlib)
 	if(provider STREQUAL "zlib" AND NOT ZLIB_FOUND)
 		continue()

@@ -9440,7 +9440,16 @@ test_rekey_global_pipeline(void)
 	return rekey_control_cases(true);
 }
 
+#include "key_material_cases.h"
+
 static struct dssh_test_entry tests[] = {
+	{ "key_material/encoding", test_key_material_encoding },
+	{ "key_material/bounds", test_key_material_bounds },
+	{ "key_material/zero_output", test_key_material_zero_output },
+	{ "key_material/known_answers", test_key_material_known_answers },
+	{ "key_material/paired_producer", test_key_material_paired_producer },
+	{ "key_material/zero_module", test_key_material_zero_module },
+	{ "key_material/hash_changes", test_key_material_hash_changes },
 	{ "rekey/global_pipeline", test_rekey_global_pipeline },
 	{ "rekey/control_traffic", test_rekey_control_traffic },
 	{ "release/dhgex_provider_contract", test_dhgex_provider_contract },

@@ -61,6 +61,13 @@ The library must never perform I/O directly (no read/write/send/recv or equivale
 through application-provided callbacks. This ensures the library is transport-agnostic and the
 application retains full control over its I/O model.
 
+An explicit exception applies only to the builtin public key-file convenience
+functions: they may perform application-requested key-file I/O and use
+platform-specific file/permission/descriptor APIs behind their private module
+boundary. They must never prompt through a provider default. This exception
+does not apply to transport, authentication, connection, module callbacks or
+any other library I/O, and does not expose native types in public headers.
+
 ## Opaque Public API
 
 Public headers must expose only opaque handles and standard C types. Internal dependencies (OpenSSL,

@@ -32,6 +32,7 @@ struct dssh_tx_iov; /* full definition in deucessh.h */
 #define SSH_MSG_DEBUG           UINT8_C(4)
 #define SSH_MSG_SERVICE_REQUEST UINT8_C(5)
 #define SSH_MSG_SERVICE_ACCEPT  UINT8_C(6)
+#define SSH_MSG_EXT_INFO        UINT8_C(7)
 
 /* Transport layer Algorithm negotiation */
 #define SSH_MSG_KEXINIT UINT8_C(20)
@@ -86,6 +87,16 @@ struct dssh_rekey_msg {
 	uint32_t               sequence;
 	size_t                 len;
 	uint8_t                data[];
+};
+
+/* Original-exchange receive positions, owned by the sole packet receiver.
+ * A server's optional second EXT_INFO must immediately precede auth success. */
+enum dssh_ext_info_state {
+	DSSH_EXT_INFO_DISABLED,
+	DSSH_EXT_INFO_INITIAL,
+	DSSH_EXT_INFO_AUTH,
+	DSSH_EXT_INFO_BEFORE_SUCCESS,
+	DSSH_EXT_INFO_CLOSED
 };
 
 /*
@@ -205,6 +216,7 @@ struct dssh_transport_state_s {
 	uint32_t rx_seq;
 	uint32_t rx_since_rekey; /* packets received since last (re)key (RX owner) */
 	uint32_t last_rx_seq;    /* seq number of last received packet */
+	enum dssh_ext_info_state ext_info_state;
 	atomic_uint_least32_t rekey_seconds; /* runtime-set threshold; 0 = disabled */
 
 				 /* Pointer-sized — round-robin index for fair channel slot drain */
@@ -212,6 +224,8 @@ struct dssh_transport_state_s {
 
 	/* 1-byte */
 	bool        client;
+	bool        ext_info_receive;     /* our original role indicator */
+	bool        ext_info_peer;        /* peer's original receive indicator */
 	atomic_bool rekey_in_progress;     /* true between KEXINIT and NEWKEYS */
 	atomic_bool tx_owner_active;       /* exclusive packet-engine owner */
 	bool        rekey_pending;         /* deferred auto-rekey (set in recv_packet) */

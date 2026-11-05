@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -154,6 +155,10 @@ wait_for_peer_disconnect(dssh_session sess)
 int
 main(void)
 {
+	/* A peer may close between readiness and write. Let the I/O callback
+	 * return the write error instead of terminating this fixture process. */
+	if (signal(SIGPIPE, SIG_IGN) == SIG_ERR)
+		return 1;
 	for (int descriptor = STDIN_FILENO; descriptor <= STDOUT_FILENO; descriptor++) {
 		int flags = fcntl(descriptor, F_GETFL);
 		if (flags < 0 || fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) < 0)

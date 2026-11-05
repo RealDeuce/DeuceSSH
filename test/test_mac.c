@@ -10,6 +10,7 @@
  */
 
 #include <stdlib.h>
+#include <stdatomic.h>
 #include <string.h>
 
 #include "deucessh.h"
@@ -20,38 +21,66 @@
 #define TEST_MAC_KEY_SIZE    32
 
 /* Global failure injection */
-static int init_fail_at = -1;
-static int init_count = 0;
-static int generate_fail_at = -1;
-static int generate_count = 0;
-static bool corrupt_output = false;
+static atomic_int init_fail_at = -1;
+static atomic_int init_count;
+static atomic_bool init_failure_seen;
+static atomic_int generate_fail_at = -1;
+static atomic_int generate_count;
+static atomic_bool corrupt_output;
 
 void
 test_mac_reset(void)
 {
 	init_fail_at = -1;
 	init_count = 0;
+	init_failure_seen = false;
 	generate_fail_at = -1;
 	generate_count = 0;
 	corrupt_output = false;
 }
 
-void test_mac_fail_init_at(int n)     { init_fail_at = n; init_count = 0; }
-void test_mac_fail_generate_at(int n) { generate_fail_at = n; generate_count = 0; }
-void test_mac_set_corrupt(bool on)    { corrupt_output = on; }
+void
+test_mac_fail_init_at(int n)
+{
+	init_count = 0;
+	init_failure_seen = false;
+	init_fail_at = n;
+}
+
+bool
+test_mac_init_failure_seen(void)
+{
+	return atomic_load(&init_failure_seen);
+}
+
+void
+test_mac_fail_generate_at(int n)
+{
+	generate_count = 0;
+	generate_fail_at = n;
+}
+
+void
+test_mac_set_corrupt(bool on)
+{
+	corrupt_output = on;
+}
 
 struct dssh_mac_ctx {
 	uint8_t key[TEST_MAC_KEY_SIZE];
 	uint16_t digest_size;
 };
 
-static uint16_t current_digest_size = TEST_MAC_DIGEST_SIZE;
+static _Atomic uint16_t current_digest_size = TEST_MAC_DIGEST_SIZE;
 
 static int
 test_mac_init(const uint8_t *key, dssh_mac_ctx **out)
 {
-	if (init_fail_at >= 0 && init_count++ == init_fail_at)
+	int fail_at = atomic_load(&init_fail_at);
+	if (fail_at >= 0 && atomic_fetch_add(&init_count, 1) == fail_at) {
+		init_failure_seen = true;
 		return DSSH_ERROR_INIT;
+	}
 
 	struct dssh_mac_ctx *cbd = malloc(sizeof(*cbd));
 	if (cbd == NULL)
@@ -66,7 +95,8 @@ static int
 test_mac_generate(const uint8_t *buf, size_t bufsz,
     uint8_t *outbuf, dssh_mac_ctx *ctx)
 {
-	if (generate_fail_at >= 0 && generate_count++ == generate_fail_at)
+	int fail_at = atomic_load(&generate_fail_at);
+	if (fail_at >= 0 && atomic_fetch_add(&generate_count, 1) == fail_at)
 		return DSSH_ERROR_INIT;
 
 	struct dssh_mac_ctx *cbd = ctx;

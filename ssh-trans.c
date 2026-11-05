@@ -23,6 +23,7 @@ static int send_packet_inner(struct dssh_session_s *sess, const uint8_t *payload
 DSSH_TESTABLE int kexinit(struct dssh_session_s *sess);
 DSSH_TESTABLE int kex(struct dssh_session_s *sess);
 DSSH_TESTABLE int newkeys(struct dssh_session_s *sess);
+static int send_server_ext_info(struct dssh_session_s *sess);
 
 /* Scrub and free security-sensitive heap buffers. */
 static void
@@ -2038,7 +2039,7 @@ send_cancel(struct dssh_session_s *sess)
  * (IGNORE, DEBUG, UNIMPLEMENTED, DISCONNECT) -- that's done by the
  * public recv_packet wrapper below.
  */
-static int
+DSSH_TESTABLE int
 recv_packet_raw(struct dssh_session_s *sess, uint8_t *msg_type, uint8_t **payload, size_t *payload_len)
 {
 	int ret;
@@ -2226,6 +2227,91 @@ check_auth_receive_phase(struct dssh_session_s *sess, uint8_t msg_type)
 	return 0;
 }
 
+/* The public auth API takes an explicit algorithm, so no peer hint needs to
+ * be retained. Validate recognized server values, and ignore all other binary
+ * values without allocating or imposing a smaller bound than the packet. */
+DSSH_TESTABLE int
+parse_ext_info(const uint8_t *payload, size_t length, bool client)
+{
+	if (length < 5 || payload[0] != SSH_MSG_EXT_INFO)
+		return DSSH_ERROR_PARSE;
+	uint32_t count = DSSH_GET_U32(&payload[1]);
+	size_t pos = 5;
+	if (count > (length - pos) / 8)
+		return DSSH_ERROR_PARSE;
+	for (uint32_t i = 0; i < count; i++) {
+		const uint8_t *name;
+		const uint8_t *value;
+		size_t name_length, value_length;
+		if (!parse_log_string(payload, length, &pos, &name, &name_length)
+		    || name_length == 0 || name_length > DSSH_ALGO_NAME_MAX
+		    || !parse_log_string(payload, length, &pos, &value, &value_length))
+			return DSSH_ERROR_PARSE;
+		for (size_t j = 0; j < name_length; j++) {
+			if (name[j] <= ' ' || name[j] >= DSSH_ASCII_DEL || name[j] == ',')
+				return DSSH_ERROR_PARSE;
+		}
+		if (!client || name_length != DSSH_STRLEN("server-sig-algs")
+		    || memcmp(name, "server-sig-algs", name_length) != 0)
+			continue;
+		size_t token_length = 0;
+		for (size_t j = 0; j < value_length; j++) {
+			if (value[j] == ',') {
+				if (token_length == 0)
+					return DSSH_ERROR_PARSE;
+				token_length = 0;
+			}
+			else {
+				if (value[j] <= ' ' || value[j] >= DSSH_ASCII_DEL
+				    || token_length == DSSH_ALGO_NAME_MAX)
+					return DSSH_ERROR_PARSE;
+				token_length++;
+			}
+		}
+		if (value_length != 0 && token_length == 0)
+			return DSSH_ERROR_PARSE;
+	}
+	return pos == length ? 0 : DSSH_ERROR_PARSE;
+}
+
+/* Apply exactly once in physical receive order, before dispatch/rekey replay.
+ * Optional extension packets do not leak into service/auth/channel receivers. */
+static int
+check_ext_info_position(struct dssh_session_s *sess, uint8_t type,
+    const uint8_t *payload, size_t length)
+{
+	int ret;
+	enum dssh_ext_info_state state = sess->trans.ext_info_state;
+	/* Disconnect is permitted at every protocol position, including while
+	 * authentication success would otherwise have to follow an extension. */
+	if (type == SSH_MSG_DISCONNECT)
+		return 0;
+	if (state == DSSH_EXT_INFO_BEFORE_SUCCESS) {
+		if (type != SSH_MSG_USERAUTH_SUCCESS || length != 1)
+			return DSSH_ERROR_PARSE;
+		sess->trans.ext_info_state = DSSH_EXT_INFO_CLOSED;
+		return 0;
+	}
+	if (type == SSH_MSG_EXT_INFO) {
+		bool first = state == DSSH_EXT_INFO_INITIAL;
+		bool second = state == DSSH_EXT_INFO_AUTH && sess->trans.client
+		    && sess->auth_service_requested && !sess->conn_initialized;
+		if (!first && !second)
+			return DSSH_ERROR_PARSE;
+		ret = parse_ext_info(payload, length, sess->trans.client);
+		if (ret < 0)
+			return ret;
+		sess->trans.ext_info_state = second ? DSSH_EXT_INFO_BEFORE_SUCCESS :
+		    sess->trans.client ? DSSH_EXT_INFO_AUTH : DSSH_EXT_INFO_CLOSED;
+		return 0;
+	}
+	if (state == DSSH_EXT_INFO_INITIAL)
+		sess->trans.ext_info_state = sess->trans.client ? DSSH_EXT_INFO_AUTH : DSSH_EXT_INFO_CLOSED;
+	if (sess->trans.client && (type == SSH_MSG_USERAUTH_SUCCESS || sess->conn_initialized))
+		sess->trans.ext_info_state = DSSH_EXT_INFO_CLOSED;
+	return 0;
+}
+
 /*
  * Public recv_packet: transparently handles transport messages
  * per RFC 4253 s11:
@@ -2281,6 +2367,10 @@ recv_packet_inner(struct dssh_session_s *sess, uint8_t *msg_type, uint8_t **payl
 			res = recv_packet_raw(sess, msg_type, payload, payload_len);
 			if (res < 0)
 				return res;
+			res = check_ext_info_position(sess, *msg_type, *payload, *payload_len);
+			if (res < 0)
+				return transport_disconnect_result(sess, SSH_DISCONNECT_PROTOCOL_ERROR,
+				    "unexpected or malformed SSH_MSG_EXT_INFO", res);
 		}
 		/* Include globals intercepted below in the authentication gate. */
 		res = check_auth_receive_phase(sess, *msg_type);
@@ -2290,6 +2380,8 @@ recv_packet_inner(struct dssh_session_s *sess, uint8_t *msg_type, uint8_t **payl
 		consumed_packet = !replayed && *msg_type != SSH_MSG_KEXINIT;
 
 		switch (*msg_type) {
+			case SSH_MSG_EXT_INFO:
+				continue;
 			case SSH_MSG_DISCONNECT:
 			{
 				size_t         pos = 1;
@@ -2551,6 +2643,14 @@ list_has_name(struct dssh_name_list list, struct dssh_name_list wanted)
 	return false;
 }
 
+static bool
+list_has_text(struct dssh_name_list list, const char *text)
+{
+	const uint8_t *bytes = (const uint8_t *)text;
+	struct dssh_name_list wanted = { bytes, strlen(text) };
+	return list_has_name(list, wanted);
+}
+
 static int
 append_registered_name(void *node, size_t name_offset, char *buf, size_t bufsz,
     size_t *pos, bool hostkeys)
@@ -2719,6 +2819,27 @@ build_kexinit_packet(struct dssh_session_s *sess, uint8_t **buf_out, size_t *pos
 		} \
 	} while (0)
 	OFFER(gconf.kex_head, struct dssh_kex_s, sess->kex_filter, false);
+	if (sess->trans.session_id == NULL) {
+		const char *indicator = sess->trans.client ? "ext-info-c" : "ext-info-s";
+		size_t length = strlen(indicator);
+		if (!dssh_buffer_has(bufsz, pos, 1 + length)) {
+			free(buf);
+			return DSSH_ERROR_TOOLONG;
+		}
+		buf[pos++] = ',';
+		memcpy(&buf[pos], indicator, length);
+		pos += length;
+		/* The KEX list immediately follows the fixed cookie/header. Its
+		 * nonempty registered prefix was already checked by OFFER. */
+		size_t prefix = 1 + DSSH_KEXINIT_COOKIE_SIZE;
+		size_t list_length = pos - prefix - 4;
+		if (list_length > UINT32_MAX) {
+			free(buf);
+			return DSSH_ERROR_TOOLONG;
+		}
+		uint32_t wire_length = (uint32_t)list_length;
+		DSSH_PUT_U32(wire_length, buf, &prefix);
+	}
 	OFFER(gconf.key_algo_head, struct dssh_key_algo_s, sess->key_algo_filter, !sess->trans.client);
 	OFFER(gconf.enc_head, struct dssh_enc_s, sess->enc_filter, false);
 	OFFER(gconf.enc_head, struct dssh_enc_s, sess->enc_filter, false);
@@ -2879,6 +3000,14 @@ negotiate_algorithms(struct dssh_session_s *sess,
 		return ret;
 	const struct dssh_name_list *client = sess->trans.client ? ours : peer;
 	const struct dssh_name_list *server = sess->trans.client ? peer : ours;
+	if (list_has_text(peer[0], sess->trans.client ? "ext-info-c" : "ext-info-s"))
+		return DSSH_ERROR_PARSE;
+	if (sess->trans.session_id == NULL) {
+		sess->trans.ext_info_receive = list_has_text(ours[0],
+		    sess->trans.client ? "ext-info-c" : "ext-info-s");
+		sess->trans.ext_info_peer = list_has_text(peer[0],
+		    sess->trans.client ? "ext-info-s" : "ext-info-c");
+	}
 	sess->trans.kex_selected = NULL;
 	sess->trans.key_algo_selected = NULL;
 	struct dssh_name_list kex_client = client[0];
@@ -2894,6 +3023,12 @@ negotiate_algorithms(struct dssh_session_s *sess,
 	struct dssh_name_list name;
 	while (next_name(kex_client, &pos, &name)) {
 		const char *text = (const char *)name.data;
+		if ((name.len == DSSH_STRLEN("ext-info-c") && memcmp(text, "ext-info-c", name.len) == 0)
+		    || (name.len == DSSH_STRLEN("ext-info-s") && memcmp(text, "ext-info-s", name.len) == 0)) {
+			if (list_has_name(server[0], name))
+				return DSSH_ERROR_PARSE;
+			continue;
+		}
 		if (sess->kex_filter != NULL && !name_in_filter(text, name.len, sess->kex_filter))
 			continue;
 		dssh_kex kex = find_node_by_name(gconf.kex_head, offsetof(struct dssh_kex_s, name), text, name.len);
@@ -3542,6 +3677,7 @@ newkeys(struct dssh_session_s *sess)
 	dssh_mac old_mac_c2s = mac_c2s_module(sess);
 	dssh_mac old_mac_s2c = mac_s2c_module(sess);
 
+	bool initial = sess->trans.session_id == NULL;
 	bool keep_owner = atomic_load_explicit(&sess->trans.rekey_in_progress, memory_order_acquire);
 	int  res        = tx_acquire(sess, SSH_MSG_NEWKEYS);
 
@@ -3610,6 +3746,14 @@ newkeys(struct dssh_session_s *sess)
 	if (sess->conn_initialized) {
 		res = resize_channel_slots(sess);
 	}
+	if (res == 0 && initial) {
+		sess->trans.ext_info_state = sess->trans.ext_info_receive
+		    ? DSSH_EXT_INFO_INITIAL : DSSH_EXT_INFO_DISABLED;
+		/* Keep exclusive packet-engine ownership: EXT_INFO is the first
+		 * new-key packet, before diagnostics, queued slots or other senders. */
+		if (!sess->trans.client && sess->trans.ext_info_peer)
+			res = send_server_ext_info(sess);
+	}
 
 newkeys_done:
 	kex_release_result(sess);
@@ -3622,6 +3766,56 @@ newkeys_done:
 	if (res < 0 || !keep_owner)
 		tx_unlock_with_slots(sess);
 	return res;
+}
+
+DSSH_TESTABLE int
+build_server_ext_info(uint8_t *buf, size_t capacity, size_t *out_length)
+{
+	size_t fixed = 13 + DSSH_STRLEN("server-sig-algs");
+	if (capacity < fixed)
+		return DSSH_ERROR_TOOLONG;
+	size_t pos = 0;
+	buf[pos++] = SSH_MSG_EXT_INFO;
+	DSSH_PUT_U32(1, buf, &pos);
+	DSSH_PUT_U32(DSSH_STRLEN("server-sig-algs"), buf, &pos);
+	memcpy(&buf[pos], "server-sig-algs", DSSH_STRLEN("server-sig-algs"));
+	pos += DSSH_STRLEN("server-sig-algs");
+	size_t prefix = pos;
+	pos += 4;
+	size_t start = pos;
+	/* Auth finds every registered verifier independently of host-key filter,
+	 * capability flags, loaded private keys or per-user authorization. */
+	for (dssh_key_algo key = gconf.key_algo_head; key != NULL; key = key->next) {
+		if (key->verify == NULL)
+			continue;
+		size_t length = strlen(key->name);
+		if (length == 0 || length > DSSH_ALGO_NAME_MAX)
+			return DSSH_ERROR_INVALID;
+		size_t comma = pos > start ? 1 : 0;
+		if (!dssh_buffer_has(capacity, pos, comma + length))
+			return DSSH_ERROR_TOOLONG;
+		if (comma != 0)
+			buf[pos++] = ',';
+		memcpy(&buf[pos], key->name, length);
+		pos += length;
+	}
+	size_t length = pos - start;
+	if (length > UINT32_MAX)
+		return DSSH_ERROR_TOOLONG;
+	uint32_t wire_length = (uint32_t)length;
+	DSSH_PUT_U32(wire_length, buf, &prefix);
+	*out_length = pos;
+	return 0;
+}
+
+static int
+send_server_ext_info(struct dssh_session_s *sess)
+{
+	size_t length;
+	int ret = build_server_ext_info(&sess->trans.tx_packet[9], tx_payload_capacity(sess), &length);
+	if (ret < 0)
+		return ret;
+	return tx_finalize(sess, sess->trans.tx_packet, length);
 }
 
 /* ================================================================
@@ -4007,7 +4201,8 @@ dssh_kex_set_ctx(const char *name, void *ctx)
 	}
 
 DEFINE_REGISTER(dssh_transport_register_kex, dssh_kex, kex_head, kex_tail, kex_entries,
-    item->init != NULL && item->handler != NULL && item->cleanup != NULL && item->hash_name != NULL)
+    item->init != NULL && item->handler != NULL && item->cleanup != NULL && item->hash_name != NULL
+        && strcmp(item->name, "ext-info-c") != 0 && strcmp(item->name, "ext-info-s") != 0)
 DEFINE_REGISTER(dssh_transport_register_key_algo, dssh_key_algo, key_algo_head, key_algo_tail, key_algo_entries, true)
 DEFINE_REGISTER(dssh_transport_register_enc, dssh_enc, enc_head, enc_tail, enc_entries, true)
 DEFINE_REGISTER(dssh_transport_register_mac, dssh_mac, mac_head, mac_tail, mac_entries, true)

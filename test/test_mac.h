@@ -27,6 +27,7 @@ void test_mac_reset(void);
 
 /* Fail the Nth init/generate call (0-based) */
 void test_mac_fail_init_at(int n);
+bool test_mac_init_failure_seen(void);
 void test_mac_fail_generate_at(int n);
 
 /* Corrupt output: flip a bit so receiver's verify fails */

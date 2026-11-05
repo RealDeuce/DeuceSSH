@@ -868,8 +868,8 @@ test_newkeys_enc_init_failure(void)
 	mock_io_close_s2c(&io);
 	thrd_join(st, NULL);
 
-	/* At least one side should have failed */
-	ASSERT_TRUE(ctx.client_result != 0 || ctx.server_result != 0);
+	ASSERT_TRUE(test_enc_init_failure_seen());
+	ASSERT_TRUE(ctx.client_result == DSSH_ERROR_INIT || ctx.server_result == DSSH_ERROR_INIT);
 
 	test_enc_reset();
 	dssh_session_cleanup(server);
@@ -928,7 +928,8 @@ test_newkeys_mac_init_failure(void)
 	mock_io_close_s2c(&io);
 	thrd_join(st, NULL);
 
-	ASSERT_TRUE(ctx.client_result != 0 || ctx.server_result != 0);
+	ASSERT_TRUE(test_mac_init_failure_seen());
+	ASSERT_TRUE(ctx.client_result == DSSH_ERROR_INIT || ctx.server_result == DSSH_ERROR_INIT);
 
 	test_mac_reset();
 	dssh_session_cleanup(server);

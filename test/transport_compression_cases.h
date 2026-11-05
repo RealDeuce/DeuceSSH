@@ -125,7 +125,8 @@ test_compression_expansion(void)
 		payload[i] = value;
 	}
 	payload[0] = SSH_MSG_CHANNEL_DATA;
-	/* Ordinary packet I/O must reuse the initialized library/module buffers. */
+	/* Ordinary packet I/O must reuse the initialized library/module buffers.
+	 * Initial EXT_INFO adds one transform in each direction after four data packets. */
 	dssh_test_alloc_fail_after(0);
 	for (unsigned round = 0; round < 4 && valid; round++)
 		valid = compression_exchange(&ctx, round % 2 == 0, payload, capacity);
@@ -134,7 +135,7 @@ test_compression_expansion(void)
 	struct dssh_test_comp_stats stats;
 	dssh_test_comp_stats(&stats);
 	valid = valid && allocation_calls == 0 && stats.allocations == 4 && stats.live == 4
-	    && stats.compressions == 4 && stats.decompressions == 4 && stats.owner_errors == 0;
+	    && stats.compressions == 5 && stats.decompressions == 5 && stats.owner_errors == 0;
 	free(payload);
 	handshake_cleanup(&ctx);
 	dssh_test_comp_stats(&stats);
@@ -518,7 +519,9 @@ test_compression_gather_slots(void)
 	}
 	struct dssh_test_comp_stats stats;
 	dssh_test_comp_stats(&stats);
-	valid = valid && stats.compressions == 3 && stats.decompressions == 3
+	/* Initial server EXT_INFO is compressed but remains unread on this
+	 * client-to-server-only fixture; the three gathered packets decode here. */
+	valid = valid && stats.compressions == 4 && stats.decompressions == 3
 	    && stats.owner_errors == 0
 	    && compression_bytes_zero(ctx.client->trans.comp_tx_packet, 4 + ctx.client->trans.packet_buf_sz);
 	handshake_cleanup(&ctx);

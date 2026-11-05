@@ -46,6 +46,8 @@ static void (*compression_tx_observer)(dssh_session sess);
 static dssh_hostkey_verify_cb handshake_verify_callback;
 static void *handshake_verify_data;
 static bool handshake_exclude_server;
+static bool ext_info_fail_send;
+static bool ext_info_send_failed;
 
 struct receive_entry_io_probe {
 	dssh_session sess;
@@ -101,6 +103,12 @@ static int
 mock_tx_dispatch(uint8_t *buf, size_t bufsz,
     dssh_session sess, void *cbdata)
 {
+	if (ext_info_fail_send && !sess->trans.client && sess->trans.session_id != NULL
+	    && sess->trans.ext_info_state == DSSH_EXT_INFO_INITIAL
+	    && atomic_load(&sess->trans.tx_since_rekey) == 0) {
+		ext_info_send_failed = true;
+		return DSSH_ERROR_INIT;
+	}
 	if (receive_entry_io_probe != NULL && receive_entry_io_probe->sess == sess) {
 		receive_entry_io_probe->tx_calls++;
 		return DSSH_ERROR_INIT;
@@ -8984,7 +8992,7 @@ test_auth_kbi_request_state(void)
 			.password_cb = auth_state_password, .keyboard_interactive_cb = auth_state_kbi,
 			.cbdata = &probe,
 		};
-		uint8_t before_service = 7;
+		uint8_t before_service = 9; /* unassigned generic transport message */
 		uint32_t rejected_service;
 		ASSERT_OK(send_packet(ctx.client, &before_service, 1, &rejected_service));
 		ASSERT_OK(queue_auth_service(ctx.client, false));
@@ -9111,7 +9119,7 @@ test_auth_client_unknown_messages(void)
 			return TEST_FAIL;
 		}
 		uint32_t rejected[3];
-		uint8_t unknown[] = { 7, 59, 200 };
+		uint8_t unknown[] = { 9, 59, 200 };
 		ASSERT_OK(send_packet(ctx.server, &unknown[0], 1, &rejected[0]));
 		ASSERT_OK(queue_auth_service(ctx.server, true));
 		for (size_t i = 1; i < sizeof(unknown); i++)
@@ -9491,8 +9499,16 @@ test_rekey_global_pipeline(void)
 
 #include "key_material_cases.h"
 #include "receive_entry_cases.h"
+#include "transport_ext_info_cases.h"
 
 static struct dssh_test_entry tests[] = {
+	{ "ext_info/codec", test_ext_info_codec },
+	{ "ext_info/packet_bound", test_ext_info_packet_bound },
+	{ "ext_info/offers", test_ext_info_offers },
+	{ "ext_info/advertisement", test_ext_info_advertisement },
+	{ "ext_info/receive_positions", test_ext_info_receive_positions },
+	{ "ext_info/receive_rejections", test_ext_info_receive_rejections },
+	{ "ext_info/send_failure", test_ext_info_send_failure },
 	{ "receive_entry/notifications", test_receive_entry_notifications },
 	{ "receive_entry/auth_callbacks", test_receive_entry_auth_callbacks },
 	{ "receive_entry/hostkey", test_receive_entry_hostkey },

@@ -39,6 +39,33 @@ test_key_availability_auth(void)
 	return TEST_PASS;
 }
 
+/* This offer-only fixture mirrors the real algorithm lists while supplying
+ * the opposite role's extension indicator. It does not run the KEX method. */
+static int
+availability_offer_tx(uint8_t *buf, size_t len, dssh_session sess, void *opaque)
+{
+	(void)opaque;
+	if (active->used != 0 || len < 5 || buf[4] > len - 5)
+		return DSSH_ERROR_INVALID;
+	int ret = memory_write(buf, len);
+	if (ret != 0)
+		return ret;
+	struct dssh_name_list lists[10];
+	bool follows;
+	ret = parse_peer_kexinit(&active->wire[5], len - 5 - buf[4], lists, &follows);
+	if (ret != 0)
+		return ret;
+	const char *ours = sess->trans.client ? ",ext-info-c" : ",ext-info-s";
+	size_t suffix = strlen(ours);
+	if (lists[0].len < suffix
+	    || memcmp(&lists[0].data[lists[0].len - suffix], ours, suffix) != 0)
+		return DSSH_ERROR_INVALID;
+	/* The parsed bounded view points inside this fixture's writable wire. */
+	size_t offset = (size_t)(lists[0].data - active->wire);
+	active->wire[offset + lists[0].len - 1] = sess->trans.client ? 's' : 'c';
+	return 0;
+}
+
 static int
 test_key_availability_offer(void)
 {
@@ -55,7 +82,7 @@ test_key_availability_offer(void)
 			bool matched = key != NULL && dssh_register_curve25519_sha256() == 0
 			    && dssh_register_none_enc() == 0 && dssh_register_none_mac() == 0
 			    && dssh_register_none_comp() == 0
-			    && dssh_transport_set_callbacks(memory_tx, memory_rx, memory_line, NULL) == 0;
+			    && dssh_transport_set_callbacks(availability_offer_tx, memory_rx, memory_line, NULL) == 0;
 			if (key != NULL && i == count)
 				key->haskey = NULL;
 			dssh_session sess = dssh_session_init(client, 0);
@@ -67,7 +94,7 @@ test_key_availability_offer(void)
 			if (matched) {
 				int ret = kexinit(sess);
 				bool offered = client || available > 0;
-				/* The memory stream returns the just-written offer for negotiation. */
+				/* The stream mirrors algorithms and supplies the peer role. */
 				int expected = offered ? 0 : (available < 0 ? available : DSSH_ERROR_INIT);
 				matched = ret == expected && f.writes == (offered ? 1U : 0U)
 				    && f.availability_calls == (client || i == count ? 0U : 1U) && f.pubkey_calls == 0;

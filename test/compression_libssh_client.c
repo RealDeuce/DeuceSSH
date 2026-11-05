@@ -169,6 +169,10 @@ done:
 	do {
 		waited = waitpid(child, &status, 0);
 	} while (waited < 0 && errno == EINTR);
+	if (waited == child && WIFSIGNALED(status))
+		fprintf(stderr, "DeuceSSH fixture terminated by signal %d\n", WTERMSIG(status));
+	else if (waited == child && WIFEXITED(status))
+		fprintf(stderr, "DeuceSSH fixture exit=%d\n", WEXITSTATUS(status));
 	if (waited != child || !WIFEXITED(status) || WEXITSTATUS(status) != 0)
 		ret = -1;
 	fprintf(stderr, "libssh %s: c2s=%s s2c=%s, %u x 16384 bytes each way, result=%d\n",

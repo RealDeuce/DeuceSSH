@@ -39,14 +39,24 @@ def proxy(args):
     # and recording its exit instead of losing that evidence.
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
     command = [args.peer, "server", args.algorithm, args.key, args.blob, args.user]
+    timed_out = False
     with Path(args.log).open("wb") as log:
         process = subprocess.Popen(command, stderr=log)
         try:
             result = process.wait(timeout=130)
         except subprocess.TimeoutExpired:
+            timed_out = True
             process.kill()
             result = process.wait(timeout=5)
-    Path(args.result).write_text(json.dumps({"command": command, "exit": result}) + "\n")
+    record = {"command": command, "exit": result}
+    if timed_out:
+        record.update(terminated_by_runner=True, pid=process.pid)
+    # Publish only a complete record. The outer process must not observe an
+    # empty or partially written JSON file while the native peer is retiring.
+    target = Path(args.result)
+    pending = target.with_name(target.name + ".pending")
+    pending.write_text(json.dumps(record) + "\n")
+    pending.replace(target)
     return 0 if result == 0 else 1
 
 
@@ -83,7 +93,7 @@ def run(args):
     temporary = None
     result = {"role": args.role, "algorithm": args.algorithm,
               "negative_host": args.negative_host, "status": "FAILED"}
-    for name in ("proxy-result.json", "result.json", "openssh.log", "peer.log", "stderr.log"):
+    for name in ("proxy-result.json", "proxy-result.json.pending", "result.json", "openssh.log", "peer.log", "stderr.log"):
         (evidence / name).unlink(missing_ok=True)
 
     def command(argv, name):
@@ -143,14 +153,19 @@ def run(args):
                    "-c", "aes256-ctr", "-m", "hmac-sha2-256", "-i", str(key),
                    "-o", "ProxyCommand=" + proxy_text, "-l", user, "dssh-interop", "dssh-interop"]
             with (evidence / "stderr.log").open("wb") as error:
+                until = time.monotonic() + 140
                 child = subprocess.Popen(ssh, stdin=subprocess.DEVNULL,
                                          stdout=subprocess.PIPE, stderr=error, start_new_session=True)
                 processes.append(child)
-                output, _ = child.communicate(timeout=140)
+                output, _ = child.communicate(timeout=max(0.1, until - time.monotonic()))
             records.append({"command": ssh, "exit": child.returncode})
-            until = time.monotonic() + 3
+            # Command exit can precede native retirement during an in-flight
+            # rekey. Keep the same overall deadline and the fixture credentials
+            # until the proxy has reaped that peer and published its result.
             while not proxy_result.exists() and time.monotonic() < until:
                 time.sleep(0.01)
+            if not proxy_result.exists():
+                raise RuntimeError("native peer result missing at the overall deadline")
             peer_result = json.loads(proxy_result.read_text())
             records.append(peer_result)
             if child.returncode != 23 or output != OUTPUT:

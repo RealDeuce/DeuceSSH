@@ -71,6 +71,9 @@ int64_t build_namelist(void *head, size_t name_offset,
  * filter string?  Returns false when filter is NULL.
  */
 bool name_in_filter(const char *name, size_t nlen, const char *filter);
+int parse_ext_info(const uint8_t *payload, size_t length, bool client);
+int build_server_ext_info(uint8_t *buf, size_t capacity, size_t *out_length);
+int recv_packet_raw(dssh_session sess, uint8_t *msg_type, uint8_t **payload, size_t *payload_len);
 
 /*
  * Global config -- DSSH_TESTABLE in ssh-trans.c.

@@ -3825,7 +3825,7 @@ dssh_session_init(bool client, size_t max_packet_size)
 	 * pattern. Initialize each atomic's additional implementation state
 	 * before any atomic operation, native construction or publication. */
 	*sess = (struct dssh_session_s){.trans = {.client = client},
-	    .timeout_ms = 75000, .default_max_events = DSSH_DEFAULT_MAX_EVENTS};
+	    .timeout_ms = DSSH_DEFAULT_TIMEOUT_MS, .default_max_events = DSSH_DEFAULT_MAX_EVENTS};
 	atomic_init(&sess->initialized, false);
 	atomic_init(&sess->terminate, false);
 	atomic_init(&sess->demux_running, false);

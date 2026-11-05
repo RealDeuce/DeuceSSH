@@ -24,6 +24,7 @@
 #include "ssh-trans.h"
 #include "ssh-internal.h"
 #include "dssh_test_internal.h"
+#include "dssh_test_ossl.h"
 #include "test_dhgex_provider.h"
 #include "test_comp.h"
 #include "compression_fixture.h"
@@ -1981,19 +1982,31 @@ static int
 test_set_timeout(void)
 {
 	/* NULL session: no crash */
-	dssh_session_set_timeout(NULL, 1000);
+	ASSERT_ERR(dssh_session_set_timeout(NULL, 1000), DSSH_ERROR_INVALID);
 
 	/* Verify default */
 	dssh_session sess = dssh_session_init(true, 0);
 	ASSERT_NOT_NULL(sess);
 	ASSERT_EQ(sess->timeout_ms, 75000);
+	struct timespec now = { .tv_sec = 100, .tv_nsec = 123 };
+	struct timespec deadline = { .tv_sec = 42, .tv_nsec = 1 };
+	dssh_test_clock_set(now);
+	int ret = dssh_deadline_from_ms(&deadline, sess->timeout_ms);
+	dssh_test_clock_reset();
+	ASSERT_OK(ret);
+	ASSERT_TRUE(deadline.tv_sec == 175);
+	ASSERT_EQ(deadline.tv_nsec, 123);
 
 	/* Set and verify */
-	dssh_session_set_timeout(sess, 200);
+	ASSERT_OK(dssh_session_set_timeout(sess, 200));
 	ASSERT_EQ(sess->timeout_ms, 200);
+	ASSERT_OK(dssh_session_set_timeout(sess, INT_MAX));
+	ASSERT_EQ(sess->timeout_ms, INT_MAX);
+	ASSERT_OK(dssh_session_set_timeout(sess, INT_MIN));
+	ASSERT_EQ(sess->timeout_ms, INT_MIN);
 
 	/* Disable timeout */
-	dssh_session_set_timeout(sess, 0);
+	ASSERT_OK(dssh_session_set_timeout(sess, 0));
 	ASSERT_EQ(sess->timeout_ms, 0);
 
 	dssh_session_cleanup(sess);

@@ -101,7 +101,7 @@ dssh_clock_read(struct timespec *ts)
 
 /* Convert a positive timeout, preserving the caller's output on failure. */
 DSSH_PRIVATE int
-dssh_deadline_from_ms(struct timespec *ts, int timeout_ms)
+dssh_deadline_from_ms(struct timespec *ts, intmax_t timeout_ms)
 {
 	if (timeout_ms <= 0)
 		return DSSH_ERROR_INVALID;

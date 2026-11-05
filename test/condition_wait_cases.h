@@ -6,6 +6,7 @@ struct wait_contract_fixture {
 	struct dssh_test_wait_probe probe;
 	unsigned path;
 	unsigned mode;
+	int timeout_ms;
 	uint8_t packet[9];
 };
 
@@ -31,7 +32,7 @@ wait_contract_worker(void *opaque)
 		case 2:
 		case 3:
 			wake->result = accept_incoming(wake->sess, &wake->incoming,
-			    fixture->path == 2 ? -1 : wake->sess->timeout_ms);
+			    fixture->path == 2 ? -1 : fixture->timeout_ms);
 			break;
 		case 4:
 		case 5:
@@ -52,7 +53,7 @@ wait_contract_worker(void *opaque)
 		case 10:
 		case 11:
 			wake->result = dssh_chan_poll(ch, DSSH_POLL_READ,
-			    fixture->path == 10 ? -1 : wake->sess->timeout_ms);
+			    fixture->path == 10 ? -1 : fixture->timeout_ms);
 			break;
 		case 12:
 		case 13:
@@ -96,7 +97,8 @@ wait_contract_init(struct wait_contract_fixture *fixture, unsigned path, unsigne
 	struct wake_fixture *wake = &fixture->wake;
 	struct dssh_channel_s *ch = &wake->channel;
 	bool timed = wait_contract_timed(path);
-	wake->sess->timeout_ms = timed ? (mode == 2 || mode == 4 ? 10 : 30000) : 0;
+	fixture->timeout_ms = timed ? (mode == 2 || mode == 4 ? 10 : 30000) : 0;
+	wake->sess->timeout_ms = fixture->timeout_ms;
 	wake->mutex = &ch->buf_mtx;
 	wake->condition = &ch->poll_cnd;
 	if (path == 0) {

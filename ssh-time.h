@@ -9,6 +9,10 @@
 #include <stdint.h>
 #include <time.h>
 
+/* Internal durations include the documented default even when int is 16-bit.
+ * intmax_t also preserves every value accepted by the public int setters. */
+#define DSSH_DEFAULT_TIMEOUT_MS INTMAX_C(75000)
+
 /* Compare a whole-second interval without overflowing subtraction, including
  * transitions across zero and timestamps near either representation bound. */
 static inline bool
@@ -71,7 +75,7 @@ dssh_relative_wait_ms(uint64_t seconds, long nanos, uint32_t limit, uint32_t *ou
 /* Add a positive millisecond interval without assuming time_t's signedness,
  * width or representation. Publish the result only after all checks pass. */
 static inline bool
-dssh_timespec_add_ms(struct timespec *ts, int timeout_ms)
+dssh_timespec_add_ms(struct timespec *ts, intmax_t timeout_ms)
 {
 	if (timeout_ms <= 0 || ts->tv_nsec < 0 || ts->tv_nsec >= 1000000000L)
 		return false;
@@ -80,8 +84,10 @@ dssh_timespec_add_ms(struct timespec *ts, int timeout_ms)
 		return false;
 	uintmax_t seconds = (uintmax_t)(timeout_ms / 1000);
 	/* Each summand is below 10^9, so this sum fits even a 32-bit long.
-	 * seconds + 1 fits uintmax_t: seconds <= INT_MAX / 1000. */
-	long nanos = ts->tv_nsec + (timeout_ms % 1000) * 1000000L;
+	 * seconds + 1 fits uintmax_t: seconds <= INTMAX_MAX / 1000.
+	 * The positive remainder is below 1000 before narrowing to long. */
+	long milliseconds = (long)(timeout_ms % 1000);
+	long nanos = ts->tv_nsec + milliseconds * 1000000L;
 	if (nanos >= 1000000000L) {
 		nanos -= 1000000000L;
 		seconds++;
@@ -91,7 +97,7 @@ dssh_timespec_add_ms(struct timespec *ts, int timeout_ms)
 		const time_t maximum = _Generic((time_t)0,
 		    float: FLT_MAX, double: DBL_MAX, long double: LDBL_MAX, default: 0);
 		/* Supported integer widths are at most 64 bits; the interval is
-		 * <= INT_MAX / 1000 + 1, well within every standard floating type.
+		 * <= INTMAX_MAX / 1000 + 1, well within every standard floating type.
 		 * The reverse conversion also fits uintmax_t, including rounding. */
 		time_t increment = (time_t)seconds;
 		uintmax_t integral = (uintmax_t)increment;

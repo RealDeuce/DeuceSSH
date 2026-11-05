@@ -469,9 +469,9 @@ struct dssh_session_s {
 	cnd_t  accept_cnd;
 	thrd_t demux_thread;
 
-	/* 4-byte */
+	/* Counters and millisecond intervals */
 	uint32_t next_channel_id;
-	int      timeout_ms;
+	intmax_t timeout_ms;
 
 	/* 1-byte */
 	atomic_bool initialized;
@@ -546,6 +546,6 @@ DSSH_PRIVATE int transport_disconnect_result(struct dssh_session_s *sess, uint32
 DSSH_PRIVATE int dssh_clock_read(struct timespec *ts);
 
 /* Convert a positive timeout, preserving the caller's output on failure. */
-DSSH_PRIVATE int dssh_deadline_from_ms(struct timespec *ts, int timeout_ms);
+DSSH_PRIVATE int dssh_deadline_from_ms(struct timespec *ts, intmax_t timeout_ms);
 
 #endif   // ifndef DSSH_INTERNAL_H

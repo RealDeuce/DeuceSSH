@@ -96,24 +96,65 @@ test_time_bounds(void)
 static int
 test_time_narrow_model(void)
 {
-#if DSSH_TIME_MODEL_NARROW && INT_MAX >= 65535000
+#if DSSH_TIME_MODEL_NARROW
 	struct model_timespec ts = { .tv_sec = 0, .tv_nsec = 0 };
-	ASSERT_TRUE(dssh_timespec_add_ms(&ts, 32767000));
+	ASSERT_TRUE(dssh_timespec_add_ms(&ts, INT64_C(32767000)));
 	ASSERT_TRUE(ts.tv_sec == 32767);
 #if DSSH_TIME_MODEL_SIGNED
 	ASSERT_FALSE(dssh_timespec_add_ms(&ts, 1000));
 	ts.tv_sec = -32768;
-	ASSERT_TRUE(dssh_timespec_add_ms(&ts, 65535000));
+	ASSERT_TRUE(dssh_timespec_add_ms(&ts, INT64_C(65535000)));
 	ASSERT_TRUE(ts.tv_sec == 32767);
 #else
 	ASSERT_TRUE(dssh_timespec_add_ms(&ts, 1000));
 	ASSERT_TRUE(ts.tv_sec == 32768);
 	ts.tv_sec = 0;
-	ASSERT_TRUE(dssh_timespec_add_ms(&ts, 65535000));
+	ASSERT_TRUE(dssh_timespec_add_ms(&ts, INT64_C(65535000)));
 	ASSERT_TRUE(ts.tv_sec == 65535);
 	ASSERT_FALSE(dssh_timespec_add_ms(&ts, 1000));
 #endif
 #endif
+	return TEST_PASS;
+}
+
+static int
+test_time_wide_intervals(void)
+{
+	const int64_t intervals[] = { INT64_C(75000), INT64_C(2147483648), INT64_MAX };
+	for (size_t i = 0; i < sizeof(intervals) / sizeof(intervals[0]); i++) {
+		struct model_timespec ts = { .tv_sec = 0, .tv_nsec = 999999999L };
+		int64_t expected = intervals[i] / 1000 + 1;
+		long fraction = (long)(intervals[i] % 1000);
+		long expected_nanos = 999999999L + fraction * 1000000L;
+		if (expected_nanos < 1000000000L)
+			expected--;
+		else
+			expected_nanos -= 1000000000L;
+#if DSSH_TIME_MODEL_FLOAT
+		/* The oracle converts a value <= INT64_MAX/1000+1, so the
+		 * rounded value also fits int64_t before this reverse cast. */
+		model_time represented = (model_time)expected;
+		int64_t recovered = (int64_t)represented;
+		bool fits = recovered == expected;
+#else
+		bool fits = expected >= 0 && expected <= DSSH_TIME_MODEL_MAX;
+#endif
+		bool added = dssh_timespec_add_ms(&ts, intervals[i]);
+		ASSERT_TRUE(added == fits);
+		if (fits) {
+			model_time expected_time = (model_time)expected;
+			ASSERT_TRUE(ts.tv_sec == expected_time);
+			ASSERT_EQ(ts.tv_nsec, expected_nanos);
+		}
+		else {
+			ASSERT_TRUE(ts.tv_sec == 0);
+			ASSERT_EQ(ts.tv_nsec, 999999999L);
+		}
+	}
+	struct model_timespec ts = { .tv_sec = 100, .tv_nsec = 123 };
+	ASSERT_FALSE(dssh_timespec_add_ms(&ts, INTMAX_MIN));
+	ASSERT_TRUE(ts.tv_sec == 100);
+	ASSERT_EQ(ts.tv_nsec, 123);
 	return TEST_PASS;
 }
 
@@ -151,11 +192,8 @@ static int
 test_time_exhaustive_narrow(void)
 {
 #if DSSH_TIME_MODEL_NARROW
-	const int intervals[] = { 1, 999, 1000, 1234,
-#if INT_MAX >= 65535000
-	    32767000, 65535000,
-#endif
-	    INT_MAX };
+	const int64_t intervals[] = { 1, 999, 1000, 1234, INT64_C(75000),
+	    INT64_C(32767000), INT64_C(65535000), INT_MAX, INT64_C(2147483648), INT64_MAX };
 	const long nanos[] = { 0, 999999999L };
 	for (int32_t value = DSSH_TIME_MODEL_MIN; value <= DSSH_TIME_MODEL_MAX; value++) {
 		model_time original = (model_time)value;
@@ -165,7 +203,7 @@ test_time_exhaustive_narrow(void)
 				/* A wider signed oracle needs none of the production
 				 * helper's narrow/unsigned representation handling.
 				 * Both sums fit: |value| <= 65535, interval/1000
-				 * <= INT_MAX/1000, fractional sum < 2*10^9. */
+				 * <= INT64_MAX/1000, fractional sum < 2*10^9. */
 				int64_t fraction = nanos[j] + (intervals[i] % 1000) * INT64_C(1000000);
 				int64_t expected = value + intervals[i] / INT64_C(1000)
 				    + fraction / INT64_C(1000000000);
@@ -217,6 +255,7 @@ test_time_relative_wait(void)
 }
 
 static struct dssh_test_entry tests[] = {
+	{ "time/wide_intervals", test_time_wide_intervals },
 	{ "time/exhaustive_narrow", test_time_exhaustive_narrow },
 	{ "time/relative_wait", test_time_relative_wait },
 	{ "time/intervals", test_time_intervals },

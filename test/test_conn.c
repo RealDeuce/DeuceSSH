@@ -7833,13 +7833,22 @@ test_clock_deadline(void)
 	ASSERT_TRUE(ts.tv_sec == 101);
 	ASSERT_EQ(ts.tv_nsec, 500000L);
 
+	now.tv_sec = 100;
+	now.tv_nsec = 123;
+	dssh_test_clock_set(now);
+	ret = dssh_deadline_from_ms(&ts, INTMAX_C(75000));
+	dssh_test_clock_reset();
+	ASSERT_OK(ret);
+	ASSERT_TRUE(ts.tv_sec == 175);
+	ASSERT_EQ(ts.tv_nsec, 123);
+
 	now.tv_nsec = 1000000000L;
 	dssh_test_clock_set(now);
 	ret = dssh_deadline_from_ms(&ts, 1);
 	dssh_test_clock_reset();
 	ASSERT_ERR(ret, DSSH_ERROR_INVALID);
-	ASSERT_TRUE(ts.tv_sec == 101);
-	ASSERT_EQ(ts.tv_nsec, 500000L);
+	ASSERT_TRUE(ts.tv_sec == 175);
+	ASSERT_EQ(ts.tv_nsec, 123);
 	return TEST_PASS;
 }
 

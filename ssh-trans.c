@@ -2235,52 +2235,57 @@ check_auth_receive_phase(struct dssh_session_s *sess, uint8_t msg_type)
 static int
 recv_packet_inner(struct dssh_session_s *sess, uint8_t *msg_type, uint8_t **payload, size_t *payload_len)
 {
-	if (atomic_load_explicit(&sess->terminate, memory_order_acquire))
-		return DSSH_ERROR_TERMINATED;
-	/* Handle deferred auto-rekey before reading new data.
-        * Safe here because no payload pointer is live yet. */
-	if (sess->trans.rekey_pending) {
-		sess->trans.rekey_pending = false;
-
-		int rk = rekey(sess);
-
-		if (rk < 0)
-			return rk;
-	}
-
-	/* Replay messages buffered during kexinit wait loop.
-         * These were valid connection-layer messages sent by the
-         * peer before it saw our KEXINIT (RFC 4253 s7.1).
-         * Skip during rekey itself (rekey_in_progress) to avoid
-         * re-buffering messages that the kexinit loop is filling. */
-	if (!sess->trans.rekey_in_progress && sess->trans.rekey_queue_head != NULL) {
-		struct dssh_rekey_msg *rmsg = sess->trans.rekey_queue_head;
-
-		sess->trans.rekey_queue_head = rmsg->next;
-		if (sess->trans.rekey_queue_head == NULL)
-			sess->trans.rekey_queue_tail = NULL;
-		sess->trans.rekey_queue_count--;
-		sess->trans.rekey_queue_bytes -= sizeof(*rmsg) + rmsg->len;
-		memcpy(&sess->trans.rx_packet[5], rmsg->data, rmsg->len);
-		*payload     = &sess->trans.rx_packet[5];
-		*payload_len = rmsg->len;
-		*msg_type    = rmsg->msg_type;
-		sess->trans.last_rx_seq = rmsg->sequence;
-		cleanse_free(rmsg, sizeof(*rmsg) + rmsg->len);
-		return check_auth_receive_phase(sess, *msg_type);
-	}
-
+	int res;
+	bool consumed_packet = false;
 	for (;;) {
 		if (atomic_load_explicit(&sess->terminate, memory_order_acquire))
 			return DSSH_ERROR_TERMINATED;
-		int res = recv_packet_raw(sess, msg_type, payload, payload_len);
+		/* Control messages have finished their callbacks before continuing
+		 * here. No borrowed payload is live, so they share the same deferred
+		 * threshold check as messages returned to the application below. */
+		if (consumed_packet && sess->trans.session_id != NULL
+		    && !sess->trans.rekey_in_progress && rekey_needed(sess))
+			sess->trans.rekey_pending = true;
+		if (sess->terminate)
+			return DSSH_ERROR_TERMINATED;
+		if (sess->trans.rekey_pending && !sess->trans.rekey_in_progress) {
+			sess->trans.rekey_pending = false;
+			res = rekey(sess);
+			if (res < 0)
+				return res;
+		}
 
-		if (res < 0)
-			return res;
+		bool replayed = false;
+		/* A rekey completed inside this receive loop may have buffered
+		 * application messages. Replay them before another physical read,
+		 * preserving their original receive sequence and authentication gate. */
+		if (!sess->trans.rekey_in_progress && sess->trans.rekey_queue_head != NULL) {
+			struct dssh_rekey_msg *rmsg = sess->trans.rekey_queue_head;
+
+			sess->trans.rekey_queue_head = rmsg->next;
+			if (sess->trans.rekey_queue_head == NULL)
+				sess->trans.rekey_queue_tail = NULL;
+			sess->trans.rekey_queue_count--;
+			sess->trans.rekey_queue_bytes -= sizeof(*rmsg) + rmsg->len;
+			memcpy(&sess->trans.rx_packet[5], rmsg->data, rmsg->len);
+			*payload = &sess->trans.rx_packet[5];
+			*payload_len = rmsg->len;
+			*msg_type = rmsg->msg_type;
+			sess->trans.last_rx_seq = rmsg->sequence;
+			cleanse_free(rmsg, sizeof(*rmsg) + rmsg->len);
+			replayed = true;
+		}
+		else {
+			res = recv_packet_raw(sess, msg_type, payload, payload_len);
+			if (res < 0)
+				return res;
+		}
 		/* Include globals intercepted below in the authentication gate. */
 		res = check_auth_receive_phase(sess, *msg_type);
 		if (res < 0)
 			return res;
+		/* An intercepted KEXINIT completes its own exchange below. */
+		consumed_packet = !replayed && *msg_type != SSH_MSG_KEXINIT;
 
 		switch (*msg_type) {
 			case SSH_MSG_DISCONNECT:
@@ -2410,6 +2415,13 @@ recv_packet_inner(struct dssh_session_s *sess, uint8_t *msg_type, uint8_t **payl
 				if (!valid)
 					return transport_disconnect_result(sess, SSH_DISCONNECT_PROTOCOL_ERROR,
 					    "malformed GLOBAL_REQUEST", DSSH_ERROR_PARSE);
+				/* Before the peer's KEXINIT, the negotiation receiver queues
+				 * in-flight higher-layer messages. Dispatch their callbacks
+				 * and replies through this same path when replayed afterward.
+				 * During the method exchange an unexpected message instead
+				 * reaches the method's normal type validation. */
+				if (sess->trans.rekey_in_progress)
+					return 0;
 				bool want_reply = (*payload)[pos] != 0;
 				pos++;
 				int result = DSSH_ERROR_REJECTED;

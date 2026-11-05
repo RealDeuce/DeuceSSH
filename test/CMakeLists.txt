@@ -583,6 +583,26 @@ foreach(part IN ITEMS group_selection group_validation peer_validation mpint_val
 		PASS_REGULAR_EXPRESSION "1 tests: 1 passed, 0 failed, 0 skipped")
 endforeach()
 dssh_add_variant_tests(dssh_transport dssh_test_transport)
+foreach(provider IN ITEMS none test-growth zlib)
+	if(provider STREQUAL "zlib" AND NOT ZLIB_FOUND)
+		continue()
+	endif()
+	add_test(NAME dssh_transport_rekey_control_${provider}
+		COMMAND dssh_test_transport --exact rekey/control_traffic)
+	set_tests_properties(dssh_transport_rekey_control_${provider} PROPERTIES
+		ENVIRONMENT "${DSSH_TEST_KEY_ENV};DSSH_TEST_REKEY_COMP=${provider}"
+		FIXTURES_REQUIRED dssh_cached_keys
+		PASS_REGULAR_EXPRESSION "1 tests: 1 passed, 0 failed, 0 skipped"
+		TIMEOUT 240)
+	add_test(NAME dssh_transport_rekey_global_pipeline_${provider}
+		COMMAND dssh_test_transport --exact rekey/global_pipeline)
+	set_tests_properties(dssh_transport_rekey_global_pipeline_${provider} PROPERTIES
+		ENVIRONMENT "${DSSH_TEST_KEY_ENV};DSSH_TEST_REKEY_COMP=${provider}"
+		FIXTURES_REQUIRED dssh_cached_keys
+		PASS_REGULAR_EXPRESSION "1 tests: 1 passed, 0 failed, 0 skipped"
+		TIMEOUT 240)
+endforeach()
+
 add_test(NAME dssh_transport_modules_stateless
 	COMMAND dssh_test_transport --exact modules/stateless)
 set_tests_properties(dssh_transport_modules_stateless PROPERTIES

@@ -9183,7 +9183,268 @@ test_auth_replayed_message_state(void)
 #include "transport_compression_cases.h"
 #include "transport_module_cases.h"
 
+struct rekey_control_probe {
+	struct handshake_ctx *pair;
+	dssh_session peer;
+	unsigned kind;
+	unsigned debug_calls;
+	unsigned unimplemented_calls;
+	unsigned global_calls;
+	unsigned requests;
+	atomic_bool finished;
+	atomic_bool timed_out;
+	bool callback_valid;
+	bool peer_valid;
+	atomic_uint_least32_t before_sequence;
+	atomic_uint_least32_t after_sequence;
+};
+
+static void
+rekey_control_debug(bool display, const uint8_t *message, size_t length, void *opaque)
+{
+	struct rekey_control_probe *p = opaque;
+	p->debug_calls++;
+	p->callback_valid = p->callback_valid && display && length == DSSH_STRLEN("control")
+	    && memcmp(message, "control", length) == 0;
+}
+
+static void
+rekey_control_unimplemented(uint32_t rejected, void *opaque)
+{
+	struct rekey_control_probe *p = opaque;
+	p->unimplemented_calls++;
+	p->callback_valid = p->callback_valid && rejected == UINT32_C(0x12345678);
+}
+
+static int
+rekey_control_global(const uint8_t *name, size_t name_len, bool want_reply,
+    const uint8_t *data, size_t data_len, void *opaque)
+{
+	struct rekey_control_probe *p = opaque;
+	p->global_calls++;
+	p->callback_valid = p->callback_valid && name_len == DSSH_STRLEN("rekey-test")
+	    && memcmp(name, "rekey-test", name_len) == 0
+	    && (p->requests == 1 ? data_len == 0 : data_len == 1 && data[0] == p->global_calls)
+	    && want_reply == (p->kind != 3);
+	return p->kind == 5 && !(data_len == 1 && data[0] == 2) ? 0 : DSSH_ERROR_REJECTED;
+}
+
+static int
+rekey_control_watchdog(void *opaque)
+{
+	struct rekey_control_probe *p = opaque;
+	unsigned attempts = getenv("DSSH_TEST_REKEY_BASELINE") != NULL ? 1U : 6U;
+	for (unsigned i = 0; i < attempts; i++) {
+		if (dssh_test_wait_bool(&p->finished, true))
+			return 0;
+	}
+	atomic_store(&p->timed_out, true);
+	dssh_session_terminate(p->pair->client);
+	dssh_session_terminate(p->pair->server);
+	mock_io_close_c2s(&p->pair->io);
+	mock_io_close_s2c(&p->pair->io);
+	return 0;
+}
+
+static int
+rekey_control_peer(void *opaque)
+{
+	struct rekey_control_probe *p = opaque;
+	uint8_t control[32];
+	size_t pos = 0;
+	if (p->kind == 0) {
+		control[pos++] = SSH_MSG_IGNORE;
+		DSSH_PUT_U32(0, control, &pos);
+	}
+	else if (p->kind == 1) {
+		control[pos++] = SSH_MSG_DEBUG;
+		control[pos++] = 1;
+		DSSH_PUT_U32(DSSH_STRLEN("control"), control, &pos);
+		memcpy(control + pos, "control", DSSH_STRLEN("control"));
+		pos += DSSH_STRLEN("control");
+		DSSH_PUT_U32(0, control, &pos);
+	}
+	else if (p->kind == 2) {
+		control[pos++] = SSH_MSG_UNIMPLEMENTED;
+		DSSH_PUT_U32(UINT32_C(0x12345678), control, &pos);
+	}
+	else {
+		control[pos++] = SSH_MSG_GLOBAL_REQUEST;
+		DSSH_PUT_U32(DSSH_STRLEN("rekey-test"), control, &pos);
+		memcpy(control + pos, "rekey-test", DSSH_STRLEN("rekey-test"));
+		pos += DSSH_STRLEN("rekey-test");
+		control[pos++] = p->kind == 3 ? 0 : 1;
+	}
+	const uint8_t before[] = {SSH_MSG_CHANNEL_DATA, 0, 0, 0, 0, 0, 0, 0, 1, 0x51};
+	const uint8_t after[] = {SSH_MSG_CHANNEL_DATA, 0, 0, 0, 0, 0, 0, 0, 1, 0x52};
+	bool valid = true;
+	for (unsigned i = 0; i < p->requests && valid; i++) {
+		size_t length = pos;
+		if (p->requests > 1) {
+			if (pos >= sizeof(control) || i >= UINT8_MAX) {
+				valid = false;
+				break;
+			}
+			uint8_t index = (uint8_t)(i + 1);
+			control[length++] = index;
+		}
+		valid = send_packet(p->peer, control, length, NULL) == 0;
+	}
+	atomic_store(&p->before_sequence, p->peer->trans.tx_seq);
+	if (valid)
+		valid = send_packet(p->peer, before, sizeof(before), NULL) == 0;
+	unsigned replies = 0;
+	while (valid) {
+		uint8_t type;
+		uint8_t *packet;
+		size_t length;
+		int ret = recv_packet(p->peer, &type, &packet, &length);
+		if (ret != 0) {
+			valid = false;
+			break;
+		}
+		if (type == SSH_MSG_REQUEST_FAILURE || type == SSH_MSG_REQUEST_SUCCESS) {
+			replies++;
+			valid = p->kind >= 4 && replies <= p->requests && length == 1
+			    && type == (p->kind == 5 && !(p->requests > 1 && replies == 2)
+		        ? SSH_MSG_REQUEST_SUCCESS : SSH_MSG_REQUEST_FAILURE);
+			continue;
+		}
+		valid = type == SSH_MSG_CHANNEL_DATA && length == sizeof(before)
+		    && packet[9] == 0x61 && replies == (p->kind >= 4 ? p->requests : 0U);
+		break;
+	}
+	atomic_store(&p->after_sequence, p->peer->trans.tx_seq);
+	if (valid)
+		valid = send_packet(p->peer, after, sizeof(after), NULL) == 0;
+	if (valid) {
+		uint8_t type;
+		uint8_t *packet;
+		size_t length;
+		valid = recv_packet(p->peer, &type, &packet, &length) == 0
+		    && type == SSH_MSG_CHANNEL_DATA && length == sizeof(before) && packet[9] == 0x62;
+	}
+	p->peer_valid = valid;
+	if (!valid) {
+		dssh_session_terminate(p->pair->client);
+		dssh_session_terminate(p->pair->server);
+		mock_io_close_c2s(&p->pair->io);
+		mock_io_close_s2c(&p->pair->io);
+	}
+	return 0;
+}
+
+static bool
+rekey_control_exchange(struct handshake_ctx *pair, bool client, unsigned kind, unsigned requests)
+{
+	dssh_session receiver = client ? pair->client : pair->server;
+	struct rekey_control_probe p = {.pair = pair, .peer = client ? pair->server : pair->client,
+	    .kind = kind, .requests = requests, .callback_valid = true};
+	atomic_init(&p.finished, false);
+	atomic_init(&p.timed_out, false);
+	atomic_init(&p.before_sequence, 0);
+	atomic_init(&p.after_sequence, 0);
+	bool valid = dssh_session_set_debug_cb(receiver, rekey_control_debug, &p) == 0
+	    && dssh_session_set_unimplemented_cb(receiver, rekey_control_unimplemented, &p) == 0
+	    && dssh_session_set_global_request_cb(receiver, rekey_control_global, &p) == 0;
+	/* The sole receiver is not active yet. Alternate packet/byte triggers;
+	 * the byte seam updates the actual RX counter at the next packet boundary. */
+	if (kind % 2 == 0)
+		receiver->trans.rx_since_rekey = DSSH_REKEY_SOFT_LIMIT - 1;
+	else {
+		dssh_enc enc = receiver->trans.client ? receiver->trans.enc_s2c_active : receiver->trans.enc_c2s_active;
+		dssh_test_arm_rx_bytes_before_count(receiver, enc->bytes_per_key);
+	}
+	thrd_t thread, watchdog;
+	bool watched = valid && thrd_create(&watchdog, rekey_control_watchdog, &p) == thrd_success;
+	bool started = watched && thrd_create(&thread, rekey_control_peer, &p) == thrd_success;
+	valid = valid && started;
+	uint8_t type;
+	uint8_t *packet;
+	size_t length;
+	if (valid)
+		valid = recv_packet(receiver, &type, &packet, &length) == 0
+		    && type == SSH_MSG_CHANNEL_DATA && length == 10 && packet[9] == 0x51
+		    && receiver->trans.rx_since_rekey == 0
+		    && receiver->trans.tx_since_rekey == (kind >= 4 ? requests - 1 : 0)
+		    && !receiver->trans.rekey_pending && receiver->trans.rekey_queue_count == 0
+		    && receiver->trans.last_rx_seq == atomic_load(&p.before_sequence);
+	uint8_t ack[] = {SSH_MSG_CHANNEL_DATA, 0, 0, 0, 0, 0, 0, 0, 1, 0x61};
+	if (valid)
+		valid = send_packet(receiver, ack, sizeof(ack), NULL) == 0;
+	if (valid)
+		valid = recv_packet(receiver, &type, &packet, &length) == 0
+		    && type == SSH_MSG_CHANNEL_DATA && length == 10 && packet[9] == 0x52
+		    && receiver->trans.rx_since_rekey == 1
+		    && receiver->trans.last_rx_seq == atomic_load(&p.after_sequence);
+	ack[9] = 0x62;
+	if (valid)
+		valid = send_packet(receiver, ack, sizeof(ack), NULL) == 0;
+	if (!valid) {
+		mock_io_close_c2s(&pair->io);
+		mock_io_close_s2c(&pair->io);
+	}
+	atomic_store(&p.finished, true);
+	if (started && thrd_join(thread, NULL) != thrd_success)
+		abort();
+	if (watched && thrd_join(watchdog, NULL) != thrd_success)
+		abort();
+	valid = valid && !atomic_load(&p.timed_out) && p.peer_valid && p.callback_valid
+	    && p.debug_calls == (kind == 1 ? 1U : 0U)
+	    && p.unimplemented_calls == (kind == 2 ? 1U : 0U)
+	    && p.global_calls == (kind >= 3 ? requests : 0U)
+	    && !dssh_session_is_terminated(receiver) && !dssh_session_is_terminated(p.peer);
+	valid = dssh_session_set_debug_cb(receiver, NULL, NULL) == 0 && valid;
+	valid = dssh_session_set_unimplemented_cb(receiver, NULL, NULL) == 0 && valid;
+	valid = dssh_session_set_global_request_cb(receiver, NULL, NULL) == 0 && valid;
+	if (!valid)
+		fprintf(stderr, "rekey control role=%u kind=%u peer=%u\n", client ? 1U : 0U, kind, p.peer_valid ? 1U : 0U);
+	return valid;
+}
+
+static int
+rekey_control_cases(bool pipeline)
+{
+	const char *compression = getenv("DSSH_TEST_REKEY_COMP");
+	for (unsigned role = 0; role < 2; role++) {
+		struct handshake_ctx ctx;
+		int ret;
+		if (compression != NULL && strcmp(compression, "test-growth") == 0) {
+			ASSERT_OK(dssh_test_comp_reset());
+			ret = compression_handshake(&ctx);
+		}
+		else if (compression != NULL && strcmp(compression, "zlib") == 0)
+			ret = compression_handshake_with(&ctx, dssh_test_register_zlib_comp);
+		else
+			ret = handshake_setup(&ctx);
+		bool valid = ret == 0;
+		if (valid)
+			valid = dssh_session_set_timeout(ctx.client, getenv("DSSH_TEST_REKEY_BASELINE") != NULL ? 1000 : 30000) == 0
+			    && dssh_session_set_timeout(ctx.server, getenv("DSSH_TEST_REKEY_BASELINE") != NULL ? 1000 : 30000) == 0;
+		for (unsigned kind = pipeline ? 3U : 0U; kind < 6 && valid; kind++)
+			valid = rekey_control_exchange(&ctx, role == 0, kind, pipeline ? 3U : 1U);
+		handshake_cleanup(&ctx);
+		ASSERT_TRUE(valid);
+	}
+	printf("rekey controls: %u exchanges with ordered replay verified\n", pipeline ? 6U : 12U);
+	return TEST_PASS;
+}
+
+static int
+test_rekey_control_traffic(void)
+{
+	return rekey_control_cases(false);
+}
+
+static int
+test_rekey_global_pipeline(void)
+{
+	return rekey_control_cases(true);
+}
+
 static struct dssh_test_entry tests[] = {
+	{ "rekey/global_pipeline", test_rekey_global_pipeline },
+	{ "rekey/control_traffic", test_rekey_control_traffic },
 	{ "release/dhgex_provider_contract", test_dhgex_provider_contract },
 	{ "release/dhgex_group_result_handshake", test_dhgex_group_result_handshake },
 	{ "release/dhgex_group_result_reuse", test_dhgex_group_result_reuse },

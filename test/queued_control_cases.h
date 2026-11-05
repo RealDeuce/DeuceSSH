@@ -20,6 +20,7 @@ struct queue_retry_fixture {
 	bool merge_valid;
 	int rekey_result;
 	atomic_bool data_done;
+	atomic_bool marker_release;
 	atomic_bool stream_entered;
 	atomic_bool stream_release;
 	dssh_chan_zc_cb stream_cb;
@@ -120,8 +121,14 @@ queue_retry_global(const uint8_t *name, size_t name_len, bool want_reply,
 	struct queue_retry_fixture *f = opaque;
 	if (name_len == DSSH_STRLEN("queue-credit-ready")
 	    && memcmp(name, "queue-credit-ready", name_len) == 0
-	    && !want_reply && data_len == 0)
+	    && !want_reply && data_len == 0) {
 		atomic_store(&f->data_done, true);
+		/* Keep the receiver at a known boundary while the controller models
+		 * a temporary packet-budget refusal. Resume after that budget is
+		 * restored so ordinary auto-rekey does not consume the model state. */
+		if (!dssh_test_wait_bool(&f->marker_release, true))
+			atomic_store(&f->bad, true);
+	}
 	return DSSH_ERROR_REJECTED;
 }
 
@@ -297,6 +304,7 @@ queue_retry_case(unsigned kind, bool gather, unsigned probe)
 	atomic_init(&f.flush_ready, false);
 	atomic_init(&f.peer_done, false);
 	atomic_init(&f.data_done, false);
+	atomic_init(&f.marker_release, false);
 	atomic_init(&f.stream_entered, false);
 	atomic_init(&f.stream_release, false);
 	atomic_init(&f.second_entered, false);
@@ -450,6 +458,7 @@ queue_retry_case(unsigned kind, bool gather, unsigned probe)
 		}
 		valid = valid && owned;
 	}
+	atomic_store(&f.marker_release, true);
 	atomic_store(&f.flush_ready, true);
 	if (owned)
 		tx_unlock_with_slots(f.ctx.server);

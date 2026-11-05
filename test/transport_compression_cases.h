@@ -10,18 +10,21 @@ struct compression_sender {
 	bool do_rekey;
 	bool exclude_alloc;
 	atomic_bool *completed;
+	mtx_t *watched_mutex;
 };
 
 static int
 compression_sender_thread(void *data)
 {
 	struct compression_sender *sender = data;
+	dssh_test_mtx_watch_ownership(sender->watched_mutex);
 	compression_callback_session = sender->sess;
 	if (sender->exclude_alloc)
 		dssh_test_alloc_exclude_thread();
 	sender->result = sender->do_rekey ? rekey(sender->sess) :
 	    send_packet(sender->sess, sender->payload, sender->length, NULL);
 	compression_callback_session = NULL;
+	dssh_test_mtx_watch_ownership(NULL);
 	if (sender->completed != NULL)
 		atomic_store(sender->completed, true);
 	if (sender->result < 0) {
@@ -855,37 +858,29 @@ test_compression_replay_cleanup(void)
 	return TEST_PASS;
 }
 
-struct compression_global_gate {
+struct compression_queue_gate {
 	dssh_session sess;
 	atomic_bool entered;
 	atomic_bool release;
 	bool valid;
 	unsigned calls;
 };
+static struct compression_queue_gate *compression_active_queue_gate;
 
-static int
-compression_global_gate_cb(const uint8_t *name, size_t name_len, bool want_reply,
-    const uint8_t *data, size_t data_len, void *opaque)
+/* Hold an actual KEX transmit callback while the controller queues reserved
+ * control slots. Callback timing for inbound globals is tested separately. */
+static void
+compression_queue_gate_tx(dssh_session sess)
 {
-	struct compression_global_gate *gate = opaque;
+	struct compression_queue_gate *gate = compression_active_queue_gate;
+	if (gate == NULL || sess != gate->sess || atomic_load(&gate->entered))
+		return;
 	gate->calls++;
-	gate->valid = name_len == 10 && memcmp(name, "audit-test", 10) == 0
-	    && want_reply && data_len == 1 && data[0] == 42
-	    && atomic_load(&gate->sess->trans.rekey_in_progress);
-	mtx_t *mutexes[] = { &gate->sess->trans.tx_mtx, &gate->sess->trans.tx_queue_mtx };
-	for (size_t i = 0; i < sizeof(mutexes) / sizeof(mutexes[0]); i++) {
-		int ret = mtx_trylock(mutexes[i]);
-		if (ret == thrd_success) {
-			if (mtx_unlock(mutexes[i]) != thrd_success)
-				gate->valid = false;
-		}
-		else
-			gate->valid = false;
-	}
+	gate->valid = atomic_load(&sess->trans.rekey_in_progress)
+	    && tx_owner_is_current(sess) && !dssh_test_mtx_ownership();
 	atomic_store(&gate->entered, true);
 	if (!dssh_test_wait_bool(&gate->release, true))
 		gate->valid = false;
-	return gate->valid ? 0 : DSSH_ERROR_REJECTED;
 }
 
 static int
@@ -911,15 +906,15 @@ test_compression_queued_rekey(void)
 		const char *method = mode % 2 == 0 ? "test-growth" : "test-growth-alt";
 		bool valid = dssh_session_set_comp_filter(ctx.client, &method, 1) == 0
 		    && dssh_session_set_comp_filter(ctx.server, &method, 1) == 0;
-		struct compression_global_gate gate = { .sess = ctx.server };
+		struct compression_queue_gate gate = { .sess = ctx.server };
 		atomic_init(&gate.entered, false);
 		atomic_init(&gate.release, false);
-		valid = valid && dssh_session_set_global_request_cb(ctx.server, compression_global_gate_cb, &gate) == 0;
-		uint8_t global[] = { SSH_MSG_GLOBAL_REQUEST, 0, 0, 0, 10,
-		    'a', 'u', 'd', 'i', 't', '-', 't', 'e', 's', 't', 1, 42 };
-		valid = valid && send_packet(ctx.client, global, sizeof(global), NULL) == 0;
+		void (*previous_observer)(dssh_session) = compression_tx_observer;
+		compression_active_queue_gate = &gate;
+		compression_tx_observer = compression_queue_gate_tx;
 		struct compression_sender client = { .pair = &ctx, .sess = ctx.client, .do_rekey = true, .result = -999 };
-		struct compression_sender server = { .pair = &ctx, .sess = ctx.server, .do_rekey = true, .result = -999 };
+		struct compression_sender server = { .pair = &ctx, .sess = ctx.server, .do_rekey = true, .result = -999,
+		    .watched_mutex = mode % 2 == 0 ? &ctx.server->trans.tx_mtx : &ctx.server->trans.tx_queue_mtx };
 		atomic_bool app_completed;
 		atomic_init(&app_completed, false);
 		uint8_t application[] = { SSH_MSG_CHANNEL_DATA, 11, 22, 33, 44 };
@@ -943,8 +938,11 @@ test_compression_queued_rekey(void)
 		uint8_t channel_reply[17] = { SSH_MSG_CHANNEL_OPEN_FAILURE };
 		channel_reply[4] = 7;
 		channel_reply[8] = 3; /* RFC 4254: unknown channel type. */
+		uint8_t global_reply = SSH_MSG_REQUEST_SUCCESS;
 		if (valid)
 			valid = dssh_test_wait_bool(waited, true) && !atomic_load(&app_completed)
+			    && send_to_slot(ctx.server, &ctx.server->trans.global_reply_slot, &global_reply, 1) == 0
+			    && atomic_load(&ctx.server->trans.global_reply_slot.ready)
 			    && send_to_slot(ctx.server, &ctx.server->trans.open_fail_slot,
 			        channel_reply, sizeof(channel_reply)) == 0
 			    && atomic_load(&ctx.server->trans.open_fail_slot.ready);
@@ -959,6 +957,8 @@ test_compression_queued_rekey(void)
 			abort();
 		if (ac && thrd_join(at, NULL) != thrd_success)
 			abort();
+		compression_tx_observer = previous_observer;
+		compression_active_queue_gate = NULL;
 		dssh_test_thrd_watch_condition(NULL);
 		valid = valid && client.result == 0 && server.result == 0 && app.result == 0
 		    && gate.valid && gate.calls == 1 && atomic_load(&app_completed)

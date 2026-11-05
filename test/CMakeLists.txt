@@ -1163,12 +1163,46 @@ add_test(NAME dssh_asymmetric_mac COMMAND dssh_test_asymmetric_mac)
 # ================================================================
 
 if(DEUCESSH_TEST_OPENSSH)
-	dssh_add_test(openssh_server test_openssh_server.c)
-	dssh_add_test(openssh_client test_openssh_client.c)
-	add_test(NAME dssh_integration_openssh
-		COMMAND ${PROJECT_SOURCE_DIR}/test/test_openssh_interop.sh
-			${CMAKE_CURRENT_BINARY_DIR}/dssh_test_openssh_server
-			${CMAKE_CURRENT_BINARY_DIR}/dssh_test_openssh_client)
+	if(NOT UNIX)
+		message(FATAL_ERROR "OpenSSH stdio fixtures currently require POSIX process/I/O support")
+	endif()
+	find_package(Python3 3.9 REQUIRED COMPONENTS Interpreter)
+	find_program(DSSH_OPENSSH_EXECUTABLE NAMES ssh REQUIRED)
+	find_program(DSSH_OPENSSH_DAEMON NAMES sshd PATHS /usr/sbin /usr/local/sbin REQUIRED)
+	find_program(DSSH_OPENSSH_KEYGEN NAMES ssh-keygen REQUIRED)
+	foreach(form IN ITEMS static shared)
+		if(TARGET deucessh_${form})
+			# Deliberately link the production target, without DSSH_TESTING,
+			# private headers, allocator hooks or replacement algorithms.
+			add_executable(dssh_openssh_${form} openssh_peer.c)
+			target_compile_definitions(dssh_openssh_${form} PRIVATE _POSIX_C_SOURCE=200809L)
+			set_property(TARGET dssh_openssh_${form} PROPERTY C_STANDARD 17)
+			set_property(TARGET dssh_openssh_${form} PROPERTY C_STANDARD_REQUIRED ON)
+			target_compile_options(dssh_openssh_${form} PRIVATE ${DEUCESSH_COMPILE_OPTIONS})
+			target_link_libraries(dssh_openssh_${form} PRIVATE deucessh_${form})
+			foreach(method IN ITEMS curve25519-sha256 diffie-hellman-group-exchange-sha256
+					sntrup761x25519-sha512 mlkem768x25519-sha256)
+				foreach(role IN ITEMS client server)
+					set(interop_name dssh_openssh_${form}_${role}_${method})
+					add_test(NAME ${interop_name} COMMAND ${Python3_EXECUTABLE}
+						${CMAKE_CURRENT_SOURCE_DIR}/openssh_interop.py run
+						--peer $<TARGET_FILE:dssh_openssh_${form}> --role ${role} --algorithm ${method}
+						--ssh ${DSSH_OPENSSH_EXECUTABLE} --sshd ${DSSH_OPENSSH_DAEMON}
+						--keygen ${DSSH_OPENSSH_KEYGEN}
+						--evidence ${CMAKE_CURRENT_BINARY_DIR}/openssh-evidence/${interop_name})
+					set_tests_properties(${interop_name} PROPERTIES TIMEOUT 210 LABELS openssh)
+				endforeach()
+			endforeach()
+			set(reject_name dssh_openssh_${form}_reject_host)
+			add_test(NAME ${reject_name} COMMAND ${Python3_EXECUTABLE}
+				${CMAKE_CURRENT_SOURCE_DIR}/openssh_interop.py run
+				--peer $<TARGET_FILE:dssh_openssh_${form}> --role client --algorithm curve25519-sha256
+				--ssh ${DSSH_OPENSSH_EXECUTABLE} --sshd ${DSSH_OPENSSH_DAEMON}
+				--keygen ${DSSH_OPENSSH_KEYGEN} --negative-host
+				--evidence ${CMAKE_CURRENT_BINARY_DIR}/openssh-evidence/${reject_name})
+			set_tests_properties(${reject_name} PROPERTIES TIMEOUT 210 LABELS openssh)
+		endif()
+	endforeach()
 endif()
 
 if(DEUCESSH_TEST_SYNCHRONET)

@@ -11,7 +11,7 @@ A from-scratch SSH library in standard C17 implementing the core SSH protocol:
 - RFC 4419 — Diffie-Hellman Group Exchange
 - RFC 6668 — SHA-2 Data Integrity Verification
 - RFC 8160 — IUTF8 Terminal Mode
-- RFC 8308 — Extension Negotiation
+- RFC 8308 — Extension Negotiation ([implementation pending](docs/release-1.0-evidence/rfc8308-ledger.md))
 - RFC 8332 — RSA SHA-256 and SHA-512 Signature Algorithms
 - RFC 8709 — Ed25519 Host Key Algorithm
 - RFC 8731 — curve25519-sha256 Key Exchange
@@ -1960,6 +1960,23 @@ ctest -R dssh_self           # integration selftests
 CTest prepares the shared Ed25519/RSA key cache before parallel consumers
 start, including filtered runs. Assertion cleanup runs before returning from
 the failed test so stack-owned sessions and worker arguments remain valid.
+
+Optional independent OpenSSH tests require POSIX process/I/O support, Python
+3.9+, `ssh`, `sshd`, and `ssh-keygen`. Enable them with
+`-DDEUCESSH_TEST_OPENSSH=ON` together with `-DDEUCESSH_BUILD_TESTS=ON`, then build
+and run `ctest --test-dir build -L openssh -j2 --output-on-failure`. They exercise
+the production static/shared libraries in both roles over stdio, with temporary
+fixture keys, pinned host keys, signed authentication, exact stdout/stderr/exit
+status, forced plain algorithm names and peer-initiated rekey. No listening
+socket, account change or global SSH configuration change is made. The daemon role requires that
+the current local account is permitted to authenticate using its isolated test
+configuration. Complete diagnostics and actual process exits remain in the
+build tree's `test/openssh-evidence/` directory; private keys are removed.
+
+These tests currently retain a failing server-role baseline while the
+[extension-negotiation continuation](docs/release-1.0-evidence/rfc8308-ledger.md)
+is implemented. A passing default suite with the option disabled is not
+independent interoperability evidence.
 
 ## Debugging
 

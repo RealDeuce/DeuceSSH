@@ -2415,12 +2415,13 @@ recv_packet_inner(struct dssh_session_s *sess, uint8_t *msg_type, uint8_t **payl
 				if (!valid)
 					return transport_disconnect_result(sess, SSH_DISCONNECT_PROTOCOL_ERROR,
 					    "malformed GLOBAL_REQUEST", DSSH_ERROR_PARSE);
-				/* Before the peer's KEXINIT, the negotiation receiver queues
+				/* Initial negotiation rejects higher-layer messages. Before
+				 * the peer's rekey KEXINIT, the negotiation receiver queues
 				 * in-flight higher-layer messages. Dispatch their callbacks
 				 * and replies through this same path when replayed afterward.
 				 * During the method exchange an unexpected message instead
 				 * reaches the method's normal type validation. */
-				if (sess->trans.rekey_in_progress)
+				if (sess->trans.session_id == NULL || sess->trans.rekey_in_progress)
 					return 0;
 				bool want_reply = (*payload)[pos] != 0;
 				pos++;

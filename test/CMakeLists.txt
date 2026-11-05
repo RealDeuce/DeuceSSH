@@ -583,6 +583,14 @@ foreach(part IN ITEMS group_selection group_validation peer_validation mpint_val
 		PASS_REGULAR_EXPRESSION "1 tests: 1 passed, 0 failed, 0 skipped")
 endforeach()
 dssh_add_variant_tests(dssh_transport dssh_test_transport)
+foreach(part IN ITEMS notifications auth_callbacks hostkey nested demux)
+	add_test(NAME dssh_transport_receive_entry_${part}
+		COMMAND dssh_test_transport --exact receive_entry/${part})
+	set_tests_properties(dssh_transport_receive_entry_${part} PROPERTIES
+		ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys
+		PASS_REGULAR_EXPRESSION "1 tests: 1 passed, 0 failed, 0 skipped"
+		TIMEOUT 180)
+endforeach()
 add_test(NAME dssh_transport_key_material
 	COMMAND dssh_test_transport key_material/)
 set_tests_properties(dssh_transport_key_material PROPERTIES

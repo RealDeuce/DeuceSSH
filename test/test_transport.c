@@ -43,6 +43,18 @@ static const char *handshake_kex_filter;
 static void (*dh_group_tx_observer)(dssh_session sess);
 static _Thread_local dssh_session compression_callback_session;
 static void (*compression_tx_observer)(dssh_session sess);
+static dssh_hostkey_verify_cb handshake_verify_callback;
+static void *handshake_verify_data;
+static bool handshake_exclude_server;
+
+struct receive_entry_io_probe {
+	dssh_session sess;
+	unsigned tx_calls;
+	unsigned rx_calls;
+};
+static _Thread_local struct receive_entry_io_probe *receive_entry_io_probe;
+static _Atomic(dssh_session) receive_entry_watched_rx;
+static atomic_bool receive_entry_rx_entered;
 
 
 static void *
@@ -89,6 +101,10 @@ static int
 mock_tx_dispatch(uint8_t *buf, size_t bufsz,
     dssh_session sess, void *cbdata)
 {
+	if (receive_entry_io_probe != NULL && receive_entry_io_probe->sess == sess) {
+		receive_entry_io_probe->tx_calls++;
+		return DSSH_ERROR_INIT;
+	}
 	if (dh_group_tx_observer != NULL)
 		dh_group_tx_observer(sess);
 	if (compression_tx_observer != NULL)
@@ -113,6 +129,12 @@ static int
 mock_rx_dispatch(uint8_t *buf, size_t bufsz,
     dssh_session sess, void *cbdata)
 {
+	if (receive_entry_io_probe != NULL && receive_entry_io_probe->sess == sess) {
+		receive_entry_io_probe->rx_calls++;
+		return DSSH_ERROR_INIT;
+	}
+	if (sess == atomic_load(&receive_entry_watched_rx))
+		atomic_store(&receive_entry_rx_entered, true);
 	if (sess->trans.client)
 		return mock_rx_client(buf, bufsz, sess, cbdata);
 	else
@@ -123,6 +145,10 @@ static int
 mock_rxline_dispatch(uint8_t *buf, size_t bufsz,
     size_t *bytes_received, dssh_session sess, void *cbdata)
 {
+	if (receive_entry_io_probe != NULL && receive_entry_io_probe->sess == sess) {
+		receive_entry_io_probe->rx_calls++;
+		return DSSH_ERROR_INIT;
+	}
 	if (sess->trans.client)
 		return mock_rxline_client(buf, bufsz, bytes_received, sess, cbdata);
 	else
@@ -210,6 +236,8 @@ static int
 handshake_server_thread(void *arg)
 {
 	struct handshake_ctx *ctx = arg;
+	if (handshake_exclude_server)
+		dssh_test_ossl_exclude_thread();
 	compression_callback_session = ctx->server;
 	ctx->server_result = dssh_transport_handshake(ctx->server);
 	compression_callback_session = NULL;
@@ -225,10 +253,11 @@ handshake_server_thread(void *arg)
  * Caller must call handshake_cleanup() when done.
  */
 static void handshake_cleanup(struct handshake_ctx *ctx);
+static void handshake_cleanup_sessions(struct handshake_ctx *ctx);
 
 static int
-handshake_setup_filtered(struct handshake_ctx *ctx, bool alternate_cipher, const char *compression,
-    const char *enc, const char *mac)
+handshake_setup_configured(struct handshake_ctx *ctx, bool alternate_cipher, const char *compression,
+    const char *enc, const char *mac, bool configure)
 {
 	memset(ctx, 0, sizeof(*ctx));
 	/* Cleanup is safe even if registration fails before mock_io_init. */
@@ -236,16 +265,18 @@ handshake_setup_filtered(struct handshake_ctx *ctx, bool alternate_cipher, const
 	atomic_init(&ctx->io.c2s.wfd, -1);
 	atomic_init(&ctx->io.s2c.rfd, -1);
 	atomic_init(&ctx->io.s2c.wfd, -1);
-	dssh_test_reset_global_config();
-	if (register_all_algorithms() < 0)
-		goto setup_fail;
-	if (alternate_cipher && dssh_register_aes128_cbc() < 0)
-		goto setup_fail;
-	if (test_generate_host_key() < 0)
-		goto setup_fail;
+	if (configure) {
+		dssh_test_reset_global_config();
+		if (register_all_algorithms() < 0)
+			goto setup_fail;
+		if (alternate_cipher && dssh_register_aes128_cbc() < 0)
+			goto setup_fail;
+		if (test_generate_host_key() < 0)
+			goto setup_fail;
+	}
 	if (mock_io_init(&ctx->io, 0) < 0)
 		goto setup_fail;
-	if (dssh_transport_set_callbacks(mock_tx_dispatch, mock_rx_dispatch,
+	if (configure && dssh_transport_set_callbacks(mock_tx_dispatch, mock_rx_dispatch,
 	    mock_rxline_dispatch, mock_extra_line_cb) < 0)
 		goto setup_fail;
 	ctx->client = dssh_session_init(true, 0);
@@ -253,7 +284,9 @@ handshake_setup_filtered(struct handshake_ctx *ctx, bool alternate_cipher, const
 		goto setup_fail;
 	if (dssh_session_set_cbdata(ctx->client, &ctx->io, &ctx->io, &ctx->io, &ctx->io) < 0)
 		goto setup_fail;
-	if (dssh_session_set_hostkey_verify_cb(ctx->client, dssh_test_accept_hostkey, NULL) < 0)
+	dssh_hostkey_verify_cb verify = handshake_verify_callback != NULL
+	    ? handshake_verify_callback : dssh_test_accept_hostkey;
+	if (dssh_session_set_hostkey_verify_cb(ctx->client, verify, handshake_verify_data) < 0)
 		goto setup_fail;
 	ctx->server = init_server_session();
 	if (ctx->server == NULL)
@@ -294,8 +327,18 @@ handshake_setup_filtered(struct handshake_ctx *ctx, bool alternate_cipher, const
 	/* Protocol failures retain the sessions for caller inspection/cleanup. */
 	return ctx->client_result == 0 && ctx->server_result == 0 ? 0 : -1;
 setup_fail:
-	handshake_cleanup(ctx);
+	if (configure)
+		handshake_cleanup(ctx);
+	else
+		handshake_cleanup_sessions(ctx);
 	return -1;
+}
+
+static int
+handshake_setup_filtered(struct handshake_ctx *ctx, bool alternate_cipher, const char *compression,
+    const char *enc, const char *mac)
+{
+	return handshake_setup_configured(ctx, alternate_cipher, compression, enc, mac, true);
 }
 
 static int
@@ -317,7 +360,7 @@ handshake_setup(struct handshake_ctx *ctx)
 }
 
 static void
-handshake_cleanup(struct handshake_ctx *ctx)
+handshake_cleanup_sessions(struct handshake_ctx *ctx)
 {
 	compression_callback_session = ctx->server;
 	if (ctx->server != NULL)
@@ -329,6 +372,12 @@ handshake_cleanup(struct handshake_ctx *ctx)
 	ctx->client = NULL;
 	compression_callback_session = NULL;
 	mock_io_free(&ctx->io);
+}
+
+static void
+handshake_cleanup(struct handshake_ctx *ctx)
+{
+	handshake_cleanup_sessions(ctx);
 	dssh_test_reset_global_config();
 }
 
@@ -9441,8 +9490,14 @@ test_rekey_global_pipeline(void)
 }
 
 #include "key_material_cases.h"
+#include "receive_entry_cases.h"
 
 static struct dssh_test_entry tests[] = {
+	{ "receive_entry/notifications", test_receive_entry_notifications },
+	{ "receive_entry/auth_callbacks", test_receive_entry_auth_callbacks },
+	{ "receive_entry/hostkey", test_receive_entry_hostkey },
+	{ "receive_entry/nested", test_receive_entry_nested },
+	{ "receive_entry/demux", test_receive_entry_demux },
 	{ "key_material/encoding", test_key_material_encoding },
 	{ "key_material/bounds", test_key_material_bounds },
 	{ "key_material/zero_output", test_key_material_zero_output },

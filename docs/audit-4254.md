@@ -1,5 +1,11 @@
 # RFC 4254 Conformance Audit — DeuceSSH
 
+> Release audit reconciliation is in progress. This historical report uses
+> earlier API names and architecture descriptions; its conformance totals
+> and completion statements are not current release evidence. See the
+> [current requirement ledger](release-1.0-evidence/rfc4254-ledger.md) for
+> traces, validation and outstanding verification.
+
 Systematic audit of every MUST, MUST NOT, REQUIRED, SHALL, SHALL NOT,
 SHOULD, SHOULD NOT, RECOMMENDED, MAY, and OPTIONAL keyword in RFC 4254
 (SSH Connection Protocol) against the DeuceSSH library code.

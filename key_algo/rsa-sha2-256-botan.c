@@ -12,7 +12,7 @@
 #define RSA_SHA2_256_NAME_LEN 12
 
 /* Implemented in rsa-sha2-256-botan.cpp */
-extern int  dssh_botan_rsa256_sign(uint8_t **out, size_t *outlen, const uint8_t *data, size_t data_len,
+extern int  dssh_botan_rsa256_sign(struct dssh_bytes_result *out, const uint8_t *data, size_t data_len,
      dssh_key_algo_ctx *ctx);
 extern int  dssh_botan_rsa256_verify(const uint8_t *key_blob, size_t key_blob_len, const uint8_t *sig_blob,
      size_t sig_blob_len, const uint8_t *data, size_t data_len);
@@ -87,5 +87,8 @@ dssh_register_rsa_sha2_256(void)
 	ka->ctx      = NULL;
 	ka->flags    = DSSH_KEY_ALGO_FLAG_SIGNATURE_CAPABLE;
 	memcpy(ka->name, RSA_SHA2_256_NAME, RSA_SHA2_256_NAME_LEN + 1);
-	return dssh_transport_register_key_algo(ka);
+	int ret = dssh_transport_register_key_algo(ka);
+	if (ret < 0)
+		free(ka);
+	return ret;
 }

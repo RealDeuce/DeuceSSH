@@ -11,8 +11,7 @@
 #include "kex/dh-gex-groups.h"
 #include "kex/dh-gex-sha256.h"
 
-extern int  dssh_botan_dhgex_handler(struct dssh_kex_context *kctx);
-extern void dssh_botan_dhgex_cleanup(void *kex_data);
+extern int  dssh_botan_dhgex_handler(const struct dssh_kex_context *kctx, struct dssh_kex_result *out);
 
 DSSH_PUBLIC int
 dssh_register_dh_gex_sha256(void)
@@ -22,11 +21,15 @@ dssh_register_dh_gex_sha256(void)
 	if (kex == NULL)
 		return DSSH_ERROR_ALLOC;
 	kex->next      = NULL;
+	kex->init      = dhgex_init;
 	kex->handler   = dssh_botan_dhgex_handler;
-	kex->cleanup   = dssh_botan_dhgex_cleanup;
+	kex->cleanup   = dhgex_cleanup;
 	kex->flags     = DSSH_KEX_FLAG_NEEDS_SIGNATURE_CAPABLE;
 	kex->hash_name = "SHA-256";
-	kex->ctx       = &default_provider;
+	kex->config       = &default_provider;
 	memcpy(kex->name, DHGEX_KEX_NAME, DHGEX_KEX_NAME_LEN + 1);
-	return dssh_transport_register_kex(kex);
+	int ret = dssh_transport_register_kex(kex);
+	if (ret < 0)
+		free(kex);
+	return ret;
 }

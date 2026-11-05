@@ -7,6 +7,106 @@
 #include "deucessh.h"
 #include "ssh-internal.h"
 
+static _Thread_local struct dssh_session_scope *active_session_scope;
+static _Thread_local bool result_callback_active;
+
+#ifdef DSSH_TESTING
+DSSH_PRIVATE int
+dssh_test_unlock_boundary(mtx_t *mutex)
+{
+	return dssh_mtx_unlock(mutex);
+}
+#endif
+
+DSSH_PRIVATE bool
+dssh_result_callback_active(void)
+{
+	return result_callback_active;
+}
+
+DSSH_PUBLIC void
+dssh_result_release(struct dssh_result_lease *lease)
+{
+	if (lease == NULL)
+		return;
+	struct dssh_result_lease saved = *lease;
+	lease->release = NULL;
+	lease->owner = NULL;
+	if (saved.release != NULL) {
+		bool previous = result_callback_active;
+		result_callback_active = true;
+		saved.release(saved.owner);
+		result_callback_active = previous;
+	}
+}
+
+DSSH_PRIVATE void
+session_scope_enter(struct dssh_session_scope *scope, struct dssh_session_s *sess)
+{
+	scope->sess = sess;
+	scope->previous = active_session_scope;
+	active_session_scope = scope;
+}
+
+DSSH_PRIVATE void
+session_scope_leave(struct dssh_session_scope *scope)
+{
+	active_session_scope = scope->previous;
+}
+
+DSSH_PRIVATE bool
+session_scope_active(struct dssh_session_s *sess)
+{
+	for (struct dssh_session_scope *scope = active_session_scope; scope != NULL; scope = scope->previous) {
+		if (scope->sess == sess)
+			return true;
+	}
+	return false;
+}
+
+/* I/O callback validation is performed by the public lifecycle wrappers. */
+DSSH_PRIVATE bool
+session_lifecycle_begin(struct dssh_session_s *sess)
+{
+	if (session_scope_active(sess) || session_on_demux_thread(sess) || tx_owner_is_current(sess)) {
+		session_set_terminate(sess);
+		return false;
+	}
+	return !atomic_exchange_explicit(&sess->lifecycle_busy, true, memory_order_acq_rel);
+}
+
+/* Use the timespec UTC seconds representation consistently, rather than
+ * assuming the separate calendar time() representation is linear seconds. */
+DSSH_PRIVATE int
+dssh_clock_read(struct timespec *ts)
+{
+	struct timespec now;
+	if (timespec_get(&now, TIME_UTC) != TIME_UTC)
+		return DSSH_ERROR_INIT;
+	long double seconds = (long double)now.tv_sec;
+	if (now.tv_nsec < 0 || now.tv_nsec >= 1000000000L || !isfinite(seconds))
+		return DSSH_ERROR_INVALID;
+	*ts = now;
+	return 0;
+}
+
+/* Convert a positive timeout, preserving the caller's output on failure. */
+DSSH_PRIVATE int
+dssh_deadline_from_ms(struct timespec *ts, int timeout_ms)
+{
+	if (timeout_ms <= 0)
+		return DSSH_ERROR_INVALID;
+	struct timespec now;
+
+	int ret = dssh_clock_read(&now);
+	if (ret < 0)
+		return ret;
+	if (!dssh_timespec_add_ms(&now, timeout_ms))
+		return DSSH_ERROR_INVALID;
+	*ts = now;
+	return 0;
+}
+
 DSSH_PUBLIC const char *
 dssh_strerror(int error_code)
 {
@@ -73,7 +173,7 @@ queue_log_forward(struct dssh_session_s *sess, bool always_display, const uint8_
 			memcpy(entry->message, message, message_len);
 		queue->count++;
 	}
-	mtx_unlock(&queue->mtx);
+	dssh_mtx_unlock(&queue->mtx);
 }
 
 DSSH_PRIVATE void
@@ -116,7 +216,10 @@ dssh_log_emit(struct dssh_session_s *sess, dssh_log_level level, dssh_log_source
 	    .language        = llen > 0 ? lang_copy : NULL,
 	    .language_len    = llen,
 	};
+	struct dssh_session_scope scope;
+	session_scope_enter(&scope, sess);
 	dssh_log_action action = sess->log_cb(&record, sess->log_cbdata);
+	session_scope_leave(&scope);
 
 	if (source != DSSH_LOG_SOURCE_LIBRARY)
 		return;
@@ -233,38 +336,36 @@ session_notify_terminated(struct dssh_session_s *sess)
 	 * its event loop, unblocking any I/O callbacks. */
 	dssh_terminate_cb tcb = sess->terminate_cb;
 
-	if (tcb)
+	if (tcb) {
+		struct dssh_session_scope scope;
+		session_scope_enter(&scope, sess);
 		tcb(sess, sess->terminate_cbdata);
+		session_scope_leave(&scope);
+	}
 }
 
 static void
 session_wake_terminated(struct dssh_session_s *sess)
 {
-	/* Wake senders blocked on packet-engine ownership or rekey. */
-	if (dssh_thrd_check(sess, mtx_lock(&sess->trans.tx_mtx)) == thrd_success) {
-		dssh_thrd_check_locked(sess, cnd_broadcast(&sess->trans.rekey_cnd));
-		dssh_thrd_check_unlock(sess, mtx_unlock(&sess->trans.tx_mtx));
-	}
+	/* Completion is required once the one-shot wake flag is published. */
+	dssh_thrd_require(mtx_lock(&sess->trans.tx_mtx));
+	dssh_thrd_require(cnd_broadcast(&sess->trans.rekey_cnd));
+	dssh_mtx_unlock(&sess->trans.tx_mtx);
 
-	/* Wake demux thread stalled on an occupied TX slot */
-	if (dssh_thrd_check(sess, mtx_lock(&sess->trans.tx_queue_mtx)) == thrd_success) {
-		dssh_thrd_check_locked(sess, cnd_broadcast(&sess->trans.tx_slot_cnd));
-		dssh_thrd_check_unlock(sess, mtx_unlock(&sess->trans.tx_queue_mtx));
-	}
+	dssh_thrd_require(mtx_lock(&sess->trans.tx_queue_mtx));
+	dssh_thrd_require(cnd_broadcast(&sess->trans.tx_slot_cnd));
+	dssh_mtx_unlock(&sess->trans.tx_queue_mtx);
 
-	/* Wake conn-layer waiters if initialized */
 	if (sess->conn_initialized) {
-		if (dssh_thrd_check(sess, mtx_lock(&sess->accept_mtx)) == thrd_success) {
-			dssh_thrd_check_locked(sess, cnd_broadcast(&sess->accept_cnd));
-			dssh_thrd_check_unlock(sess, mtx_unlock(&sess->accept_mtx));
-		}
+		dssh_thrd_require(mtx_lock(&sess->accept_mtx));
+		dssh_thrd_require(cnd_broadcast(&sess->accept_cnd));
+		dssh_mtx_unlock(&sess->accept_mtx);
 
-		/* Pin and wake one channel at a time so channel_mtx is never held
-		 * while acquiring buf_mtx. */
+		/* Pin one channel at a time, releasing the registry mutex before
+		 * acquiring the channel mutex. No nested library lock is needed. */
 		for (;;) {
 			struct dssh_channel_s *ch = NULL;
-			if (dssh_thrd_check(sess, mtx_lock(&sess->channel_mtx)) != thrd_success)
-				break;
+			dssh_thrd_require(mtx_lock(&sess->channel_mtx));
 			for (size_t i = 0; i < sess->channel_count; i++) {
 				struct dssh_channel_s *candidate = sess->channels[i];
 
@@ -275,17 +376,12 @@ session_wake_terminated(struct dssh_session_s *sess)
 					break;
 				}
 			}
-			if (dssh_thrd_check_unlock(sess, mtx_unlock(&sess->channel_mtx)) != thrd_success) {
-				if (ch != NULL)
-					atomic_fetch_sub_explicit(&ch->tx_refs, 1, memory_order_acq_rel);
-				break;
-			}
+			dssh_mtx_unlock(&sess->channel_mtx);
 			if (ch == NULL)
 				break;
-			if (dssh_thrd_check(sess, mtx_lock(&ch->buf_mtx)) == thrd_success) {
-				dssh_thrd_check_locked(sess, cnd_broadcast(&ch->poll_cnd));
-				dssh_thrd_check_unlock(sess, mtx_unlock(&ch->buf_mtx));
-			}
+			dssh_thrd_require(mtx_lock(&ch->buf_mtx));
+			dssh_thrd_require(cnd_broadcast(&ch->poll_cnd));
+			dssh_mtx_unlock(&ch->buf_mtx);
 			atomic_fetch_sub_explicit(&ch->tx_refs, 1, memory_order_acq_rel);
 		}
 	}
@@ -295,8 +391,6 @@ DSSH_PRIVATE void
 session_set_terminate(struct dssh_session_s *sess)
 {
 	(void)session_mark_terminated(sess);
-	if (atomic_load_explicit(&sess->lock_ownership_failed, memory_order_acquire))
-		return;
 	session_notify_terminated(sess);
 	if (!atomic_exchange(&sess->terminate_wake_started, true))
 		session_wake_terminated(sess);
@@ -480,7 +574,7 @@ dssh_session_set_rekey_seconds(struct dssh_session_s *sess, uint32_t seconds)
 		return DSSH_ERROR_INVALID;
 	if (session_api_forbidden(sess))
 		return DSSH_ERROR_INVALID;
-	sess->trans.rekey_seconds = seconds;
+	atomic_store_explicit(&sess->trans.rekey_seconds, seconds, memory_order_relaxed);
 	return 0;
 }
 

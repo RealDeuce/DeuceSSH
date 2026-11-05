@@ -24,6 +24,7 @@
 #include "deucessh-crypto.h"
 #include "deucessh.h"
 #include "private-key-file.h"
+#include "key-context-botan.h"
 
 struct dssh_key_algo_ctx;
 
@@ -43,17 +44,16 @@ struct dssh_key_algo_ctx;
    the modern spelling. */
 #define RSA_SIGN_PADDING "PKCS1v15(SHA-256)"
 
-struct cbdata {
-	std::unique_ptr<Botan::Private_Key> privkey;
-	uint8_t                            *pub_blob;
-	size_t                              pub_blob_len;
-};
 
-static struct cbdata *rsa_ctx;
+static struct dssh_botan_key_context *rsa_ctx;
 
 static int
-sign_impl(uint8_t **out, size_t *outlen, const uint8_t *data, size_t data_len, struct cbdata *cbd)
+sign_impl(struct dssh_bytes_result *out, const uint8_t *data, size_t data_len, struct dssh_botan_key_context *cbd)
 {
+	if (out == NULL || (data == NULL && data_len > 0)
+	    || out->bytes.data != NULL || out->bytes.len != 0
+	    || out->lease.release != NULL || out->lease.owner != NULL)
+		return DSSH_ERROR_INVALID;
 	if (cbd == NULL || cbd->privkey == NULL)
 		return DSSH_ERROR_INIT;
 
@@ -62,21 +62,22 @@ sign_impl(uint8_t **out, size_t *outlen, const uint8_t *data, size_t data_len, s
 		signer.update(data, data_len);
 		auto raw_sig = signer.signature(Botan::system_rng());
 
+		if (raw_sig.empty())
+			return DSSH_ERROR_INIT;
 		if (raw_sig.size() > UINT32_MAX)
 			return DSSH_ERROR_INVALID;
 		if (raw_sig.size() > SIZE_MAX - 20)
 			return DSSH_ERROR_INVALID;
 		size_t needed = 20 + raw_sig.size();
 
-		uint8_t *buf = static_cast<uint8_t *>(malloc(needed));
-
-		if (buf == NULL)
-			return DSSH_ERROR_ALLOC;
+		uint8_t *buf = NULL;
+		int acquired = dssh_signature_buffer_acquire(cbd->signatures, needed, out, &buf);
+		if (acquired < 0)
+			return acquired;
 
 		size_t pos  = 0;
 		int    sret = dssh_serialize_uint32(RSA_SHA2_256_NAME_LEN, buf, needed, &pos);
 		if (sret < 0) {
-			free(buf);
 			return sret;
 		}
 		memcpy(&buf[pos], RSA_SHA2_256_NAME, RSA_SHA2_256_NAME_LEN);
@@ -84,14 +85,12 @@ sign_impl(uint8_t **out, size_t *outlen, const uint8_t *data, size_t data_len, s
 		uint32_t siglen_u32 = static_cast<uint32_t>(raw_sig.size());
 		sret                = dssh_serialize_uint32(siglen_u32, buf, needed, &pos);
 		if (sret < 0) {
-			free(buf);
 			return sret;
 		}
 		memcpy(&buf[pos], raw_sig.data(), raw_sig.size());
 		pos += raw_sig.size();
 
-		*out    = buf;
-		*outlen = pos;
+		out->bytes.len = pos;
 		return 0;
 	}
 	catch (...) {
@@ -106,7 +105,7 @@ sign_impl(uint8_t **out, size_t *outlen, const uint8_t *data, size_t data_len, s
  *   string  n (modulus)
  */
 static int
-pubkey_impl(const uint8_t **out, size_t *outlen, struct cbdata *cbd)
+pubkey_impl(const uint8_t **out, size_t *outlen, struct dssh_botan_key_context *cbd)
 {
 	if (cbd == NULL || cbd->privkey == NULL)
 		return DSSH_ERROR_INIT;
@@ -192,11 +191,11 @@ pubkey_impl(const uint8_t **out, size_t *outlen, struct cbdata *cbd)
 /* --- extern "C" wrappers for function pointer vtable --- */
 
 extern "C" int
-dssh_botan_rsa256_sign(uint8_t **out, size_t *outlen, const uint8_t *data, size_t data_len,
+dssh_botan_rsa256_sign(struct dssh_bytes_result *out, const uint8_t *data, size_t data_len,
     dssh_key_algo_ctx *ctx)
 {
 	try {
-		return sign_impl(out, outlen, data, data_len, reinterpret_cast<struct cbdata *>(ctx));
+		return sign_impl(out, data, data_len, reinterpret_cast<struct dssh_botan_key_context *>(ctx));
 	}
 	catch (...) {
 		return DSSH_ERROR_INIT;
@@ -284,7 +283,7 @@ extern "C" int
 dssh_botan_rsa256_pubkey(const uint8_t **out, size_t *outlen, dssh_key_algo_ctx *ctx)
 {
 	try {
-		return pubkey_impl(out, outlen, reinterpret_cast<struct cbdata *>(ctx));
+		return pubkey_impl(out, outlen, reinterpret_cast<struct dssh_botan_key_context *>(ctx));
 	}
 	catch (...) {
 		return DSSH_ERROR_INIT;
@@ -294,7 +293,7 @@ dssh_botan_rsa256_pubkey(const uint8_t **out, size_t *outlen, dssh_key_algo_ctx 
 extern "C" int
 dssh_botan_rsa256_haskey(dssh_key_algo_ctx *ctx)
 {
-	struct cbdata *cbd = reinterpret_cast<struct cbdata *>(ctx);
+	struct dssh_botan_key_context *cbd = reinterpret_cast<struct dssh_botan_key_context *>(ctx);
 	if (cbd == NULL || cbd->privkey == NULL)
 		return 0;
 	try {
@@ -308,18 +307,46 @@ dssh_botan_rsa256_haskey(dssh_key_algo_ctx *ctx)
 extern "C" void
 dssh_botan_rsa256_cleanup(dssh_key_algo_ctx *ctx)
 {
-	struct cbdata *cbd = reinterpret_cast<struct cbdata *>(ctx);
+	struct dssh_botan_key_context *cbd = reinterpret_cast<struct dssh_botan_key_context *>(ctx);
 
 	if (cbd == rsa_ctx)
 		rsa_ctx = NULL;
 	if (cbd != NULL) {
 		free(cbd->pub_blob);
+		dssh_signature_pool_destroy(cbd->signatures);
 		try {
 			delete cbd;
 		}
 		catch (...) {
 		}
 	}
+}
+
+/* Finish construction and caching before the registry can expose the key. */
+static int
+install_key(std::unique_ptr<Botan::Private_Key> privkey)
+{
+	std::unique_ptr<dssh_botan_key_context> replacement(new (std::nothrow) dssh_botan_key_context{});
+	if (replacement == nullptr)
+		return DSSH_ERROR_ALLOC;
+	replacement->privkey = std::move(privkey);
+	const uint8_t *blob;
+	size_t blob_len;
+	int ret = pubkey_impl(&blob, &blob_len, replacement.get());
+	if (ret == 0)
+		ret = dssh_signature_pool_create(&replacement->signatures);
+	if (ret == 0)
+		ret = dssh_key_algo_set_ctx(RSA_SHA2_256_NAME, replacement.get());
+	if (ret < 0) {
+		free(replacement->pub_blob);
+		dssh_signature_pool_destroy(replacement->signatures);
+		return ret;
+	}
+	struct dssh_botan_key_context *old = rsa_ctx;
+	dssh_key_algo_ctx *old_opaque = reinterpret_cast<dssh_key_algo_ctx *>(old);
+	rsa_ctx = replacement.release();
+	dssh_botan_rsa256_cleanup(old_opaque);
+	return 0;
 }
 
 /* --- Public API functions --- */
@@ -329,6 +356,9 @@ dssh_rsa_sha2_256_load_key_file(const char *path, dssh_pem_password_cb pw_cb, vo
 {
 	if (path == NULL)
 		return DSSH_ERROR_INIT;
+	int config_ret = dssh_key_algo_set_ctx(RSA_SHA2_256_NAME, rsa_ctx);
+	if (config_ret < 0)
+		return config_ret;
 
 	FILE *fp = fopen(path, "rb");
 	if (fp == NULL)
@@ -386,30 +416,14 @@ dssh_rsa_sha2_256_load_key_file(const char *path, dssh_pem_password_cb pw_cb, vo
 	free(pem_data);
 	dssh_cleanse(pw_buf, sizeof(pw_buf));
 
-	if (privkey->algo_name() != "RSA")
-		return DSSH_ERROR_INVALID;
-
-	if (rsa_ctx == NULL) {
-		rsa_ctx = new (std::nothrow) cbdata;
-		if (rsa_ctx == NULL)
-			return DSSH_ERROR_ALLOC;
-		rsa_ctx->pub_blob     = NULL;
-		rsa_ctx->pub_blob_len = 0;
-		int res               = dssh_key_algo_set_ctx(RSA_SHA2_256_NAME, rsa_ctx);
-		if (res < 0) {
-			delete rsa_ctx;
-			rsa_ctx = NULL;
-			return res;
-		}
+	try {
+		if (privkey == nullptr || privkey->algo_name() != "RSA")
+			return DSSH_ERROR_INVALID;
+		return install_key(std::move(privkey));
 	}
-	else {
-		free(rsa_ctx->pub_blob);
-		rsa_ctx->pub_blob     = NULL;
-		rsa_ctx->pub_blob_len = 0;
+	catch (...) {
+		return DSSH_ERROR_INIT;
 	}
-
-	rsa_ctx->privkey = std::move(privkey);
-	return 0;
 }
 
 static bool
@@ -520,6 +534,9 @@ dssh_rsa_sha2_256_save_pub_file(const char *path)
 DSSH_PUBLIC int
 dssh_rsa_sha2_256_generate_key(unsigned int bits)
 {
+	int config_ret = dssh_key_algo_set_ctx(RSA_SHA2_256_NAME, rsa_ctx);
+	if (config_ret < 0)
+		return config_ret;
 	char bits_str[16];
 	int  sret = snprintf(bits_str, sizeof(bits_str), "%u", bits);
 	if (sret < 0 || static_cast<size_t>(sret) >= sizeof(bits_str))
@@ -534,25 +551,5 @@ dssh_rsa_sha2_256_generate_key(unsigned int bits)
 		return DSSH_ERROR_INIT;
 	}
 
-	if (rsa_ctx == NULL) {
-		rsa_ctx = new (std::nothrow) cbdata;
-		if (rsa_ctx == NULL)
-			return DSSH_ERROR_ALLOC;
-		rsa_ctx->pub_blob     = NULL;
-		rsa_ctx->pub_blob_len = 0;
-		int res               = dssh_key_algo_set_ctx(RSA_SHA2_256_NAME, rsa_ctx);
-		if (res < 0) {
-			delete rsa_ctx;
-			rsa_ctx = NULL;
-			return res;
-		}
-	}
-	else {
-		free(rsa_ctx->pub_blob);
-		rsa_ctx->pub_blob     = NULL;
-		rsa_ctx->pub_blob_len = 0;
-	}
-
-	rsa_ctx->privkey = std::move(privkey);
-	return 0;
+	return install_key(std::move(privkey));
 }

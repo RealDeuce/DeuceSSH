@@ -14,6 +14,15 @@
 #include <inttypes.h>
 
 #include "deucessh.h"
+#include "deucessh-result.h"
+
+static inline bool
+dssh_test_bytes_equal(struct dssh_bytes bytes, const void *data, size_t len)
+{
+	return bytes.len == len && (len == 0
+	    || (bytes.data != NULL && memcmp(bytes.data, data, len) == 0));
+}
+
 
 /*
  * Accept-all host key verification callback for tests.

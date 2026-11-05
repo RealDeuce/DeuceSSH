@@ -107,9 +107,13 @@ register_test_enc(void)
 	enc->encrypt = test_enc_encrypt;
 	enc->decrypt = test_enc_decrypt;
 	enc->cleanup = test_enc_cleanup;
+	enc->bytes_per_key = UINT64_MAX;
 	enc->flags = 0;
 	enc->blocksize = TEST_ENC_BLOCK_SIZE;
 	enc->key_size = TEST_ENC_KEY_SIZE;
 	memcpy(enc->name, name, sizeof(name));
-	return dssh_transport_register_enc(enc);
+	int ret = dssh_transport_register_enc(enc);
+	if (ret < 0)
+		free(enc);
+	return ret;
 }

@@ -73,7 +73,7 @@ if(DEUCESSH_CRYPTO_BACKEND STREQUAL "Botan")
 		    ${BOTAN3_VENDORED_TARGET} INTERFACE_INCLUDE_DIRECTORIES)
 	else()
 		set(DSSH_CRYPTO_LIB_PRIVATE PkgConfig::BOTAN3)
-		set(DSSH_CRYPTO_LIB_INTERFACE ${BOTAN3_LDFLAGS})
+		set(DSSH_CRYPTO_LIB_INTERFACE PkgConfig::BOTAN3)
 		set(DSSH_CRYPTO_INCLUDE ${BOTAN3_INCLUDE_DIRS})
 	endif()
 	set(DSSH_CRYPTO_IMPL crypto/botan.cpp)
@@ -81,7 +81,7 @@ if(DEUCESSH_CRYPTO_BACKEND STREQUAL "Botan")
 	set(DSSH_PC_REQUIRES_PRIVATE "botan-3 >= ${DEUCESSH_BOTAN_MIN_VERSION}")
 elseif(DEUCESSH_CRYPTO_BACKEND STREQUAL "OpenSSL")
 	set(DSSH_CRYPTO_LIB_PRIVATE OpenSSL::Crypto)
-	set(DSSH_CRYPTO_LIB_INTERFACE ${OPENSSL_CRYPTO_LIBRARIES})
+	set(DSSH_CRYPTO_LIB_INTERFACE OpenSSL::Crypto)
 	set(DSSH_CRYPTO_INCLUDE ${OPENSSL_INCLUDE_DIR})
 	set(DSSH_CRYPTO_IMPL crypto/openssl.c)
 	set(DSSH_CONFIG_FIND_DEPENDENCY "find_dependency(OpenSSL 3.0)")
@@ -149,6 +149,7 @@ if(NOT HAVE_THREADS_IN_LIBC)
 		    ${CMAKE_CURRENT_SOURCE_DIR}/posix)
 		find_package(Threads REQUIRED)
 		set(THREADS_LINK_LIB Threads::Threads)
+		string(APPEND DSSH_CONFIG_FIND_DEPENDENCY "\nfind_dependency(Threads)")
 	else()
 		message(FATAL_ERROR
 			"C11 <threads.h> not found in libc or libstdthreads, "
@@ -250,6 +251,8 @@ set(DEUCESSH_SOURCES
 	ssh-trans.c ssh.c ssh-auth.c ssh-conn.c
 	${DSSH_CRYPTO_IMPL}
 	${DSSH_PRIVATE_KEY_FILE_SOURCE}
+	key_algo/signature-result.c
+	kex/workspace.c
 	kex/curve25519-sha256.c
 	kex/hybrid-pq-kex.c
 	kex/dh-gex-sha256.c
@@ -267,7 +270,7 @@ set(DEUCESSH_PUBLIC_HEADERS
 	deucessh.h deucessh-auth.h deucessh-conn.h
 	deucessh-algorithms.h deucessh-crypto.h deucessh-kex.h
 	deucessh-key-algo.h deucessh-enc.h deucessh-mac.h
-	deucessh-comp.h deucessh-portable.h
+	deucessh-comp.h deucessh-lang.h deucessh-portable.h deucessh-result.h
 )
 
 include(CheckCCompilerFlag)
@@ -418,6 +421,8 @@ if(UNIX AND NOT APPLE)
 	endforeach()
 endif()
 
+include(GNUInstallDirs)
+
 set(DEUCESSH_INSTALL_TARGETS "")
 
 # --- Static library ---
@@ -436,7 +441,7 @@ if(DEUCESSH_BUILD_STATIC)
 	target_include_directories(deucessh_static
 		PUBLIC
 			$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
-			$<INSTALL_INTERFACE:include/deucessh>)
+			$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/deucessh>)
 	if(DSSH_THREADS_SHIM_INCLUDE)
 		target_include_directories(deucessh_static BEFORE
 			PRIVATE ${DSSH_THREADS_SHIM_INCLUDE})
@@ -445,7 +450,7 @@ if(DEUCESSH_BUILD_STATIC)
 		PRIVATE ${DSSH_CRYPTO_INCLUDE})
 	target_link_libraries(deucessh_static
 		INTERFACE ${DSSH_CRYPTO_LIB_INTERFACE} ${THREADS_LINK_LIB}
-			${DSSH_PRIVATE_KEY_FILE_LIB})
+			${DSSH_PRIVATE_KEY_FILE_LIB} ${DSSH_PC_CXX_RUNTIME_LIBRARIES})
 	target_compile_definitions(deucessh_static
 		PRIVATE DSSH_VERSION_STRING="${PROJECT_VERSION}"
 		$<$<CONFIG:Release>:NDEBUG>)
@@ -474,7 +479,7 @@ if(DEUCESSH_BUILD_SHARED)
 	target_include_directories(deucessh_shared
 		PUBLIC
 			$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
-			$<INSTALL_INTERFACE:include/deucessh>)
+			$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/deucessh>)
 	if(DSSH_THREADS_SHIM_INCLUDE)
 		target_include_directories(deucessh_shared BEFORE
 			PRIVATE ${DSSH_THREADS_SHIM_INCLUDE})
@@ -510,7 +515,6 @@ endif()
 
 # --- Install ---
 
-include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 
 install(TARGETS ${DEUCESSH_INSTALL_TARGETS}
@@ -615,6 +619,21 @@ if(DEUCESSH_BUILD_STATIC AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/examples/client
 endif()
 
 # --- Test suite ---
+
+option(DEUCESSH_BUILD_ZLIB_EXAMPLE "Build optional external zlib module example" OFF)
+if(DEUCESSH_BUILD_ZLIB_EXAMPLE)
+	find_package(ZLIB REQUIRED)
+	add_library(dssh_example_zlib STATIC examples/zlib-comp.c)
+	set_property(TARGET dssh_example_zlib PROPERTY C_STANDARD 17)
+	set_property(TARGET dssh_example_zlib PROPERTY C_STANDARD_REQUIRED ON)
+	target_compile_options(dssh_example_zlib PRIVATE ${DEUCESSH_COMPILE_OPTIONS})
+	target_include_directories(dssh_example_zlib PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/examples")
+	if(DEUCESSH_BUILD_STATIC)
+		target_link_libraries(dssh_example_zlib PRIVATE deucessh_static ZLIB::ZLIB)
+	else()
+		target_link_libraries(dssh_example_zlib PRIVATE deucessh_shared ZLIB::ZLIB)
+	endif()
+endif()
 
 option(DEUCESSH_BUILD_TESTS "Build test suite" OFF)
 option(DEUCESSH_TEST_OPENSSH "Build OpenSSH interop tests" OFF)

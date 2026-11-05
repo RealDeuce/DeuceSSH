@@ -25,8 +25,8 @@ extern "C" {
  * in a positive value requires a zero-byte prefix (RFC 4251 s5). */
 #define DSSH_MPINT_SIGN_BIT 0x80
 
-/* Opaque hash context.  Allocated by dssh_hash_init, consumed by
- * dssh_hash_final (or freed without finalizing by dssh_hash_free). */
+/* Opaque hash context. Allocated by dssh_hash_init, reusable after successful
+ * dssh_hash_final, and released only by dssh_hash_free. */
 typedef struct dssh_hash_ctx dssh_hash_ctx;
 
 /*
@@ -41,6 +41,8 @@ DSSH_PUBLIC int dssh_hash_init(dssh_hash_ctx **ctx, const char *name, size_t *ou
 /*
  * Feed data into the hash context.
  * Returns 0 on success, negative DSSH_ERROR_* on failure.
+ * A provider failure invalidates the context; release it with dssh_hash_free.
+ * Invalid arguments leave an otherwise usable context unchanged.
  */
 DSSH_PUBLIC int dssh_hash_update(dssh_hash_ctx *ctx, const uint8_t *data, size_t len);
 
@@ -50,6 +52,8 @@ DSSH_PUBLIC int dssh_hash_update(dssh_hash_ctx *ctx, const uint8_t *data, size_t
  * with the same algorithm, but without re-allocating).
  * out must be at least out_digest_len bytes (from dssh_hash_init).
  * Returns 0 on success, negative DSSH_ERROR_* on failure.
+ * A provider/finalization failure invalidates the context; free it rather
+ * than retrying. Argument/capacity rejection preserves the current hash.
  */
 DSSH_PUBLIC int dssh_hash_final(dssh_hash_ctx *ctx, uint8_t *out, size_t outlen);
 

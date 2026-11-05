@@ -15,16 +15,50 @@
 #include <unistd.h>
 
 #include "dssh_test.h"
+#include "dssh_test_wait.h"
 #include "dssh_test_alloc.h"
+#include "dssh_test_ossl.h"
 #include "deucessh.h"
 #include "deucessh-algorithms.h"
 #include "kex/dh-gex-sha256.h"
+#include "kex/dh-gex-groups.h"
+#include "kex/dh-gex-sha256-ops.h"
+#include "kex/curve25519-sha256-ops.h"
+#include "kex/hybrid-pq-kex-ops.h"
 #include "ssh-trans.h"
 #include "ssh-internal.h"
 #include "dssh_test_internal.h"
 #include "mock_io.h"
 #include "test_dhgex_provider.h"
+#include "test_comp.h"
+#include "test_stateless.h"
 
+#include "auth_result_fixture.h"
+
+#include "signature_copy_fixture.h"
+#include "kex_result_fixture.h"
+
+static int (*extra_algorithm_registration)(void);
+static const char *handshake_kex_filter;
+static void (*dh_group_tx_observer)(dssh_session sess);
+static _Thread_local dssh_session compression_callback_session;
+static void (*compression_tx_observer)(dssh_session sess);
+
+
+static void *
+negotiate_text(const char *client, const char *server, void *head, size_t offset, const char *filter)
+{
+	struct dssh_name_list client_names = { (const uint8_t *)client, strlen(client) };
+	struct dssh_name_list server_names = { (const uint8_t *)server, strlen(server) };
+	return negotiate_algo(client_names, server_names, head, offset, filter);
+}
+
+static size_t
+first_name_text(const char *text, char *buf, size_t bufsz)
+{
+	struct dssh_name_list list = { (const uint8_t *)text, strlen(text) };
+	return first_name(list, buf, bufsz);
+}
 
 /* ================================================================
  * Dispatch callbacks for two-sided tests.
@@ -34,14 +68,45 @@
  * client flag to route I/O through the correct pipe direction.
  * ================================================================ */
 
+struct disconnect_queue_state {
+	dssh_session sess;
+	atomic_bool entered;
+	atomic_bool release;
+	unsigned writes;
+	int queued;
+};
+static struct disconnect_queue_state *disconnect_queue;
+
+struct control_tx_failure {
+	dssh_session sess;
+	unsigned calls;
+	unsigned fail_at;
+};
+static struct control_tx_failure *control_tx_failure;
+
+
 static int
 mock_tx_dispatch(uint8_t *buf, size_t bufsz,
     dssh_session sess, void *cbdata)
 {
-	if (sess->trans.client)
-		return mock_tx_client(buf, bufsz, sess, cbdata);
-	else
-		return mock_tx_server(buf, bufsz, sess, cbdata);
+	if (dh_group_tx_observer != NULL)
+		dh_group_tx_observer(sess);
+	if (compression_tx_observer != NULL)
+		compression_tx_observer(sess);
+	if (control_tx_failure != NULL && control_tx_failure->sess == sess) {
+		unsigned call = control_tx_failure->calls++;
+		if (call == control_tx_failure->fail_at)
+			return DSSH_ERROR_INIT;
+	}
+	int ret = sess->trans.client ? mock_tx_client(buf, bufsz, sess, cbdata)
+	    : mock_tx_server(buf, bufsz, sess, cbdata);
+	if (disconnect_queue != NULL && disconnect_queue->sess == sess) {
+		disconnect_queue->writes++;
+		if (!atomic_exchange(&disconnect_queue->entered, true)
+		    && !dssh_test_wait_bool(&disconnect_queue->release, true))
+			return DSSH_ERROR_TERMINATED;
+	}
+	return ret;
 }
 
 static int
@@ -100,6 +165,11 @@ register_all_algorithms(void)
 	res = test_register_mac_algos();
 	if (res < 0)
 		return res;
+	if (extra_algorithm_registration != NULL) {
+		res = extra_algorithm_registration();
+		if (res < 0)
+			return res;
+	}
 	res = dssh_register_none_comp();
 	if (res < 0)
 		return res;
@@ -126,7 +196,9 @@ static int
 handshake_client_thread(void *arg)
 {
 	struct handshake_ctx *ctx = arg;
+	compression_callback_session = ctx->client;
 	ctx->client_result = dssh_transport_handshake(ctx->client);
+	compression_callback_session = NULL;
 	if (ctx->client_result != 0) {
 		mock_io_close_c2s(&ctx->io);
 		mock_io_close_s2c(&ctx->io);
@@ -138,7 +210,9 @@ static int
 handshake_server_thread(void *arg)
 {
 	struct handshake_ctx *ctx = arg;
+	compression_callback_session = ctx->server;
 	ctx->server_result = dssh_transport_handshake(ctx->server);
+	compression_callback_session = NULL;
 	if (ctx->server_result != 0) {
 		mock_io_close_c2s(&ctx->io);
 		mock_io_close_s2c(&ctx->io);
@@ -150,76 +224,110 @@ handshake_server_thread(void *arg)
  * Set up and run a full handshake.  Returns 0 on success.
  * Caller must call handshake_cleanup() when done.
  */
+static void handshake_cleanup(struct handshake_ctx *ctx);
+
 static int
-handshake_setup(struct handshake_ctx *ctx)
+handshake_setup_filtered(struct handshake_ctx *ctx, bool alternate_cipher, const char *compression,
+    const char *enc, const char *mac)
 {
 	memset(ctx, 0, sizeof(*ctx));
-
+	/* Cleanup is safe even if registration fails before mock_io_init. */
+	atomic_init(&ctx->io.c2s.rfd, -1);
+	atomic_init(&ctx->io.c2s.wfd, -1);
+	atomic_init(&ctx->io.s2c.rfd, -1);
+	atomic_init(&ctx->io.s2c.wfd, -1);
 	dssh_test_reset_global_config();
-
 	if (register_all_algorithms() < 0)
-		return -1;
+		goto setup_fail;
+	if (alternate_cipher && dssh_register_aes128_cbc() < 0)
+		goto setup_fail;
 	if (test_generate_host_key() < 0)
-		return -1;
-
+		goto setup_fail;
 	if (mock_io_init(&ctx->io, 0) < 0)
-		return -1;
-
-	dssh_transport_set_callbacks(mock_tx_dispatch, mock_rx_dispatch,
-	    mock_rxline_dispatch, mock_extra_line_cb);
-
+		goto setup_fail;
+	if (dssh_transport_set_callbacks(mock_tx_dispatch, mock_rx_dispatch,
+	    mock_rxline_dispatch, mock_extra_line_cb) < 0)
+		goto setup_fail;
 	ctx->client = dssh_session_init(true, 0);
-	if (ctx->client == NULL) {
-		mock_io_free(&ctx->io);
-		return -1;
-	}
-	dssh_session_set_cbdata(ctx->client, &ctx->io, &ctx->io,
-	    &ctx->io, &ctx->io);
-	dssh_session_set_hostkey_verify_cb(ctx->client, dssh_test_accept_hostkey, NULL);
-
+	if (ctx->client == NULL)
+		goto setup_fail;
+	if (dssh_session_set_cbdata(ctx->client, &ctx->io, &ctx->io, &ctx->io, &ctx->io) < 0)
+		goto setup_fail;
+	if (dssh_session_set_hostkey_verify_cb(ctx->client, dssh_test_accept_hostkey, NULL) < 0)
+		goto setup_fail;
 	ctx->server = init_server_session();
-	if (ctx->server == NULL) {
-		dssh_session_cleanup(ctx->client);
-		mock_io_free(&ctx->io);
-		return -1;
-	}
-	dssh_session_set_cbdata(ctx->server, &ctx->io, &ctx->io,
-	    &ctx->io, &ctx->io);
-
+	if (ctx->server == NULL)
+		goto setup_fail;
+	if (dssh_session_set_cbdata(ctx->server, &ctx->io, &ctx->io, &ctx->io, &ctx->io) < 0)
+		goto setup_fail;
+	if (compression != NULL
+	    && (dssh_session_set_comp_filter(ctx->client, &compression, 1) < 0
+	        || dssh_session_set_comp_filter(ctx->server, &compression, 1) < 0))
+		goto setup_fail;
+	if (enc != NULL
+	    && (dssh_session_set_enc_filter(ctx->client, &enc, 1) < 0
+	        || dssh_session_set_enc_filter(ctx->server, &enc, 1) < 0))
+		goto setup_fail;
+	if (mac != NULL
+	    && (dssh_session_set_mac_filter(ctx->client, &mac, 1) < 0
+	        || dssh_session_set_mac_filter(ctx->server, &mac, 1) < 0))
+		goto setup_fail;
+	if (handshake_kex_filter != NULL
+	    && (dssh_session_set_kex_filter(ctx->client, &handshake_kex_filter, 1) < 0
+	        || dssh_session_set_kex_filter(ctx->server, &handshake_kex_filter, 1) < 0))
+		goto setup_fail;
 	thrd_t ct, st;
-	if (thrd_create(&ct, handshake_client_thread, ctx) != thrd_success) {
-		dssh_session_cleanup(ctx->server);
-		dssh_session_cleanup(ctx->client);
-		mock_io_free(&ctx->io);
-		return -1;
-	}
+	if (thrd_create(&ct, handshake_client_thread, ctx) != thrd_success)
+		goto setup_fail;
 	if (thrd_create(&st, handshake_server_thread, ctx) != thrd_success) {
 		dssh_session_terminate(ctx->client);
 		mock_io_close_c2s(&ctx->io);
 		mock_io_close_s2c(&ctx->io);
-		thrd_join(ct, NULL);
-		dssh_session_cleanup(ctx->server);
-		dssh_session_cleanup(ctx->client);
-		mock_io_free(&ctx->io);
-		return -1;
+		if (thrd_join(ct, NULL) != thrd_success)
+			abort();
+		goto setup_fail;
 	}
+	int cj = thrd_join(ct, NULL);
+	int sj = thrd_join(st, NULL);
+	if (cj != thrd_success || sj != thrd_success)
+		abort();
+	/* Protocol failures retain the sessions for caller inspection/cleanup. */
+	return ctx->client_result == 0 && ctx->server_result == 0 ? 0 : -1;
+setup_fail:
+	handshake_cleanup(ctx);
+	return -1;
+}
 
-	thrd_join(ct, NULL);
-	thrd_join(st, NULL);
+static int
+handshake_setup_options(struct handshake_ctx *ctx, bool alternate_cipher, const char *compression)
+{
+	return handshake_setup_filtered(ctx, alternate_cipher, compression, NULL, NULL);
+}
 
-	if (ctx->client_result != 0 || ctx->server_result != 0)
-		return -1;
+static int
+handshake_setup_with_cipher(struct handshake_ctx *ctx, bool alternate_cipher)
+{
+	return handshake_setup_options(ctx, alternate_cipher, NULL);
+}
 
-	return 0;
+static int
+handshake_setup(struct handshake_ctx *ctx)
+{
+	return handshake_setup_with_cipher(ctx, false);
 }
 
 static void
 handshake_cleanup(struct handshake_ctx *ctx)
 {
-	if (ctx->server)
+	compression_callback_session = ctx->server;
+	if (ctx->server != NULL)
 		dssh_session_cleanup(ctx->server);
-	if (ctx->client)
+	ctx->server = NULL;
+	compression_callback_session = ctx->client;
+	if (ctx->client != NULL)
 		dssh_session_cleanup(ctx->client);
+	ctx->client = NULL;
+	compression_callback_session = NULL;
 	mock_io_free(&ctx->io);
 	dssh_test_reset_global_config();
 }
@@ -382,7 +490,7 @@ test_negotiate_first_client_match(void)
 	struct test_algo_node a = { &b, "chacha20" };
 
 	size_t noff = offsetof(struct test_algo_node, name);
-	void *result = negotiate_algo(
+	void *result = negotiate_text(
 	    "aes128-ctr,aes256-ctr", "aes256-ctr,aes128-ctr",
 	    &a, noff, NULL);
 	ASSERT_NOT_NULL(result);
@@ -398,7 +506,7 @@ test_negotiate_no_match(void)
 	struct test_algo_node a = { &b, "aes256-ctr" };
 
 	size_t noff = offsetof(struct test_algo_node, name);
-	void *result = negotiate_algo(
+	void *result = negotiate_text(
 	    "aes256-ctr,chacha20", "3des-cbc,blowfish-cbc",
 	    &a, noff, NULL);
 	ASSERT_NULL(result);
@@ -413,7 +521,7 @@ test_negotiate_client_priority(void)
 
 	size_t noff = offsetof(struct test_algo_node, name);
 	/* Client lists B first, server lists A first */
-	void *result = negotiate_algo(
+	void *result = negotiate_text(
 	    "algo-B,algo-A", "algo-A,algo-B",
 	    &a, noff, NULL);
 	ASSERT_NOT_NULL(result);
@@ -428,7 +536,7 @@ test_negotiate_single_match(void)
 	struct test_algo_node a = { NULL, "the-only-one" };
 
 	size_t noff = offsetof(struct test_algo_node, name);
-	void *result = negotiate_algo(
+	void *result = negotiate_text(
 	    "the-only-one", "the-only-one",
 	    &a, noff, NULL);
 	ASSERT_NOT_NULL(result);
@@ -443,7 +551,7 @@ test_negotiate_not_registered(void)
 
 	size_t noff = offsetof(struct test_algo_node, name);
 	/* Both lists agree on "unregistered" but it is not in the linked list */
-	void *result = negotiate_algo(
+	void *result = negotiate_text(
 	    "unregistered", "unregistered",
 	    &a, noff, NULL);
 	ASSERT_NULL(result);
@@ -457,7 +565,7 @@ test_build_namelist_single(void)
 	char buf[256];
 
 	size_t noff = offsetof(struct test_algo_node, name);
-	size_t len = build_namelist(&a, noff, buf, sizeof(buf), NULL);
+	int64_t len = build_namelist(&a, noff, buf, sizeof(buf), NULL);
 	ASSERT_STR_EQ(buf, "aes256-ctr");
 	ASSERT_EQ_U(len, strlen("aes256-ctr"));
 	return TEST_PASS;
@@ -472,7 +580,7 @@ test_build_namelist_multiple(void)
 	char buf[256];
 
 	size_t noff = offsetof(struct test_algo_node, name);
-	size_t len = build_namelist(&a, noff, buf, sizeof(buf), NULL);
+	int64_t len = build_namelist(&a, noff, buf, sizeof(buf), NULL);
 	ASSERT_STR_EQ(buf, "aes256-ctr,hmac-sha2-256,none");
 	ASSERT_EQ_U(len, strlen("aes256-ctr,hmac-sha2-256,none"));
 	return TEST_PASS;
@@ -483,7 +591,7 @@ test_build_namelist_empty(void)
 {
 	char buf[256];
 	buf[0] = 'X';
-	size_t len = build_namelist(NULL, 0, buf, sizeof(buf), NULL);
+	int64_t len = build_namelist(NULL, 0, buf, sizeof(buf), NULL);
 	ASSERT_EQ_U(len, 0);
 	ASSERT_EQ(buf[0], '\0');
 	return TEST_PASS;
@@ -502,7 +610,7 @@ test_filter_drops_algo(void)
 	char   buf[64];
 
 	size_t noff = offsetof(struct test_algo_node, name);
-	size_t len  = build_namelist(&a, noff, buf, sizeof(buf), "aes256-ctr");
+	int64_t len  = build_namelist(&a, noff, buf, sizeof(buf), "aes256-ctr");
 	ASSERT_STR_EQ(buf, "aes256-ctr");
 	ASSERT_EQ_U(len, strlen("aes256-ctr"));
 	return TEST_PASS;
@@ -517,7 +625,7 @@ test_filter_reorders(void)
 	char   buf[64];
 
 	size_t noff = offsetof(struct test_algo_node, name);
-	size_t len  = build_namelist(&a, noff, buf, sizeof(buf), "B,A");
+	int64_t len  = build_namelist(&a, noff, buf, sizeof(buf), "B,A");
 	ASSERT_STR_EQ(buf, "B,A");
 	ASSERT_EQ_U(len, 3);
 	return TEST_PASS;
@@ -531,7 +639,7 @@ test_filter_skips_unknown(void)
 	char   buf[64];
 
 	size_t noff = offsetof(struct test_algo_node, name);
-	size_t len  = build_namelist(&a, noff, buf, sizeof(buf),
+	int64_t len  = build_namelist(&a, noff, buf, sizeof(buf),
 	    "aes256-ctr,nonexistent");
 	ASSERT_STR_EQ(buf, "aes256-ctr");
 	ASSERT_EQ_U(len, strlen("aes256-ctr"));
@@ -547,7 +655,7 @@ test_filter_null_uses_all(void)
 	char   buf[64];
 
 	size_t noff = offsetof(struct test_algo_node, name);
-	size_t len  = build_namelist(&a, noff, buf, sizeof(buf), NULL);
+	int64_t len  = build_namelist(&a, noff, buf, sizeof(buf), NULL);
 	ASSERT_STR_EQ(buf, "A,B");
 	ASSERT_EQ_U(len, 3);
 	return TEST_PASS;
@@ -578,12 +686,12 @@ test_negotiate_filter_blocks(void)
 	size_t noff = offsetof(struct test_algo_node, name);
 
 	/* Peer offers both; filter only allows A.  A must win. */
-	void *result = negotiate_algo("A,B", "A,B", &a, noff, "A");
+	void *result = negotiate_text("A,B", "A,B", &a, noff, "A");
 	ASSERT_NOT_NULL(result);
 	ASSERT_STR_EQ(((struct test_algo_node *)result)->name, "A");
 
 	/* Peer offers only B; filter only allows A.  No match. */
-	result = negotiate_algo("B", "B", &a, noff, "A");
+	result = negotiate_text("B", "B", &a, noff, "A");
 	ASSERT_NULL(result);
 	return TEST_PASS;
 }
@@ -3652,8 +3760,7 @@ test_global_request_truncated(void)
 	dssh_session_set_cbdata(server, &io, &io, &io, &io);
 
 	/* Just the msg_type byte -- not enough for name length.
-	 * Malformed GLOBAL_REQUEST sends REQUEST_FAILURE then
-	 * disconnects, so recv_packet returns an error. */
+	 * Malformed GLOBAL_REQUEST disconnects, so recv_packet returns an error. */
 	uint8_t gr[] = { 80 };
 	ASSERT_OK(send_packet(client, gr, sizeof(gr), NULL));
 
@@ -3773,6 +3880,14 @@ test_debug_no_callback(void)
 	return TEST_PASS;
 }
 
+static void
+unimplemented_flag_cb(uint32_t seq, void *cbdata)
+{
+	(void)seq;
+	bool *called = cbdata;
+	*called = true;
+}
+
 static int
 test_unimplemented_short_payload(void)
 {
@@ -3796,10 +3911,7 @@ test_unimplemented_short_payload(void)
 	dssh_session_set_cbdata(server, &io, &io, &io, &io);
 
 	bool unimpl_invoked = false;
-	/* Set callback so we can verify it was NOT invoked */
-	dssh_unimplemented_cb unimp_cb;
-	memcpy(&unimp_cb, &(void *){&unimpl_invoked}, sizeof(unimp_cb));
-	dssh_session_set_unimplemented_cb(server, unimp_cb, NULL);
+	ASSERT_OK(dssh_session_set_unimplemented_cb(server, unimplemented_flag_cb, &unimpl_invoked));
 
 	/* UNIMPLEMENTED with just 2 bytes (needs 5 for seq number) */
 	uint8_t unimp[] = { SSH_MSG_UNIMPLEMENTED, 0x00 };
@@ -3813,6 +3925,7 @@ test_unimplemented_short_payload(void)
 	size_t payload_len;
 	ASSERT_OK(recv_packet(server, &msg_type, &payload, &payload_len));
 	ASSERT_EQ(msg_type, SSH_MSG_SERVICE_REQUEST);
+	ASSERT_FALSE(unimpl_invoked);
 
 	dssh_session_cleanup(client);
 	dssh_session_cleanup(server);
@@ -3893,23 +4006,23 @@ test_build_namelist_overflow(void)
 	/* Buffer fits "alpha," but not "alpha,bravo".
 	 * Comma+name checked together, so only "alpha" is emitted. */
 	char buf[8];
-	size_t len = build_namelist(e1,
+	int64_t len = build_namelist(e1,
 	    offsetof(struct dssh_kex_s, name), buf, sizeof(buf), NULL);
 	ASSERT_STR_EQ(buf, "alpha");
-	ASSERT_EQ_U(len, 5);
+	ASSERT_EQ(len, DSSH_ERROR_TOOLONG);
 
 	/* Buffer too small for comma after "alpha" -- covers pos+1>=bufsz */
 	char exact[6];  /* pos=5 after "alpha", 5+1>=6 so comma not written */
 	len = build_namelist(e1,
 	    offsetof(struct dssh_kex_s, name), exact, sizeof(exact), NULL);
 	ASSERT_STR_EQ(exact, "alpha");
-	ASSERT_EQ_U(len, 5);
+	ASSERT_EQ(len, DSSH_ERROR_TOOLONG);
 
 	/* Buffer too small even for "alpha" */
 	char tiny[4];
 	len = build_namelist(e1,
 	    offsetof(struct dssh_kex_s, name), tiny, sizeof(tiny), NULL);
-	ASSERT_TRUE(len < sizeof(tiny));
+	ASSERT_EQ(len, DSSH_ERROR_TOOLONG);
 
 	dssh_test_reset_global_config();
 	return TEST_PASS;
@@ -3942,7 +4055,7 @@ test_build_namelist_truncation_no_trailing_comma(void)
 
 	/* Exact fit: buf[12] holds "alpha,bravo\0" */
 	char exact_fit[12];
-	size_t len = build_namelist(e1,
+	int64_t len = build_namelist(e1,
 	    offsetof(struct dssh_kex_s, name), exact_fit, sizeof(exact_fit), NULL);
 	ASSERT_STR_EQ(exact_fit, "alpha,bravo");
 	ASSERT_EQ_U(len, 11);
@@ -3953,7 +4066,7 @@ test_build_namelist_truncation_no_trailing_comma(void)
 	len = build_namelist(e1,
 	    offsetof(struct dssh_kex_s, name), one_short, sizeof(one_short), NULL);
 	ASSERT_STR_EQ(one_short, "alpha");
-	ASSERT_EQ_U(len, 5);
+	ASSERT_EQ(len, DSSH_ERROR_TOOLONG);
 
 	/* Three entries: "aa", "bb", "cc".  "aa,bb,cc" = 8 + NUL = 9.
 	 * Buffer of 7 fits "aa,bb," but not "cc" -- must be "aa,bb". */
@@ -3977,7 +4090,7 @@ test_build_namelist_truncation_no_trailing_comma(void)
 	len = build_namelist(e3,
 	    offsetof(struct dssh_kex_s, name), three, sizeof(three), NULL);
 	ASSERT_STR_EQ(three, "aa,bb");
-	ASSERT_EQ_U(len, 5);
+	ASSERT_EQ(len, DSSH_ERROR_TOOLONG);
 
 	/* Buffer fits comma but nothing after: "aa,bb" in buf[6].
 	 * pos=5 after "aa,bb", comma check: 5+1>=6 -> break. */
@@ -3985,7 +4098,7 @@ test_build_namelist_truncation_no_trailing_comma(void)
 	len = build_namelist(e3,
 	    offsetof(struct dssh_kex_s, name), tight, sizeof(tight), NULL);
 	ASSERT_STR_EQ(tight, "aa,bb");
-	ASSERT_EQ_U(len, 5);
+	ASSERT_EQ(len, DSSH_ERROR_TOOLONG);
 
 	dssh_test_reset_global_config();
 	return TEST_PASS;
@@ -4356,6 +4469,8 @@ dhgex_server_teardown(struct dhgex_server_ctx *ctx)
 	dssh_test_reset_global_config();
 }
 
+static int group_test_alloc_failure = -1;
+
 /* Run the server handler with specific injected packets */
 static int
 dhgex_server_run(struct dhgex_server_ctx *ctx,
@@ -4381,15 +4496,14 @@ dhgex_server_run(struct dhgex_server_ctx *ctx,
 	dssh_test_alloc_reset();
 
 	/* Reset mutable server state */
-	free(ctx->server->trans.shared_secret);
-	ctx->server->trans.shared_secret = NULL;
-	ctx->server->trans.shared_secret_sz = 0;
-	free(ctx->server->trans.exchange_hash);
-	ctx->server->trans.exchange_hash = NULL;
-	ctx->server->trans.exchange_hash_sz = 0;
+	dssh_result_release(&ctx->server->trans.kex_result.lease);
+	ctx->server->trans.kex_result = (struct dssh_kex_result){0};
 	ctx->server->terminate = false;
 
+	if (group_test_alloc_failure >= 0)
+		dssh_test_alloc_fail_after(group_test_alloc_failure);
 	int res = kex(ctx->server);
+	dssh_test_alloc_reset();
 
 	uint8_t drain[16384];
 	mock_io_drain(&iter_io.s2c, drain, sizeof(drain));
@@ -4402,11 +4516,308 @@ dhgex_server_run(struct dhgex_server_ctx *ctx,
 /* end DH-GEX server handler infra */
 
 static int
-dummy_sign(uint8_t **b, size_t *ol, const uint8_t *d,
+finish_transport_group(struct dssh_dh_gex_group_result *out,
+    const uint8_t *p, size_t plen, const uint8_t *g, size_t glen, int status)
+{
+	out->p = (struct dssh_bytes){p, plen};
+	out->g = (struct dssh_bytes){g, glen};
+	return status;
+}
+
+static int
+release_group_provider(uint32_t min, uint32_t preferred, uint32_t max,
+    struct dssh_dh_gex_group_result *out, void *cbdata)
+{
+	uint8_t *p_bytes = NULL, *g_bytes = NULL;
+	size_t p_length = 0, g_length = 0;
+	uint8_t **p = &p_bytes, **g = &g_bytes;
+	size_t *p_len = &p_length, *g_len = &g_length;
+	(void)min;
+	(void)preferred;
+	(void)max;
+	unsigned *which = cbdata;
+	*p_len = rfc3526_groups[*which == 5 ? 2 : 0].p_len;
+	*p = test_auth_lease_alloc(&out->lease, *p_len);
+	*g_len = *which == 2 ? *p_len : 1;
+	*g = test_auth_lease_alloc(&out->lease, *g_len);
+	if (*p == NULL || *g == NULL) {
+		*p = NULL;
+		*g = NULL;
+		return finish_transport_group(out, p_bytes, p_length, g_bytes, g_length, DSSH_ERROR_ALLOC);
+	}
+	memcpy(*p, rfc3526_groups[*which == 5 ? 2 : 0].p, *p_len);
+	(*g)[0] = 2;
+	if (*which == 0)
+		(*g)[0] = 0;
+	else if (*which == 1)
+		(*g)[0] = 1;
+	else if (*which == 2) {
+		memcpy(*g, *p, *p_len);
+		(*g)[*g_len - 1]--;
+	}
+	else if (*which == 3)
+		(*p)[*p_len - 1] &= 0xfe;
+	else if (*which == 4)
+		(*p)[*p_len - 1] -= 2;
+	else if (*which == 6)
+		*p_len = 0;
+	else if (*which == 7)
+		return finish_transport_group(out, p_bytes, p_length, g_bytes, g_length, 1);
+	else if (*which == 8) {
+		*g = *p;
+		*g_len = *p_len;
+	}
+	else if (*which == 9)
+		(*g)[0] = 5;
+	return finish_transport_group(out, p_bytes, p_length, g_bytes, g_length, 0);
+}
+
+static int
+test_dhgex_group_selection(void)
+{
+	static const struct {
+		uint32_t min, preferred, max;
+		size_t bytes;
+	} cases[] = {
+		{ 2048, 2048, 8192, 256 },
+		{ 2048, 3100, 8192, 512 },
+		{ 2048, 5000, 8192, 768 },
+		{ 2048, 8000, 8100, 768 },
+		{ 2048, 4096, 8192, 512 },
+		{ 2048, 8192, 8192, 1024 },
+		{ 3072, 3072, 3072, 384 },
+		{ 6144, 6144, 6144, 768 },
+	};
+	for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+		struct dssh_dh_gex_group_result group = {0};
+		dssh_test_alloc_fail_after(0);
+		int ret = default_select_group(cases[i].min, cases[i].preferred, cases[i].max, &group, NULL);
+		int allocations = dssh_test_alloc_count();
+		dssh_test_alloc_reset();
+		bool generator_ok = group.g.len == 1 && group.g.data != NULL && *group.g.data == 2;
+		size_t p_len = group.p.len;
+		bool lease_ok = group.lease.release != NULL && group.lease.owner == NULL;
+		dssh_result_release(&group.lease);
+		dssh_result_release(&group.lease);
+		ASSERT_OK(ret);
+		ASSERT_EQ(allocations, 0);
+		ASSERT_EQ_U(p_len, cases[i].bytes);
+		ASSERT_TRUE(generator_ok && lease_ok);
+	}
+	struct dssh_dh_gex_group_result invalid = {0};
+	ASSERT_ERR(default_select_group(4096, 2048, 8192, &invalid, NULL), DSSH_ERROR_INVALID);
+	ASSERT_ERR(default_select_group(2048, 8192, 4096, &invalid, NULL), DSSH_ERROR_INVALID);
+	ASSERT_ERR(default_select_group(1, 512, 1024, &invalid, NULL), DSSH_ERROR_INIT);
+	ASSERT_ERR(default_select_group(2048, 4096, 8192, NULL, NULL), DSSH_ERROR_INVALID);
+	ASSERT_NULL(invalid.p.data);
+	ASSERT_NULL(invalid.g.data);
+	ASSERT_NULL(invalid.lease.release);
+	invalid.p.data = rfc3526_grp14_p;
+	ASSERT_ERR(default_select_group(2048, 4096, 8192, &invalid, NULL), DSSH_ERROR_INVALID);
+	ASSERT_TRUE(invalid.p.data == rfc3526_grp14_p);
+
+	return TEST_PASS;
+}
+
+static int
+test_dhgex_group_validation(void)
+{
+	struct dhgex_server_ctx ctx;
+	if (dhgex_server_setup(&ctx) < 0)
+		return TEST_FAIL;
+	void *original = ctx.server->trans.kex_selected->config;
+	unsigned which = 0;
+	struct dssh_dh_gex_provider provider = { release_group_provider, &which };
+	ctx.server->trans.kex_selected->config = &provider;
+	uint8_t request[] = { 34, 0, 0, 8, 0, 0, 0, 8, 0, 0, 0, 8, 0 };
+	uint8_t init[] = { 32, 0, 0, 0, 1, 2 };
+	uint8_t wire[64];
+	size_t len = build_plaintext_packet_t(request, sizeof(request), wire, sizeof(wire));
+	len += build_plaintext_packet_t(init, sizeof(init), wire + len, sizeof(wire) - len);
+	int results[10];
+	for (which = 0; which < 10; which++)
+		results[which] = dhgex_server_run(&ctx, wire, len);
+	ctx.server->trans.kex_selected->config = original;
+	bool complete = ctx.server->trans.kex_result.shared_secret.len > 0
+	    && ctx.server->trans.kex_result.exchange_hash.len == 32;
+	dhgex_server_teardown(&ctx);
+	for (size_t i = 0; i < 9; i++)
+		ASSERT_EQ(results[i], DSSH_ERROR_INVALID);
+	ASSERT_OK(results[9]);
+	ASSERT_TRUE(complete);
+	return TEST_PASS;
+}
+
+static int
+test_dhgex_peer_validation(void)
+{
+	struct dhgex_server_ctx ctx;
+	if (dhgex_server_setup(&ctx) < 0)
+		return TEST_FAIL;
+	uint8_t request[] = { 34, 0, 0, 8, 0, 0, 0, 8, 0, 0, 0, 8, 0 };
+	uint8_t init[] = { 32, 0, 0, 0, 1, 1 };
+	uint8_t wire[64];
+	size_t len = build_plaintext_packet_t(request, sizeof(request), wire, sizeof(wire));
+	len += build_plaintext_packet_t(init, sizeof(init), wire + len, sizeof(wire) - len);
+	int ret = dhgex_server_run(&ctx, wire, len);
+	bool absent = ctx.server->trans.kex_result.shared_secret.data == NULL;
+	dhgex_server_teardown(&ctx);
+	ASSERT_TRUE(ret < 0);
+	ASSERT_TRUE(absent);
+	return TEST_PASS;
+}
+
+static int
+test_hybrid_shared_secret_validation(void)
+{
+	static const uint8_t sha256[] = {
+		0xad, 0x21, 0x1f, 0x23, 0xbb, 0x28, 0xb3, 0x62, 0x5e, 0xac, 0x51, 0xe5,
+		0x9d, 0x4e, 0x10, 0xe5, 0x13, 0x9c, 0xfe, 0xde, 0x42, 0xed, 0xe3, 0x78,
+		0x8e, 0x4d, 0xce, 0x0e, 0xcb, 0x41, 0x06, 0xfa,
+	};
+	static const uint8_t sha512[] = {
+		0xc4, 0xe4, 0xd9, 0xe2, 0xf9, 0xc4, 0x08, 0x50, 0xe5, 0xd9, 0xe7, 0xa1,
+		0x7d, 0x56, 0x17, 0xbe, 0xc4, 0x59, 0x14, 0x38, 0x4c, 0x2b, 0x9f, 0xd1,
+		0x4b, 0x68, 0xef, 0x31, 0x08, 0xc6, 0xac, 0x08, 0xd1, 0x0e, 0x9f, 0x73,
+		0x52, 0x6a, 0x41, 0x4e, 0x13, 0xc9, 0x3f, 0xcc, 0x17, 0xbe, 0x23, 0xa2,
+		0x27, 0x61, 0xe4, 0x6b, 0x7d, 0x8a, 0xe7, 0xff, 0xe9, 0x0e, 0xdb, 0x6f,
+		0x98, 0xcc, 0x23, 0x75,
+	};
+
+	const uint8_t *expected[] = { sha256, sha512 };
+	uint8_t pq[32], classical[32];
+	memset(pq, 0x11, sizeof(pq));
+	memset(classical, 0x22, sizeof(classical));
+	classical[0] = 0;
+	for (size_t i = 0; i < 2; i++) {
+		struct hybrid_pq_params params = {
+			.hash_name = i == 0 ? "SHA-256" : "SHA-512",
+			.digest_len = i == 0 ? 32 : 64,
+			.pq_ss_len = 32,
+		};
+		dssh_hash_ctx *hash = NULL;
+		size_t length = 0;
+		ASSERT_OK(dssh_hash_init(&hash, params.hash_name, &length));
+		uint8_t out[64];
+		memset(out, 0x5a, sizeof(out));
+		dssh_test_alloc_fail_after(0);
+		int ret = hybrid_pq_compute_shared_secret(hash, &params, pq, classical, out, sizeof(out));
+		int allocations = dssh_test_alloc_count();
+		dssh_test_alloc_reset();
+		dssh_hash_free(hash);
+		bool matches = ret == 0 && allocations == 0 && length == params.digest_len
+		    && memcmp(out, expected[i], length) == 0;
+		for (size_t j = length; j < sizeof(out); j++)
+			matches = matches && out[j] == 0x5a;
+		dssh_cleanse(out, sizeof(out));
+		ASSERT_TRUE(matches);
+	}
+	memset(classical, 0, sizeof(classical));
+	struct hybrid_pq_params params = { .hash_name = "SHA-256", .digest_len = 32, .pq_ss_len = 32 };
+	dssh_hash_ctx *hash = NULL;
+	size_t length = 0;
+	ASSERT_OK(dssh_hash_init(&hash, params.hash_name, &length));
+	uint8_t out[64];
+	memset(out, 0x5a, sizeof(out));
+	int ret = hybrid_pq_compute_shared_secret(hash, &params, pq, classical, out, sizeof(out));
+	int short_result = hybrid_pq_compute_shared_secret(hash, &params, pq, classical, out, 31);
+	dssh_hash_free(hash);
+	ASSERT_EQ(ret, DSSH_ERROR_INVALID);
+	ASSERT_EQ(short_result, DSSH_ERROR_TOOLONG);
+	for (size_t i = 0; i < sizeof(out); i++)
+		ASSERT_EQ(out[i], 0x5a);
+	return TEST_PASS;
+}
+
+static int
+test_dhgex_mpint_validation(void)
+{
+	static const struct {
+		uint8_t bytes[7];
+		size_t len;
+	} invalid[] = {
+		{ { 0, 0, 0, 1, 0x80 }, 5 },
+		{ { 0, 0, 0, 1, 0 }, 5 },
+		{ { 0, 0, 0, 2, 0, 1 }, 6 },
+		{ { 0, 0, 0, 2, 1 }, 5 },
+		{ { 0, 0, 0 }, 3 },
+	};
+	const uint8_t *body;
+	size_t body_len;
+	for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++)
+		ASSERT_EQ(dssh_dhgex_parse_mpint(invalid[i].bytes, invalid[i].len, &body, &body_len),
+		    DSSH_ERROR_PARSE);
+	uint8_t positive[] = { 0, 0, 0, 2, 0, 0x80 };
+	ASSERT_EQ(dssh_dhgex_parse_mpint(positive, sizeof(positive), &body, &body_len), 6);
+	ASSERT_EQ_U(body_len, 2);
+	ASSERT_TRUE(body == positive + 4);
+	return TEST_PASS;
+}
+
+#ifdef DSSH_CRYPTO_OPENSSL
+static int
+test_dhgex_group_failure_paths(void)
+{
+	const struct rfc3526_group *group = &rfc3526_groups[0];
+	uint8_t generator = 5;
+	BIGNUM *p = BN_bin2bn(group->p, 256, NULL);
+	BIGNUM *g = BN_bin2bn(&generator, 1, NULL);
+	BN_CTX *bnctx = BN_CTX_new();
+	ASSERT_NOT_NULL(p);
+	ASSERT_NOT_NULL(g);
+	ASSERT_NOT_NULL(bnctx);
+	int ret = DSSH_ERROR_INIT;
+	int calls = 0;
+	for (int n = 0; n < 32; n++) {
+		dssh_test_ossl_fail_after(n);
+		ret = dhgex_validate_group(p, g, bnctx, group->p, group->p_len, &generator, 1);
+		calls = dssh_test_ossl_count();
+		dssh_test_ossl_reset();
+		if (ret == 0)
+			break;
+	}
+	BN_free(p);
+	BN_free(g);
+	BN_CTX_free(bnctx);
+	ASSERT_OK(ret);
+	ASSERT_TRUE(calls >= 5);
+	return TEST_PASS;
+}
+
+static int
+test_dhgex_group_constants(void)
+{
+	BIGNUM *(*get_prime[])(BIGNUM *) = {
+		BN_get_rfc3526_prime_2048, BN_get_rfc3526_prime_3072,
+		BN_get_rfc3526_prime_4096, BN_get_rfc3526_prime_6144,
+		BN_get_rfc3526_prime_8192
+	};
+	for (size_t i = 0; i < RFC3526_NGROUPS; i++) {
+		BIGNUM *p = get_prime[i](NULL);
+		ASSERT_NOT_NULL(p);
+		uint8_t bytes[1024];
+		int len = BN_bn2bin(p, bytes);
+		BN_free(p);
+		ASSERT_TRUE(len > 0);
+		size_t size = (size_t)len;
+		ASSERT_EQ_U(size, rfc3526_groups[i].p_len);
+		ASSERT_MEM_EQ(bytes, rfc3526_groups[i].p, size);
+	}
+	return TEST_PASS;
+}
+#endif
+
+static int
+dummy_sign(struct dssh_bytes_result *output_result, const uint8_t *d,
     size_t dl, dssh_key_algo_ctx *c)
 {
+	uint8_t *fixture_output = NULL;
+	size_t fixture_length = 0;
+	uint8_t **b = &fixture_output;
+	size_t *ol = &fixture_length;
+
 	(void)b; (void)ol; (void)d; (void)dl; (void)c;
-	return 0;
+	return test_auth_output_finish(output_result, fixture_output, fixture_length, 0);
 }
 
 static int
@@ -4533,7 +4944,7 @@ test_dhgex_server_null_provider(void)
 
 	/* Set provider with NULL select_group */
 	struct dssh_dh_gex_provider bad_prov = { .select_group = NULL };
-	ctx.server->trans.kex_selected->ctx = &bad_prov;
+	ctx.server->trans.kex_selected->config = &bad_prov;
 
 	int res = dhgex_server_run(&ctx, wire, wlen);
 	ASSERT_EQ(res, DSSH_ERROR_INIT);
@@ -4544,10 +4955,13 @@ test_dhgex_server_null_provider(void)
 
 static int
 provider_error_cb(uint32_t min, uint32_t preferred, uint32_t max,
-    uint8_t **p, size_t *p_len, uint8_t **g, size_t *g_len, void *cbdata)
+    struct dssh_dh_gex_group_result *out, void *cbdata)
 {
-	(void)min; (void)preferred; (void)max;
-	(void)p; (void)p_len; (void)g; (void)g_len; (void)cbdata;
+	(void)min;
+	(void)preferred;
+	(void)max;
+	(void)out;
+	(void)cbdata;
 	return DSSH_ERROR_INIT;
 }
 
@@ -4570,7 +4984,7 @@ test_dhgex_server_provider_error(void)
 	struct dssh_dh_gex_provider err_prov = {
 		.select_group = provider_error_cb
 	};
-	ctx.server->trans.kex_selected->ctx = &err_prov;
+	ctx.server->trans.kex_selected->config = &err_prov;
 
 	int res = dhgex_server_run(&ctx, wire, wlen);
 	ASSERT_EQ(res, DSSH_ERROR_INIT);
@@ -4799,12 +5213,8 @@ c25519_server_run(struct c25519_server_ctx *ctx,
 	dssh_test_alloc_reset();
 
 	/* Reset mutable server state */
-	free(ctx->server->trans.shared_secret);
-	ctx->server->trans.shared_secret = NULL;
-	ctx->server->trans.shared_secret_sz = 0;
-	free(ctx->server->trans.exchange_hash);
-	ctx->server->trans.exchange_hash = NULL;
-	ctx->server->trans.exchange_hash_sz = 0;
+	dssh_result_release(&ctx->server->trans.kex_result.lease);
+	ctx->server->trans.kex_result = (struct dssh_kex_result){0};
 	ctx->server->terminate = false;
 
 	int res = kex(ctx->server);
@@ -4969,69 +5379,120 @@ test_c25519_server_qc_overrun(void)
 static int
 test_c25519_encode_shared_secret_leading_zeros(void)
 {
-	/* Raw bytes with leading zeros -- exercises the
-	 * while (raw_len > 1 && start[0] == 0) loop */
-	uint8_t raw[3] = { 0x00, 0x00, 0x42 };
-	uint8_t *ss_out = NULL;
-	size_t ss_len = 0;
-	uint8_t *mpint_out = NULL;
-	size_t mpint_len = 0;
-
-	int res = encode_shared_secret(raw, sizeof(raw),
-	    &ss_out, &ss_len, &mpint_out, &mpint_len);
-	ASSERT_EQ(res, 0);
-	ASSERT_NOT_NULL(ss_out);
-	ASSERT_NOT_NULL(mpint_out);
-	ASSERT_TRUE(ss_len > 0);
-	ASSERT_TRUE(mpint_len > 0);
-
-	free(ss_out);
-	free(mpint_out);
+	const uint8_t raw[] = {0, 0, 0x42};
+	const uint8_t expected[] = {0, 0, 0, 1, 0x42};
+	struct dssh_bytes secret = {0};
+	uint8_t mpint[37];
+	size_t length = 0;
+	ASSERT_OK(encode_shared_secret(raw, sizeof(raw), &secret, mpint, sizeof(mpint), &length));
+	ASSERT_TRUE(secret.data == &raw[2] && secret.len == 1 && length == sizeof(expected));
+	ASSERT_EQ(memcmp(mpint, expected, sizeof(expected)), 0);
 	return TEST_PASS;
 }
 
-#ifdef DSSH_CRYPTO_OPENSSL
 static int
-test_c25519_x25519_exchange_alloc_fail(void)
+test_c25519_secret_validation(void)
 {
-	uint8_t peer[32] = {9}; /* base point is valid */
-	uint8_t our_pub[32];
-	uint8_t *secret = NULL;
-	size_t secret_len = 0;
-
-	dssh_test_alloc_fail_after(0);
-	int res = x25519_exchange(peer, sizeof(peer),
-	    our_pub, &secret, &secret_len);
-	dssh_test_alloc_reset();
-	ASSERT_TRUE(res < 0);
+	uint8_t raw[33] = {0};
+	struct dssh_bytes secret = {0};
+	uint8_t mpint[37];
+	size_t length = 0;
+	ASSERT_EQ(encode_shared_secret(raw, 0, &secret, mpint, sizeof(mpint), &length), DSSH_ERROR_INVALID);
+	ASSERT_EQ(encode_shared_secret(raw, 32, &secret, mpint, sizeof(mpint), &length), DSSH_ERROR_INVALID);
+	ASSERT_EQ(encode_shared_secret(raw, sizeof(raw), &secret, mpint, sizeof(mpint), &length), DSSH_ERROR_INVALID);
+	ASSERT_NULL(secret.data);
+	ASSERT_EQ_U(secret.len, 0);
+	ASSERT_EQ_U(length, 0);
 	return TEST_PASS;
 }
-#endif
 
 static int
-test_c25519_encode_shared_secret_alloc_fail(void)
+test_c25519_peer_validation(void)
 {
-	uint8_t raw[32];
-	memset(raw, 0x42, sizeof(raw));
-	uint8_t *ss_out = NULL;
-	size_t ss_len = 0;
-	uint8_t *mpint_out = NULL;
-	size_t mpint_len = 0;
+	struct c25519_server_ctx ctx;
+	if (c25519_server_setup(&ctx) < 0)
+		return TEST_FAIL;
+	uint8_t pkt[37] = { SSH_MSG_KEX_ECDH_INIT, 0, 0, 0, 32 };
+	uint8_t wire[64];
+	size_t len = build_plaintext_packet_t(pkt, sizeof(pkt), wire, sizeof(wire));
+	int ret = c25519_server_run(&ctx, wire, len);
+	bool output_absent = ctx.server->trans.kex_result.shared_secret.data == NULL;
+	c25519_server_teardown(&ctx);
+	ASSERT_TRUE(ret < 0);
+	ASSERT_TRUE(output_absent);
+	return TEST_PASS;
+}
 
-	/* Fail first malloc (line 163) */
-	dssh_test_alloc_fail_after(0);
-	int res = encode_shared_secret(raw, sizeof(raw),
-	    &ss_out, &ss_len, &mpint_out, &mpint_len);
-	dssh_test_alloc_reset();
-	ASSERT_TRUE(res < 0);
+static int
+test_c25519_init_allocations(void)
+{
+	bool succeeded = false;
+	for (int allocation = 0; allocation < 16; allocation++) {
+		void *state = NULL;
+		dssh_test_alloc_fail_after(allocation);
+		int ret = curve25519_init(false, NULL, &state);
+		dssh_test_alloc_reset();
+		bool valid = ret == 0 ? state != NULL : ret == DSSH_ERROR_ALLOC && state == NULL;
+		curve25519_cleanup(state);
+		ASSERT_TRUE(valid);
+		if (ret == 0) {
+			succeeded = true;
+			break;
+		}
+	}
+	ASSERT_TRUE(succeeded);
+	return TEST_PASS;
+}
 
-	/* Fail second malloc (line 172) */
-	dssh_test_alloc_fail_after(1);
-	res = encode_shared_secret(raw, sizeof(raw),
-	    &ss_out, &ss_len, &mpint_out, &mpint_len);
-	dssh_test_alloc_reset();
-	ASSERT_TRUE(res < 0);
-
+static int
+test_c25519_encode_shared_secret_storage(void)
+{
+	/* Independently written wire prefixes; no serialize helper in the oracle. */
+	const uint8_t raw[4][3] = {{0, 0, 0x7f}, {0, 0, 0x80}, {0, 1, 0x80}, {0x80, 0, 0}};
+	const uint8_t expected[4][8] = {
+		{0, 0, 0, 1, 0x7f}, {0, 0, 0, 2, 0, 0x80},
+		{0, 0, 0, 2, 1, 0x80}, {0, 0, 0, 4, 0, 0x80, 0, 0},
+	};
+	const size_t lengths[] = {5, 6, 6, 8};
+	const size_t secret_lengths[] = {1, 1, 2, 3};
+	for (size_t i = 0; i < sizeof(raw) / sizeof(raw[0]); i++) {
+		uint8_t encoded[40];
+		memset(encoded, 0x5a, sizeof(encoded));
+		struct dssh_bytes secret = {0};
+		size_t length = 0;
+		dssh_test_alloc_fail_after(0);
+		int ret = encode_shared_secret(raw[i], sizeof(raw[i]), &secret,
+		    &encoded[1], lengths[i], &length);
+		int allocations = dssh_test_alloc_count();
+		dssh_test_alloc_reset();
+		ASSERT_OK(ret);
+		ASSERT_EQ(allocations, 0);
+		ASSERT_EQ_U(length, lengths[i]);
+		ASSERT_TRUE(secret.len == secret_lengths[i] && secret.data == &raw[i][3 - secret_lengths[i]]);
+		ASSERT_EQ(memcmp(&encoded[1], expected[i], length), 0);
+		ASSERT_TRUE(encoded[0] == 0x5a && encoded[1 + length] == 0x5a);
+		memset(encoded, 0x5a, sizeof(encoded));
+		ret = encode_shared_secret(raw[i], sizeof(raw[i]), &secret,
+		    &encoded[1], lengths[i] - 1, &length);
+		ASSERT_EQ(ret, DSSH_ERROR_TOOLONG);
+		ASSERT_NULL(secret.data);
+		ASSERT_EQ_U(length, 0);
+		for (size_t j = 0; j < sizeof(encoded); j++)
+			ASSERT_EQ(encoded[j], 0x5a);
+	}
+	uint8_t maximum[32], encoded[39];
+	memset(maximum, 0x80, sizeof(maximum));
+	memset(encoded, 0x5a, sizeof(encoded));
+	struct dssh_bytes secret = {0};
+	size_t length = 0;
+	ASSERT_OK(encode_shared_secret(maximum, sizeof(maximum), &secret, &encoded[1], 37, &length));
+	const uint8_t prefix[] = {0, 0, 0, 33, 0};
+	ASSERT_TRUE(length == 37 && secret.data == maximum && secret.len == sizeof(maximum));
+	ASSERT_EQ(memcmp(&encoded[1], prefix, sizeof(prefix)), 0);
+	ASSERT_EQ(memcmp(&encoded[6], maximum, sizeof(maximum)), 0);
+	ASSERT_TRUE(encoded[0] == 0x5a && encoded[38] == 0x5a);
+	ASSERT_EQ(encode_shared_secret(maximum, sizeof(maximum), &secret, &encoded[1], 36, &length),
+	    DSSH_ERROR_TOOLONG);
 	return TEST_PASS;
 }
 
@@ -5116,10 +5577,13 @@ test_negotiate_no_common_kex(void)
 	}
 	dssh_session_set_cbdata(client, &io2, &io2, &io2, &io2);
 
-	/* Null out the kex list so our_lists[0] is empty.
-	 * negotiate_algo will return NULL for kex -> line 1131 fires. */
-	dssh_kex saved_kex_head = gconf.kex_head;
-	gconf.kex_head = NULL;
+	/* Keep our complete offer valid, and replace only the peer's
+	 * exchange names with equally sized unsupported names. */
+	uint32_t names_len = DSSH_GET_U32(&client->trans.peer_kexinit[17]);
+	for (size_t i = 0; i < names_len; i++) {
+		if (client->trans.peer_kexinit[21 + i] != ',')
+			client->trans.peer_kexinit[21 + i] = 'x';
+	}
 
 	/* Clear selected fields so the || chain exercises fresh */
 	client->trans.kex_selected = NULL;
@@ -5136,8 +5600,6 @@ test_negotiate_no_common_kex(void)
 	int res = kexinit(client);
 	ASSERT_EQ(res, DSSH_ERROR_INVALID);
 
-	/* Restore */
-	gconf.kex_head = saved_kex_head;
 
 	mock_io_close_c2s(&io2);
 	mock_io_close_s2c(&io2);
@@ -5259,9 +5721,18 @@ test_none_comp(void)
 	ASSERT_NOT_NULL(comp);
 
 	uint8_t buf[16] = {0};
-	size_t bufsz = sizeof(buf);
-	ASSERT_EQ(comp->compress(buf, &bufsz, NULL), 0);
-	ASSERT_EQ(comp->uncompress(buf, &bufsz, NULL), 0);
+	uint8_t output[16];
+	size_t bufsz = 0;
+	dssh_comp_ctx *ctx = NULL;
+	ASSERT_OK(comp->init(true, &ctx));
+	ASSERT_OK(comp->bound(sizeof(buf), &bufsz, ctx));
+	ASSERT_EQ_U(bufsz, sizeof(buf));
+	ASSERT_OK(comp->compress(buf, sizeof(buf), output, sizeof(output), &bufsz, ctx));
+	ASSERT_EQ_U(bufsz, sizeof(buf));
+	ASSERT_MEM_EQ(output, buf, sizeof(buf));
+	ASSERT_OK(comp->uncompress(output, sizeof(output), buf, sizeof(buf), &bufsz, ctx));
+	ASSERT_EQ_U(bufsz, sizeof(buf));
+	comp->cleanup(ctx);
 
 	dssh_test_reset_global_config();
 	return TEST_PASS;
@@ -5378,7 +5849,7 @@ test_global_request_name_exceeds_payload(void)
 	dssh_session_set_cbdata(server, &io, &io, &io, &io);
 
 	/* GLOBAL_REQUEST: name_len=100 but only 2 bytes of name + no want_reply.
-	 * Malformed GLOBAL_REQUEST sends REQUEST_FAILURE then disconnects. */
+	 * Malformed GLOBAL_REQUEST disconnects. */
 	uint8_t gr[16];
 	size_t gp = 0;
 	gr[gp++] = 80; /* SSH_MSG_GLOBAL_REQUEST */
@@ -5408,19 +5879,80 @@ static int
 test_rekey_time_zero(void)
 {
 	dssh_test_reset_global_config();
-	ASSERT_EQ(register_all_algorithms(), 0);
-	dssh_transport_set_callbacks(mock_tx_dispatch, mock_rx_dispatch,
-	    mock_rxline_dispatch, mock_extra_line_cb);
-
+	dssh_test_clock_reset();
+	struct timespec now = { .tv_sec = 0, .tv_nsec = 0 };
+	dssh_test_clock_set(now);
 	dssh_session sess = dssh_session_init(true, 0);
+	dssh_test_clock_reset();
 	ASSERT_NOT_NULL(sess);
-
-	/* Force rekey_time to 0 -- rekey_needed should return false */
-	sess->trans.rekey_time = 0;
-	ASSERT_FALSE(rekey_needed(sess));
-
+	ASSERT_TRUE(sess->trans.rekey_time == 0);
+	ASSERT_OK(dssh_session_set_rekey_seconds(sess, 1));
+	dssh_test_clock_set(now);
+	bool first = rekey_needed(sess);
+	now.tv_sec = 2;
+	dssh_test_clock_set(now);
+	bool second = rekey_needed(sess);
+	dssh_test_clock_reset();
+	ASSERT_FALSE(first);
+	ASSERT_TRUE(second);
 	dssh_session_cleanup(sess);
 	dssh_test_reset_global_config();
+	return TEST_PASS;
+}
+
+static int
+test_clock_transport(void)
+{
+	dssh_test_reset_global_config();
+	dssh_test_clock_fail_after(0);
+	dssh_session failed = dssh_session_init(true, 0);
+	dssh_test_clock_reset();
+	ASSERT_NULL(failed);
+	struct timespec before_epoch = { .tv_sec = -1, .tv_nsec = 0 };
+	dssh_test_clock_set(before_epoch);
+	dssh_session earlier = dssh_session_init(true, 0);
+	dssh_test_clock_reset();
+	ASSERT_NOT_NULL(earlier);
+	ASSERT_TRUE(earlier->trans.rekey_time == before_epoch.tv_sec);
+	dssh_session_cleanup(earlier);
+
+	struct handshake_ctx ctx;
+	if (handshake_setup(&ctx) < 0) {
+		handshake_cleanup(&ctx);
+		return TEST_FAIL;
+	}
+	dssh_enc_ctx *old_ctx = ctx.client->trans.enc_c2s_ctx;
+	const uint8_t encoded[] = { 0, 0, 0, 1, 1 };
+	dssh_test_clock_fail_after(0);
+	int ret = derive_and_apply_keys(ctx.client, encoded, sizeof(encoded),
+	    ctx.client->trans.enc_c2s_active, ctx.client->trans.enc_s2c_active,
+	    ctx.client->trans.mac_c2s_active, ctx.client->trans.mac_s2c_active);
+	dssh_test_clock_reset();
+	ASSERT_ERR(ret, DSSH_ERROR_INIT);
+	ASSERT_TRUE(ctx.client->trans.enc_c2s_ctx == old_ctx);
+	ASSERT_FALSE(dssh_session_is_terminated(ctx.client));
+
+	ASSERT_OK(dssh_session_set_rekey_seconds(ctx.client, 10));
+	ctx.client->trans.rekey_time = 100;
+	struct timespec now = { .tv_sec = 109 };
+	dssh_test_clock_set(now);
+	bool before = rekey_needed(ctx.client);
+	now.tv_sec = 110;
+	dssh_test_clock_set(now);
+	bool at = rekey_needed(ctx.client);
+	now.tv_sec = 90;
+	dssh_test_clock_set(now);
+	bool backwards = rekey_needed(ctx.client);
+	dssh_test_clock_reset();
+	ASSERT_FALSE(before);
+	ASSERT_TRUE(at);
+	ASSERT_FALSE(backwards);
+	dssh_test_clock_fail_after(0);
+	bool clock_failed = rekey_needed(ctx.client);
+	dssh_test_clock_reset();
+	ASSERT_FALSE(clock_failed);
+	ASSERT_TRUE(dssh_session_is_terminated(ctx.client));
+	handshake_cleanup(&ctx);
 	return TEST_PASS;
 }
 
@@ -5476,6 +6008,8 @@ test_blocksize_lt8(void)
 static int
 test_ed25519_sign_basic(void)
 {
+	struct test_signature_copies fixture_copies = {0};
+
 	dssh_test_reset_global_config();
 	ASSERT_EQ(dssh_register_ssh_ed25519(), 0);
 	ASSERT_EQ(dssh_ed25519_generate_key(), 0);
@@ -5486,14 +6020,14 @@ test_ed25519_sign_basic(void)
 	const uint8_t data[] = "test";
 	uint8_t *out = NULL;
 	size_t outlen;
-	ASSERT_EQ(ka->sign(&out, &outlen, data, sizeof(data) - 1,
+	ASSERT_EQ(test_signature_copy(&fixture_copies, ka->sign, &out, &outlen, data, sizeof(data) - 1,
 	    ka->ctx), 0);
 	ASSERT_NOT_NULL(out);
 	ASSERT_TRUE(outlen > 0);
-	free(out);
+	test_signature_copy_free(&fixture_copies, out);
 
 	dssh_test_reset_global_config();
-	return TEST_PASS;
+	return test_signature_copies_finish(&fixture_copies, TEST_PASS);
 }
 
 static int
@@ -5519,6 +6053,8 @@ test_ed25519_pubkey_basic(void)
 static int
 test_rsa_sign_basic(void)
 {
+	struct test_signature_copies fixture_copies = {0};
+
 	dssh_test_reset_global_config();
 	ASSERT_EQ(dssh_register_rsa_sha2_256(), 0);
 	ASSERT_EQ(dssh_rsa_sha2_256_generate_key(2048), 0);
@@ -5529,14 +6065,14 @@ test_rsa_sign_basic(void)
 	const uint8_t data[] = "test";
 	uint8_t *out = NULL;
 	size_t outlen;
-	ASSERT_EQ(ka->sign(&out, &outlen, data, sizeof(data) - 1,
+	ASSERT_EQ(test_signature_copy(&fixture_copies, ka->sign, &out, &outlen, data, sizeof(data) - 1,
 	    ka->ctx), 0);
 	ASSERT_NOT_NULL(out);
 	ASSERT_TRUE(outlen > 0);
-	free(out);
+	test_signature_copy_free(&fixture_copies, out);
 
 	dssh_test_reset_global_config();
-	return TEST_PASS;
+	return test_signature_copies_finish(&fixture_copies, TEST_PASS);
 }
 
 static int
@@ -5645,7 +6181,7 @@ static int
 test_first_name_basic(void)
 {
 	char buf[32];
-	size_t len = first_name("curve25519-sha256,aes256-ctr", buf, sizeof(buf));
+	size_t len = first_name_text("curve25519-sha256,aes256-ctr", buf, sizeof(buf));
 	ASSERT_EQ(len, (size_t)17);
 	ASSERT_STR_EQ(buf, "curve25519-sha256");
 	return TEST_PASS;
@@ -5655,7 +6191,7 @@ static int
 test_first_name_single(void)
 {
 	char buf[32];
-	size_t len = first_name("only-one", buf, sizeof(buf));
+	size_t len = first_name_text("only-one", buf, sizeof(buf));
 	ASSERT_EQ(len, (size_t)8);
 	ASSERT_STR_EQ(buf, "only-one");
 	return TEST_PASS;
@@ -5665,7 +6201,7 @@ static int
 test_first_name_small_buf(void)
 {
 	char buf[4];
-	size_t len = first_name("longname", buf, sizeof(buf));
+	size_t len = first_name_text("longname", buf, sizeof(buf));
 	ASSERT_EQ(len, (size_t)3); /* clamped to bufsz-1 */
 	ASSERT_STR_EQ(buf, "lon");
 	return TEST_PASS;
@@ -5702,6 +6238,11 @@ test_register_two_comp(void)
 	struct dssh_comp_s *comp2 = calloc(1, sz);
 	ASSERT_NOT_NULL(comp2);
 	strcpy(comp2->name, "zlib");
+	comp2->init = gconf.comp_head->init;
+	comp2->bound = gconf.comp_head->bound;
+	comp2->compress = gconf.comp_head->compress;
+	comp2->uncompress = gconf.comp_head->uncompress;
+	comp2->cleanup = gconf.comp_head->cleanup;
 	ASSERT_EQ(dssh_transport_register_comp(comp2), 0);
 
 	dssh_test_reset_global_config();
@@ -5733,8 +6274,8 @@ test_register_two_lang(void)
  * ================================================================ */
 
 /*
- * Build a minimal valid KEXINIT buffer with 10 empty name-lists.
- * Returns total size.  buf must be at least 1 + 16 + 10*4 + 1 = 58 bytes.
+ * Build a minimal complete KEXINIT with nonempty algorithm lists.
+ * Returns total size.  buf must have room for the names and the five-byte trailer.
  */
 static size_t
 build_minimal_kexinit(uint8_t *buf, size_t bufsz)
@@ -5745,13 +6286,14 @@ build_minimal_kexinit(uint8_t *buf, size_t bufsz)
 	memset(&buf[pos], 0xAA, DSSH_KEXINIT_COOKIE_SIZE);
 	pos += DSSH_KEXINIT_COOKIE_SIZE;
 
-	/* 10 empty name-lists (each: uint32 length = 0) */
+	/* Eight nonempty algorithm lists and two empty language lists. */
 	for (int i = 0; i < 10; i++) {
-		DSSH_PUT_U32(0, buf, &pos);
+		DSSH_PUT_U32(i < 8 ? 1 : 0, buf, &pos);
+		if (i < 8)
+			buf[pos++] = 'a';
 	}
-
-	/* first_kex_packet_follows = false */
 	buf[pos++] = 0;
+	DSSH_PUT_U32(0, buf, &pos);
 	(void)bufsz;
 	return pos;
 }
@@ -5786,17 +6328,22 @@ test_kexinit_parse_valid(void)
 	}
 
 	buf[pos++] = 0; /* first_kex_packet_follows = false */
+	DSSH_PUT_U32(0, buf, &pos);
 
-	char peer_lists[10][1024];
+	struct dssh_name_list peer_lists[10];
 	bool first_kex_follows = true;
 
 	ASSERT_EQ(parse_peer_kexinit(buf, pos, peer_lists,
 	    &first_kex_follows), 0);
-	ASSERT_STR_EQ(peer_lists[0], "curve25519-sha256");
-	ASSERT_STR_EQ(peer_lists[1], "ssh-ed25519");
-	ASSERT_STR_EQ(peer_lists[2], "aes256-ctr");
-	ASSERT_STR_EQ(peer_lists[6], "none");
-	ASSERT_STR_EQ(peer_lists[8], "");
+	ASSERT_EQ_U(peer_lists[0].len, strlen("curve25519-sha256"));
+	ASSERT_MEM_EQ(peer_lists[0].data, "curve25519-sha256", peer_lists[0].len);
+	ASSERT_EQ_U(peer_lists[1].len, strlen("ssh-ed25519"));
+	ASSERT_MEM_EQ(peer_lists[1].data, "ssh-ed25519", peer_lists[1].len);
+	ASSERT_EQ_U(peer_lists[2].len, strlen("aes256-ctr"));
+	ASSERT_MEM_EQ(peer_lists[2].data, "aes256-ctr", peer_lists[2].len);
+	ASSERT_EQ_U(peer_lists[6].len, strlen("none"));
+	ASSERT_MEM_EQ(peer_lists[6].data, "none", peer_lists[6].len);
+	ASSERT_EQ_U(peer_lists[8].len, 0);
 	ASSERT_EQ(first_kex_follows, false);
 
 	return TEST_PASS;
@@ -5816,7 +6363,7 @@ test_kexinit_parse_control_char(void)
 	buf[nl_pos + 1] = '\x01'; /* control char */
 	buf[nl_pos + 2] = 'b';
 
-	char peer_lists[10][1024];
+	struct dssh_name_list peer_lists[10];
 	bool first_kex_follows;
 
 	ASSERT_EQ(parse_peer_kexinit(buf, pos + 3, peer_lists,
@@ -5849,7 +6396,7 @@ test_kexinit_parse_name_too_long(void)
 
 	buf[pos++] = 0;
 
-	char peer_lists[10][1024];
+	struct dssh_name_list peer_lists[10];
 	bool first_kex_follows;
 
 	ASSERT_EQ(parse_peer_kexinit(buf, pos, peer_lists,
@@ -5871,7 +6418,7 @@ test_kexinit_parse_truncated(void)
 	/* First list claims 100 bytes but buffer ends */
 	DSSH_PUT_U32(100, buf, &pos);
 
-	char peer_lists[10][1024];
+	struct dssh_name_list peer_lists[10];
 	bool first_kex_follows;
 
 	ASSERT_EQ(parse_peer_kexinit(buf, pos, peer_lists,
@@ -5885,7 +6432,7 @@ test_kexinit_parse_too_short(void)
 {
 	/* Buffer shorter than msg_type + cookie */
 	uint8_t buf[10] = {20};
-	char peer_lists[10][1024];
+	struct dssh_name_list peer_lists[10];
 	bool first_kex_follows;
 
 	ASSERT_EQ(parse_peer_kexinit(buf, 5, peer_lists,
@@ -5901,9 +6448,9 @@ test_kexinit_parse_first_kex_follows(void)
 	size_t pos = build_minimal_kexinit(buf, sizeof(buf));
 
 	/* Set first_kex_packet_follows to true */
-	buf[pos - 1] = 1;
+	buf[pos - 5] = 1;
 
-	char peer_lists[10][1024];
+	struct dssh_name_list peer_lists[10];
 	bool first_kex_follows = false;
 
 	ASSERT_EQ(parse_peer_kexinit(buf, pos, peer_lists,
@@ -5929,7 +6476,7 @@ test_kexinit_peer_parse_truncated_namelist(void)
 	buf[pos++] = 'a';
 	buf[pos++] = 'b';
 
-	char peer_lists[10][1024];
+	struct dssh_name_list peer_lists[10];
 	bool first_kex_follows;
 
 	ASSERT_EQ(parse_peer_kexinit(buf, pos, peer_lists,
@@ -6223,6 +6770,10 @@ test_register_kex_toomany(void)
 	struct dssh_kex_s *k1 = calloc(1, sz);
 	ASSERT_NOT_NULL(k1);
 	strcpy(k1->name, "kex-1");
+	k1->init = test_kex_stateless_init;
+	k1->handler = test_kex_static_handler;
+	k1->cleanup = test_kex_stateless_cleanup;
+	k1->hash_name = "SHA-256";
 	ASSERT_EQ(dssh_transport_register_kex(k1), 0);
 
 	/* Forge the entries counter to SIZE_MAX - 1 */
@@ -6316,11 +6867,7 @@ test_register_comp_toomany(void)
 {
 	dssh_test_reset_global_config();
 
-	size_t sz = sizeof(struct dssh_comp_s) + 8;
-	struct dssh_comp_s *c1 = calloc(1, sz);
-	ASSERT_NOT_NULL(c1);
-	strcpy(c1->name, "comp-1");
-	ASSERT_EQ(dssh_transport_register_comp(c1), 0);
+	ASSERT_OK(dssh_register_none_comp());
 
 	gconf.comp_entries = SIZE_MAX - 1;
 
@@ -7403,7 +7950,1301 @@ test_rxline_from_rx_handshake(void)
  * Test table
  * ================================================================ */
 
+struct boundary_input {
+	uint8_t packet[1024];
+	size_t consumed;
+	size_t limit;
+	size_t reported;
+	bool invalid_line;
+};
+
+static int
+test_rekey_changes_algorithms(void)
+{
+	struct handshake_ctx ctx;
+	if (handshake_setup_with_cipher(&ctx, true) < 0) {
+		handshake_cleanup(&ctx);
+		return TEST_FAIL;
+	}
+	int client_result = 0;
+	int server_result = 0;
+	bool changed = true;
+	for (unsigned round = 0; round < 2; round++) {
+		const char *mac_name = ctx.client->trans.mac_c2s_selected->digest_size == 32
+		    ? "hmac-sha2-512" : "hmac-sha2-256";
+		const char *cipher_name = round == 0 ? "aes128-cbc" : "aes256-ctr";
+		const char *macs[] = { mac_name };
+		const char *ciphers[] = { cipher_name };
+		ASSERT_OK(dssh_session_set_mac_filter(ctx.client, macs, 1));
+		ASSERT_OK(dssh_session_set_mac_filter(ctx.server, macs, 1));
+		ASSERT_OK(dssh_session_set_enc_filter(ctx.client, ciphers, 1));
+		ASSERT_OK(dssh_session_set_enc_filter(ctx.server, ciphers, 1));
+		struct rekey_thread_arg ca = { &ctx, -1 };
+		struct rekey_thread_arg sa = { &ctx, -1 };
+		thrd_t ct, st;
+		ASSERT_THRD_CREATE(&ct, rekey_client_thread, &ca);
+		ASSERT_THRD_CREATE(&st, rekey_server_recv_thread, &sa);
+		thrd_join(ct, NULL);
+		client_result = ca.result;
+		if (client_result == 0) {
+			uint8_t message[] = { SSH_MSG_SERVICE_REQUEST, 0x42 };
+			client_result = send_packet(ctx.client, message, sizeof(message), NULL);
+		}
+		if (client_result < 0) {
+			mock_io_close_c2s(&ctx.io);
+			mock_io_close_s2c(&ctx.io);
+		}
+		thrd_join(st, NULL);
+		server_result = sa.result;
+		if (client_result < 0 || server_result < 0)
+			break;
+		changed = changed
+		    && strcmp(dssh_transport_get_mac_name(ctx.client), mac_name) == 0
+		    && strcmp(dssh_transport_get_mac_name(ctx.server), mac_name) == 0
+		    && strcmp(dssh_transport_get_enc_name(ctx.client), cipher_name) == 0
+		    && strcmp(dssh_transport_get_enc_name(ctx.server), cipher_name) == 0;
+	}
+	handshake_cleanup(&ctx);
+	ASSERT_EQ(client_result, 0);
+	ASSERT_EQ(server_result, 0);
+	ASSERT_TRUE(changed);
+	return TEST_PASS;
+}
+
+static int
+boundary_tx(uint8_t *buf, size_t bufsz, dssh_session sess, void *cbdata)
+{
+	(void)buf;
+	(void)bufsz;
+	(void)sess;
+	(void)cbdata;
+	return 0;
+}
+
+static int
+boundary_rx(uint8_t *buf, size_t bufsz, dssh_session sess, void *cbdata)
+{
+	(void)sess;
+	struct boundary_input *input = cbdata;
+	if (input->consumed > input->limit || bufsz > input->limit - input->consumed)
+		return DSSH_ERROR_TERMINATED;
+	for (size_t i = 0; i < bufsz; i++)
+		buf[i] = input->packet[(input->consumed + i) % sizeof(input->packet)];
+	input->consumed += bufsz;
+	return 0;
+}
+
+static int
+boundary_line(uint8_t *buf, size_t bufsz, size_t *received, dssh_session sess, void *cbdata)
+{
+	(void)sess;
+	(void)bufsz;
+	struct boundary_input *input = cbdata;
+	if (input->invalid_line) {
+		buf[0] = 'X';
+		*received = input->reported;
+	}
+	else {
+		static const char version[] = "SSH-2.0-boundary\r\n";
+		memcpy(buf, version, sizeof(version) - 1);
+		*received = sizeof(version) - 1;
+	}
+	return 0;
+}
+
+static size_t
+make_peer_offer(const char *names[10], uint8_t follows, uint8_t *buf, size_t capacity)
+{
+	if (capacity < 17)
+		return 0;
+	buf[0] = SSH_MSG_KEXINIT;
+	memset(buf + 1, 0, 16);
+	size_t pos = 17;
+	for (size_t i = 0; i < 10; i++) {
+		size_t len = strlen(names[i]);
+		if (len > UINT32_MAX)
+			return 0;
+		uint32_t wire_len = (uint32_t)len;
+		if (dssh_serialize_uint32(wire_len, buf, capacity, &pos) < 0
+		    || !dssh_buffer_has(capacity, pos, len))
+			return 0;
+		memcpy(&buf[pos], names[i], len);
+		pos += len;
+	}
+	if (!dssh_buffer_has(capacity, pos, 5))
+		return 0;
+	buf[pos++] = follows;
+	if (dssh_serialize_uint32(0, buf, capacity, &pos) < 0)
+		return 0;
+	return pos;
+}
+
+static int
+negotiation_setup(void)
+{
+	dssh_test_reset_global_config();
+	if (dssh_transport_set_callbacks(boundary_tx, boundary_rx, boundary_line, NULL) < 0
+	    || dssh_register_curve25519_sha256() < 0
+	    || dssh_register_rsa_sha2_256() < 0 || dssh_register_ssh_ed25519() < 0
+	    || dssh_ed25519_generate_key() < 0 || dssh_register_aes256_ctr() < 0
+	    || dssh_register_hmac_sha2_256() < 0 || dssh_register_none_comp() < 0)
+		return TEST_FAIL;
+	return TEST_PASS;
+}
+
+static int
+add_test_kex(const char *name, uint32_t flags)
+{
+	size_t len = strlen(name);
+	struct dssh_kex_s *entry = malloc(sizeof(*entry) + len + 1);
+	if (entry == NULL)
+		return DSSH_ERROR_ALLOC;
+	*entry = *gconf.kex_head;
+	entry->next = NULL;
+	entry->flags = flags;
+	memcpy(entry->name, name, len + 1);
+	int ret = dssh_transport_register_kex(entry);
+	if (ret < 0)
+		free(entry);
+	return ret;
+}
+
+static size_t
+long_offer_names(char *buf, size_t capacity, const char *tail)
+{
+	size_t pos = 0;
+	for (unsigned i = 0; i < 24; i++) {
+		int written = snprintf(&buf[pos], capacity - pos, "%060u,", i);
+		if (written < 0)
+			return 0;
+		size_t len = (size_t)written;
+		if (len >= capacity - pos)
+			return 0;
+		pos += len;
+	}
+	size_t len = strlen(tail);
+	if (!dssh_buffer_has(capacity, pos, len + 1))
+		return 0;
+	memcpy(&buf[pos], tail, len + 1);
+	return pos + len;
+}
+
+static int
+test_negotiation_full_offers(void)
+{
+	for (unsigned role = 0; role < 2; role++) {
+		ASSERT_EQ(negotiation_setup(), TEST_PASS);
+		for (unsigned i = 0; i < 24; i++) {
+			char name[65];
+			int len = snprintf(name, sizeof(name), "registered-%052u", i);
+			ASSERT_TRUE(len > 0 && len < 65);
+			ASSERT_OK(add_test_kex(name, DSSH_KEX_FLAG_NEEDS_SIGNATURE_CAPABLE));
+		}
+		ASSERT_OK(add_test_kex("large-list-tail", DSSH_KEX_FLAG_NEEDS_SIGNATURE_CAPABLE));
+		char exchange[2048], keys[2048];
+		ASSERT_TRUE(long_offer_names(exchange, sizeof(exchange), "large-list-tail") > 1024);
+		const char *tail = role == 0 ? "ssh-ed25519" : "rsa-sha2-256,ssh-ed25519";
+		ASSERT_TRUE(long_offer_names(keys, sizeof(keys), tail) > 1024);
+		const char *names[10] = { exchange, keys, "aes256-ctr", "aes256-ctr",
+		    "hmac-sha2-256", "hmac-sha2-256", "none", "none", "", "" };
+		uint8_t packet[8192];
+		size_t len = make_peer_offer(names, 0, packet, sizeof(packet));
+		ASSERT_TRUE(len > 0);
+		dssh_session sess = dssh_session_init(role == 0, 0);
+		ASSERT_NOT_NULL(sess);
+		sess->trans.peer_kexinit = malloc(len);
+		ASSERT_NOT_NULL(sess->trans.peer_kexinit);
+		memcpy(sess->trans.peer_kexinit, packet, len);
+		sess->trans.peer_kexinit_sz = len;
+		int ret = kexinit(sess);
+		bool chosen = ret == 0 && strcmp(sess->trans.kex_selected->name, "large-list-tail") == 0
+		    && strcmp(sess->trans.key_algo_selected->name, "ssh-ed25519") == 0;
+		struct dssh_name_list ours[10];
+		bool follows;
+		bool complete = ret == 0 && parse_peer_kexinit(sess->trans.our_kexinit,
+		    sess->trans.our_kexinit_sz, ours, &follows) == 0 && ours[0].len > 1024;
+		dssh_session_cleanup(sess);
+		dssh_test_reset_global_config();
+		ASSERT_OK(ret);
+		ASSERT_TRUE(chosen);
+		ASSERT_TRUE(complete);
+	}
+	return TEST_PASS;
+}
+
+static int
+test_negotiation_key_capabilities(void)
+{
+	for (unsigned which = 0; which < 4; which++) {
+		ASSERT_EQ(negotiation_setup(), TEST_PASS);
+		ASSERT_OK(add_test_kex("needs-encryption", DSSH_KEX_FLAG_NEEDS_ENCRYPTION_CAPABLE));
+		bool client = which < 2;
+		bool same_guess = (which % 2) != 0;
+		const char *peer_exchange = client && !same_guess
+		    ? "curve25519-sha256,needs-encryption" : "needs-encryption,curve25519-sha256";
+		const char *names[10] = { peer_exchange, "ssh-ed25519", "aes256-ctr", "aes256-ctr",
+		    "hmac-sha2-256", "hmac-sha2-256", "none", "none", "", "" };
+		uint8_t packet[512];
+		size_t len = make_peer_offer(names, 0, packet, sizeof(packet));
+		ASSERT_TRUE(len > 0);
+		dssh_session sess = dssh_session_init(client, 0);
+		ASSERT_NOT_NULL(sess);
+		const char *order[2] = { "needs-encryption", "curve25519-sha256" };
+		if (!client && !same_guess) {
+			order[0] = "curve25519-sha256";
+			order[1] = "needs-encryption";
+		}
+		ASSERT_OK(dssh_session_set_kex_filter(sess, order, 2));
+		sess->trans.peer_kexinit = malloc(len);
+		ASSERT_NOT_NULL(sess->trans.peer_kexinit);
+		memcpy(sess->trans.peer_kexinit, packet, len);
+		sess->trans.peer_kexinit_sz = len;
+		int ret = kexinit(sess);
+		bool chosen = ret == 0 && strcmp(sess->trans.kex_selected->name, "curve25519-sha256") == 0;
+		dssh_session_cleanup(sess);
+		dssh_test_reset_global_config();
+		if (same_guess)
+			ASSERT_EQ(ret, DSSH_ERROR_INVALID);
+		else {
+			ASSERT_OK(ret);
+			ASSERT_TRUE(chosen);
+		}
+	}
+	return TEST_PASS;
+}
+
+static int
+test_registration_rejection(void)
+{
+	dssh_test_reset_global_config();
+	int (*constructors[])(void) = {
+		dssh_register_curve25519_sha256, dssh_register_dh_gex_sha256,
+		dssh_register_sntrup761x25519_sha512, dssh_register_mlkem768x25519_sha256,
+		dssh_register_ssh_ed25519, dssh_register_rsa_sha2_256, dssh_register_rsa_sha2_512,
+		dssh_register_aes256_ctr, dssh_register_aes128_cbc, dssh_register_none_enc,
+		dssh_register_hmac_sha2_256, dssh_register_hmac_sha2_512, dssh_register_none_mac,
+		dssh_register_none_comp
+	};
+	for (size_t i = 0; i < sizeof(constructors) / sizeof(constructors[0]); i++) {
+		ASSERT_OK(constructors[i]());
+		ASSERT_EQ(constructors[i](), DSSH_ERROR_INVALID);
+	}
+	dssh_session sess = dssh_session_init(true, 0);
+	ASSERT_NOT_NULL(sess);
+	for (size_t i = 0; i < sizeof(constructors) / sizeof(constructors[0]); i++)
+		ASSERT_EQ(constructors[i](), DSSH_ERROR_TOOLATE);
+	dssh_session_cleanup(sess);
+	dssh_test_reset_global_config();
+	static const char *bad[] = { "a,b", " a", "a b", "a\001", "a\177" };
+	for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+		struct dssh_language_s *entry = calloc(1, sizeof(*entry) + 16);
+		ASSERT_NOT_NULL(entry);
+		strcpy(entry->name, bad[i]);
+		int ret = dssh_transport_register_lang(entry);
+		free(entry);
+		ASSERT_EQ(ret, DSSH_ERROR_INVALID);
+	}
+	struct dssh_language_s *entry = calloc(1, sizeof(*entry) + 4);
+	ASSERT_NOT_NULL(entry);
+	strcpy(entry->name, "en");
+	ASSERT_OK(dssh_transport_register_lang(entry));
+	ASSERT_EQ(dssh_transport_register_lang(entry), DSSH_ERROR_INVALID);
+	ASSERT_NULL(entry->next);
+	dssh_test_reset_global_config();
+	return TEST_PASS;
+}
+
+static int
+unavailable_key(dssh_key_algo_ctx *ctx)
+{
+	(void)ctx;
+	return DSSH_ERROR_INIT;
+}
+
+static int
+test_offer_haskey_error(void)
+{
+	ASSERT_EQ(negotiation_setup(), TEST_PASS);
+	dssh_key_algo key = find_key_algo("ssh-ed25519");
+	ASSERT_NOT_NULL(key);
+	key->haskey = unavailable_key;
+	dssh_session sess = dssh_session_init(false, 0);
+	ASSERT_NOT_NULL(sess);
+	int ret = kexinit(sess);
+	bool unpublished = sess->trans.our_kexinit == NULL;
+	dssh_session_cleanup(sess);
+	dssh_test_reset_global_config();
+	ASSERT_EQ(ret, DSSH_ERROR_INIT);
+	ASSERT_TRUE(unpublished);
+	return TEST_PASS;
+}
+
+static int
+test_kexinit_complete_fields(void)
+{
+	const char *names[10] = { "a", "a", "a", "a", "a", "a", "a", "a", "", "" };
+	uint8_t packet[512];
+	size_t len = make_peer_offer(names, 2, packet, sizeof(packet));
+	ASSERT_TRUE(len > 5);
+	struct dssh_name_list lists[10];
+	bool follows;
+	for (size_t missing = 1; missing <= 5; missing++)
+		ASSERT_EQ(parse_peer_kexinit(packet, len - missing, lists, &follows), DSSH_ERROR_PARSE);
+	packet[len] = 0;
+	ASSERT_EQ(parse_peer_kexinit(packet, len + 1, lists, &follows), DSSH_ERROR_PARSE);
+	packet[len - 1] = 0x42;
+	ASSERT_OK(parse_peer_kexinit(packet, len, lists, &follows));
+	ASSERT_TRUE(follows);
+	packet[0] = SSH_MSG_NEWKEYS;
+	ASSERT_EQ(parse_peer_kexinit(packet, len, lists, &follows), DSSH_ERROR_PARSE);
+	static const char *invalid[] = { "", ",a", "a,", "a,,b", "a b", "a\001b", "a\177b" };
+	for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+		names[0] = invalid[i];
+		len = make_peer_offer(names, 0, packet, sizeof(packet));
+		ASSERT_EQ(parse_peer_kexinit(packet, len, lists, &follows), DSSH_ERROR_PARSE);
+	}
+	return TEST_PASS;
+}
+
+static int
+test_version_rx_callback_count(void)
+{
+	dssh_test_reset_global_config();
+	ASSERT_OK(dssh_transport_set_callbacks(boundary_tx, boundary_rx,
+	    boundary_line, mock_extra_line_cb));
+	struct boundary_input input = { .invalid_line = true, .reported = SIZE_MAX };
+	dssh_session sess = dssh_session_init(false, 0);
+	ASSERT_NOT_NULL(sess);
+	ASSERT_OK(dssh_session_set_cbdata(sess, NULL, &input, &input, NULL));
+	ASSERT_EQ(version_exchange(sess), DSSH_ERROR_INVALID);
+	dssh_session_cleanup(sess);
+	dssh_test_reset_global_config();
+	return TEST_PASS;
+}
+
+static int
+boundary_stale_line(uint8_t *buf, size_t bufsz, size_t *received, dssh_session sess, void *cbdata)
+{
+	(void)bufsz;
+	(void)sess;
+	size_t *calls = cbdata;
+	static const char line[] = "banner\r\n";
+	if ((*calls)++ == 0) {
+		memcpy(buf, line, sizeof(line) - 1);
+		*received = sizeof(line) - 1;
+		return 0;
+	}
+	if (*calls == 2)
+		return 0;
+	return DSSH_ERROR_TERMINATED;
+}
+
+static int
+test_version_rx_count_reset(void)
+{
+	dssh_test_reset_global_config();
+	ASSERT_OK(dssh_transport_set_callbacks(boundary_tx, boundary_rx,
+	    boundary_stale_line, NULL));
+	size_t calls = 0;
+	dssh_session sess = dssh_session_init(false, 0);
+	ASSERT_NOT_NULL(sess);
+	ASSERT_OK(dssh_session_set_cbdata(sess, NULL, NULL, &calls, NULL));
+	int ret = version_exchange(sess);
+	dssh_session_cleanup(sess);
+	dssh_test_reset_global_config();
+	ASSERT_EQ(ret, DSSH_ERROR_INVALID);
+	ASSERT_EQ_U(calls, 2);
+	return TEST_PASS;
+}
+
+static int
+boundary_positive_io(uint8_t *buf, size_t bufsz, dssh_session sess, void *cbdata)
+{
+	(void)buf;
+	(void)bufsz;
+	(void)sess;
+	(void)cbdata;
+	return 1;
+}
+
+static int
+boundary_positive_line(uint8_t *buf, size_t bufsz, size_t *received, dssh_session sess, void *cbdata)
+{
+	int ret = boundary_line(buf, bufsz, received, sess, cbdata);
+	return ret == 0 ? 1 : ret;
+}
+
+static int
+boundary_positive_extra(uint8_t *buf, size_t bufsz, void *cbdata)
+{
+	(void)buf;
+	(void)bufsz;
+	(void)cbdata;
+	return 1;
+}
+
+static int
+boundary_positive_gather(const struct dssh_tx_iov *iov, size_t count, dssh_session sess, void *cbdata)
+{
+	(void)iov;
+	(void)count;
+	(void)sess;
+	(void)cbdata;
+	return 1;
+}
+
+static int
+test_callback_positive_results(void)
+{
+	for (unsigned which = 0; which < 5; which++) {
+		dssh_test_reset_global_config();
+		ASSERT_OK(dssh_transport_set_callbacks(which == 0 ? boundary_positive_io : boundary_tx,
+		    which == 1 ? boundary_positive_io : boundary_rx,
+		    which == 2 ? boundary_positive_line : boundary_line,
+		    which == 3 ? boundary_positive_extra : NULL));
+		if (which == 4)
+			ASSERT_OK(dssh_transport_set_tx_gather(boundary_positive_gather));
+		struct boundary_input input = { .invalid_line = which == 3, .reported = 1 };
+		dssh_session sess = dssh_session_init(false, 0);
+		ASSERT_NOT_NULL(sess);
+		ASSERT_OK(dssh_session_set_cbdata(sess, NULL, &input, &input, NULL));
+		int ret;
+		uint8_t type;
+		uint8_t *payload;
+		size_t len;
+		uint8_t message[] = { SSH_MSG_USERAUTH_SUCCESS };
+		if (which == 1)
+			ret = recv_packet(sess, &type, &payload, &len);
+		else if (which == 4)
+			ret = send_packet(sess, message, sizeof(message), NULL);
+		else
+			ret = version_exchange(sess);
+		bool terminated = dssh_session_is_terminated(sess);
+		dssh_session_cleanup(sess);
+		dssh_test_reset_global_config();
+		ASSERT_EQ(ret, DSSH_ERROR_INVALID);
+		ASSERT_TRUE(terminated);
+	}
+	return TEST_PASS;
+}
+
+static int
+test_packet_framing_boundaries(void)
+{
+	for (uint8_t which = 0; which < 5; which++) {
+		dssh_test_reset_global_config();
+		ASSERT_OK(dssh_transport_set_callbacks(boundary_tx, boundary_rx, boundary_line, NULL));
+		struct boundary_input input = { .limit = 16 };
+		input.packet[3] = which < 4 ? 12 : 11;
+		input.packet[4] = which < 4 ? which : 4;
+		input.packet[5] = SSH_MSG_USERAUTH_SUCCESS;
+		dssh_session sess = dssh_session_init(false, 0);
+		ASSERT_NOT_NULL(sess);
+		ASSERT_OK(dssh_session_set_cbdata(sess, NULL, &input, &input, NULL));
+		uint8_t type;
+		uint8_t *payload;
+		size_t len;
+		int ret = recv_packet(sess, &type, &payload, &len);
+		bool terminated = dssh_session_is_terminated(sess);
+		dssh_session_cleanup(sess);
+		dssh_test_reset_global_config();
+		ASSERT_EQ(ret, DSSH_ERROR_PARSE);
+		ASSERT_TRUE(terminated);
+	}
+	return TEST_PASS;
+}
+
+static int
+test_initial_kex_rejects_out_of_phase(void)
+{
+	dssh_test_reset_global_config();
+	ASSERT_OK(register_all_algorithms());
+	ASSERT_OK(test_generate_host_key());
+	ASSERT_OK(dssh_transport_set_callbacks(boundary_tx, boundary_rx,
+	    boundary_line, NULL));
+	struct boundary_input input = { .limit = 1024 };
+	input.packet[2] = 3;
+	input.packet[3] = 252;
+	input.packet[4] = 4;
+	input.packet[5] = SSH_MSG_USERAUTH_REQUEST;
+	dssh_session sess = dssh_session_init(false, 0);
+	ASSERT_NOT_NULL(sess);
+	ASSERT_OK(dssh_session_set_cbdata(sess, NULL, &input, &input, NULL));
+	ASSERT_EQ(dssh_transport_handshake(sess), DSSH_ERROR_PARSE);
+	ASSERT_NULL(sess->trans.rekey_queue_head);
+	ASSERT_EQ_U(input.consumed, 1024);
+	dssh_session_cleanup(sess);
+	dssh_test_reset_global_config();
+	return TEST_PASS;
+}
+
+static int
+test_rekey_queue_bounded(void)
+{
+	dssh_test_reset_global_config();
+	ASSERT_OK(register_all_algorithms());
+	ASSERT_OK(test_generate_host_key());
+	ASSERT_OK(dssh_transport_set_callbacks(boundary_tx, boundary_rx,
+	    boundary_line, NULL));
+	struct boundary_input input = { .limit = 1024 * (DSSH_REKEY_QUEUE_MAX_MESSAGES + 1) };
+	input.packet[2] = 3;
+	input.packet[3] = 252;
+	input.packet[4] = 4;
+	input.packet[5] = SSH_MSG_CHANNEL_DATA;
+	dssh_session sess = dssh_session_init(false, 0);
+	ASSERT_NOT_NULL(sess);
+	ASSERT_OK(dssh_session_set_cbdata(sess, NULL, &input, &input, NULL));
+	/* Established-session state, with old-key traffic arriving before
+	 * the peer's KEXINIT. No cryptographic operations are needed here. */
+	sess->trans.session_id = malloc(1);
+	ASSERT_NOT_NULL(sess->trans.session_id);
+	sess->trans.session_id_sz = 1;
+	sess->trans.rekey_in_progress = true;
+	ASSERT_EQ(kexinit(sess), DSSH_ERROR_TOOLONG);
+	ASSERT_EQ_U(sess->trans.rekey_queue_count, DSSH_REKEY_QUEUE_MAX_MESSAGES);
+	ASSERT_TRUE(sess->trans.rekey_queue_bytes <= DSSH_REKEY_QUEUE_MAX_BYTES);
+	dssh_session_cleanup(sess);
+	dssh_test_reset_global_config();
+	return TEST_PASS;
+}
+
+static int
+test_rekey_server_direction_limits(void)
+{
+	dssh_test_reset_global_config();
+	dssh_session sess = dssh_session_init(false, 0);
+	ASSERT_NOT_NULL(sess);
+	struct dssh_enc_s small = { .bytes_per_key = 1024 };
+	struct dssh_enc_s large = { .bytes_per_key = 8192 };
+	sess->trans.enc_c2s_selected = &large;
+	sess->trans.enc_s2c_selected = &small;
+	sess->trans.tx_bytes_since_rekey = 1024;
+	ASSERT_TRUE(rekey_needed(sess));
+	sess->trans.tx_bytes_since_rekey = 0;
+	sess->trans.rx_bytes_since_rekey = 1024;
+	ASSERT_FALSE(rekey_needed(sess));
+	sess->trans.rx_bytes_since_rekey = 8192;
+	ASSERT_TRUE(rekey_needed(sess));
+	dssh_session_cleanup(sess);
+	dssh_test_reset_global_config();
+	return TEST_PASS;
+}
+
+static int
+queue_during_disconnect(void *arg)
+{
+	struct disconnect_queue_state *state = arg;
+	if (!dssh_test_wait_bool(&state->entered, true)) {
+		state->queued = DSSH_ERROR_TIMEOUT;
+		atomic_store(&state->release, true);
+		return -1;
+	}
+	uint8_t reply = SSH_MSG_REQUEST_FAILURE;
+	state->queued = send_to_slot(state->sess, &state->sess->trans.global_reply_slot, &reply, 1);
+	atomic_store(&state->release, true);
+	return 0;
+}
+
+static int
+test_disconnect_queue_order(void)
+{
+	struct handshake_ctx ctx;
+	if (handshake_setup(&ctx) < 0) {
+		handshake_cleanup(&ctx);
+		return TEST_FAIL;
+	}
+	struct disconnect_queue_state state = { .sess = ctx.client, .queued = -1 };
+	atomic_init(&state.entered, false);
+	atomic_init(&state.release, false);
+	disconnect_queue = &state;
+	thrd_t producer;
+	int created = thrd_create(&producer, queue_during_disconnect, &state);
+	if (created != thrd_success) {
+		disconnect_queue = NULL;
+		handshake_cleanup(&ctx);
+		return TEST_FAIL;
+	}
+	int ret = dssh_transport_disconnect(ctx.client, SSH_DISCONNECT_BY_APPLICATION, "done");
+	int joined = thrd_join(producer, NULL);
+	disconnect_queue = NULL;
+	ASSERT_EQ(joined, thrd_success);
+	ASSERT_OK(ret);
+	ASSERT_OK(state.queued);
+	ASSERT_EQ_U(state.writes, 1);
+	ASSERT_TRUE(atomic_load(&ctx.client->trans.global_reply_slot.ready));
+	ASSERT_TRUE(dssh_session_is_terminated(ctx.client));
+	ASSERT_FALSE(tx_owner_is_current(ctx.client));
+	uint8_t type;
+	uint8_t *payload;
+	size_t len;
+	ASSERT_ERR(recv_packet(ctx.server, &type, &payload, &len), DSSH_ERROR_TERMINATED);
+	handshake_cleanup(&ctx);
+	return TEST_PASS;
+}
+
+static int
+test_disconnect_validation(void)
+{
+	for (int mode = 0; mode < 3; mode++) {
+		struct handshake_ctx ctx;
+		if (handshake_setup(&ctx) < 0) {
+			handshake_cleanup(&ctx);
+			return TEST_FAIL;
+		}
+		uint32_t seq = ctx.client->trans.tx_seq;
+		ASSERT_ERR(dssh_transport_disconnect(ctx.client, 0, "invalid"), DSSH_ERROR_INVALID);
+		ASSERT_FALSE(dssh_session_is_terminated(ctx.client));
+		ASSERT_EQ_U(ctx.client->trans.tx_seq, seq);
+		if (mode == 2) {
+			mock_io_close_c2s(&ctx.io);
+			ASSERT_TRUE(dssh_transport_disconnect(ctx.client, 11, "closed") < 0);
+			ASSERT_TRUE(dssh_session_is_terminated(ctx.client));
+		}
+		else {
+			test_log_peer_count = 0;
+			ASSERT_OK(dssh_session_set_log_cb(ctx.server, test_transport_log_cb, NULL));
+			if (mode == 0)
+				ASSERT_OK(dssh_transport_disconnect(ctx.client, UINT32_MAX, "private"));
+			else {
+				uint8_t invalid[13] = { SSH_MSG_DISCONNECT };
+				ASSERT_OK(send_packet(ctx.client, invalid, sizeof(invalid), NULL));
+			}
+			uint8_t type;
+			uint8_t *payload;
+			size_t len;
+			ASSERT_ERR(recv_packet(ctx.server, &type, &payload, &len), DSSH_ERROR_TERMINATED);
+			if (mode == 0) {
+				ASSERT_EQ(test_log_peer_count, 1);
+				ASSERT_EQ_U(test_log_peer_reason, UINT32_MAX);
+			}
+			else
+				ASSERT_EQ(test_log_peer_count, 0);
+		}
+		handshake_cleanup(&ctx);
+	}
+	return TEST_PASS;
+}
+
+struct global_probe {
+	dssh_session sess;
+	unsigned calls;
+	size_t name_len;
+	size_t data_len;
+	uint8_t data[3];
+	bool terminate;
+};
+
+static int
+global_probe_cb(const uint8_t *name, size_t name_len, bool want_reply,
+    const uint8_t *data, size_t data_len, void *cbdata)
+{
+	(void)name;
+	(void)want_reply;
+	struct global_probe *probe = cbdata;
+	probe->calls++;
+	probe->name_len = name_len;
+	probe->data_len = data_len;
+	if (data_len == sizeof(probe->data))
+		memcpy(probe->data, data, data_len);
+	if (probe->terminate)
+		dssh_session_terminate(probe->sess);
+	return 0;
+}
+
+static int
+test_global_request_validation(void)
+{
+	for (unsigned mode = 0; mode < 8; mode++) {
+		struct handshake_ctx ctx;
+		if (handshake_setup(&ctx) < 0) {
+			handshake_cleanup(&ctx);
+			return TEST_FAIL;
+		}
+		struct global_probe probe = { .sess = ctx.server };
+		ASSERT_OK(dssh_session_set_global_request_cb(ctx.server, global_probe_cb, &probe));
+		uint8_t name[65];
+		memset(name, 'a', sizeof(name));
+		size_t length = mode == 0 ? 0 : mode == 1 ? 65 : 1;
+		if (mode >= 2 && mode <= 5) {
+			const uint8_t invalid[] = { ' ', ',', 127, 255 };
+			name[0] = invalid[mode - 2];
+		}
+		uint32_t declared = (uint32_t)length;
+		if (mode == 7)
+			declared = UINT32_MAX;
+		uint8_t packet[72];
+		size_t pos = 0;
+		packet[pos++] = SSH_MSG_GLOBAL_REQUEST;
+		DSSH_PUT_U32(declared, packet, &pos);
+		memcpy(&packet[pos], name, length);
+		pos += length;
+		if (mode != 6)
+			packet[pos++] = 1;
+		ASSERT_OK(send_packet(ctx.client, packet, pos, NULL));
+		uint8_t type;
+		uint8_t *payload;
+		size_t len;
+		ASSERT_ERR(recv_packet(ctx.server, &type, &payload, &len), DSSH_ERROR_PARSE);
+		ASSERT_EQ_U(probe.calls, 0);
+		/* No request reply is permitted before a valid want_reply field. */
+		ASSERT_ERR(recv_packet(ctx.client, &type, &payload, &len), DSSH_ERROR_TERMINATED);
+		handshake_cleanup(&ctx);
+	}
+	return TEST_PASS;
+}
+
+static int
+test_global_request_results(void)
+{
+	for (int mode = 0; mode < 3; mode++) {
+		struct handshake_ctx ctx;
+		if (handshake_setup(&ctx) < 0) {
+			handshake_cleanup(&ctx);
+			return TEST_FAIL;
+		}
+		struct global_probe probe = { .sess = ctx.server, .terminate = mode == 2 };
+		ASSERT_OK(dssh_session_set_global_request_cb(ctx.server, global_probe_cb, &probe));
+		uint8_t packet[73];
+		size_t pos = 0;
+		packet[pos++] = SSH_MSG_GLOBAL_REQUEST;
+		DSSH_PUT_U32(64, packet, &pos);
+		memset(&packet[pos], 'a', 64);
+		pos += 64;
+		packet[pos++] = mode == 0 ? 0 : 1;
+		packet[pos++] = 0;
+		packet[pos++] = 255;
+		packet[pos++] = 1;
+		ASSERT_OK(send_packet(ctx.client, packet, pos, NULL));
+		if (mode == 0) {
+			uint8_t follow = SSH_MSG_REQUEST_FAILURE;
+			ASSERT_OK(send_packet(ctx.client, &follow, 1, NULL));
+		}
+		else if (mode == 1)
+			mock_io_close_s2c(&ctx.io);
+		uint32_t before = ctx.server->trans.tx_seq;
+		uint8_t type;
+		uint8_t *payload;
+		size_t len;
+		int ret = recv_packet(ctx.server, &type, &payload, &len);
+		if (mode == 0) {
+			ASSERT_OK(ret);
+			ASSERT_EQ(type, SSH_MSG_REQUEST_FAILURE);
+			ASSERT_EQ_U(ctx.server->trans.tx_seq, before);
+		}
+		else {
+			ASSERT_TRUE(ret < 0);
+			ASSERT_TRUE(dssh_session_is_terminated(ctx.server));
+			if (mode == 2)
+				ASSERT_EQ_U(ctx.server->trans.tx_seq, before);
+		}
+		ASSERT_EQ_U(probe.calls, 1);
+		ASSERT_EQ_U(probe.name_len, 64);
+		ASSERT_EQ_U(probe.data_len, 3);
+		const uint8_t expected[] = { 0, 255, 1 };
+		ASSERT_MEM_EQ(probe.data, expected, sizeof(expected));
+		handshake_cleanup(&ctx);
+	}
+	return TEST_PASS;
+}
+
+static int
+unused_control_prompt(const uint8_t *name, size_t name_len, const uint8_t *instruction,
+    size_t instruction_len, uint32_t count, const uint8_t **prompts, const size_t *prompt_lens,
+    const bool *echo, struct dssh_auth_responses *out, void *cbdata)
+{
+	(void)name;
+	(void)name_len;
+	(void)instruction;
+	(void)instruction_len;
+	(void)count;
+	(void)prompts;
+	(void)prompt_lens;
+	(void)echo;
+	(void)out;
+	(void)cbdata;
+	return DSSH_ERROR_INVALID;
+}
+
+static int
+test_auth_control_reply_errors(void)
+{
+	for (unsigned mode = 0; mode < 6; mode++) {
+		struct handshake_ctx ctx;
+		if (handshake_setup(&ctx) < 0) {
+			handshake_cleanup(&ctx);
+			return TEST_FAIL;
+		}
+		bool server = mode < 2;
+		dssh_session receiver = server ? ctx.server : ctx.client;
+		dssh_session sender = server ? ctx.client : ctx.server;
+		if (mode == 1) {
+			uint8_t service[17];
+			size_t pos = 0;
+			service[pos++] = SSH_MSG_SERVICE_REQUEST;
+			DSSH_PUT_U32(12, service, &pos);
+			memcpy(&service[pos], "ssh-userauth", 12);
+			pos += 12;
+			ASSERT_OK(send_packet(sender, service, pos, NULL));
+		}
+		uint8_t unknown = server ? 59 : 200;
+		ASSERT_OK(send_packet(sender, &unknown, 1, NULL));
+		if (mode >= 3)
+			receiver->auth_service_requested = true;
+		struct control_tx_failure failure = {
+			.sess = receiver, .fail_at = mode == 0 ? 0 : 1,
+		};
+		control_tx_failure = &failure;
+		int ret;
+		if (server) {
+			struct dssh_auth_server_cbs cbs = { .methods_str = "password" };
+			ret = auth_server_impl(receiver, &cbs, NULL, NULL);
+		}
+		else if (mode == 2) {
+			char methods[32];
+			ret = get_methods_impl(receiver, "user", methods, sizeof(methods));
+		}
+		else if (mode == 3)
+			ret = auth_password_impl(receiver, "user", "password", NULL, NULL);
+		else if (mode == 4)
+			ret = auth_kbi_impl(receiver, "user", unused_control_prompt, NULL);
+		else
+			ret = auth_publickey_impl(receiver, "user", test_key_algo_name());
+		control_tx_failure = NULL;
+		ASSERT_ERR(ret, DSSH_ERROR_INIT);
+		ASSERT_EQ_U(failure.calls, failure.fail_at + 1);
+		ASSERT_TRUE(dssh_session_is_terminated(receiver));
+		ASSERT_FALSE(tx_owner_is_current(receiver));
+		handshake_cleanup(&ctx);
+	}
+	return TEST_PASS;
+}
+
+struct auth_state_probe {
+	unsigned none_calls;
+	unsigned password_calls;
+	unsigned kbi_calls;
+	unsigned unimplemented_calls;
+	uint32_t rejected[3];
+	bool complete_kbi;
+	bool valid_identity;
+};
+
+static void
+auth_state_unimplemented(uint32_t rejected, void *cbdata)
+{
+	struct auth_state_probe *probe = cbdata;
+	if (probe->unimplemented_calls < 3)
+		probe->rejected[probe->unimplemented_calls] = rejected;
+	probe->unimplemented_calls++;
+}
+
+static int
+auth_state_none(const uint8_t *user, size_t length, void *cbdata)
+{
+	struct auth_state_probe *probe = cbdata;
+	probe->none_calls++;
+	probe->valid_identity = probe->valid_identity && length == 6 && memcmp(user, "second", 6) == 0;
+	return DSSH_AUTH_SUCCESS;
+}
+
+static int
+auth_state_password(const uint8_t *user, size_t length, const uint8_t *password,
+    size_t password_len, struct dssh_bytes_result *output_result, void *cbdata)
+{
+	uint8_t *fixture_output = NULL;
+	size_t fixture_length = 0;
+	uint8_t **prompt = &fixture_output;
+	size_t *prompt_len = &fixture_length;
+	(void)prompt;
+	(void)prompt_len;
+
+	(void)prompt;
+	(void)prompt_len;
+	(void)password;
+	struct auth_state_probe *probe = cbdata;
+	probe->password_calls++;
+	probe->valid_identity = probe->valid_identity && length == 6 && memcmp(user, "second", 6) == 0 && password_len == 0;
+	return test_auth_output_finish(output_result, fixture_output, fixture_length, DSSH_AUTH_SUCCESS);
+}
+
+static int
+auth_state_kbi(const uint8_t *user, size_t length, uint32_t count,
+    const uint8_t **responses, const size_t *response_lens, struct dssh_auth_challenge *out, void *cbdata)
+{
+	(void)responses;
+	(void)response_lens;
+	(void)out;
+	struct auth_state_probe *probe = cbdata;
+	probe->kbi_calls++;
+	const char *expected = probe->kbi_calls == 1 || probe->complete_kbi ? "first" : "second";
+	probe->valid_identity = probe->valid_identity && length == strlen(expected) && memcmp(user, expected, length) == 0 && count == 0;
+	return probe->kbi_calls == 1 ? DSSH_AUTH_KBI_PROMPT : DSSH_AUTH_SUCCESS;
+}
+
+static int
+queue_auth_service(dssh_session sender, bool accept)
+{
+	uint8_t packet[17];
+	size_t pos = 0;
+	packet[pos++] = accept ? SSH_MSG_SERVICE_ACCEPT : SSH_MSG_SERVICE_REQUEST;
+	DSSH_PUT_U32(12, packet, &pos);
+	memcpy(&packet[pos], "ssh-userauth", 12);
+	pos += 12;
+	return send_packet(sender, packet, pos, NULL);
+}
+
+static int
+queue_auth_state_request(dssh_session sender, const char *username, const char *method)
+{
+	uint8_t packet[128];
+	size_t pos = 0;
+	size_t user_len = strlen(username);
+	size_t method_len = strlen(method);
+	packet[pos++] = SSH_MSG_USERAUTH_REQUEST;
+	DSSH_PUT_U32((uint32_t)user_len, packet, &pos);
+	memcpy(&packet[pos], username, user_len);
+	pos += user_len;
+	DSSH_PUT_U32(14, packet, &pos);
+	memcpy(&packet[pos], "ssh-connection", 14);
+	pos += 14;
+	DSSH_PUT_U32((uint32_t)method_len, packet, &pos);
+	memcpy(&packet[pos], method, method_len);
+	pos += method_len;
+	if (strcmp(method, "keyboard-interactive") == 0) {
+		DSSH_PUT_U32(0, packet, &pos);
+		DSSH_PUT_U32(0, packet, &pos);
+	}
+	else if (strcmp(method, "password") == 0) {
+		packet[pos++] = 0;
+		DSSH_PUT_U32(0, packet, &pos);
+	}
+	return send_packet(sender, packet, pos, NULL);
+}
+
+static int
+test_auth_kbi_request_state(void)
+{
+	const char *methods[] = { "none", "password", "keyboard-interactive" };
+	for (unsigned mode = 0; mode < 6; mode++) {
+		struct handshake_ctx ctx;
+		if (handshake_setup(&ctx) < 0) {
+			handshake_cleanup(&ctx);
+			return TEST_FAIL;
+		}
+		struct auth_state_probe probe = { .complete_kbi = mode == 3, .valid_identity = true };
+		struct dssh_auth_server_cbs cbs = {
+			.methods_str = "password,keyboard-interactive", .none_cb = auth_state_none,
+			.password_cb = auth_state_password, .keyboard_interactive_cb = auth_state_kbi,
+			.cbdata = &probe,
+		};
+		uint8_t before_service = 7;
+		uint32_t rejected_service;
+		ASSERT_OK(send_packet(ctx.client, &before_service, 1, &rejected_service));
+		ASSERT_OK(queue_auth_service(ctx.client, false));
+		ASSERT_OK(queue_auth_state_request(ctx.client, "first", "keyboard-interactive"));
+		uint8_t unknown = 59;
+		uint32_t rejected;
+		ASSERT_OK(send_packet(ctx.client, &unknown, 1, &rejected));
+		if (mode < 3)
+			ASSERT_OK(queue_auth_state_request(ctx.client, "second", methods[mode]));
+		else if (mode == 3) {
+			const uint8_t response[5] = { SSH_MSG_USERAUTH_INFO_RESPONSE, 0, 0, 0, 0 };
+			ASSERT_OK(send_packet(ctx.client, response, sizeof(response), NULL));
+		}
+		else {
+			uint8_t response[9] = { SSH_MSG_USERAUTH_INFO_RESPONSE };
+			size_t pos = 1;
+			uint32_t count = mode == 4 ? 1 : UINT32_MAX;
+			DSSH_PUT_U32(count, response, &pos);
+			if (mode == 4)
+				DSSH_PUT_U32(0, response, &pos);
+			ASSERT_OK(send_packet(ctx.client, response, pos, NULL));
+			ASSERT_OK(queue_auth_state_request(ctx.client, "second", "none"));
+		}
+		mock_io_close_c2s_write(&ctx.io);
+		uint8_t username[16];
+		size_t username_len = sizeof(username);
+		ASSERT_OK(auth_server_impl(ctx.server, &cbs, username, &username_len));
+		ASSERT_FALSE(ctx.server->server_auth_active);
+		ASSERT_FALSE(dssh_session_is_terminated(ctx.server));
+		ASSERT_TRUE(probe.valid_identity);
+		ASSERT_EQ_U(probe.none_calls, mode == 0 || mode > 3 ? 1 : 0);
+		ASSERT_EQ_U(probe.password_calls, mode == 1 ? 1 : 0);
+		ASSERT_EQ_U(probe.kbi_calls, mode == 2 || mode == 3 ? 2 : 1);
+		const char *expected = mode == 3 ? "first" : "second";
+		ASSERT_EQ_U(username_len, strlen(expected));
+		ASSERT_MEM_EQ(username, expected, username_len);
+		ASSERT_OK(dssh_session_set_unimplemented_cb(ctx.client, auth_state_unimplemented, &probe));
+		uint8_t type;
+		uint8_t *payload;
+		size_t length;
+		ASSERT_OK(recv_packet(ctx.client, &type, &payload, &length));
+		ASSERT_EQ(type, SSH_MSG_SERVICE_ACCEPT);
+		ASSERT_OK(recv_packet(ctx.client, &type, &payload, &length));
+		ASSERT_EQ(type, SSH_MSG_USERAUTH_INFO_REQUEST);
+		if (mode > 3) {
+			ASSERT_OK(recv_packet(ctx.client, &type, &payload, &length));
+			ASSERT_EQ(type, SSH_MSG_USERAUTH_FAILURE);
+			ASSERT_TRUE(length >= 6);
+			ASSERT_EQ_U(payload[length - 1], 0);
+		}
+		ASSERT_OK(recv_packet(ctx.client, &type, &payload, &length));
+		ASSERT_EQ(type, SSH_MSG_USERAUTH_SUCCESS);
+		ASSERT_EQ_U(probe.unimplemented_calls, 2);
+		ASSERT_EQ_U(probe.rejected[0], rejected_service);
+		ASSERT_EQ_U(probe.rejected[1], rejected);
+		handshake_cleanup(&ctx);
+	}
+	return TEST_PASS;
+}
+
+static int
+test_auth_server_phase_gate(void)
+{
+	const uint8_t messages[] = { 80, 81, 82, 90, 94, 200, 255 };
+	for (unsigned stage = 0; stage < 3; stage++) {
+		for (size_t i = 0; i < sizeof(messages); i++) {
+			struct handshake_ctx ctx;
+			if (handshake_setup(&ctx) < 0) {
+				handshake_cleanup(&ctx);
+				return TEST_FAIL;
+			}
+			struct auth_state_probe probe = { 0 };
+			struct global_probe global = { .sess = ctx.server };
+			ASSERT_OK(dssh_session_set_global_request_cb(ctx.server, global_probe_cb, &global));
+			struct dssh_auth_server_cbs cbs = {
+				.methods_str = "keyboard-interactive", .none_cb = auth_state_none,
+				.keyboard_interactive_cb = auth_state_kbi, .cbdata = &probe,
+			};
+			if (stage > 0)
+				ASSERT_OK(queue_auth_service(ctx.client, false));
+			if (stage == 2)
+				ASSERT_OK(queue_auth_state_request(ctx.client, "first", "keyboard-interactive"));
+			uint8_t packet[10] = { messages[i] };
+			size_t pos = 1;
+			if (messages[i] == SSH_MSG_GLOBAL_REQUEST) {
+				DSSH_PUT_U32(4, packet, &pos);
+				memcpy(&packet[pos], "test", 4);
+				pos += 4;
+				packet[pos++] = 1;
+			}
+			ASSERT_OK(send_packet(ctx.client, packet, pos, NULL));
+			mock_io_close_c2s_write(&ctx.io);
+			ASSERT_ERR(auth_server_impl(ctx.server, &cbs, NULL, NULL), DSSH_ERROR_PARSE);
+			ASSERT_FALSE(ctx.server->server_auth_active);
+			ASSERT_TRUE(dssh_session_is_terminated(ctx.server));
+			ASSERT_EQ_U(probe.none_calls, 0);
+			ASSERT_EQ_U(probe.kbi_calls, stage == 2 ? 1 : 0);
+			ASSERT_EQ_U(global.calls, 0);
+			uint8_t type;
+			uint8_t *payload;
+			size_t length;
+			if (stage > 0) {
+				ASSERT_OK(recv_packet(ctx.client, &type, &payload, &length));
+				ASSERT_EQ(type, SSH_MSG_SERVICE_ACCEPT);
+			}
+			if (stage == 2) {
+				ASSERT_OK(recv_packet(ctx.client, &type, &payload, &length));
+				ASSERT_EQ(type, SSH_MSG_USERAUTH_INFO_REQUEST);
+			}
+			ASSERT_ERR(recv_packet(ctx.client, &type, &payload, &length), DSSH_ERROR_TERMINATED);
+			handshake_cleanup(&ctx);
+		}
+	}
+	return TEST_PASS;
+}
+
+static int
+test_auth_client_unknown_messages(void)
+{
+	for (unsigned method = 0; method < 4; method++) {
+		struct handshake_ctx ctx;
+		if (handshake_setup(&ctx) < 0) {
+			handshake_cleanup(&ctx);
+			return TEST_FAIL;
+		}
+		uint32_t rejected[3];
+		uint8_t unknown[] = { 7, 59, 200 };
+		ASSERT_OK(send_packet(ctx.server, &unknown[0], 1, &rejected[0]));
+		ASSERT_OK(queue_auth_service(ctx.server, true));
+		for (size_t i = 1; i < sizeof(unknown); i++)
+			ASSERT_OK(send_packet(ctx.server, &unknown[i], 1, &rejected[i]));
+		uint8_t success = SSH_MSG_USERAUTH_SUCCESS;
+		ASSERT_OK(send_packet(ctx.server, &success, 1, NULL));
+		mock_io_close_s2c_write(&ctx.io);
+		int ret;
+		char methods[64];
+		if (method == 0)
+			ret = get_methods_impl(ctx.client, "user", methods, sizeof(methods));
+		else if (method == 1)
+			ret = auth_password_impl(ctx.client, "user", "password", NULL, NULL);
+		else if (method == 2)
+			ret = auth_kbi_impl(ctx.client, "user", unused_control_prompt, NULL);
+		else
+			ret = auth_publickey_impl(ctx.client, "user", test_key_algo_name());
+		ASSERT_OK(ret);
+		ASSERT_FALSE(dssh_session_is_terminated(ctx.client));
+		ASSERT_TRUE(ctx.client->auth_service_requested);
+		mock_io_close_c2s_write(&ctx.io);
+		struct auth_state_probe probe = { 0 };
+		ASSERT_OK(dssh_session_set_unimplemented_cb(ctx.server, auth_state_unimplemented, &probe));
+		uint8_t type;
+		uint8_t *payload;
+		size_t length;
+		ASSERT_OK(recv_packet(ctx.server, &type, &payload, &length));
+		ASSERT_EQ(type, SSH_MSG_SERVICE_REQUEST);
+		ASSERT_OK(recv_packet(ctx.server, &type, &payload, &length));
+		ASSERT_EQ(type, SSH_MSG_USERAUTH_REQUEST);
+		ASSERT_EQ_U(probe.unimplemented_calls, 1);
+		ASSERT_TRUE(recv_packet(ctx.server, &type, &payload, &length) < 0);
+		ASSERT_TRUE(dssh_session_is_terminated(ctx.server));
+		ASSERT_EQ_U(probe.unimplemented_calls, 3);
+		for (size_t i = 0; i < 3; i++)
+			ASSERT_EQ_U(probe.rejected[i], rejected[i]);
+		handshake_cleanup(&ctx);
+	}
+	return TEST_PASS;
+}
+
+static int
+test_auth_replayed_message_state(void)
+{
+	for (unsigned mode = 0; mode < 2; mode++) {
+		struct handshake_ctx ctx;
+		if (handshake_setup(&ctx) < 0) {
+			handshake_cleanup(&ctx);
+			return TEST_FAIL;
+		}
+		const uint8_t unknown[] = { 59, 79, 200 };
+		uint32_t rejected[3];
+		for (size_t i = 0; i < sizeof(unknown); i++)
+			ASSERT_OK(send_packet(ctx.client, &unknown[i], 1, &rejected[i]));
+		const char *names[10] = {
+			ctx.client->trans.kex_selected->name, ctx.client->trans.key_algo_selected->name,
+			ctx.client->trans.enc_c2s_selected->name, ctx.client->trans.enc_s2c_selected->name,
+			ctx.client->trans.mac_c2s_selected->name, ctx.client->trans.mac_s2c_selected->name,
+			ctx.client->trans.comp_c2s_selected->name, ctx.client->trans.comp_s2c_selected->name,
+			"", "",
+		};
+		uint8_t offer[1024];
+		size_t offer_len = make_peer_offer(names, 0, offer, sizeof(offer));
+		ASSERT_TRUE(offer_len > 0);
+		ASSERT_OK(send_packet(ctx.client, offer, offer_len, NULL));
+		free(ctx.server->trans.peer_kexinit);
+		ctx.server->trans.peer_kexinit = NULL;
+		ctx.server->trans.peer_kexinit_sz = 0;
+		ctx.server->trans.rekey_in_progress = true;
+		ASSERT_OK(kexinit(ctx.server));
+		ctx.server->trans.rekey_in_progress = false;
+		ASSERT_EQ_U(ctx.server->trans.rekey_queue_count, 3);
+		/* Only KEXINIT buffering/negotiation is exercised here. Consume the
+		 * outgoing KEXINIT without initiating an unrelated full rekey. */
+		uint8_t type;
+		uint8_t *payload;
+		size_t length;
+		ctx.client->trans.rekey_in_progress = true;
+		ASSERT_OK(recv_packet(ctx.client, &type, &payload, &length));
+		ctx.client->trans.rekey_in_progress = false;
+		ASSERT_EQ(type, SSH_MSG_KEXINIT);
+		struct auth_state_probe probe = { 0 };
+		ASSERT_OK(dssh_session_set_unimplemented_cb(ctx.client, auth_state_unimplemented, &probe));
+		if (mode == 0) {
+			for (size_t i = 0; i < sizeof(unknown); i++) {
+				ASSERT_OK(recv_packet(ctx.server, &type, &payload, &length));
+				ASSERT_EQ(type, unknown[i]);
+				ASSERT_EQ_U(ctx.server->trans.last_rx_seq, rejected[i]);
+				ASSERT_OK(send_unimplemented(ctx.server, ctx.server->trans.last_rx_seq));
+			}
+			uint8_t marker = SSH_MSG_USERAUTH_SUCCESS;
+			ASSERT_OK(send_packet(ctx.server, &marker, 1, NULL));
+			ASSERT_OK(recv_packet(ctx.client, &type, &payload, &length));
+			ASSERT_EQ(type, marker);
+			ASSERT_EQ_U(probe.unimplemented_calls, 3);
+		}
+		else {
+			struct dssh_auth_server_cbs cbs = { .methods_str = "password" };
+			ASSERT_ERR(auth_server_impl(ctx.server, &cbs, NULL, NULL), DSSH_ERROR_PARSE);
+			ASSERT_TRUE(dssh_session_is_terminated(ctx.server));
+			ASSERT_FALSE(ctx.server->server_auth_active);
+			ASSERT_ERR(recv_packet(ctx.client, &type, &payload, &length), DSSH_ERROR_TERMINATED);
+			ASSERT_EQ_U(probe.unimplemented_calls, 2);
+		}
+		for (unsigned i = 0; i < probe.unimplemented_calls; i++)
+			ASSERT_EQ_U(probe.rejected[i], rejected[i]);
+		ASSERT_EQ_U(ctx.server->trans.rekey_queue_count, 0);
+		ASSERT_EQ_U(ctx.server->trans.rekey_queue_bytes, 0);
+		handshake_cleanup(&ctx);
+	}
+	return TEST_PASS;
+}
+
+#include "dh_group_result_cases.h"
+#include "transport_identification_cases.h"
+#include "transport_compression_cases.h"
+#include "transport_module_cases.h"
+
 static struct dssh_test_entry tests[] = {
+	{ "release/dhgex_provider_contract", test_dhgex_provider_contract },
+	{ "release/dhgex_group_result_handshake", test_dhgex_group_result_handshake },
+	{ "release/dhgex_group_result_reuse", test_dhgex_group_result_reuse },
+	{ "modules/stateless", test_modules_stateless },
+	{ "compression/expansion", test_compression_expansion },
+	{ "compression/context_replacement", test_compression_context_replacement },
+	{ "compression/auth_cleanup", test_compression_auth_cleanup },
+	{ "compression/sensitive_failure", test_compression_sensitive_failure },
+	{ "compression/teardown_cleanup", test_compression_teardown_cleanup },
+	{ "compression/queued_rekey", test_compression_queued_rekey },
+	{ "compression/scratch_failures", test_compression_scratch_failures },
+	{ "compression/replay_cleanup", test_compression_replay_cleanup },
+	{ "compression/callbacks", test_compression_callbacks },
+	{ "compression/newkeys_framing", test_compression_newkeys_framing },
+	{ "compression/mac_before_decode", test_compression_mac_before_decode },
+	{ "compression/zlib_bounds", test_compression_zlib_bounds },
+	{ "compression/gather_slots", test_compression_gather_slots },
+	{ "compression/provider_changes", test_compression_provider_changes },
+	{ "compression/setup_failures", test_compression_setup_failures },
+	{ "compression/registration", test_compression_registration },
+	{ "compression/zlib_allocations", test_compression_zlib_allocations },
+	{ "compression/rekey_reuse", test_compression_rekey_reuse },
+	{ "compression/transform_failures", test_compression_transform_failures },
+	{ "compression/zlib", test_compression_zlib },
+	{ "identification/grammar", test_identification_grammar },
+	{ "identification/bytes", test_identification_bytes },
+	{ "identification/bounds", test_identification_bounds },
+	{ "release/auth_replayed_message_state", test_auth_replayed_message_state },
+	{ "release/auth_kbi_request_state", test_auth_kbi_request_state },
+	{ "release/auth_server_phase_gate", test_auth_server_phase_gate },
+	{ "release/auth_client_unknown_messages", test_auth_client_unknown_messages },
+	{ "release/auth_control_reply_errors", test_auth_control_reply_errors },
+	{ "release/disconnect_validation", test_disconnect_validation },
+	{ "release/disconnect_queue_order", test_disconnect_queue_order },
+	{ "release/global_request_validation", test_global_request_validation },
+	{ "release/global_request_results", test_global_request_results },
+	{ "release/clock_transport", test_clock_transport },
+	{ "release/registration_rejection", test_registration_rejection },
+	{ "release/offer_haskey_error", test_offer_haskey_error },
+	{ "release/full_negotiation_offers", test_negotiation_full_offers },
+	{ "release/key_capability_selection", test_negotiation_key_capabilities },
+	{ "release/kexinit_complete_fields", test_kexinit_complete_fields },
+	{ "release/dhgex_group_selection", test_dhgex_group_selection },
+	{ "release/hybrid_shared_secret_validation", test_hybrid_shared_secret_validation },
+	{ "release/dhgex_group_validation", test_dhgex_group_validation },
+	{ "release/dhgex_peer_validation", test_dhgex_peer_validation },
+	{ "release/dhgex_mpint_validation", test_dhgex_mpint_validation },
+#ifdef DSSH_CRYPTO_OPENSSL
+	{ "release/dhgex_group_constants", test_dhgex_group_constants },
+	{ "release/dhgex_group_failure_paths", test_dhgex_group_failure_paths },
+#endif
+	{ "release/c25519_secret_validation", test_c25519_secret_validation },
+	{ "release/c25519_peer_validation", test_c25519_peer_validation },
+	{ "release/version_count_reset", test_version_rx_count_reset },
+	{ "release/callback_results", test_callback_positive_results },
+	{ "release/packet_framing", test_packet_framing_boundaries },
+	{ "release/rekey_changes_algorithms", test_rekey_changes_algorithms },
+	{ "release/version_callback_count", test_version_rx_callback_count },
+	{ "release/initial_kex_out_of_phase", test_initial_kex_rejects_out_of_phase },
+	{ "release/rekey_queue_bounded", test_rekey_queue_bounded },
+	{ "release/server_direction_limits", test_rekey_server_direction_limits },
 	/* Version validators */
 	{ "version/has_nulls_true",           test_has_nulls_true },
 	{ "version/has_nulls_false",          test_has_nulls_false },
@@ -7723,10 +9564,8 @@ static struct dssh_test_entry tests[] = {
 
 	/* Curve25519 helper function tests */
 	{ "c25519/encode_ss_leading_zeros",  test_c25519_encode_shared_secret_leading_zeros },
-#ifdef DSSH_CRYPTO_OPENSSL
-	{ "c25519/x25519_exchange_alloc",    test_c25519_x25519_exchange_alloc_fail },
-#endif
-	{ "c25519/encode_ss_alloc_fail",     test_c25519_encode_shared_secret_alloc_fail },
+	{ "c25519/init_allocations",          test_c25519_init_allocations },
+	{ "c25519/encode_ss_storage",         test_c25519_encode_shared_secret_storage },
 
 	/* kex_set_ctx and tx_gather coverage */
 	{ "kex/set_ctx",                     test_kex_set_ctx },

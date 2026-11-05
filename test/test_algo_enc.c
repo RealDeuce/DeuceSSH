@@ -471,6 +471,55 @@ test_aes256_ctr_nist_per_block(void)
 	return TEST_PASS;
 }
 
+/* Use the registered module callbacks as well as the independent backend
+ * helpers above. Separate directional contexts are advanced in interleaved
+ * calls, including the first-block/remainder split used by SSH receive. */
+static int
+test_aes256_ctr_module_vectors(void)
+{
+	dssh_test_reset_global_config();
+	ASSERT_OK(dssh_register_aes256_ctr());
+	dssh_enc enc = gconf.enc_head;
+	ASSERT_NOT_NULL(enc);
+	ASSERT_STR_EQ(enc->name, "aes256-ctr");
+	ASSERT_EQ_U(enc->blocksize, 16);
+	ASSERT_EQ_U(enc->key_size, 32);
+	ASSERT_EQ_U(enc->bytes_per_key, UINT64_C(1) << 36);
+	const size_t cuts[] = { 16, 32, 48, 64 };
+	bool valid = true;
+	for (size_t i = 0; i < sizeof(cuts) / sizeof(cuts[0]); i++) {
+		dssh_enc_ctx *tx = NULL;
+		dssh_enc_ctx *rx = NULL;
+		uint8_t encrypted[sizeof(nist_pt)];
+		uint8_t decrypted[sizeof(nist_ct)];
+		memcpy(encrypted, nist_pt, sizeof(encrypted));
+		memcpy(decrypted, nist_ct, sizeof(decrypted));
+		int ret = enc->init(nist_key, nist_iv, true, &tx);
+		if (ret == 0)
+			ret = enc->init(nist_key, nist_iv, false, &rx);
+		if (ret == 0 && (tx == NULL || rx == NULL || tx == rx))
+			ret = DSSH_ERROR_INIT;
+		if (ret == 0)
+			ret = enc->encrypt(encrypted, cuts[i], tx);
+		if (ret == 0)
+			ret = enc->decrypt(decrypted, cuts[i], rx);
+		if (ret == 0 && cuts[i] < sizeof(encrypted))
+			ret = enc->encrypt(&encrypted[cuts[i]], sizeof(encrypted) - cuts[i], tx);
+		if (ret == 0 && cuts[i] < sizeof(decrypted))
+			ret = enc->decrypt(&decrypted[cuts[i]], sizeof(decrypted) - cuts[i], rx);
+		valid = valid && ret == 0
+		    && memcmp(encrypted, nist_ct, sizeof(encrypted)) == 0
+		    && memcmp(decrypted, nist_pt, sizeof(decrypted)) == 0;
+		if (rx != NULL && rx != tx)
+			enc->cleanup(rx);
+		if (tx != NULL)
+			enc->cleanup(tx);
+	}
+	dssh_test_reset_global_config();
+	ASSERT_TRUE(valid);
+	return TEST_PASS;
+}
+
 /* ================================================================
  * AES-256-CTR: Large buffer (256 bytes, encrypt/decrypt roundtrip)
  * ================================================================ */
@@ -611,6 +660,7 @@ static struct dssh_test_entry tests[] = {
 	{ "enc/aes256_ctr/nist_block1_dec", test_aes256_ctr_nist_block1_decrypt },
 	{ "enc/aes256_ctr/nist_4block_dec", test_aes256_ctr_nist_4block_decrypt },
 	{ "enc/aes256_ctr/nist_per_block",  test_aes256_ctr_nist_per_block },
+	{ "enc/aes256_ctr/module_vectors",  test_aes256_ctr_module_vectors },
 
 	/* AES-256-CTR: behavioral */
 	{ "enc/aes256_ctr/roundtrip",       test_aes256_ctr_roundtrip },

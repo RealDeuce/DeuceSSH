@@ -22,25 +22,27 @@ extern "C" {
 #include "deucessh.h"
 #include "deucessh-algorithms.h"
 #include "deucessh-crypto.h"
+#include "deucessh-result.h"
 }
 
+struct dssh_key_algo_ctx;
 /* Declared in rsa-sha2-256-botan.cpp / rsa-sha2-512-botan.cpp */
-extern "C" int dssh_botan_rsa256_sign(uint8_t **out, size_t *outlen,
-    const uint8_t *data, size_t data_len, void *ctx);
+extern "C" int dssh_botan_rsa256_sign(struct dssh_bytes_result *out,
+    const uint8_t *data, size_t data_len, dssh_key_algo_ctx *ctx);
 extern "C" int dssh_botan_rsa256_verify(const uint8_t *key_blob,
     size_t key_blob_len, const uint8_t *sig_blob, size_t sig_blob_len,
     const uint8_t *data, size_t data_len);
 extern "C" int dssh_botan_rsa256_pubkey(const uint8_t **out,
-    size_t *outlen, void *ctx);
-extern "C" int dssh_botan_rsa256_haskey(void *ctx);
-extern "C" void dssh_botan_rsa256_cleanup(void *ctx);
+    size_t *outlen, dssh_key_algo_ctx *ctx);
+extern "C" int dssh_botan_rsa256_haskey(dssh_key_algo_ctx *ctx);
+extern "C" void dssh_botan_rsa256_cleanup(dssh_key_algo_ctx *ctx);
 
-extern "C" int dssh_botan_ed25519_sign(uint8_t **out, size_t *outlen,
-    const uint8_t *data, size_t data_len, void *ctx);
+extern "C" int dssh_botan_ed25519_sign(struct dssh_bytes_result *out,
+    const uint8_t *data, size_t data_len, dssh_key_algo_ctx *ctx);
 extern "C" int dssh_botan_ed25519_pubkey(const uint8_t **out,
-    size_t *outlen, void *ctx);
-extern "C" int dssh_botan_ed25519_haskey(void *ctx);
-extern "C" void dssh_botan_ed25519_cleanup(void *ctx);
+    size_t *outlen, dssh_key_algo_ctx *ctx);
+extern "C" int dssh_botan_ed25519_haskey(dssh_key_algo_ctx *ctx);
+extern "C" void dssh_botan_ed25519_cleanup(dssh_key_algo_ctx *ctx);
 
 /* Reset function from test library */
 extern "C" void dssh_test_reset_global_config(void);
@@ -75,19 +77,7 @@ parse_u32(const uint8_t *buf, size_t len, size_t *pos)
  * the mpint sign-bit padding branches in pubkey_impl().
  * ================================================================ */
 
-/*
- * cbdata layout must match the one in rsa-sha2-256-botan.cpp:
- *   std::unique_ptr<Botan::Private_Key> privkey;
- *   uint8_t *pub_blob;
- *   size_t   pub_blob_len;
- *
- * We use this to construct a synthetic cbdata with a specific key.
- */
-struct rsa_cbdata {
-	std::unique_ptr<Botan::Private_Key> privkey;
-	uint8_t                            *pub_blob;
-	size_t                              pub_blob_len;
-};
+#include "key_algo/key-context-botan.h"
 
 static int
 test_rsa_pubkey_e_pad(void)
@@ -122,7 +112,7 @@ test_rsa_pubkey_e_pad(void)
 	}
 
 	/* Build synthetic cbdata and inject into the algo */
-	auto *cbd = new (std::nothrow) rsa_cbdata;
+	auto *cbd = new (std::nothrow) dssh_botan_key_context{};
 	ASSERT_NOT_NULL(cbd);
 	cbd->privkey.reset(priv);
 	cbd->pub_blob = nullptr;
@@ -133,7 +123,8 @@ test_rsa_pubkey_e_pad(void)
 	/* Call pubkey through the extern "C" wrapper */
 	const uint8_t *blob = nullptr;
 	size_t blob_len;
-	int res = dssh_botan_rsa256_pubkey(&blob, &blob_len, cbd);
+	dssh_key_algo_ctx *context = reinterpret_cast<dssh_key_algo_ctx *>(cbd);
+	int res = dssh_botan_rsa256_pubkey(&blob, &blob_len, context);
 	ASSERT_EQ(res, 0);
 
 	/* Parse: string "ssh-rsa", string e, string n */
@@ -184,12 +175,12 @@ static int
 test_rsa256_sign_null_ctx(void)
 {
 	uint8_t data[] = "test data";
-	uint8_t *sig = nullptr;
-	size_t siglen = 0;
+	struct dssh_bytes_result sig = {};
 
-	ASSERT_EQ(dssh_botan_rsa256_sign(&sig, &siglen,
+	ASSERT_EQ(dssh_botan_rsa256_sign(&sig,
 	    data, sizeof(data), nullptr), DSSH_ERROR_INIT);
-	ASSERT_NULL(sig);
+	ASSERT_NULL(sig.bytes.data);
+	ASSERT_NULL(sig.lease.release);
 	return TEST_PASS;
 }
 
@@ -223,12 +214,12 @@ static int
 test_ed25519_sign_null_ctx(void)
 {
 	uint8_t data[] = "test data";
-	uint8_t *sig = nullptr;
-	size_t siglen = 0;
+	struct dssh_bytes_result sig = {};
 
-	ASSERT_EQ(dssh_botan_ed25519_sign(&sig, &siglen,
+	ASSERT_EQ(dssh_botan_ed25519_sign(&sig,
 	    data, sizeof(data), nullptr), DSSH_ERROR_INIT);
-	ASSERT_NULL(sig);
+	ASSERT_NULL(sig.bytes.data);
+	ASSERT_NULL(sig.lease.release);
 	return TEST_PASS;
 }
 

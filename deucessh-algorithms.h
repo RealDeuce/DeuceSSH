@@ -29,6 +29,9 @@ DSSH_PUBLIC int dssh_register_sntrup761x25519_sha512(void);
 DSSH_PUBLIC int dssh_register_mlkem768x25519_sha256(void);
 
 /* Host key algorithms */
+/* Load or generate keys before the first dssh_session_init(). Subsequent
+ * key replacement returns DSSH_ERROR_TOOLATE. Failed replacement preserves
+ * the existing key. Public-key blobs are cached before key publication. */
 DSSH_PUBLIC int     dssh_register_ssh_ed25519(void);
 DSSH_PUBLIC int     dssh_ed25519_load_key_file(const char *path, dssh_pem_password_cb pw_cb, void *pw_cbdata);
 DSSH_PUBLIC int     dssh_ed25519_save_key_file(const char *path, dssh_pem_password_cb pw_cb, void *pw_cbdata);
@@ -72,7 +75,10 @@ DSSH_PUBLIC int dssh_register_none_comp(void);
 DSSH_PUBLIC int dssh_key_algo_set_ctx(const char *name, void *ctx);
 
 /*
- * Set the opaque context pointer for a registered KEX algorithm.
+ * Set borrowed process-lifetime configuration for a registered KEX algorithm.
+ * This becomes kctx->config and the initializer's config argument; per-session
+ * state is created/reset by that module's init callback and cleaned by its
+ * cleanup callback. Neither callback owns this global configuration.
  * Must be called before dssh_session_init() -- returns DSSH_ERROR_TOOLATE
  * if any session has been created (the global registry is read
  * concurrently by active sessions during KEX).

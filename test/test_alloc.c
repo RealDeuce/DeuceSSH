@@ -37,6 +37,10 @@
  * Register all algorithms.  Must be called with the mock allocator
  * disabled (mock_alloc_reset) since registration itself allocates.
  */
+#include "auth_result_fixture.h"
+
+#include "signature_copy_fixture.h"
+
 static dssh_session
 init_server_session(void)
 {
@@ -725,14 +729,21 @@ test_alloc_handshake_iterate(void)
 static int
 iter_password_cb(const uint8_t *username, size_t username_len,
     const uint8_t *password, size_t password_len,
-    uint8_t **change_prompt, size_t *change_prompt_len,
+    struct dssh_bytes_result *output_result,
     void *cbdata)
 {
+	uint8_t *fixture_output = NULL;
+	size_t fixture_length = 0;
+	uint8_t **change_prompt = &fixture_output;
+	size_t *change_prompt_len = &fixture_length;
+	(void)change_prompt;
+	(void)change_prompt_len;
+
 	(void)username; (void)username_len;
 	(void)password; (void)password_len;
 	(void)change_prompt; (void)change_prompt_len;
 	(void)cbdata;
-	return DSSH_AUTH_SUCCESS;
+	return test_auth_output_finish(output_result, fixture_output, fixture_length, DSSH_AUTH_SUCCESS);
 }
 
 struct auth_alloc_ctx {
@@ -965,12 +976,15 @@ conn_alloc_client_thread(void *arg)
 		return 0;
 	}
 	struct dssh_chan_params p;
-	dssh_chan_params_init(&p, DSSH_CHAN_EXEC);
-	dssh_chan_params_set_command(&p, "echo test");
-	dssh_chan_params_set_pty(&p, false);
-	ctx->ch = dssh_chan_open(ctx->sess, &p);
+	res = dssh_chan_params_init(&p, DSSH_CHAN_EXEC);
+	if (res == 0)
+		res = dssh_chan_params_set_command(&p, "echo test");
+	if (res == 0)
+		res = dssh_chan_params_set_pty(&p, false);
+	if (res == 0)
+		ctx->ch = dssh_chan_open(ctx->sess, &p);
 	dssh_chan_params_free(&p);
-	ctx->result = ctx->ch ? 0 : -1;
+	ctx->result = res < 0 ? res : ctx->ch ? 0 : -1;
 	if (ctx->result < 0)
 		mock_io_close_c2s(ctx->io);
 	return 0;
@@ -1067,7 +1081,8 @@ watchdog_thread(void *arg)
 static int
 test_alloc_conn_iterate(void)
 {
-	int prev_count = -1;
+	int last_count = 0;
+	bool fault_seen = false;
 	struct dssh_auth_server_cbs cbs = {0};
 	cbs.methods_str = "password";
 	cbs.password_cb = iter_password_cb;
@@ -1190,17 +1205,19 @@ test_alloc_conn_iterate(void)
 		mock_io_free(&io);
 		dssh_test_reset_global_config();
 
-		if (ok) {
-			ASSERT_TRUE(n > 0);
+		bool injected = cur_count > n;
+		fault_seen = fault_seen || injected;
+		/* A tolerated optional allocation failure is not the end of a
+		 * sweep. Continue until a successful run never reaches its target. */
+		if (ok && !injected) {
+			ASSERT_TRUE(fault_seen);
 			return TEST_PASS;
 		}
-		if (cur_count == prev_count)
-			return TEST_PASS;
-		prev_count = cur_count;
+		last_count = cur_count;
 	}
 
 	fprintf(stderr, "  alloc/conn_iterate: still incrementing at n=%d "
-	    "(count=%d), raise limit\n", 200, prev_count);
+	    "(count=%d), raise limit\n", 200, last_count);
 	return TEST_FAIL;
 }
 
@@ -1326,6 +1343,8 @@ test_ossl_handshake_iterate(void)
 static int
 test_ossl_key_sign_verify_iterate(void)
 {
+	struct test_signature_copies fixture_copies = {0};
+
 	int prev_count = -1;
 	for (int n = 0; n < 500; n++) {
 		dssh_test_reset_global_config();
@@ -1334,14 +1353,14 @@ test_ossl_key_sign_verify_iterate(void)
 
 		int res = test_register_key_algos();
 		if (res < 0)
-			return TEST_FAIL;
+			return test_signature_copies_finish(&fixture_copies, TEST_FAIL);
 		if (test_generate_host_key() < 0)
-			return TEST_FAIL;
+			return test_signature_copies_finish(&fixture_copies, TEST_FAIL);
 
 		dssh_key_algo ka = find_key_algo(
 		    test_key_algo_name());
 		if (ka == NULL)
-			return TEST_FAIL;
+			return test_signature_copies_finish(&fixture_copies, TEST_FAIL);
 
 		const uint8_t data[] = "test data for ossl sign/verify";
 		uint8_t *sig_buf = NULL;
@@ -1351,7 +1370,7 @@ test_ossl_key_sign_verify_iterate(void)
 
 		dssh_test_ossl_fail_after(n);
 
-		int sign_res = ka->sign(&sig_buf, &sig_len,
+		int sign_res = test_signature_copy(&fixture_copies, ka->sign, &sig_buf, &sig_len,
 		    data, sizeof(data) - 1, ka->ctx);
 		int pub_res = ka->pubkey(&pub_buf, &pub_len,
 		    ka->ctx);
@@ -1360,24 +1379,24 @@ test_ossl_key_sign_verify_iterate(void)
 			verify_res = ka->verify(pub_buf, pub_len, sig_buf,
 			    sig_len, data, sizeof(data) - 1);
 
-		free(sig_buf);
+		test_signature_copy_free(&fixture_copies, sig_buf);
 		int cur_count = dssh_test_ossl_count();
 		dssh_test_ossl_reset();
 
 		if (sign_res == 0 && pub_res == 0 && verify_res == 0) {
 			dssh_test_reset_global_config();
 			ASSERT_TRUE(n > 0);
-			return TEST_PASS;
+			return test_signature_copies_finish(&fixture_copies, TEST_PASS);
 		}
 		dssh_test_reset_global_config();
 		if (cur_count == prev_count)
-			return TEST_PASS;
+			return test_signature_copies_finish(&fixture_copies, TEST_PASS);
 		prev_count = cur_count;
 	}
 
 	fprintf(stderr, "  ossl/key_sign_verify: still incrementing at n=%d "
 	    "(count=%d), raise limit\n", 500, prev_count);
-	return TEST_FAIL;
+	return test_signature_copies_finish(&fixture_copies, TEST_FAIL);
 }
 
 /* ================================================================
@@ -1555,26 +1574,28 @@ test_ossl_mac_iterate(void)
 static int
 test_ossl_key_verify_iterate(void)
 {
+	struct test_signature_copies fixture_copies = {0};
+
 	dssh_test_reset_global_config();
 	dssh_test_ossl_reset();
 	mock_alloc_reset();
 
 	int res = test_register_key_algos();
 	if (res < 0)
-		return TEST_FAIL;
+		return test_signature_copies_finish(&fixture_copies, TEST_FAIL);
 	if (test_generate_host_key() < 0)
-		return TEST_FAIL;
+		return test_signature_copies_finish(&fixture_copies, TEST_FAIL);
 
 	dssh_key_algo ka = find_key_algo(test_key_algo_name());
 	if (ka == NULL)
-		return TEST_FAIL;
+		return test_signature_copies_finish(&fixture_copies, TEST_FAIL);
 
 	/* Generate valid sig + pubkey blobs with ossl off */
 	const uint8_t data[] = "test data for verify iterate";
 	uint8_t *sig_buf = NULL;
 	const uint8_t *pub_buf = NULL;
 	size_t sig_len, pub_len;
-	ASSERT_EQ(ka->sign(&sig_buf, &sig_len,
+	ASSERT_EQ(test_signature_copy(&fixture_copies, ka->sign, &sig_buf, &sig_len,
 	    data, sizeof(data) - 1, ka->ctx), 0);
 	ASSERT_EQ(ka->pubkey(&pub_buf, &pub_len, ka->ctx), 0);
 
@@ -1589,20 +1610,20 @@ test_ossl_key_verify_iterate(void)
 		if (vres == 0) {
 			dssh_test_reset_global_config();
 			ASSERT_TRUE(n > 0);
-			return TEST_PASS;
+			return test_signature_copies_finish(&fixture_copies, TEST_PASS);
 		}
 		if (cur_count == prev_count) {
 			dssh_test_reset_global_config();
-			return TEST_PASS;
+			return test_signature_copies_finish(&fixture_copies, TEST_PASS);
 		}
 		prev_count = cur_count;
 	}
 
 	fprintf(stderr, "  ossl/key_verify: still incrementing at n=%d "
 	    "(count=%d), raise limit\n", 500, prev_count);
-	free(sig_buf);
+	test_signature_copy_free(&fixture_copies, sig_buf);
 	dssh_test_reset_global_config();
-	return TEST_FAIL;
+	return test_signature_copies_finish(&fixture_copies, TEST_FAIL);
 }
 
 static int
@@ -1611,40 +1632,47 @@ test_ossl_key_pubkey_iterate(void)
 	dssh_test_reset_global_config();
 	dssh_test_ossl_reset();
 	mock_alloc_reset();
-
-	int res = test_register_key_algos();
-	if (res < 0)
-		return TEST_FAIL;
-	if (test_generate_host_key() < 0)
-		return TEST_FAIL;
-
+	ASSERT_OK(test_register_key_algos());
+	ASSERT_OK(test_generate_host_key());
 	dssh_key_algo ka = find_key_algo(test_key_algo_name());
-	if (ka == NULL)
-		return TEST_FAIL;
+	ASSERT_NOT_NULL(ka);
+	dssh_key_algo_ctx *original_ctx = ka->ctx;
+	const uint8_t *original_blob = NULL;
+	size_t original_len = 0;
+	ASSERT_OK(ka->pubkey(&original_blob, &original_len, ka->ctx));
 
-	int prev_count = -1;
+	/* Published keys are complete: readers use the immutable cache. */
+	dssh_test_ossl_fail_after(0);
+	const uint8_t *blob = NULL;
+	size_t len = 0;
+	int ret = ka->pubkey(&blob, &len, ka->ctx);
+	int calls = dssh_test_ossl_count();
+	dssh_test_ossl_reset();
+	ASSERT_OK(ret);
+	ASSERT_EQ(calls, 0);
+	ASSERT_TRUE(blob == original_blob);
+	ASSERT_EQ_U(len, original_len);
+
+	/* Exercise cache construction during replacement, including every
+	 * backend failure, while retaining the previously published key. */
 	for (int n = 0; n < 500; n++) {
 		dssh_test_ossl_fail_after(n);
-		const uint8_t *buf = NULL;
-		size_t outlen;
-		int pres = ka->pubkey(&buf, &outlen, ka->ctx);
-		int cur_count = dssh_test_ossl_count();
+		ret = test_generate_host_key();
 		dssh_test_ossl_reset();
-
-		if (pres == 0) {
-			dssh_test_reset_global_config();
-			ASSERT_TRUE(n > 0);
-			return TEST_PASS;
+		if (ret < 0) {
+			ASSERT_TRUE(ka->ctx == original_ctx);
+			ASSERT_OK(ka->pubkey(&blob, &len, ka->ctx));
+			ASSERT_TRUE(blob == original_blob);
+			ASSERT_EQ_U(len, original_len);
+			continue;
 		}
-		if (cur_count == prev_count) {
-			dssh_test_reset_global_config();
-			return TEST_PASS;
-		}
-		prev_count = cur_count;
+		ASSERT_TRUE(n > 0);
+		ASSERT_OK(ka->pubkey(&blob, &len, ka->ctx));
+		ASSERT_NOT_NULL(blob);
+		ASSERT_TRUE(len > 0);
+		dssh_test_reset_global_config();
+		return TEST_PASS;
 	}
-
-	fprintf(stderr, "  ossl/key_pubkey: still incrementing at n=%d "
-	    "(count=%d), raise limit\n", 500, prev_count);
 	dssh_test_reset_global_config();
 	return TEST_FAIL;
 }
@@ -1878,12 +1906,8 @@ test_ossl_kex_server_iterate(void)
 		mock_io_inject(&iter_io.c2s, wire_pkts, wire_total);
 
 		/* Reset mutable server state */
-		free(server->trans.shared_secret);
-		server->trans.shared_secret = NULL;
-		server->trans.shared_secret_sz = 0;
-		free(server->trans.exchange_hash);
-		server->trans.exchange_hash = NULL;
-		server->trans.exchange_hash_sz = 0;
+		dssh_result_release(&server->trans.kex_result.lease);
+		server->trans.kex_result = (struct dssh_kex_result){0};
 		server->trans.rx_seq = saved_rx_seq;
 		server->trans.tx_seq = saved_tx_seq;
 		server->trans.rx_since_rekey = 0;
@@ -2096,6 +2120,7 @@ static int
 bad_server_reply_thread(void *arg)
 {
 	struct bad_server_ctx *ctx = arg;
+	struct dssh_dh_gex_group_result group = {0};
 	dssh_test_ossl_exclude_thread();
 	dssh_test_alloc_exclude_thread();
 
@@ -2116,14 +2141,17 @@ bad_server_reply_thread(void *arg)
 
 	/* Get the DH group from the provider */
 	struct dssh_dh_gex_provider *prov =
-	    (struct dssh_dh_gex_provider *)ctx->sess->trans.kex_selected->ctx;
-	uint8_t *p_bytes = NULL, *g_bytes = NULL;
-	size_t p_len, g_len;
-	ctx->result = prov->select_group(2048, 4096, 8192,
-	    &p_bytes, &p_len, &g_bytes, &g_len, prov->cbdata);
-	if (ctx->result < 0) {
-		free(p_bytes);
-		free(g_bytes);
+	    (struct dssh_dh_gex_provider *)ctx->sess->trans.kex_selected->config;
+	ctx->result = prov->select_group(2048, 4096, 8192, &group, prov->cbdata);
+	if (ctx->result > 0)
+		ctx->result = DSSH_ERROR_INVALID;
+	if (ctx->result < 0)
+		goto done;
+	const uint8_t *p_bytes = group.p.data, *g_bytes = group.g.data;
+	size_t p_len = group.p.len, g_len = group.g.len;
+	if (group.lease.release == NULL || p_bytes == NULL || g_bytes == NULL
+	    || p_len == 0 || g_len == 0 || p_len > 1024 || g_len > 1024) {
+		ctx->result = DSSH_ERROR_INVALID;
 		goto done;
 	}
 
@@ -2138,7 +2166,9 @@ bad_server_reply_thread(void *arg)
 		bool p_pad = (p_len > 0 && (p_bytes[0] & 0x80));
 		uint32_t p_mpint_len = (uint32_t)p_len + (p_pad ? 1 : 0);
 
-		dssh_serialize_uint32(p_mpint_len, group_msg, sizeof(group_msg), &gp);
+		ctx->result = dssh_serialize_uint32(p_mpint_len, group_msg, sizeof(group_msg), &gp);
+		if (ctx->result < 0)
+			goto done;
 		if (p_pad)
 			group_msg[gp++] = 0;
 		memcpy(&group_msg[gp], p_bytes, p_len);
@@ -2148,14 +2178,15 @@ bad_server_reply_thread(void *arg)
 		bool g_pad = (g_len > 0 && (g_bytes[0] & 0x80));
 		uint32_t g_mpint_len = (uint32_t)g_len + (g_pad ? 1 : 0);
 
-		dssh_serialize_uint32(g_mpint_len, group_msg, sizeof(group_msg), &gp);
+		ctx->result = dssh_serialize_uint32(g_mpint_len, group_msg, sizeof(group_msg), &gp);
+		if (ctx->result < 0)
+			goto done;
 		if (g_pad)
 			group_msg[gp++] = 0;
 		memcpy(&group_msg[gp], g_bytes, g_len);
 		gp += g_len;
 
-		free(p_bytes);
-		free(g_bytes);
+		dssh_result_release(&group.lease);
 		ctx->result = send_packet(ctx->sess,
 		    group_msg, gp, NULL);
 		if (ctx->result < 0)
@@ -2173,6 +2204,7 @@ bad_server_reply_thread(void *arg)
 	    ctx->reply_data, ctx->reply_len, NULL);
 
 done:
+	dssh_result_release(&group.lease);
 	mock_io_close_s2c(ctx->io);
 	return 0;
 }
@@ -3029,12 +3061,8 @@ test_alloc_kex_server_iterate(void)
 
 		mock_io_inject(&iter_io.c2s, wire_pkts, wire_total);
 
-		free(server->trans.shared_secret);
-		server->trans.shared_secret = NULL;
-		server->trans.shared_secret_sz = 0;
-		free(server->trans.exchange_hash);
-		server->trans.exchange_hash = NULL;
-		server->trans.exchange_hash_sz = 0;
+		dssh_result_release(&server->trans.kex_result.lease);
+		server->trans.kex_result = (struct dssh_kex_result){0};
 		server->trans.rx_seq = saved_rx_seq;
 		server->trans.tx_seq = saved_tx_seq;
 		server->trans.rx_since_rekey = 0;
@@ -3350,12 +3378,8 @@ test_dhgex_server_bn_rand_fail(void)
 		dssh_session_set_cbdata(server, &io, &io, &io, &io);
 		mock_io_inject(&io.c2s, wire_pkts, wire_total);
 
-		free(server->trans.shared_secret);
-		server->trans.shared_secret = NULL;
-		server->trans.shared_secret_sz = 0;
-		free(server->trans.exchange_hash);
-		server->trans.exchange_hash = NULL;
-		server->trans.exchange_hash_sz = 0;
+		dssh_result_release(&server->trans.kex_result.lease);
+		server->trans.kex_result = (struct dssh_kex_result){0};
 		server->trans.rx_seq = saved_rx_seq;
 		server->trans.tx_seq = saved_tx_seq;
 		server->trans.rx_since_rekey = 0;

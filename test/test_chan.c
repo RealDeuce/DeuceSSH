@@ -9,6 +9,7 @@
 #include "dssh_test.h"
 #include "dssh_test_internal.h"
 #include "deucessh-conn.h"
+#include "dssh_test_alloc.h"
 
 /* ================================================================
  * Bytebuf -- circular byte buffer
@@ -1147,6 +1148,10 @@ static int test_params_set_term(void)
 	ASSERT_OK(dssh_chan_params_init(&p, DSSH_CHAN_SHELL));
 	ASSERT_OK(dssh_chan_params_set_term(&p, "xterm-256color"));
 	ASSERT_STR_EQ(p.term, "xterm-256color");
+	ASSERT_OK(dssh_chan_params_set_term(&p, p.term));
+	ASSERT_STR_EQ(p.term, "xterm-256color");
+	ASSERT_OK(dssh_chan_params_set_term(&p, p.term + 6));
+	ASSERT_STR_EQ(p.term, "256color");
 
 	/* Long term string preserved in full (dynamic allocation) */
 	char longterm[128];
@@ -1185,6 +1190,10 @@ static int test_params_set_command(void)
 	/* Replace */
 	ASSERT_OK(dssh_chan_params_set_command(&p, "uname -a"));
 	ASSERT_STR_EQ(p.command, "uname -a");
+	ASSERT_OK(dssh_chan_params_set_command(&p, p.command));
+	ASSERT_STR_EQ(p.command, "uname -a");
+	ASSERT_OK(dssh_chan_params_set_command(&p, p.command + 6));
+	ASSERT_STR_EQ(p.command, "-a");
 
 	dssh_chan_params_free(&p);
 	ASSERT_NULL(p.command);
@@ -1198,6 +1207,10 @@ static int test_params_set_subsystem(void)
 	ASSERT_OK(dssh_chan_params_init(&p, DSSH_CHAN_SUBSYSTEM));
 	ASSERT_OK(dssh_chan_params_set_subsystem(&p, "sftp"));
 	ASSERT_STR_EQ(p.subsystem, "sftp");
+	ASSERT_OK(dssh_chan_params_set_subsystem(&p, p.subsystem));
+	ASSERT_STR_EQ(p.subsystem, "sftp");
+	ASSERT_OK(dssh_chan_params_set_subsystem(&p, p.subsystem + 1));
+	ASSERT_STR_EQ(p.subsystem, "ftp");
 	dssh_chan_params_free(&p);
 	ASSERT_NULL(p.subsystem);
 	return TEST_PASS;
@@ -1224,6 +1237,250 @@ static int test_params_add_env(void)
 	dssh_chan_params_free(&p);
 	ASSERT_NULL(p.env);
 	ASSERT_EQ_U(p.env_count, 0);
+	return TEST_PASS;
+}
+
+static int
+test_params_env_failure_atomic(void)
+{
+	struct dssh_chan_params p;
+	ASSERT_OK(dssh_chan_params_init(&p, DSSH_CHAN_EXEC));
+	for (int n = 0; n < 3; n++) {
+		dssh_test_alloc_fail_after(n);
+		int ret = dssh_chan_params_add_env(&p, "name", "value");
+		dssh_test_alloc_reset();
+		ASSERT_EQ(ret, DSSH_ERROR_ALLOC);
+		ASSERT_EQ_U(p.env_count, 0);
+		ASSERT_EQ_U(p.env_capacity, 0);
+		ASSERT_NULL(p.env);
+	}
+	for (int n = 0; n < 4; n++)
+		ASSERT_OK(dssh_chan_params_add_env(&p, "name", "value"));
+	for (int n = 0; n < 3; n++) {
+		struct dssh_chan_env *original = p.env;
+		dssh_test_alloc_fail_after(n);
+		int ret = dssh_chan_params_add_env(&p, p.env[0].name, p.env[0].value);
+		dssh_test_alloc_reset();
+		ASSERT_EQ(ret, DSSH_ERROR_ALLOC);
+		ASSERT_EQ_U(p.env_count, 4);
+		ASSERT_EQ_U(p.env_capacity, 4);
+		ASSERT_TRUE(p.env == original);
+		ASSERT_STR_EQ(p.env[0].name, "name");
+		ASSERT_STR_EQ(p.env[0].value, "value");
+	}
+	ASSERT_OK(dssh_chan_params_add_env(&p, p.env[0].name, p.env[0].value));
+	ASSERT_EQ_U(p.env_count, 5);
+	ASSERT_STR_EQ(p.env[4].name, "name");
+	ASSERT_STR_EQ(p.env[4].value, "value");
+	dssh_chan_params_free(&p);
+	return TEST_PASS;
+}
+
+struct env_decision {
+	int result;
+	size_t calls;
+	size_t count;
+};
+
+static int
+record_env_decision(dssh_channel ch, const struct dssh_chan_params *p, void *cbdata)
+{
+	(void)ch;
+	struct env_decision *decision = cbdata;
+	decision->calls++;
+	decision->count = p->env_count;
+	return decision->result;
+}
+
+static int
+test_accept_env_validation(void)
+{
+	bool cancelled = false;
+	const uint8_t valid[] = { 0, 0, 0, 1, 'A', 0, 0, 0, 1, 'B' };
+	uint8_t packet[sizeof(valid) + 1];
+	struct dssh_chan_params p;
+	struct env_decision decision = { .result = DSSH_ERROR_REJECTED };
+	struct dssh_chan_accept_cbs cbs = {
+		.env = record_env_decision,
+		.cbdata = &decision,
+	};
+	ASSERT_OK(dssh_chan_params_init(&p, DSSH_CHAN_EXEC));
+	for (size_t len = 0; len < sizeof(valid); len++)
+		ASSERT_EQ(accept_env_request(NULL, valid, len, &p, &cbs, &cancelled), DSSH_ERROR_PARSE);
+	memcpy(packet, valid, sizeof(valid));
+	packet[sizeof(valid)] = 1;
+	ASSERT_EQ(accept_env_request(NULL, packet, sizeof(packet), &p, &cbs, &cancelled), DSSH_ERROR_PARSE);
+	packet[4] = 0;
+	ASSERT_EQ(accept_env_request(NULL, packet, sizeof(valid), &p, &cbs, &cancelled), DSSH_ERROR_PARSE);
+	memcpy(packet, valid, sizeof(valid));
+	packet[9] = 0;
+	ASSERT_EQ(accept_env_request(NULL, packet, sizeof(valid), &p, &cbs, &cancelled), DSSH_ERROR_PARSE);
+	ASSERT_EQ_U(decision.calls, 0);
+	ASSERT_EQ_U(p.env_count, 0);
+
+	/* Every rejected request releases its provisional entry. */
+	for (int n = 0; n < 256; n++) {
+		ASSERT_EQ(accept_env_request(NULL, valid, sizeof(valid), &p, &cbs, &cancelled), DSSH_ERROR_REJECTED);
+		ASSERT_EQ_U(p.env_count, 0);
+		ASSERT_EQ_U(decision.count, 1);
+	}
+	decision.result = 0;
+	for (int n = 0; n < 128; n++)
+		ASSERT_OK(accept_env_request(NULL, valid, sizeof(valid), &p, &cbs, &cancelled));
+	ASSERT_EQ(accept_env_request(NULL, valid, sizeof(valid), &p, &cbs, &cancelled), DSSH_ERROR_TOOMANY);
+	ASSERT_EQ_U(p.env_count, 128);
+	ASSERT_EQ_U(decision.calls, 384);
+	ASSERT_STR_EQ(p.env[0].name, "A");
+	ASSERT_STR_EQ(p.env[127].value, "B");
+	dssh_chan_params_free(&p);
+	return TEST_PASS;
+}
+
+static int
+test_accept_env_byte_limit(void)
+{
+	bool cancelled = false;
+#if SIZE_MAX < 1048576
+	size_t limit = SIZE_MAX;
+#else
+	size_t limit = 1048576;
+#endif
+	/* Each retained entry includes a one-byte name and two terminators. */
+	size_t value_len = limit / 2 - 3;
+	size_t packet_len = value_len + 9;
+	uint32_t wire_len = (uint32_t)value_len;
+	uint8_t *packet = malloc(packet_len);
+	ASSERT_NOT_NULL(packet);
+	size_t pos = 0;
+	ASSERT_OK(dssh_serialize_uint32(1, packet, packet_len, &pos));
+	packet[pos++] = 'A';
+	ASSERT_OK(dssh_serialize_uint32(wire_len, packet, packet_len, &pos));
+	memset(&packet[pos], 'B', value_len);
+	struct dssh_chan_params p;
+	struct env_decision decision = { 0 };
+	struct dssh_chan_accept_cbs cbs = {
+		.env = record_env_decision,
+		.cbdata = &decision,
+	};
+	ASSERT_OK(dssh_chan_params_init(&p, DSSH_CHAN_EXEC));
+	ASSERT_OK(accept_env_request(NULL, packet, packet_len, &p, &cbs, &cancelled));
+	ASSERT_OK(accept_env_request(NULL, packet, packet_len, &p, &cbs, &cancelled));
+	ASSERT_EQ(accept_env_request(NULL, packet, packet_len, &p, &cbs, &cancelled), DSSH_ERROR_TOOLONG);
+	ASSERT_EQ_U(decision.calls, 2);
+	ASSERT_EQ_U(p.env_count, 2);
+	dssh_chan_params_free(&p);
+	free(packet);
+	return TEST_PASS;
+}
+
+static int
+test_accept_string_validation(void)
+{
+	const uint8_t valid[] = { 0, 0, 0, 3, 'a', 'b', 'c' };
+	const uint8_t empty[] = { 0, 0, 0, 0 };
+	const uint8_t large[] = { 255, 255, 255, 255 };
+	uint8_t packet[sizeof(valid) + 1];
+	struct dssh_chan_params p;
+	ASSERT_OK(dssh_chan_params_init(&p, DSSH_CHAN_EXEC));
+	ASSERT_OK(dssh_chan_params_set_command(&p, "original"));
+	ASSERT_OK(dssh_chan_params_set_subsystem(&p, "original"));
+	for (size_t len = 0; len < sizeof(valid); len++) {
+		ASSERT_EQ(accept_parse_exec(valid, len, &p), DSSH_ERROR_PARSE);
+		ASSERT_EQ(accept_parse_subsystem(valid, len, &p), DSSH_ERROR_PARSE);
+	}
+	ASSERT_EQ(accept_parse_exec(large, sizeof(large), &p), DSSH_ERROR_PARSE);
+	ASSERT_EQ(accept_parse_subsystem(large, sizeof(large), &p), DSSH_ERROR_PARSE);
+	memcpy(packet, valid, sizeof(valid));
+	packet[sizeof(valid)] = 1;
+	ASSERT_EQ(accept_parse_exec(packet, sizeof(packet), &p), DSSH_ERROR_PARSE);
+	ASSERT_EQ(accept_parse_subsystem(packet, sizeof(packet), &p), DSSH_ERROR_PARSE);
+	packet[5] = 0;
+	ASSERT_EQ(accept_parse_exec(packet, sizeof(valid), &p), DSSH_ERROR_PARSE);
+	ASSERT_EQ(accept_parse_subsystem(packet, sizeof(valid), &p), DSSH_ERROR_PARSE);
+	for (int which = 0; which < 2; which++) {
+		dssh_test_alloc_fail_after(0);
+		int ret = which == 0 ? accept_parse_exec(valid, sizeof(valid), &p)
+		    : accept_parse_subsystem(valid, sizeof(valid), &p);
+		dssh_test_alloc_reset();
+		ASSERT_EQ(ret, DSSH_ERROR_ALLOC);
+	}
+	ASSERT_STR_EQ(p.command, "original");
+	ASSERT_STR_EQ(p.subsystem, "original");
+	ASSERT_OK(accept_parse_exec(valid, sizeof(valid), &p));
+	ASSERT_OK(accept_parse_subsystem(valid, sizeof(valid), &p));
+	ASSERT_STR_EQ(p.command, "abc");
+	ASSERT_STR_EQ(p.subsystem, "abc");
+	ASSERT_OK(accept_parse_exec(empty, sizeof(empty), &p));
+	ASSERT_OK(accept_parse_subsystem(empty, sizeof(empty), &p));
+	ASSERT_STR_EQ(p.command, "");
+	ASSERT_STR_EQ(p.subsystem, "");
+	dssh_chan_params_free(&p);
+	return TEST_PASS;
+}
+
+static int
+test_accept_pty_validation(void)
+{
+	/* TERM="x", 80x24 characters, 640x480 pixels, one mode and END. */
+	const uint8_t valid[] = {
+		0, 0, 0, 1, 'x',
+		0, 0, 0, 80, 0, 0, 0, 24,
+		0, 0, 2, 128, 0, 0, 1, 224,
+		0, 0, 0, 6, 53, 0, 0, 0, 1, 0,
+	};
+	uint8_t packet[sizeof(valid) + 1];
+	struct dssh_chan_params p;
+	ASSERT_OK(dssh_chan_params_init(&p, DSSH_CHAN_EXEC));
+	ASSERT_OK(dssh_chan_params_set_mode(&p, 1, 42));
+	for (size_t len = 0; len < sizeof(valid); len++)
+		ASSERT_EQ(accept_parse_pty(valid, len, &p), DSSH_ERROR_PARSE);
+	memcpy(packet, valid, sizeof(valid));
+	packet[sizeof(valid)] = 1;
+	ASSERT_EQ(accept_parse_pty(packet, sizeof(packet), &p), DSSH_ERROR_PARSE);
+	packet[4] = 0;
+	ASSERT_EQ(accept_parse_pty(packet, sizeof(valid), &p), DSSH_ERROR_PARSE);
+	memcpy(packet, valid, sizeof(valid));
+	/* Missing opcode argument and missing stream terminator. */
+	for (uint8_t n = 1; n <= 5; n++) {
+		packet[24] = n;
+		size_t len = 25 + n;
+		ASSERT_EQ(accept_parse_pty(packet, len, &p), DSSH_ERROR_PARSE);
+	}
+	for (int n = 0; n < 2; n++) {
+		dssh_test_alloc_fail_after(n);
+		int ret = accept_parse_pty(valid, sizeof(valid), &p);
+		dssh_test_alloc_reset();
+		ASSERT_EQ(ret, DSSH_ERROR_ALLOC);
+		ASSERT_STR_EQ(p.term, "dumb");
+		ASSERT_EQ_U(p.mode_count, 1);
+		ASSERT_EQ(p.modes[0].opcode, 1);
+		ASSERT_EQ_U(p.modes[0].value, 42);
+		ASSERT_FALSE(p.flags & DSSH_PARAM_HAS_PTY);
+	}
+	ASSERT_OK(accept_parse_pty(valid, sizeof(valid), &p));
+	ASSERT_STR_EQ(p.term, "x");
+	ASSERT_EQ_U(p.cols, 80);
+	ASSERT_EQ_U(p.rows, 24);
+	ASSERT_EQ_U(p.wpx, 640);
+	ASSERT_EQ_U(p.hpx, 480);
+	ASSERT_EQ_U(p.mode_count, 1);
+	ASSERT_EQ(p.modes[0].opcode, 53);
+	ASSERT_EQ_U(p.modes[0].value, 1);
+	ASSERT_TRUE(p.flags & DSSH_PARAM_HAS_PTY);
+	memcpy(packet, valid, sizeof(valid));
+	/* Future opcode stops parsing; bytes after it are uninterpreted. */
+	packet[25] = 160;
+	ASSERT_OK(accept_parse_pty(packet, sizeof(valid), &p));
+	ASSERT_EQ_U(p.mode_count, 0);
+	/* END has the same stopping behavior. */
+	packet[25] = 0;
+	ASSERT_OK(accept_parse_pty(packet, sizeof(valid), &p));
+	ASSERT_EQ_U(p.mode_count, 0);
+	/* An empty mode string supplies no modes. */
+	packet[24] = 0;
+	ASSERT_OK(accept_parse_pty(packet, 25, &p));
+	ASSERT_EQ_U(p.mode_count, 0);
+	dssh_chan_params_free(&p);
 	return TEST_PASS;
 }
 
@@ -1322,7 +1579,7 @@ static int
 test_event_queue_cap_enforced(void)
 {
 	struct dssh_event_queue q;
-	int res = event_queue_init(&q, 4);
+	int res = event_queue_init(&q, 4, 32768);
 
 	ASSERT_EQ(res, 0);
 
@@ -1348,7 +1605,7 @@ static int
 test_event_queue_no_cap(void)
 {
 	struct dssh_event_queue q;
-	int res = event_queue_init(&q, 0);
+	int res = event_queue_init(&q, 0, 32768);
 
 	ASSERT_EQ(res, 0);
 
@@ -1371,7 +1628,7 @@ test_event_queue_cap_at_initial_capacity(void)
 {
 	/* Cap exactly at initial capacity (8) — no realloc needed */
 	struct dssh_event_queue q;
-	int res = event_queue_init(&q, 8);
+	int res = event_queue_init(&q, 8, 32768);
 
 	ASSERT_EQ(res, 0);
 
@@ -1393,7 +1650,44 @@ test_event_queue_cap_at_initial_capacity(void)
  * Test table
  * ================================================================ */
 
+static int
+test_params_copy_failure(void)
+{
+	struct dssh_chan_params p;
+	dssh_test_alloc_fail_after(0);
+	int ret = dssh_chan_params_init(&p, DSSH_CHAN_EXEC);
+	int count = dssh_test_alloc_count();
+	dssh_test_alloc_reset();
+	dssh_chan_params_free(&p);
+	ASSERT_EQ(ret, DSSH_ERROR_ALLOC);
+	ASSERT_EQ(count, 1);
+	for (unsigned field = 0; field < 3; field++) {
+		ASSERT_OK(dssh_chan_params_init(&p, DSSH_CHAN_EXEC));
+		ASSERT_OK(dssh_chan_params_set_term(&p, "old-term"));
+		ASSERT_OK(dssh_chan_params_set_command(&p, "old-command"));
+		ASSERT_OK(dssh_chan_params_set_subsystem(&p, "old-subsystem"));
+		const char *old = field == 0 ? p.term : field == 1 ? p.command : p.subsystem;
+		dssh_test_alloc_fail_after(0);
+		ret = field == 0 ? dssh_chan_params_set_term(&p, "replacement")
+		    : field == 1 ? dssh_chan_params_set_command(&p, "replacement")
+		    : dssh_chan_params_set_subsystem(&p, "replacement");
+		count = dssh_test_alloc_count();
+		dssh_test_alloc_reset();
+		const char *current = field == 0 ? p.term : field == 1 ? p.command : p.subsystem;
+		bool intact = current == old && strcmp(current,
+		    field == 0 ? "old-term" : field == 1 ? "old-command" : "old-subsystem") == 0;
+		dssh_chan_params_free(&p);
+		ASSERT_EQ(ret, DSSH_ERROR_ALLOC);
+		ASSERT_EQ(count, 1);
+		ASSERT_TRUE(intact);
+	}
+	return TEST_PASS;
+}
+
+#include "event_text_queue_cases.h"
+
 static struct dssh_test_entry tests[] = {
+	{ "params_copy_failure", test_params_copy_failure },
 	/* Bytebuf */
 	{ "bytebuf_init_free",                test_bytebuf_init_free },
 	{ "bytebuf_write_read_basic",         test_bytebuf_write_read_basic },
@@ -1438,6 +1732,9 @@ static struct dssh_test_entry tests[] = {
 	{ "acceptqueue_pop_no_affect_rest",   test_acceptqueue_pop_does_not_affect_remaining },
 
 	/* Event queue */
+	{ "event_text_queue_lifetime", test_event_text_queue_lifetime },
+	{ "event_text_queue_rollback", test_event_text_queue_rollback },
+	{ "event_text_queue_envelope", test_event_text_queue_envelope },
 	{ "event_queue_cap_enforced",         test_event_queue_cap_enforced },
 	{ "event_queue_no_cap",               test_event_queue_no_cap },
 	{ "event_queue_cap_at_initial",       test_event_queue_cap_at_initial_capacity },
@@ -1475,6 +1772,11 @@ static struct dssh_test_entry tests[] = {
 	{ "params_set_command",             test_params_set_command },
 	{ "params_set_subsystem",           test_params_set_subsystem },
 	{ "params_add_env",                 test_params_add_env },
+	{ "params_env_failure_atomic",      test_params_env_failure_atomic },
+	{ "accept_env_validation",          test_accept_env_validation },
+	{ "accept_env_byte_limit",          test_accept_env_byte_limit },
+	{ "accept_string_validation",       test_accept_string_validation },
+	{ "accept_pty_validation",          test_accept_pty_validation },
 	{ "params_set_mode",                test_params_set_mode },
 	{ "params_mode_dedup",              test_params_mode_dedup },
 	{ "params_free_null",               test_params_free_null },

@@ -1,5 +1,11 @@
 # RFC 4252 Conformance Audit — DeuceSSH
 
+> Historical report: its blanket conformance and APPLICATION classifications
+> are not current release evidence. The complete current review and outstanding
+> library/application requirements are tracked in
+> [the release ledger](release-1.0-evidence/rfc4252-ledger.md) and
+> [the release audit](release-1.0-audit.md).
+
 Systematic audit of every MUST, MUST NOT, REQUIRED, SHALL, SHALL NOT,
 SHOULD, SHOULD NOT, RECOMMENDED, MAY, and OPTIONAL keyword in RFC 4252
 (SSH Authentication Protocol) against the DeuceSSH library code.

@@ -214,10 +214,15 @@ looking_at(const char *cmd, const char *obj)
 	return false;
 }
 
+static void
+static_prompt_release(void *owner)
+{
+	(void)owner;
+}
+
 static int
 auth_kbi(const uint8_t *username, size_t username_len, uint32_t num_responses, const uint8_t **responses,
-    const size_t *response_lens, char **name_out, char **instruction_out, uint32_t *num_prompts_out,
-    char ***prompts_out, bool **echo_out, void *cbdata)
+    const size_t *response_lens, struct dssh_auth_challenge *out, void *cbdata)
 {
 	static struct game_state gs;
 	char                     banner[1024];
@@ -654,36 +659,39 @@ auth_kbi(const uint8_t *username, size_t username_len, uint32_t num_responses, c
 	}
 
 prompt:
-	/* Set up the prompt for this room */
-	*name_out        = strdup("The Gate of Authentication");
-	*instruction_out = strdup("");
-	*num_prompts_out = 1;
-	*prompts_out     = malloc(sizeof(char *));
-	*echo_out        = malloc(sizeof(bool));
-	if (*prompts_out == NULL || *echo_out == NULL)
-		return DSSH_AUTH_FAILURE;
+	{
+		static const uint8_t name[] = "The Gate of Authentication";
+		static struct dssh_auth_prompt item;
 
-	const char *prompt;
-	switch (gs.room) {
-		case ROOM_GATE:
-			prompt = gate_prompt;
-			break;
-		case ROOM_GARDEN:
-			prompt = garden_prompt;
-			break;
-		case ROOM_TOWER:
-			prompt = tower_prompt;
-			break;
-		case ROOM_PARAPET:
-			prompt = parapet_prompt;
-			break;
-		default:
-			prompt = "> ";
-			break;
+		const char *prompt;
+		switch (gs.room) {
+			case ROOM_GATE:
+				prompt = gate_prompt;
+				break;
+			case ROOM_GARDEN:
+				prompt = garden_prompt;
+				break;
+			case ROOM_TOWER:
+				prompt = tower_prompt;
+				break;
+			case ROOM_PARAPET:
+				prompt = parapet_prompt;
+				break;
+			default:
+				prompt = "> ";
+				break;
+		}
+		const uint8_t *text = (const uint8_t *)prompt;
+		item.text.data = text;
+		item.text.len = strlen(prompt);
+		item.echo = true;
+		out->name.data = name;
+		out->name.len = sizeof(name) - 1;
+		out->prompts = &item;
+		out->count = 1;
+		out->lease.release = static_prompt_release;
+		return DSSH_AUTH_KBI_PROMPT;
 	}
-	(*prompts_out)[0] = strdup(prompt);
-	(*echo_out)[0]    = true;
-	return DSSH_AUTH_KBI_PROMPT;
 }
 
 static struct dssh_auth_server_cbs auth_cbs = {

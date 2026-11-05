@@ -163,9 +163,15 @@ auth_none(const uint8_t *username, size_t username_len, void *cbdata)
 	return DSSH_AUTH_SUCCESS;
 }
 
+static void
+static_prompt_release(void *owner)
+{
+	(void)owner;
+}
+
 static int
 auth_password(const uint8_t *username, size_t username_len, const uint8_t *password, size_t password_len,
-    uint8_t **change_prompt, size_t *change_prompt_len, void *cbdata)
+    struct dssh_bytes_result *change_prompt, void *cbdata)
 {
 	char buf[256];
 
@@ -177,11 +183,10 @@ auth_password(const uint8_t *username, size_t username_len, const uint8_t *passw
 		    reject_quips[arc4random_uniform(N_QUIPS)]);
 		set_banner(buf);
 		static const char prompt[] = "Your password is terrible. Pick a new one.";
-		*change_prompt             = malloc(sizeof(prompt));
-		if (*change_prompt != NULL) {
-			memcpy(*change_prompt, prompt, sizeof(prompt));
-			*change_prompt_len = sizeof(prompt) - 1;
-		}
+		const uint8_t *bytes = (const uint8_t *)prompt;
+		change_prompt->bytes.data = bytes;
+		change_prompt->bytes.len = sizeof(prompt) - 1;
+		change_prompt->lease.release = static_prompt_release;
 		return DSSH_AUTH_CHANGE_PASSWORD;
 	}
 	snprintf(buf, sizeof(buf),
@@ -194,8 +199,8 @@ auth_password(const uint8_t *username, size_t username_len, const uint8_t *passw
 
 static int
 auth_passwd_change(const uint8_t *username, size_t username_len, const uint8_t *old_password,
-    size_t old_password_len, const uint8_t *new_password, size_t new_password_len, uint8_t **change_prompt,
-    size_t *change_prompt_len, void *cbdata)
+    size_t old_password_len, const uint8_t *new_password, size_t new_password_len,
+    struct dssh_bytes_result *change_prompt, void *cbdata)
 {
 	char buf[256];
 
@@ -330,8 +335,7 @@ looking_at(const char *cmd, const char *obj)
 
 static int
 auth_kbi(const uint8_t *username, size_t username_len, uint32_t num_responses, const uint8_t **responses,
-    const size_t *response_lens, char **name_out, char **instruction_out, uint32_t *num_prompts_out,
-    char ***prompts_out, bool **echo_out, void *cbdata)
+    const size_t *response_lens, struct dssh_auth_challenge *out, void *cbdata)
 {
 	static struct game_state gs;
 	char                     banner[1024];
@@ -768,36 +772,39 @@ auth_kbi(const uint8_t *username, size_t username_len, uint32_t num_responses, c
 	}
 
 prompt:
-	/* Set up the prompt for this room */
-	*name_out        = strdup("The Gate of Authentication");
-	*instruction_out = strdup("");
-	*num_prompts_out = 1;
-	*prompts_out     = malloc(sizeof(char *));
-	*echo_out        = malloc(sizeof(bool));
-	if (*prompts_out == NULL || *echo_out == NULL)
-		return DSSH_AUTH_FAILURE;
+	{
+		static const uint8_t name[] = "The Gate of Authentication";
+		static struct dssh_auth_prompt item;
 
-	const char *prompt;
-	switch (gs.room) {
-		case ROOM_GATE:
-			prompt = gate_prompt;
-			break;
-		case ROOM_GARDEN:
-			prompt = garden_prompt;
-			break;
-		case ROOM_TOWER:
-			prompt = tower_prompt;
-			break;
-		case ROOM_PARAPET:
-			prompt = parapet_prompt;
-			break;
-		default:
-			prompt = "> ";
-			break;
+		const char *prompt;
+		switch (gs.room) {
+			case ROOM_GATE:
+				prompt = gate_prompt;
+				break;
+			case ROOM_GARDEN:
+				prompt = garden_prompt;
+				break;
+			case ROOM_TOWER:
+				prompt = tower_prompt;
+				break;
+			case ROOM_PARAPET:
+				prompt = parapet_prompt;
+				break;
+			default:
+				prompt = "> ";
+				break;
+		}
+		const uint8_t *text = (const uint8_t *)prompt;
+		item.text.data = text;
+		item.text.len = strlen(prompt);
+		item.echo = true;
+		out->name.data = name;
+		out->name.len = sizeof(name) - 1;
+		out->prompts = &item;
+		out->count = 1;
+		out->lease.release = static_prompt_release;
+		return DSSH_AUTH_KBI_PROMPT;
 	}
-	(*prompts_out)[0] = strdup(prompt);
-	(*echo_out)[0]    = true;
-	return DSSH_AUTH_KBI_PROMPT;
 }
 
 static struct dssh_auth_server_cbs auth_cbs = {

@@ -30,24 +30,76 @@ static dssh_session sess;
 /* ================================================================
  * Keyboard-interactive callback: answer every prompt with password
  * ================================================================ */
+struct kbi_state {
+	const char *password;
+	uint8_t *answer;
+	size_t answer_capacity;
+	struct dssh_bytes *responses;
+	size_t response_capacity;
+	bool leased;
+};
+
+static void
+kbi_release(void *owner)
+{
+	struct kbi_state *state = owner;
+	dssh_cleanse(state->answer, state->answer_capacity);
+	if (state->responses != NULL)
+		dssh_cleanse(state->responses, state->response_capacity * sizeof(*state->responses));
+	state->leased = false;
+}
+
 static int
 kbi_prompt(const uint8_t *name, size_t name_len, const uint8_t *instruction, size_t instruction_len,
     uint32_t num_prompts, const uint8_t **prompts, const size_t *prompt_lens, const bool *echo,
-    uint8_t **responses, size_t *response_lens, void *cbdata)
+    struct dssh_auth_responses *out, void *cbdata)
 {
-	const char *password = cbdata;
-	size_t      plen     = strlen(password);
-
-	for (uint32_t i = 0; i < num_prompts; i++) {
-		responses[i] = malloc(plen);
-		if (responses[i] == NULL) {
-			for (uint32_t j = 0; j < i; j++)
-				free(responses[j]);
+	(void)name;
+	(void)name_len;
+	(void)instruction;
+	(void)instruction_len;
+	(void)prompts;
+	(void)prompt_lens;
+	(void)echo;
+	struct kbi_state *state = cbdata;
+	if (state == NULL || state->password == NULL || state->leased)
+		return DSSH_ERROR_INVALID;
+	state->leased = true;
+	out->lease.release = kbi_release;
+	out->lease.owner = state;
+#if SIZE_MAX < UINT32_MAX
+	if (num_prompts > SIZE_MAX)
+		return DSSH_ERROR_INVALID;
+#endif
+	size_t count = (size_t)num_prompts;
+	if (count > SIZE_MAX / sizeof(*state->responses))
+		return DSSH_ERROR_INVALID;
+	if (count > state->response_capacity) {
+		struct dssh_bytes *replacement = malloc(count * sizeof(*replacement));
+		if (replacement == NULL)
 			return DSSH_ERROR_ALLOC;
-		}
-		memcpy(responses[i], password, plen);
-		response_lens[i] = plen;
+		free(state->responses);
+		state->responses = replacement;
+		state->response_capacity = count;
 	}
+	size_t length = strlen(state->password);
+	if (count > 0 && length > state->answer_capacity) {
+		uint8_t *replacement = malloc(length);
+		if (replacement == NULL)
+			return DSSH_ERROR_ALLOC;
+		dssh_cleanse(state->answer, state->answer_capacity);
+		free(state->answer);
+		state->answer = replacement;
+		state->answer_capacity = length;
+	}
+	if (count > 0 && length > 0)
+		memcpy(state->answer, state->password, length);
+	for (size_t i = 0; i < count; i++) {
+		state->responses[i].data = state->answer;
+		state->responses[i].len = length;
+	}
+	out->items = count > 0 ? state->responses : NULL;
+	out->count = num_prompts;
 	return 0;
 }
 
@@ -64,7 +116,7 @@ verify_hostkey(const char *algo_name, unsigned int key_bits, const uint8_t *sha2
 
 	/* Base64-encode the SHA-256 fingerprint for display */
 	static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-	char              fp[44]; /* ceil(32/3)*4 + 1 */
+	char              fp[45]; /* ceil(32/3)*4 + 1 */
 	size_t            o = 0;
 
 	for (int i = 0; i < 32; i += 3) {
@@ -123,13 +175,15 @@ tx(uint8_t *buf, size_t bufsz, dssh_session s, void *cbdata)
 		if (n > 0) {
 			sent_total += n;
 		}
+		else if (n == 0)
+			return DSSH_ERROR_INIT;
 		else if (n < 0) {
 			if ((errno == EAGAIN) || (errno == EINTR))
 				continue;
 			return DSSH_ERROR_INIT;
 		}
 	}
-	return 0;
+	return sent_total == bufsz ? 0 : DSSH_ERROR_TERMINATED;
 }
 
 static int
@@ -166,7 +220,7 @@ rx(uint8_t *buf, size_t bufsz, dssh_session s, void *cbdata)
 			return DSSH_ERROR_INIT;
 		}
 	}
-	return 0;
+	return rxlen == bufsz ? 0 : DSSH_ERROR_TERMINATED;
 }
 
 static int
@@ -180,12 +234,11 @@ rxline(uint8_t *buf, size_t bufsz, size_t *bytes_received, dssh_session s, void 
 
 		if (res < 0)
 			return res;
-		if (buf[pos] == '\r')
-			lastcr = true;
 		if ((buf[pos] == '\n') && lastcr) {
 			*bytes_received = pos + 1;
 			return 0;
 		}
+		lastcr = buf[pos] == '\r';
 		if (pos + 1 < bufsz)
 			pos++;
 		else
@@ -227,8 +280,10 @@ stdin_thread(void *arg)
 		if (n <= 0)
 			break;
 
-		/* Wait for channel write space, then send */
-		while (n > 0) {
+		/* Wait for channel write space, then send the entire input. */
+		size_t len = (size_t)n;
+		size_t offset = 0;
+		while (offset < len) {
 			int ev = dssh_chan_poll(ch, DSSH_POLL_WRITE, 1000);
 
 			if ((ev < 0) || dssh_session_is_terminated(sess))
@@ -236,11 +291,14 @@ stdin_thread(void *arg)
 			if (!(ev & DSSH_POLL_WRITE))
 				continue;
 
-			ssize_t w = dssh_chan_write(ch, 0, buf, n);
+			int64_t w = dssh_chan_write(ch, 0, &buf[offset], len - offset);
 
-			if (w < 0)
+			if (w <= 0)
 				goto done;
-			n -= w;
+			if (w > len - offset)
+				goto done;
+			size_t written = (size_t)w;
+			offset += written;
 		}
 	}
 done:
@@ -367,8 +425,13 @@ main(int argc, char **argv)
 		res = -1;
 		if (strstr(methods, "password"))
 			res = dssh_auth_password(sess, username, password, NULL, NULL);
-		if ((res < 0) && strstr(methods, "keyboard-interactive"))
-			res = dssh_auth_keyboard_interactive(sess, username, kbi_prompt, (void *)password);
+		if ((res < 0) && strstr(methods, "keyboard-interactive")) {
+			struct kbi_state state = { .password = password };
+			res = dssh_auth_keyboard_interactive(sess, username, kbi_prompt, &state);
+			kbi_release(&state);
+			free(state.answer);
+			free(state.responses);
+		}
 		if (res < 0) {
 			fprintf(stderr, "authentication failed: %d\n", res);
 			return 1;
@@ -430,8 +493,14 @@ main(int argc, char **argv)
 			struct dssh_chan_event event;
 
 			if (dssh_chan_read_event(ch, &event) == 0) {
-				if (event.type == DSSH_EVENT_SIGNAL)
-					fprintf(stderr, "[signal: SIG%s]\n", event.signal.name);
+				if (event.type == DSSH_EVENT_SIGNAL) {
+					fputs("[signal bytes:", stderr);
+					for (size_t i = 0; i < event.signal.name.len; i++) {
+						unsigned int byte = event.signal.name.data[i];
+						fprintf(stderr, " %02x", byte);
+					}
+					fputs("]\n", stderr);
+				}
 			}
 			continue;
 		}

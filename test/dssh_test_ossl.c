@@ -14,6 +14,9 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <threads.h>
+#include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 #ifdef DSSH_CRYPTO_OPENSSL
 #include <openssl/bn.h>
@@ -27,6 +30,158 @@
 
 #include "dssh_test_ossl.h"
 
+static _Thread_local int clock_fail_at = -1;
+static _Thread_local int clock_call_num;
+static _Thread_local bool clock_fixed;
+static _Thread_local struct timespec clock_value;
+static _Thread_local struct timespec clock_next;
+static _Thread_local unsigned clock_remaining;
+static _Thread_local bool clock_scheduled;
+static _Atomic(cnd_t *) watched_condition;
+static atomic_bool condition_wait_entered;
+static _Atomic(mtx_t *) paused_mutex;
+static _Thread_local mtx_t *delayed_mutex;
+static _Thread_local unsigned delayed_mutex_skip;
+static atomic_bool mutex_pause_entered;
+static atomic_bool mutex_pause_released;
+static _Thread_local struct dssh_test_wait_probe *wait_probe;
+static _Thread_local mtx_t *ownership_mutex;
+static _Thread_local bool ownership_held;
+
+void
+dssh_test_mtx_watch_ownership(mtx_t *mutex)
+{
+	ownership_mutex = mutex;
+	ownership_held = false;
+}
+
+bool
+dssh_test_mtx_ownership(void)
+{
+	return ownership_held;
+}
+
+void
+dssh_test_wait_probe(struct dssh_test_wait_probe *probe)
+{
+	wait_probe = probe;
+}
+
+atomic_bool *
+dssh_test_thrd_pause_mutex(mtx_t *mutex)
+{
+	atomic_store(&mutex_pause_entered, false);
+	atomic_store(&mutex_pause_released, false);
+	atomic_store(&paused_mutex, mutex);
+	return &mutex_pause_entered;
+}
+
+atomic_bool *
+dssh_test_thrd_pause_mutex_after(mtx_t *mutex, unsigned skip)
+{
+	delayed_mutex = mutex;
+	delayed_mutex_skip = skip;
+	atomic_store(&mutex_pause_entered, false);
+	atomic_store(&mutex_pause_released, false);
+	return &mutex_pause_entered;
+}
+
+void
+dssh_test_thrd_resume_mutex(void)
+{
+	atomic_store(&mutex_pause_released, true);
+}
+
+atomic_bool *
+dssh_test_thrd_watch_condition(cnd_t *condition)
+{
+	atomic_store(&condition_wait_entered, false);
+	atomic_store(&watched_condition, condition);
+	return &condition_wait_entered;
+}
+
+static void
+observe_condition(cnd_t *condition)
+{
+	if (condition == atomic_load(&watched_condition))
+		atomic_store(&condition_wait_entered, true);
+}
+
+void
+dssh_test_clock_reset(void)
+{
+	clock_fail_at = -1;
+	clock_call_num = 0;
+	clock_fixed = false;
+	clock_scheduled = false;
+}
+
+void
+dssh_test_clock_fail_after(int n)
+{
+	clock_fail_at = n;
+	clock_call_num = 0;
+}
+
+void
+dssh_test_clock_set(struct timespec value)
+{
+	clock_value = value;
+	clock_fixed = true;
+	clock_scheduled = false;
+}
+
+void
+dssh_test_clock_schedule(struct timespec first, unsigned count, struct timespec second)
+{
+	clock_value = first;
+	clock_next = second;
+	clock_remaining = count;
+	clock_scheduled = true;
+	clock_fixed = true;
+}
+
+int
+dssh_test_clock_count(void)
+{
+	return clock_call_num;
+}
+
+static bool
+clock_should_fail(void)
+{
+	/* Disarmed calls need not count; bounded armed tests count up to the
+	 * requested failure, then disarm to avoid signed counter overflow. */
+	if (clock_fail_at < 0)
+		return false;
+	int call = clock_call_num;
+	if (clock_call_num < INT_MAX)
+		clock_call_num++;
+	if (call == clock_fail_at) {
+		clock_fail_at = -1;
+		return true;
+	}
+	return false;
+}
+
+int
+dssh_test_timespec_get(struct timespec *ts, int base)
+{
+	if (clock_should_fail())
+		return 0;
+	if (clock_fixed && base == TIME_UTC) {
+		if (clock_scheduled) {
+			if (clock_remaining == 0)
+				clock_value = clock_next;
+			else
+				clock_remaining--;
+		}
+		*ts = clock_value;
+		return TIME_UTC;
+	}
+	return timespec_get(ts, base);
+}
+
 static atomic_int ossl_fail_at = -1;
 static atomic_int ossl_call_num = 0;
 
@@ -38,14 +193,97 @@ static atomic_int ossl_call_num = 0;
  * without incrementing the counter.
  */
 static _Thread_local bool ossl_this_thread = true;
+#ifdef DSSH_CRYPTO_OPENSSL
+static _Thread_local bool md_size_override;
+static _Thread_local int md_size_value;
+static _Thread_local bool digest_length_override;
+static _Thread_local unsigned int digest_length_value;
+static _Thread_local bool encoded_length_override;
+static _Thread_local int encoded_length_value;
+
+void
+dssh_test_ossl_encoded_length(int value)
+{
+	encoded_length_override = true;
+	encoded_length_value = value;
+}
+
+void
+dssh_test_ossl_md_size(int value)
+{
+	md_size_override = true;
+	md_size_value = value;
+}
+
+void
+dssh_test_ossl_digest_length(unsigned int value)
+{
+	digest_length_override = true;
+	digest_length_value = value;
+}
+#endif
 
 /*
- * Separate countdown for lock/unlock/condvar wrappers (items 85-86).
+ * Separate countdown for recoverable lock/condvar wrappers (items 85-86).
  * Kept independent of the OpenSSL + init countdown so existing ossl
  * tests are not affected by the additional failable call sites.
  */
 static atomic_int thrd_fail_at = -1;
 static atomic_int thrd_call_num = 0;
+static atomic_bool join_fail_next;
+static atomic_int join_call_num;
+static _Thread_local mtx_t *reject_mutex_once;
+static _Thread_local mtx_t *rejected_mutex;
+static _Thread_local unsigned rejected_unlocks;
+static _Thread_local mtx_t *unlock_fail_mutex;
+static _Thread_local unsigned unlock_fail_skip;
+static _Thread_local bool unlock_fail_release_real;
+static _Thread_local mtx_t *wake_fail_mutex;
+static _Thread_local cnd_t *wake_fail_condition;
+static _Thread_local unsigned wake_fail_remaining;
+static _Thread_local unsigned wake_fail_hits;
+static _Thread_local bool wake_fail_complete_real;
+static _Thread_local bool wake_fail_report;
+
+static void
+wake_failure_record(void)
+{
+	wake_fail_remaining--;
+	wake_fail_hits++;
+	if (wake_fail_report && wake_fail_remaining == 0) {
+		if (fputs("DSSH_TEST_WAKE_FAILURE\n", stderr) < 0 || fflush(stderr) != 0)
+			_Exit(7);
+	}
+}
+
+void
+dssh_test_wake_lock(mtx_t *mutex, bool complete_real)
+{
+	wake_fail_mutex = mutex;
+	wake_fail_condition = NULL;
+	wake_fail_remaining = 1;
+	wake_fail_hits = 0;
+	wake_fail_complete_real = complete_real;
+	wake_fail_report = true;
+}
+
+void
+dssh_test_wake_condition(cnd_t *condition, unsigned failures,
+    bool complete_real, bool report)
+{
+	wake_fail_mutex = NULL;
+	wake_fail_condition = condition;
+	wake_fail_remaining = failures;
+	wake_fail_hits = 0;
+	wake_fail_complete_real = complete_real;
+	wake_fail_report = report;
+}
+
+unsigned
+dssh_test_wake_hits(void)
+{
+	return wake_fail_hits;
+}
 
 void
 dssh_test_ossl_reset(void)
@@ -54,7 +292,25 @@ dssh_test_ossl_reset(void)
 	atomic_store(&ossl_call_num, 0);
 	atomic_store(&thrd_fail_at, -1);
 	atomic_store(&thrd_call_num, 0);
+	atomic_store(&join_fail_next, false);
+	atomic_store(&join_call_num, 0);
+	reject_mutex_once = NULL;
+	rejected_mutex = NULL;
+	rejected_unlocks = 0;
+	unlock_fail_mutex = NULL;
+	wait_probe = NULL;
+	dssh_test_mtx_watch_ownership(NULL);
+	wake_fail_mutex = NULL;
+	wake_fail_condition = NULL;
+	wake_fail_remaining = 0;
+	wake_fail_hits = 0;
 	ossl_this_thread = true;
+#ifdef DSSH_CRYPTO_OPENSSL
+	md_size_override = false;
+	digest_length_override = false;
+	encoded_length_override = false;
+#endif
+	dssh_test_clock_reset();
 }
 
 void
@@ -88,6 +344,53 @@ dssh_test_thrd_reset(void)
 {
 	atomic_store(&thrd_fail_at, -1);
 	atomic_store(&thrd_call_num, 0);
+	atomic_store(&join_fail_next, false);
+	atomic_store(&join_call_num, 0);
+	reject_mutex_once = NULL;
+	rejected_mutex = NULL;
+	rejected_unlocks = 0;
+	unlock_fail_mutex = NULL;
+	wait_probe = NULL;
+	dssh_test_mtx_watch_ownership(NULL);
+	wake_fail_mutex = NULL;
+	wake_fail_condition = NULL;
+	wake_fail_remaining = 0;
+	wake_fail_hits = 0;
+}
+
+void
+dssh_test_unlock_fail_after(mtx_t *mutex, unsigned skip, bool release_real)
+{
+	unlock_fail_mutex = mutex;
+	unlock_fail_skip = skip;
+	unlock_fail_release_real = release_real;
+}
+
+void
+dssh_test_mtx_reject_once(mtx_t *mutex)
+{
+	reject_mutex_once = mutex;
+	rejected_mutex = NULL;
+	rejected_unlocks = 0;
+}
+
+unsigned
+dssh_test_mtx_rejected_unlocks(void)
+{
+	return rejected_unlocks;
+}
+
+void
+dssh_test_join_fail_next(void)
+{
+	atomic_store(&join_call_num, 0);
+	atomic_store(&join_fail_next, true);
+}
+
+int
+dssh_test_join_count(void)
+{
+	return atomic_load(&join_call_num);
 }
 
 int
@@ -97,7 +400,7 @@ dssh_test_thrd_count(void)
 }
 
 /*
- * Check if a lock/unlock/condvar call should fail.  Uses the
+ * Check if a lock/unlock/condvar/join call should fail.  Uses the
  * separate thrd_fail_at / thrd_call_num countdown.
  */
 static bool
@@ -110,6 +413,18 @@ should_thrd_fail(void)
 		return false;
 	int n = atomic_fetch_add(&thrd_call_num, 1);
 	return (n == fa);
+}
+
+/* Simulated failure never consumes the real joinable worker. */
+int
+dssh_test_thrd_join(thrd_t thr, int *res)
+{
+	atomic_fetch_add(&join_call_num, 1);
+	if (atomic_exchange(&join_fail_next, false))
+		return thrd_error;
+	if (should_thrd_fail())
+		return thrd_error;
+	return thrd_join(thr, res);
 }
 
 /*
@@ -130,6 +445,20 @@ should_fail(void)
 }
 
 #ifdef DSSH_CRYPTO_OPENSSL
+int
+dssh_test_EVP_MD_get_size(const EVP_MD *md)
+{
+	if (md_size_override)
+		return md_size_value;
+	return EVP_MD_get_size(md);
+}
+
+int
+dssh_test_EVP_EncodeBlock(unsigned char *out, const unsigned char *in, int length)
+{
+	int ret = EVP_EncodeBlock(out, in, length);
+	return encoded_length_override ? encoded_length_value : ret;
+}
 /* ================================================================
  * OpenSSL creation wrappers (return NULL on failure)
  * ================================================================ */
@@ -256,6 +585,14 @@ dssh_test_EVP_DigestInit_ex(EVP_MD_CTX *ctx, const EVP_MD *type,
 }
 
 int
+dssh_test_EVP_MD_CTX_reset(EVP_MD_CTX *ctx)
+{
+	if (should_fail())
+		return 0;
+	return EVP_MD_CTX_reset(ctx);
+}
+
+int
 dssh_test_EVP_DigestUpdate(EVP_MD_CTX *ctx, const void *d,
     size_t cnt)
 {
@@ -270,7 +607,10 @@ dssh_test_EVP_DigestFinal_ex(EVP_MD_CTX *ctx, unsigned char *md,
 {
 	if (should_fail())
 		return 0;
-	return EVP_DigestFinal_ex(ctx, md, s);
+	int ret = EVP_DigestFinal_ex(ctx, md, s);
+	if (ret == 1 && digest_length_override && s != NULL)
+		*s = digest_length_value;
+	return ret;
 }
 
 int
@@ -436,7 +776,10 @@ dssh_test_EVP_Digest(const void *data, size_t count, unsigned char *md,
 {
 	if (should_fail())
 		return 0;
-	return EVP_Digest(data, count, md, size, type, impl);
+	int ret = EVP_Digest(data, count, md, size, type, impl);
+	if (ret == 1 && digest_length_override && size != NULL)
+		*size = digest_length_value;
+	return ret;
 }
 
 int
@@ -464,12 +807,68 @@ dssh_test_BN_rand(BIGNUM *rnd, int bits, int top, int bottom)
 	return BN_rand(rnd, bits, top, bottom);
 }
 
+int
+dssh_test_BN_rand_range(BIGNUM *rnd, const BIGNUM *range)
+{
+	if (should_fail())
+		return 0;
+	return BN_rand_range(rnd, range);
+}
+
+BIGNUM *
+dssh_test_BN_dup(const BIGNUM *a)
+{
+	if (should_fail())
+		return NULL;
+	return BN_dup(a);
+}
+
+int
+dssh_test_BN_rshift1(BIGNUM *r, const BIGNUM *a)
+{
+	if (should_fail())
+		return 0;
+	return BN_rshift1(r, a);
+}
+
+int
+dssh_test_BN_sub_word(BIGNUM *a, BN_ULONG word)
+{
+	if (should_fail())
+		return 0;
+	return BN_sub_word(a, word);
+}
+
+int
+dssh_test_BN_add_word(BIGNUM *a, BN_ULONG word)
+{
+	if (should_fail())
+		return 0;
+	return BN_add_word(a, word);
+}
+
+int
+dssh_test_BN_check_prime(const BIGNUM *p, BN_CTX *ctx, BN_GENCB *cb)
+{
+	if (should_fail())
+		return 0;
+	return BN_check_prime(p, ctx, cb);
+}
+
 BIGNUM *
 dssh_test_BN_bin2bn(const unsigned char *s, int len, BIGNUM *ret)
 {
 	if (should_fail())
 		return NULL;
 	return BN_bin2bn(s, len, ret);
+}
+
+int
+dssh_test_BN_bn2bin(const BIGNUM *value, unsigned char *out)
+{
+	if (should_fail())
+		return -1;
+	return BN_bn2bin(value, out);
 }
 
 int
@@ -539,51 +938,160 @@ dssh_test_thrd_create(thrd_t *thr, thrd_start_t func, void *arg)
 /*
  * Lock/unlock/condvar wrappers.
  *
- * mtx_lock, cnd_wait, cnd_timedwait: skip the real call on injected
- * failure.  Safe because the caller does not hold the lock on error.
+ * mtx_lock: skip the real acquisition on injected failure.
+ * cnd_wait/cnd_timedwait: skip waiting on injected failure, preserving
+ * the caller's already-held associated mutex in this model.
  *
- * mtx_unlock, cnd_broadcast, cnd_signal: always call the real function,
- * return thrd_error on injected failure.  Prevents test deadlocks and
- * missed wakeups while still exercising the library error path.
+ * cnd_broadcast/cnd_signal call the real function, then report injected error.
+ * Mutex release uses only the independent fresh-process fatal control: either
+ * retain the real owned mutex, or really unlock before reporting failure.
+ * The recoverable countdown does not count/inject mutex releases.
  */
 
 int
 dssh_test_mtx_lock(mtx_t *mtx)
 {
+	if (mtx == delayed_mutex) {
+		if (delayed_mutex_skip > 0)
+			delayed_mutex_skip--;
+		else {
+			delayed_mutex = NULL;
+			atomic_store(&mutex_pause_entered, true);
+			while (!atomic_load(&mutex_pause_released))
+				thrd_yield();
+		}
+	}
+	if (mtx == atomic_load(&paused_mutex)) {
+		atomic_store(&mutex_pause_entered, true);
+		while (!atomic_load(&mutex_pause_released))
+			thrd_yield();
+	}
+	if (wake_fail_remaining != 0 && mtx == wake_fail_mutex) {
+		if (wake_fail_complete_real && mtx_lock(mtx) != thrd_success)
+			_Exit(7);
+		wake_failure_record();
+		return thrd_error;
+	}
+	if (reject_mutex_once != NULL && mtx == reject_mutex_once) {
+		reject_mutex_once = NULL;
+		rejected_mutex = mtx;
+		return thrd_error;
+	}
 	if (should_thrd_fail())
 		return thrd_error;
-	return mtx_lock(mtx);
+	int ret = mtx_lock(mtx);
+	if (ret == thrd_success && mtx == ownership_mutex)
+		ownership_held = true;
+	if (ret == thrd_success && mtx == rejected_mutex)
+		rejected_mutex = NULL;
+	return ret;
 }
 
 int
 dssh_test_mtx_unlock(mtx_t *mtx)
 {
+	if (rejected_mutex != NULL && mtx == rejected_mutex) {
+		if (rejected_unlocks < UINT_MAX)
+			rejected_unlocks++;
+		return thrd_error;
+	}
+	if (unlock_fail_mutex != NULL && mtx == unlock_fail_mutex) {
+		if (unlock_fail_skip > 0)
+			unlock_fail_skip--;
+		else {
+			unlock_fail_mutex = NULL;
+			if (unlock_fail_release_real && mtx_unlock(mtx) != thrd_success)
+				_Exit(7);
+			/* Test-driver provenance: emit only when the armed native
+			 * boundary is reached, never from the production library. */
+			if (fputs("DSSH_TEST_UNLOCK_FAILURE\n", stderr) < 0 || fflush(stderr) != 0)
+				_Exit(7);
+			return thrd_error;
+		}
+	}
+	/* Release faults have their own process-isolated fatal checks. */
 	int ret = mtx_unlock(mtx);
+	if (ret == thrd_success && mtx == ownership_mutex)
+		ownership_held = false;
+	if (wait_probe != NULL && mtx == wait_probe->mutex
+	    && atomic_load(&wait_probe->returning)) {
+		if (wait_probe->releases == 0)
+			wait_probe->unlock_result = ret;
+		if (wait_probe->releases < UINT_MAX)
+			wait_probe->releases++;
+	}
+	return ret;
+}
+
+static int
+probe_wait_result(struct dssh_test_wait_probe *probe)
+{
+	atomic_store(&probe->returning, true);
+	/* Test-only nonblocking atomic handoff: no callback, wait, yield or
+	 * additional physical mutex while the associated mutex is owned. */
+	while (!atomic_load(&probe->release)) {
+	}
+	return probe->result;
+}
+
+static int
+condition_wait(cnd_t *cond, mtx_t *mtx, const struct timespec *ts)
+{
+	struct dssh_test_wait_probe *probe = wait_probe;
+	if (probe != NULL && (probe->condition != cond || probe->mutex != mtx))
+		probe = NULL;
+	bool first = false;
+	if (probe != NULL) {
+		unsigned calls = atomic_load(&probe->calls);
+		first = calls == 0;
+		if (first)
+			probe->timed = ts != NULL;
+		if (calls < UINT_MAX)
+			atomic_store(&probe->calls, calls + 1);
+		if (first && !probe->complete_real)
+			return probe_wait_result(probe);
+	}
 	if (should_thrd_fail())
 		return thrd_error;
+	int ret;
+	do {
+		observe_condition(cond);
+		if (probe != NULL) {
+			unsigned calls = atomic_load(&probe->native_calls);
+			if (calls < UINT_MAX)
+				atomic_store(&probe->native_calls, calls + 1);
+		}
+		ret = ts != NULL ? cnd_timedwait(cond, mtx, ts) : cnd_wait(cond, mtx);
+	} while (first && probe->until_timeout && ts != NULL && ret == thrd_success);
+	if (first) {
+		atomic_store(&probe->native_result, ret);
+		return probe_wait_result(probe);
+	}
 	return ret;
 }
 
 int
 dssh_test_cnd_wait(cnd_t *cond, mtx_t *mtx)
 {
-	if (should_thrd_fail())
-		return thrd_error;
-	return cnd_wait(cond, mtx);
+	return condition_wait(cond, mtx, NULL);
 }
 
 int
 dssh_test_cnd_timedwait(cnd_t *cond, mtx_t *mtx,
     const struct timespec *ts)
 {
-	if (should_thrd_fail())
-		return thrd_error;
-	return cnd_timedwait(cond, mtx, ts);
+	return condition_wait(cond, mtx, ts);
 }
 
 int
 dssh_test_cnd_broadcast(cnd_t *cond)
 {
+	if (wake_fail_remaining != 0 && cond == wake_fail_condition) {
+		if (wake_fail_complete_real && cnd_broadcast(cond) != thrd_success)
+			_Exit(7);
+		wake_failure_record();
+		return thrd_error;
+	}
 	int ret = cnd_broadcast(cond);
 	if (should_thrd_fail())
 		return thrd_error;
@@ -593,6 +1101,12 @@ dssh_test_cnd_broadcast(cnd_t *cond)
 int
 dssh_test_cnd_signal(cnd_t *cond)
 {
+	if (wake_fail_remaining != 0 && cond == wake_fail_condition) {
+		if (wake_fail_complete_real && cnd_signal(cond) != thrd_success)
+			_Exit(7);
+		wake_failure_record();
+		return thrd_error;
+	}
 	int ret = cnd_signal(cond);
 	if (should_thrd_fail())
 		return thrd_error;

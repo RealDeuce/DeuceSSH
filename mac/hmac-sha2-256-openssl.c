@@ -75,7 +75,8 @@ generate(const uint8_t *buf, size_t bufsz, uint8_t *outbuf, dssh_mac_ctx *ctx)
 
 	size_t outlen = 0;
 
-	if (EVP_MAC_final(cbd->ctx, outbuf, &outlen, HMAC_SHA2_256_DIGEST_SIZE) != 1)
+	if (EVP_MAC_final(cbd->ctx, outbuf, &outlen, HMAC_SHA2_256_DIGEST_SIZE) != 1
+	    || outlen != HMAC_SHA2_256_DIGEST_SIZE)
 		return DSSH_ERROR_INIT;
 
 	return 0;
@@ -108,5 +109,8 @@ dssh_register_hmac_sha2_256(void)
 	mac->digest_size = HMAC_SHA2_256_DIGEST_SIZE;
 	mac->key_size    = HMAC_SHA2_256_KEY_SIZE;
 	memcpy(mac->name, name, sizeof(name));
-	return dssh_transport_register_mac(mac);
+	int ret = dssh_transport_register_mac(mac);
+	if (ret < 0)
+		free(mac);
+	return ret;
 }

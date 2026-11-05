@@ -68,6 +68,11 @@ do_crypt(uint8_t *buf, size_t bufsz, dssh_enc_ctx *ctx)
 
 	if (EVP_EncryptUpdate(cbd->ctx, buf, &outlen, buf, (int)bufsz) != 1)
 		return DSSH_ERROR_INIT;
+	if (outlen < 0)
+		return DSSH_ERROR_INIT;
+	size_t written = (size_t)outlen;
+	if (written != bufsz)
+		return DSSH_ERROR_INIT;
 
 	return 0;
 }
@@ -101,5 +106,8 @@ dssh_register_aes256_ctr(void)
 	enc->blocksize     = AES256_CTR_BLOCK_SIZE;
 	enc->key_size      = AES256_CTR_KEY_SIZE;
 	memcpy(enc->name, name, sizeof(name));
-	return dssh_transport_register_enc(enc);
+	int ret = dssh_transport_register_enc(enc);
+	if (ret < 0)
+		free(enc);
+	return ret;
 }

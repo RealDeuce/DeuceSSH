@@ -3,9 +3,6 @@
 // Provides X25519 and ML-KEM-768 crypto operations for the shared
 // protocol handler in hybrid-pq-kex.c.
 
-#include <openssl/crypto.h>
-#include <openssl/evp.h>
-
 #include <stdlib.h>
 #include <string.h>
 
@@ -34,103 +31,21 @@ static const struct hybrid_pq_params mlkem_params = {
     .pq_pk_len    = MLKEM_PK_LEN,
     .pq_ct_len    = MLKEM_CT_LEN,
     .pq_ss_len    = MLKEM_SS_LEN,
-    .q_c_len      = MLKEM_PK_LEN + HYBRID_PQ_X25519_KEY_LEN,
-    .q_s_len      = MLKEM_CT_LEN + HYBRID_PQ_X25519_KEY_LEN,
+	.pq_sk_len    = MLKEM_SK_LEN,
+    .q_c_len      = MLKEM_PK_LEN + DSSH_X25519_LEN,
+    .q_s_len      = MLKEM_CT_LEN + DSSH_X25519_LEN,
 };
-
-/* --- X25519 operations (OpenSSL EVP) --- */
-
-static int
-ossl_x25519_keygen(uint8_t pub_out[HYBRID_PQ_X25519_KEY_LEN], void **priv_ctx)
-{
-	EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_from_name(NULL, "X25519", NULL);
-	EVP_PKEY     *key  = NULL;
-
-	if (pctx == NULL)
-		return DSSH_ERROR_ALLOC;
-	if ((EVP_PKEY_keygen_init(pctx) != 1) || (EVP_PKEY_keygen(pctx, &key) != 1)) {
-		EVP_PKEY_CTX_free(pctx);
-		return DSSH_ERROR_INIT;
-	}
-	EVP_PKEY_CTX_free(pctx);
-
-	size_t pub_len = HYBRID_PQ_X25519_KEY_LEN;
-
-	if (EVP_PKEY_get_raw_public_key(key, pub_out, &pub_len) != 1) {
-		EVP_PKEY_free(key);
-		return DSSH_ERROR_INIT;
-	}
-	*priv_ctx = key;
-	return 0;
-}
-
-static int
-ossl_x25519_derive(void *priv_ctx, const uint8_t *peer_pub, uint8_t ss_out[HYBRID_PQ_X25519_KEY_LEN])
-{
-	EVP_PKEY     *our_key  = priv_ctx;
-	EVP_PKEY     *peer_key = NULL;
-	EVP_PKEY_CTX *dctx     = NULL;
-
-	peer_key = EVP_PKEY_new_raw_public_key_ex(NULL, "X25519", NULL, peer_pub, HYBRID_PQ_X25519_KEY_LEN);
-	if (peer_key == NULL)
-		return DSSH_ERROR_INIT;
-
-	dctx = EVP_PKEY_CTX_new(our_key, NULL);
-	if (dctx == NULL) {
-		EVP_PKEY_free(peer_key);
-		return DSSH_ERROR_ALLOC;
-	}
-
-	size_t ss_len = HYBRID_PQ_X25519_KEY_LEN;
-
-	if ((EVP_PKEY_derive_init(dctx) != 1) || (EVP_PKEY_derive_set_peer(dctx, peer_key) != 1)
-	    || (EVP_PKEY_derive(dctx, ss_out, &ss_len) != 1)) {
-		EVP_PKEY_CTX_free(dctx);
-		EVP_PKEY_free(peer_key);
-		return DSSH_ERROR_INIT;
-	}
-	EVP_PKEY_CTX_free(dctx);
-	EVP_PKEY_free(peer_key);
-	return 0;
-}
-
-static int
-ossl_x25519_exchange(const uint8_t *peer_pub, size_t peer_pub_len, uint8_t *our_pub, uint8_t *ss_out)
-{
-	if (peer_pub_len != HYBRID_PQ_X25519_KEY_LEN)
-		return DSSH_ERROR_INVALID;
-
-	void *priv = NULL;
-
-	int res = ossl_x25519_keygen(our_pub, &priv);
-	if (res < 0)
-		return res;
-	res = ossl_x25519_derive(priv, peer_pub, ss_out);
-	EVP_PKEY_free(priv);
-	return res;
-}
-
-static void
-ossl_x25519_free_priv(void *priv_ctx)
-{
-	EVP_PKEY_free(priv_ctx);
-}
 
 /* --- PQ operations (vendor mlkem768 lib) --- */
 
 static int
-mlkem_keygen(uint8_t *pk_out, void **sk_ctx)
+mlkem_keygen(uint8_t *pk_out, uint8_t *storage, size_t capacity, void **sk_ctx)
 {
-	uint8_t *sk = malloc(MLKEM_SK_LEN);
-
-	if (sk == NULL)
-		return DSSH_ERROR_ALLOC;
-	if (crypto_kem_mlkem768_keypair(pk_out, sk) != 0) {
-		dssh_cleanse(sk, MLKEM_SK_LEN);
-		free(sk);
+	if (storage == NULL || capacity < MLKEM_SK_LEN)
+		return DSSH_ERROR_INVALID;
+	if (crypto_kem_mlkem768_keypair(pk_out, storage) != 0)
 		return DSSH_ERROR_INIT;
-	}
-	*sk_ctx = sk;
+	*sk_ctx = storage;
 	return 0;
 }
 
@@ -157,10 +72,8 @@ mlkem_decaps(uint8_t *ss_out, const uint8_t *ct, size_t ct_len, void *sk_ctx)
 static void
 mlkem_free_sk(void *sk_ctx)
 {
-	if (sk_ctx != NULL) {
-		dssh_cleanse(sk_ctx, MLKEM_SK_LEN);
-		free(sk_ctx);
-	}
+	/* The shared handler owns/clears the full retained raw-key slot. */
+	(void)sk_ctx;
 }
 
 #ifdef DSSH_TESTING
@@ -173,35 +86,33 @@ dssh_test_mlkem768_public_key(uint8_t *pk_out, size_t pk_len)
 	if (pk_out == NULL || pk_len != MLKEM_PK_LEN)
 		return DSSH_ERROR_INVALID;
 
+	uint8_t storage[MLKEM_SK_LEN];
 	void *sk_ctx = NULL;
-	int   ret    = mlkem_keygen(pk_out, &sk_ctx);
-
+	int ret = mlkem_keygen(pk_out, storage, sizeof(storage), &sk_ctx);
 	mlkem_free_sk(sk_ctx);
+	dssh_cleanse(storage, sizeof(storage));
 	return ret;
 }
 #endif
 
 static const struct hybrid_pq_ops ossl_mlkem_ops = {
-    .x25519_keygen    = ossl_x25519_keygen,
-    .x25519_derive    = ossl_x25519_derive,
-    .x25519_exchange  = ossl_x25519_exchange,
-    .x25519_free_priv = ossl_x25519_free_priv,
+	.x25519          = &dssh_x25519_backend,
     .pq_keygen        = mlkem_keygen,
     .pq_encaps        = mlkem_encaps,
     .pq_decaps        = mlkem_decaps,
     .pq_free_sk       = mlkem_free_sk,
 };
 
-DSSH_TESTABLE int
-mlkem768x25519_handler(struct dssh_kex_context *kctx)
+DSSH_PRIVATE int
+mlkem768x25519_init(bool client, void *config, void **state)
 {
-	return hybrid_pq_handler_impl(kctx, &mlkem_params, &ossl_mlkem_ops);
+	return hybrid_pq_init_impl(client, config, state, &mlkem_params, &ossl_mlkem_ops);
 }
 
-static void
-kex_cleanup(void *kex_data)
+DSSH_TESTABLE int
+mlkem768x25519_handler(const struct dssh_kex_context *kctx, struct dssh_kex_result *out)
 {
-	(void)kex_data;
+	return hybrid_pq_handler_impl(kctx, out, &mlkem_params, &ossl_mlkem_ops);
 }
 
 DSSH_PUBLIC int
@@ -212,11 +123,15 @@ dssh_register_mlkem768x25519_sha256(void)
 	if (kex == NULL)
 		return DSSH_ERROR_ALLOC;
 	kex->next      = NULL;
+	kex->init      = mlkem768x25519_init;
 	kex->handler   = mlkem768x25519_handler;
-	kex->cleanup   = kex_cleanup;
+	kex->cleanup   = hybrid_pq_cleanup;
 	kex->flags     = DSSH_KEX_FLAG_NEEDS_SIGNATURE_CAPABLE | DSSH_KEX_FLAG_K_ENCODING_STRING;
 	kex->hash_name = "SHA-256";
-	kex->ctx       = NULL;
+	kex->config       = NULL;
 	memcpy(kex->name, KEX_NAME, KEX_NAME_LEN + 1);
-	return dssh_transport_register_kex(kex);
+	int ret = dssh_transport_register_kex(kex);
+	if (ret < 0)
+		free(kex);
+	return ret;
 }

@@ -240,7 +240,9 @@ DSSH_PUBLIC dssh_session dssh_session_init(bool client, size_t max_packet_size);
 /*
  * Signal a session to terminate.  Sets terminate flag and returns true
  * if the session was initialized, false if already terminated.
- * Does not block -- the session's I/O callbacks will see the flag.
+ * Does not wait for the worker to exit. Notification callbacks and
+ * condition-variable wakeups run synchronously on the calling thread.
+ * Failure of a required internal termination wake calls abort().
  */
 DSSH_PUBLIC bool dssh_session_terminate(dssh_session sess);
 
@@ -251,6 +253,17 @@ DSSH_PUBLIC bool dssh_session_is_terminated(dssh_session sess);
 
 /*
  * Clean up and free all session resources.  Calls terminate if needed.
+ * Before calling, stop and join all application threads using this session
+ * or its channels. Serialize start, stop, and cleanup calls externally.
+ * Cleanup waits for the library's demux thread; I/O callbacks must return
+ * promptly after termination (see dssh_terminate_cb).
+ * A failed join of the valid joinable demux is an unrecoverable internal
+ * ownership failure and calls abort(); it does not return a retry request.
+ * Failure to release a valid owned internal mutex likewise calls abort().
+ * Calls during a callback on this session or while the caller owns a zero-copy
+ * TX reservation request termination and defer destruction. The owner must
+ * call cleanup again after the callback/reservation ends. I/O callback and
+ * other callback restrictions still apply.
  */
 DSSH_PUBLIC void dssh_session_cleanup(dssh_session sess);
 
@@ -419,7 +432,9 @@ DSSH_PUBLIC int dssh_transport_set_tx_gather(dssh_transport_tx_gather_cb cb);
 DSSH_PUBLIC int dssh_transport_handshake(dssh_session sess);
 
 /*
- * Send SSH_MSG_DISCONNECT and set the terminate flag.
+ * Send SSH_MSG_DISCONNECT and set the terminate flag. reason_code must be
+ * nonzero; future/private uint32_t reason values are accepted. A failed send
+ * returns its error and still terminates the session.
  */
 DSSH_PUBLIC int dssh_transport_disconnect(dssh_session sess, uint32_t reason_code, const char *description);
 

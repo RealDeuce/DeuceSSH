@@ -8,6 +8,74 @@ set(DSSH_TEST_KEY_ENV
 	"DSSH_TEST_ED25519_KEY=${CMAKE_CURRENT_BINARY_DIR}/test_ed25519.pem"
 	"DSSH_TEST_RSA_KEY=${CMAKE_CURRENT_BINARY_DIR}/test_rsa.pem")
 
+# Fresh-process production-library consumers must not use the test registry
+# reset, which would otherwise hide first-use publication behavior.
+foreach(kind IN ITEMS static shared)
+	if(TARGET deucessh_${kind})
+		set(target dssh_test_session_init_${kind})
+		add_executable(${target} test_session_init.c)
+		# A shared-library consumer supplies its own C11 thread facility;
+		# the library's private dependency is not part of its public API.
+		foreach(shim IN LISTS DSSH_THREADS_SHIM_SOURCES)
+			target_sources(${target} PRIVATE "${PROJECT_SOURCE_DIR}/${shim}")
+		endforeach()
+		set_property(TARGET ${target} PROPERTY C_STANDARD ${DEUCESSH_C_STANDARD})
+		set_property(TARGET ${target} PROPERTY C_STANDARD_REQUIRED ON)
+		target_compile_options(${target} PRIVATE ${DEUCESSH_COMPILE_OPTIONS})
+		target_link_libraries(${target} PRIVATE deucessh_${kind} ${THREADS_LINK_LIB})
+		if(DSSH_THREADS_SHIM_INCLUDE)
+			target_include_directories(${target} BEFORE PRIVATE ${DSSH_THREADS_SHIM_INCLUDE})
+		endif()
+		add_test(NAME dssh_session_init_${kind}_default COMMAND ${target})
+		add_test(NAME dssh_session_init_${kind}_configured COMMAND ${target} configured)
+		set_tests_properties(dssh_session_init_${kind}_default dssh_session_init_${kind}_configured
+			PROPERTIES TIMEOUT 60
+			PASS_REGULAR_EXPRESSION "workers=8 sessions=256 failures=0 frozen=1")
+		set(release_target dssh_test_release_entry_${kind})
+		add_executable(${release_target} test_release_entry.c)
+		set_property(TARGET ${release_target} PROPERTY C_STANDARD ${DEUCESSH_C_STANDARD})
+		set_property(TARGET ${release_target} PROPERTY C_STANDARD_REQUIRED ON)
+		target_compile_options(${release_target} PRIVATE ${DEUCESSH_COMPILE_OPTIONS})
+		target_link_libraries(${release_target} PRIVATE deucessh_${kind})
+		add_test(NAME dssh_release_entry_${kind} COMMAND ${release_target})
+		set_tests_properties(dssh_release_entry_${kind} PROPERTIES TIMEOUT 60
+			PASS_REGULAR_EXPRESSION "release_entries=48 releases=4 before=1 after=1 restored=1")
+		if(UNIX)
+			set(event_target dssh_test_event_peer_${kind})
+			add_executable(${event_target} test_event_peer.c mock_io.c)
+			foreach(shim IN LISTS DSSH_THREADS_SHIM_SOURCES)
+				target_sources(${event_target} PRIVATE "${PROJECT_SOURCE_DIR}/${shim}")
+			endforeach()
+			set_property(TARGET ${event_target} PROPERTY C_STANDARD ${DEUCESSH_C_STANDARD})
+			set_property(TARGET ${event_target} PROPERTY C_STANDARD_REQUIRED ON)
+			target_compile_options(${event_target} PRIVATE ${DEUCESSH_COMPILE_OPTIONS})
+			# This application fixture uses the host socket test driver,
+			# including its nonblocking drain helper; it is not library code.
+			target_compile_definitions(${event_target} PRIVATE _DEFAULT_SOURCE)
+			target_link_libraries(${event_target} PRIVATE deucessh_${kind} ${THREADS_LINK_LIB})
+			if(DSSH_THREADS_SHIM_INCLUDE)
+				target_include_directories(${event_target} BEFORE PRIVATE ${DSSH_THREADS_SHIM_INCLUDE})
+			endif()
+			add_test(NAME dssh_event_peer_${kind} COMMAND ${event_target})
+			set_tests_properties(dssh_event_peer_${kind} PROPERTIES TIMEOUT 60
+				PASS_REGULAR_EXPRESSION "events=130 queue=0 positions=3/2 production=1")
+			set(callback_target dssh_test_accept_callback_peer_${kind})
+			add_executable(${callback_target} test_accept_callback_peer.c mock_io.c)
+			set_property(TARGET ${callback_target} PROPERTY C_STANDARD ${DEUCESSH_C_STANDARD})
+			set_property(TARGET ${callback_target} PROPERTY C_STANDARD_REQUIRED ON)
+			target_compile_options(${callback_target} PRIVATE ${DEUCESSH_COMPILE_OPTIONS})
+			target_compile_definitions(${callback_target} PRIVATE _DEFAULT_SOURCE)
+			target_link_libraries(${callback_target} PRIVATE deucessh_${kind} ${THREADS_LINK_LIB})
+			foreach(mode RANGE 0 5)
+				add_test(NAME dssh_accept_callback_peer_${kind}_${mode} COMMAND ${callback_target} ${mode})
+				set_tests_properties(dssh_accept_callback_peer_${kind}_${mode} PROPERTIES TIMEOUT 60
+					PASS_REGULAR_EXPRESSION "setup_contract=1 kind=${mode}.*production=1")
+			endforeach()
+
+		endif()
+	endif()
+endforeach()
+
 # Prepend project root to source paths (they're relative to ssh/, not test/)
 set(DSSH_TEST_LIB_SOURCES "")
 foreach(src ${DEUCESSH_SOURCES})
@@ -79,6 +147,61 @@ endif()
 # so all test executables get the definitions library code references.
 target_link_libraries(deucessh_test_lib INTERFACE
 	dssh_test_allocator dssh_test_ossl)
+if(DEUCESSH_CRYPTO_BACKEND STREQUAL "Botan")
+	add_library(dssh_test_botan_hash STATIC dssh_test_botan_hash.cpp)
+	set_property(TARGET dssh_test_botan_hash PROPERTY CXX_STANDARD 20)
+	set_property(TARGET dssh_test_botan_hash PROPERTY CXX_STANDARD_REQUIRED ON)
+	target_include_directories(dssh_test_botan_hash PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+	target_link_libraries(dssh_test_botan_hash PRIVATE PkgConfig::BOTAN3)
+	target_compile_options(dssh_test_botan_hash PRIVATE ${DEUCESSH_COMPILE_OPTIONS})
+	target_link_libraries(deucessh_test_lib INTERFACE dssh_test_botan_hash)
+endif()
+
+# External test providers compiled against public headers only.
+add_library(dssh_mock_comp STATIC test_comp.c test_comp_zlib.c test_stateless.c)
+set_property(TARGET dssh_mock_comp PROPERTY C_STANDARD ${DEUCESSH_C_STANDARD})
+set_property(TARGET dssh_mock_comp PROPERTY C_STANDARD_REQUIRED ON)
+target_include_directories(dssh_mock_comp PUBLIC
+	${PROJECT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_options(dssh_mock_comp PRIVATE ${DEUCESSH_COMPILE_OPTIONS})
+target_link_libraries(dssh_mock_comp PRIVATE deucessh_test_lib)
+find_package(ZLIB QUIET)
+if(ZLIB_FOUND)
+	target_sources(dssh_mock_comp PRIVATE ../examples/zlib-comp.c)
+	target_compile_definitions(dssh_mock_comp PRIVATE DSSH_TEST_HAVE_ZLIB DSSH_EXAMPLE_ZLIB_TESTING)
+	target_link_libraries(dssh_mock_comp PRIVATE ZLIB::ZLIB)
+	if(UNIX AND TARGET deucessh_static)
+		# Separate production-library consumer: no DSSH_TESTING/internal headers.
+		add_executable(dssh_compression_peer_server
+			compression_peer_server.c test_comp_zlib.c ../examples/zlib-comp.c)
+		set_property(TARGET dssh_compression_peer_server PROPERTY C_STANDARD 17)
+		set_property(TARGET dssh_compression_peer_server PROPERTY C_STANDARD_REQUIRED ON)
+		target_compile_definitions(dssh_compression_peer_server PRIVATE
+			_POSIX_C_SOURCE=200809L DSSH_TEST_HAVE_ZLIB DSSH_EXAMPLE_ZLIB_TESTING)
+		target_compile_options(dssh_compression_peer_server PRIVATE ${DEUCESSH_COMPILE_OPTIONS})
+		target_link_libraries(dssh_compression_peer_server PRIVATE deucessh_static ZLIB::ZLIB)
+		find_package(PkgConfig QUIET)
+		if(PkgConfig_FOUND)
+			pkg_check_modules(DSSH_INTEROP_LIBSSH QUIET IMPORTED_TARGET libssh)
+			if(DSSH_INTEROP_LIBSSH_FOUND)
+				add_executable(dssh_compression_libssh_client compression_libssh_client.c)
+				set_property(TARGET dssh_compression_libssh_client PROPERTY C_STANDARD 17)
+				set_property(TARGET dssh_compression_libssh_client PROPERTY C_STANDARD_REQUIRED ON)
+				target_compile_definitions(dssh_compression_libssh_client PRIVATE _POSIX_C_SOURCE=200809L)
+				target_compile_options(dssh_compression_libssh_client PRIVATE ${DEUCESSH_COMPILE_OPTIONS})
+				target_link_libraries(dssh_compression_libssh_client PRIVATE PkgConfig::DSSH_INTEROP_LIBSSH)
+				add_test(NAME dssh_compression_libssh
+					COMMAND dssh_compression_libssh_client $<TARGET_FILE:dssh_compression_peer_server>)
+				set_tests_properties(dssh_compression_libssh PROPERTIES TIMEOUT 60)
+				foreach(direction IN ITEMS c2s s2c)
+					add_test(NAME dssh_compression_libssh_${direction}
+						COMMAND dssh_compression_libssh_client $<TARGET_FILE:dssh_compression_peer_server> ${direction})
+					set_tests_properties(dssh_compression_libssh_${direction} PROPERTIES TIMEOUT 60)
+				endforeach()
+			endif()
+		endif()
+	endif()
+endif()
 
 # Mock allocator library (--wrap based, for process-wide injection).
 # Apple's Mach-O linker does not support the GNU --wrap option.
@@ -116,6 +239,67 @@ function(dssh_add_test test_name source_file)
 		target_compile_definitions(dssh_test_${test_name} PRIVATE DSSH_CRYPTO_BOTAN)
 	endif()
 endfunction()
+
+# Exercise the exact production time arithmetic under different C type models.
+foreach(model IN ITEMS i16 u16 i32 u32 i64 u64 f32 f64 fwide)
+	if(model STREQUAL "i16")
+		set(time_type int16_t)
+		set(time_max INT16_MAX)
+		set(time_min INT16_MIN)
+	elseif(model STREQUAL "u16")
+		set(time_type uint16_t)
+		set(time_max UINT16_MAX)
+		set(time_min 0)
+	elseif(model STREQUAL "i32")
+		set(time_type int32_t)
+		set(time_max INT32_MAX)
+		set(time_min INT32_MIN)
+	elseif(model STREQUAL "u32")
+		set(time_type uint32_t)
+		set(time_max UINT32_MAX)
+		set(time_min 0)
+	elseif(model STREQUAL "i64")
+		set(time_type int64_t)
+		set(time_max INT64_MAX)
+		set(time_min INT64_MIN)
+	elseif(model STREQUAL "u64")
+		set(time_type uint64_t)
+		set(time_max UINT64_MAX)
+		set(time_min 0)
+	elseif(model STREQUAL "f32")
+		set(time_type float)
+		set(time_max FLT_MAX)
+		set(time_min -FLT_MAX)
+	elseif(model STREQUAL "f64")
+		set(time_type double)
+		set(time_max DBL_MAX)
+		set(time_min -DBL_MAX)
+	else()
+		set(time_type "long double")
+		set(time_max LDBL_MAX)
+		set(time_min -LDBL_MAX)
+	endif()
+	dssh_add_test(time_${model} test_time.c)
+	target_compile_definitions(dssh_test_time_${model} PRIVATE
+		DSSH_TIME_MODEL_TYPE=${time_type}
+		DSSH_TIME_MODEL_MAX=${time_max} DSSH_TIME_MODEL_MIN=${time_min})
+	if(model MATCHES "^u")
+		target_compile_definitions(dssh_test_time_${model} PRIVATE DSSH_TIME_MODEL_SIGNED=0)
+	else()
+		target_compile_definitions(dssh_test_time_${model} PRIVATE DSSH_TIME_MODEL_SIGNED=1)
+	endif()
+	if(model MATCHES "^f")
+		target_compile_definitions(dssh_test_time_${model} PRIVATE DSSH_TIME_MODEL_FLOAT=1)
+	else()
+		target_compile_definitions(dssh_test_time_${model} PRIVATE DSSH_TIME_MODEL_FLOAT=0)
+	endif()
+	if(model MATCHES "16$")
+		target_compile_definitions(dssh_test_time_${model} PRIVATE DSSH_TIME_MODEL_NARROW=1)
+	else()
+		target_compile_definitions(dssh_test_time_${model} PRIVATE DSSH_TIME_MODEL_NARROW=0)
+	endif()
+	add_test(NAME dssh_unit_time_${model} COMMAND dssh_test_time_${model})
+endforeach()
 
 # The assertion hook must run before stack-owned contexts go out of scope.
 dssh_add_test(framework test_framework.c)
@@ -263,8 +447,39 @@ add_test(NAME dssh_unit_chan COMMAND dssh_test_chan)
 
 dssh_add_test(crypto test_crypto.c)
 add_test(NAME dssh_unit_crypto COMMAND dssh_test_crypto)
+if(DEUCESSH_CRYPTO_BACKEND STREQUAL "Botan")
+	dssh_add_test(crypto_botan_faults test_crypto_botan_faults.cpp)
+	set_property(TARGET dssh_test_crypto_botan_faults PROPERTY CXX_STANDARD 20)
+	set_property(TARGET dssh_test_crypto_botan_faults PROPERTY CXX_STANDARD_REQUIRED ON)
+	add_test(NAME dssh_unit_crypto_botan_faults COMMAND dssh_test_crypto_botan_faults)
+endif()
 
 # Algorithm validation tests — reference helpers are backend-conditional
+dssh_add_test(signature_storage test_signature_storage.c)
+add_test(NAME dssh_unit_signature_storage COMMAND dssh_test_signature_storage)
+
+dssh_add_test(kex_workspace test_kex_workspace.c)
+add_test(NAME dssh_unit_kex_workspace COMMAND dssh_test_kex_workspace)
+
+dssh_add_test(curve_storage test_curve_storage.c)
+add_test(NAME dssh_unit_curve_storage COMMAND dssh_test_curve_storage)
+
+dssh_add_test(hybrid_storage test_hybrid_storage.c)
+foreach(method IN ITEMS sntrup mlkem)
+	add_test(NAME dssh_unit_hybrid_storage_${method} COMMAND dssh_test_hybrid_storage)
+	set_tests_properties(dssh_unit_hybrid_storage_${method} PROPERTIES
+		ENVIRONMENT "DSSH_TEST_HYBRID=${method}")
+endforeach()
+
+dssh_add_test(dhgex_storage test_dhgex_storage.c)
+add_test(NAME dssh_unit_dhgex_storage COMMAND dssh_test_dhgex_storage)
+set_tests_properties(dssh_unit_dhgex_storage PROPERTIES TIMEOUT 180)
+
+if(DEUCESSH_CRYPTO_BACKEND STREQUAL "OpenSSL")
+	dssh_add_test(hash_provider test_hash_provider.c)
+	add_test(NAME dssh_hash_provider_lifetime COMMAND dssh_test_hash_provider)
+endif()
+
 dssh_add_test(algo_enc test_algo_enc.c)
 if(DEUCESSH_CRYPTO_BACKEND STREQUAL "OpenSSL")
 	target_link_libraries(dssh_test_algo_enc PRIVATE OpenSSL::Crypto)
@@ -282,6 +497,17 @@ endif()
 add_test(NAME dssh_unit_algo_mac COMMAND dssh_test_algo_mac)
 
 dssh_add_test(algo_key test_algo_key.c)
+foreach(result_case IN ITEMS ed25519 rsa256 rsa512 concurrent)
+	add_test(NAME dssh_signature_result_${result_case}
+		COMMAND dssh_test_algo_key --exact result/${result_case})
+	set_tests_properties(dssh_signature_result_${result_case} PROPERTIES
+		ENVIRONMENT "${DSSH_TEST_KEY_ENV}")
+endforeach()
+if(DEUCESSH_CRYPTO_BACKEND STREQUAL "Botan")
+	target_sources(dssh_test_algo_key PRIVATE key_context_fixture_botan.cpp)
+	set_property(TARGET dssh_test_algo_key PROPERTY CXX_STANDARD 20)
+	set_property(TARGET dssh_test_algo_key PROPERTY CXX_STANDARD_REQUIRED ON)
+endif()
 if(DEUCESSH_CRYPTO_BACKEND STREQUAL "OpenSSL")
 	target_link_libraries(dssh_test_algo_key PRIVATE OpenSSL::Crypto)
 elseif(DEUCESSH_CRYPTO_BACKEND STREQUAL "Botan")
@@ -301,6 +527,12 @@ add_test(NAME dssh_targeted_mlkem768_null_ka
 
 # Botan-specific C++ unit tests
 if(DEUCESSH_CRYPTO_BACKEND STREQUAL "Botan")
+	dssh_add_test(mlkem_parity test_mlkem_parity.cpp)
+	target_sources(dssh_test_mlkem_parity PRIVATE ${PROJECT_SOURCE_DIR}/kex/mlkem768.c)
+	set_property(TARGET dssh_test_mlkem_parity PROPERTY CXX_STANDARD 20)
+	set_property(TARGET dssh_test_mlkem_parity PROPERTY CXX_STANDARD_REQUIRED ON)
+	add_test(NAME dssh_unit_mlkem_parity COMMAND dssh_test_mlkem_parity)
+
 	add_executable(dssh_test_botan_algo_key test_botan_algo_key.cpp)
 	set_property(TARGET dssh_test_botan_algo_key PROPERTY CXX_STANDARD 20)
 	set_property(TARGET dssh_test_botan_algo_key PROPERTY CXX_STANDARD_REQUIRED ON)
@@ -335,12 +567,48 @@ endif()
 # ================================================================
 
 dssh_add_test(transport test_transport.c)
-target_link_libraries(dssh_test_transport PRIVATE dssh_mock_io)
+dssh_add_test(kex_framing test_kex_framing.c)
+add_test(NAME dssh_unit_kex_framing COMMAND dssh_test_kex_framing)
+dssh_add_test(module_contract test_module_contract.c)
+add_test(NAME dssh_unit_module_contract COMMAND dssh_test_module_contract)
+dssh_add_test(dhgex_contract test_dhgex_contract.c)
+add_test(NAME dssh_unit_dhgex_contract COMMAND dssh_test_dhgex_contract)
+target_link_libraries(dssh_test_transport PRIVATE dssh_mock_io dssh_mock_comp)
+target_sources(dssh_test_transport PRIVATE dh_group_result_provider.c)
+foreach(part IN ITEMS group_selection group_validation peer_validation mpint_validation provider_contract group_result_handshake group_result_reuse)
+	add_test(NAME dssh_dhgex_${part}
+		COMMAND dssh_test_transport --exact release/dhgex_${part})
+	set_tests_properties(dssh_dhgex_${part} PROPERTIES
+		ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys
+		PASS_REGULAR_EXPRESSION "1 tests: 1 passed, 0 failed, 0 skipped")
+endforeach()
 dssh_add_variant_tests(dssh_transport dssh_test_transport)
+add_test(NAME dssh_transport_modules_stateless
+	COMMAND dssh_test_transport --exact modules/stateless)
+set_tests_properties(dssh_transport_modules_stateless PROPERTIES
+	ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys
+	PASS_REGULAR_EXPRESSION "1 passed, 0 failed, 0 skipped")
+foreach(part IN ITEMS grammar bytes bounds)
+	add_test(NAME dssh_transport_identification_${part}
+		COMMAND dssh_test_transport --exact identification/${part})
+endforeach()
+foreach(part IN ITEMS expansion context_replacement auth_cleanup sensitive_failure teardown_cleanup queued_rekey scratch_failures replay_cleanup callbacks newkeys_framing mac_before_decode zlib_bounds gather_slots rekey_reuse transform_failures provider_changes setup_failures registration zlib zlib_allocations)
+	add_test(NAME dssh_transport_compression_${part}
+		COMMAND dssh_test_transport --exact compression/${part})
+	set_tests_properties(dssh_transport_compression_${part} PROPERTIES
+		ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys)
+endforeach()
 
 dssh_add_test(auth test_auth.c)
-target_link_libraries(dssh_test_auth PRIVATE dssh_mock_io)
+add_test(NAME dssh_auth_request_capacity
+	COMMAND dssh_test_auth --exact release/request_capacity)
+target_link_libraries(dssh_test_auth PRIVATE dssh_mock_io dssh_mock_comp)
+target_sources(dssh_test_auth PRIVATE password_result_provider.c kbi_result_provider.c signature_result_provider.c)
 set(AUTH_TESTS
+	callbacks/banner_transaction callbacks/output_pairs callbacks/password_lifetime callbacks/password_result callbacks/signature_result callbacks/kbi_client_result callbacks/kbi_server_result
+	callbacks/kbi_lifetime callbacks/client_cleanup callbacks/results callbacks/reply_failures
+	framing/client_results framing/client_text framing/client_kbi framing/server_requests
+	framing/server_config_update
 	parse/prefix_valid parse/prefix_empty
 	parse/prefix_no_service parse/prefix_trunc_service
 	parse/prefix_trunc_username parse/prefix_no_method
@@ -474,13 +742,74 @@ set(AUTH_TESTS
 dssh_add_individual_tests(dssh_test_auth dssh_auth AUTH_TESTS)
 
 dssh_add_test(conn test_conn.c)
-target_link_libraries(dssh_test_conn PRIVATE dssh_mock_io)
+target_link_libraries(dssh_test_conn PRIVATE dssh_mock_io dssh_mock_comp)
+
+# Exercise actual auth/channel fixtures with external compression. Exact-test
+# output is required so a skipped setup cannot be credited as a passing case.
+foreach(provider IN ITEMS test-growth zlib)
+	if(provider STREQUAL "zlib" AND NOT ZLIB_FOUND)
+		continue()
+	endif()
+	set(compressed_auth_cases
+		callbacks/password_lifetime callbacks/password_result callbacks/signature_result callbacks/kbi_client_result callbacks/kbi_server_result callbacks/kbi_lifetime callbacks/client_cleanup
+		callbacks/results callbacks/reply_failures framing/server_requests
+		framing/client_kbi auth/roundtrip/password auth/roundtrip/kbi
+		auth/server/password_change)
+	set(compressed_conn_cases
+		queue_retry/packet_size_refusal queue_retry/gather_size_partial
+		queue_retry/packet_concurrent_key queue_retry/gather_concurrent_size
+		queue_retry/packet_channel_key_partial queue_retry/gather_key_probe_write
+		queue_retry/packet_key_rekey queue_retry/gather_size_rekey
+		window_credit/reverse_packet_0_stream_full window_credit/reverse_gather_0_stream_full
+		window_credit/reverse_packet_1_zc_full window_credit/reverse_gather_1_zc_full
+		window_credit/packet_0_stream_full window_credit/gather_0_stream_full
+		window_credit/packet_1_zc_full window_credit/gather_1_zc_full
+		test_session_write_read test_session_read_write_reverse test_session_large_write
+		test_subsys_large_write test_concurrent_write_read test_replenish_queued_accounting
+		zc/open_client zc/cancel data/extended_zc_types control/unknown_replies
+		lifecycle/receive_callback)
+	foreach(layer IN ITEMS auth conn)
+		foreach(case IN LISTS compressed_${layer}_cases)
+			string(REPLACE "/" "_" case_name "${case}")
+			set(test_name "dssh_${layer}_compression_${provider}_${case_name}")
+			add_test(NAME "${test_name}" COMMAND dssh_test_${layer} --exact "${case}")
+			set_tests_properties("${test_name}" PROPERTIES
+				ENVIRONMENT "${DSSH_TEST_KEY_ENV};DSSH_TEST_COMPRESSION=${provider}"
+				FIXTURES_REQUIRED dssh_cached_keys
+				PASS_REGULAR_EXPRESSION "1 tests: 1 passed, 0 failed, 0 skipped")
+		endforeach()
+	endforeach()
+endforeach()
+add_test(NAME dssh_conn_compression_test-growth_window_rekey
+	COMMAND dssh_test_conn --exact compression/window_rekey)
+set_tests_properties(dssh_conn_compression_test-growth_window_rekey PROPERTIES
+	ENVIRONMENT "${DSSH_TEST_KEY_ENV};DSSH_TEST_COMPRESSION=test-growth"
+	FIXTURES_REQUIRED dssh_cached_keys
+	PASS_REGULAR_EXPRESSION "1 tests: 1 passed, 0 failed, 0 skipped"
+	TIMEOUT 60)
 set(CONN_TESTS
+	queue_retry/packet_stream_callback queue_retry/gather_stream_callback
+	queue_retry/packet_ordinary queue_retry/packet_key_refusal queue_retry/packet_size_refusal queue_retry/packet_key_partial queue_retry/packet_size_partial queue_retry/packet_phase_pause queue_retry/packet_concurrent_key queue_retry/packet_channel_key_partial queue_retry/packet_window_size queue_retry/packet_concurrent_size queue_retry/packet_key_rekey queue_retry/packet_size_rekey queue_retry/packet_key_probe_send queue_retry/packet_key_probe_write queue_retry/packet_key_probe_slot queue_retry/packet_key_probe_rekey queue_retry/packet_size_probe_send queue_retry/packet_size_probe_write queue_retry/packet_size_probe_slot queue_retry/packet_size_probe_rekey queue_retry/gather_ordinary queue_retry/gather_key_refusal queue_retry/gather_size_refusal queue_retry/gather_key_partial queue_retry/gather_size_partial queue_retry/gather_phase_pause queue_retry/gather_concurrent_key queue_retry/gather_channel_key_partial queue_retry/gather_window_size queue_retry/gather_concurrent_size queue_retry/gather_key_rekey queue_retry/gather_size_rekey queue_retry/gather_key_probe_send queue_retry/gather_key_probe_write queue_retry/gather_key_probe_slot queue_retry/gather_key_probe_rekey queue_retry/gather_size_probe_send queue_retry/gather_size_probe_write queue_retry/gather_size_probe_slot queue_retry/gather_size_probe_rekey
+	control_frame/wire_normal_window control_frame/wire_normal_eof control_frame/wire_normal_close control_frame/wire_normal_success control_frame/wire_normal_failure control_frame/wire_setup_window control_frame/wire_setup_eof control_frame/wire_setup_close control_frame/wire_setup_success control_frame/wire_setup_failure control_frame/wire_pending_success control_frame/wire_pending_failure
+	control_frame/stream_normal_window control_frame/stream_normal_eof control_frame/stream_normal_close control_frame/stream_normal_success control_frame/stream_normal_failure control_frame/stream_normal_valid control_frame/stream_setup_window control_frame/stream_setup_eof control_frame/stream_setup_close control_frame/stream_setup_success control_frame/stream_setup_failure control_frame/stream_setup_valid control_frame/zc_normal_window control_frame/zc_normal_eof control_frame/zc_normal_close control_frame/zc_normal_success control_frame/zc_normal_failure control_frame/zc_normal_valid control_frame/zc_setup_window control_frame/zc_setup_eof control_frame/zc_setup_close control_frame/zc_setup_success control_frame/zc_setup_failure control_frame/zc_setup_valid control_frame/unknown control_frame/stale
+	window_credit/arithmetic window_credit/atomic
+	window_credit/packet_0_stream_small window_credit/packet_0_stream_full window_credit/packet_0_zc_small window_credit/packet_0_zc_full window_credit/packet_0_cancel window_credit/packet_0_oversize window_credit/packet_0_key_limit window_credit/packet_0_io_failure window_credit/packet_1_stream_small window_credit/packet_1_stream_full window_credit/packet_1_zc_small window_credit/packet_1_zc_full window_credit/packet_1_cancel window_credit/packet_1_oversize window_credit/packet_1_key_limit window_credit/packet_1_io_failure window_credit/gather_0_stream_small window_credit/gather_0_stream_full window_credit/gather_0_zc_small window_credit/gather_0_zc_full window_credit/gather_0_cancel window_credit/gather_0_oversize window_credit/gather_0_key_limit window_credit/gather_0_io_failure window_credit/gather_1_stream_small window_credit/gather_1_stream_full window_credit/gather_1_zc_small window_credit/gather_1_zc_full window_credit/gather_1_cancel window_credit/gather_1_oversize window_credit/gather_1_key_limit window_credit/gather_1_io_failure window_credit/reverse_packet_0_stream_small window_credit/reverse_packet_0_stream_full window_credit/reverse_packet_0_zc_small window_credit/reverse_packet_0_zc_full window_credit/reverse_packet_0_cancel window_credit/reverse_packet_0_oversize window_credit/reverse_packet_0_key_limit window_credit/reverse_packet_0_io_failure window_credit/reverse_packet_1_stream_small window_credit/reverse_packet_1_stream_full window_credit/reverse_packet_1_zc_small window_credit/reverse_packet_1_zc_full window_credit/reverse_packet_1_cancel window_credit/reverse_packet_1_oversize window_credit/reverse_packet_1_key_limit window_credit/reverse_packet_1_io_failure window_credit/reverse_gather_0_stream_small window_credit/reverse_gather_0_stream_full window_credit/reverse_gather_0_zc_small window_credit/reverse_gather_0_zc_full window_credit/reverse_gather_0_cancel window_credit/reverse_gather_0_oversize window_credit/reverse_gather_0_key_limit window_credit/reverse_gather_0_io_failure window_credit/reverse_gather_1_stream_small window_credit/reverse_gather_1_stream_full window_credit/reverse_gather_1_zc_small window_credit/reverse_gather_1_zc_full window_credit/reverse_gather_1_cancel window_credit/reverse_gather_1_oversize window_credit/reverse_gather_1_key_limit window_credit/reverse_gather_1_io_failure
+	accept_callback/publish_before_return accept_callback/terminate_deferred accept_callback/stop_deferred accept_callback/cleanup_deferred
+	accept_callback/pty_silent_positive accept_callback/pty_silent_negative accept_callback/pty_reply_positive accept_callback/pty_reply_negative accept_callback/env_silent_positive accept_callback/env_silent_negative accept_callback/env_reply_positive accept_callback/env_reply_negative accept_callback/shell_silent_positive accept_callback/shell_silent_negative accept_callback/shell_reply_positive accept_callback/shell_reply_negative accept_callback/exec_silent_positive accept_callback/exec_silent_negative accept_callback/exec_reply_positive accept_callback/exec_reply_negative accept_callback/subsystem_silent_positive accept_callback/subsystem_silent_negative accept_callback/subsystem_reply_positive accept_callback/subsystem_reply_negative accept_callback/pty_request_only accept_callback/env_request_only
 	test_assertion_cleanup
 	test_session_start test_session_stop test_session_start_stop
 	test_session_stop_open_channel
+	lifecycle/join_once lifecycle/demux_callback lifecycle/receive_callback
+	lifecycle/recursive_callbacks lifecycle/tx_reservation
+	clock/deadline clock/poll_accept clock/pending_waits clock/receive
+	data/extended_stream_types data/extended_zc_types data/framing
+	data/replenish_sync control/unknown_replies
 	test_open_exec test_open_exec_command test_open_exec_rejected
 	test_open_shell test_open_subsystem
+	open/before_start open/type_and_queue_policy open/response_state
+	open/failure_roundtrip open/sync_failures
+	io/validation io/request_response_state io/sync_failures io/tx_sync_sweep
+	io/registration_failures
 	test_session_write_read test_session_read_write_reverse
 	test_session_write_ext test_session_read_ext
 	test_session_poll_read test_session_poll_timeout
@@ -541,11 +870,55 @@ set(CONN_TESTS
 	chanreq/parse_truncated_type_len chanreq/parse_truncated_type
 	chanreq/parse_truncated_want_reply
 	zc/open_client zc/cancel null/zc_open
+	event/overflow_request_notification event/overflow_eof_notification event/overflow_close_notification event/overflow_request_close_failure event/overflow_eof_close_failure event/overflow_close_close_failure event/overflow_request_normal event/overflow_eof_normal event/overflow_close_normal
+	framing/name_byte_and_boolean
+	framing/setup_short_length framing/setup_short_name framing/setup_short_reply framing/setup_empty framing/setup_nonascii framing/setup_zero framing/setup_comma framing/setup_long framing/normal_short_length framing/normal_short_name framing/normal_short_reply framing/normal_empty framing/normal_nonascii framing/normal_zero framing/normal_comma framing/normal_long framing/break_short framing/break_trailer framing/shell_reply framing/shell_no_reply framing/setup_unknown framing/normal_unknown framing/event_lengths_stream framing/event_lengths_zc
+	params/stream_sync params/zc_sync
+	params/stream_validation params/zc_validation
+	params/stream_snapshot params/stream_term params/stream_command params/stream_subsystem params/stream_modes params/stream_env_array params/stream_env_name1 params/stream_env_value1 params/stream_env_name2 params/stream_env_value2 params/zc_snapshot params/zc_term params/zc_command params/zc_subsystem params/zc_modes params/zc_env_array params/zc_env_name1 params/zc_env_value1 params/zc_env_name2 params/zc_env_value2
+	accept_failure/notify_failure accept_failure/success_send_failure accept_failure/window_send_failure
+	accept_failure/close_deadline
+	accept_failure/channel_storage accept_failure/event_storage accept_failure/param_storage accept_failure/stream_first accept_failure/stream_second accept_failure/exec_reject accept_failure/exec_no_reply accept_failure/peer_close accept_failure/shell_reject accept_failure/subsystem_reject accept_failure/buf_init accept_failure/cb_init accept_failure/cnd_init accept_failure/slot_first accept_failure/slot_second accept_failure/stream_first_no_reply accept_failure/stream_second_no_reply
+	setup/confirmation_cleanup
+	setup/mailbox_no_allocation setup/gap_disable setup/gap_detach setup/gap_terminate setup/gap_reacquire
+	setup/mailbox_reuse setup/mailbox_growth setup/mailbox_rollback setup/mailbox_bound
+	setup/terminal_storage setup/terminal_first_failure setup/terminal_second_failure
+	event/text_poll_reuse
+	event/text_growth_unlocked event/text_poll_race
+	event/text_binary_callback event/text_binary_poll event/text_empty_callback event/text_empty_poll event/text_packet_boundary
+	event/delivery_atomic_state
+	event/delivery_self_disable
+	event/delivery_client_defaults event/delivery_lengths event/delivery_positions event/delivery_reacquire
+	event/delivery_acquire event/delivery_queue_allocation event/delivery_malformed event/delivery_close_race
+	event/delivery_peer_stream event/delivery_peer_zc event/delivery_stress event/delivery_switch event/delivery_replacement event/delivery_lifecycle
 	event/session_set_cb event/session_set_cb_toolate event/chan_set_cb
 	event/session_set_max event/session_set_max_toolate event/chan_set_max
-	pty/get_pty env/roundtrip
+	pty/get_pty env/roundtrip env/callback_rejection
 )
 dssh_add_individual_tests(dssh_test_conn dssh_conn CONN_TESTS)
+get_property(queue_retry_tests DIRECTORY PROPERTY TESTS)
+foreach(case IN LISTS queue_retry_tests)
+	if(case MATCHES "^dssh_conn_queue_retry/")
+		set_property(TEST "${case}" APPEND PROPERTY ENVIRONMENT "DSSH_TEST_COMPRESSION=test-growth")
+	endif()
+endforeach()
+
+
+# Actual SIGABRT checks run in a fresh exec, with no inherited library workers.
+if(UNIX)
+	add_executable(dssh_test_fatal_driver test_fatal_driver.c)
+	set_property(TARGET dssh_test_fatal_driver PROPERTY C_STANDARD ${DEUCESSH_C_STANDARD})
+	set_property(TARGET dssh_test_fatal_driver PROPERTY C_STANDARD_REQUIRED ON)
+	target_compile_definitions(dssh_test_fatal_driver PRIVATE _POSIX_C_SOURCE=200809L)
+	target_compile_options(dssh_test_fatal_driver PRIVATE ${DEUCESSH_COMPILE_OPTIONS})
+	foreach(operation IN ITEMS stop cleanup)
+		add_test(NAME dssh_lifecycle_fatal_${operation}
+			COMMAND dssh_test_fatal_driver $<TARGET_FILE:dssh_test_conn> ${operation})
+		set_tests_properties(dssh_lifecycle_fatal_${operation} PROPERTIES
+			FIXTURES_REQUIRED dssh_cached_keys ENVIRONMENT "${DSSH_TEST_KEY_ENV}"
+			TIMEOUT 60)
+	endforeach()
+endif()
 
 # ================================================================
 # Tier 1b: Alloc failure tests (need mock allocator + mock I/O)
@@ -656,12 +1029,52 @@ set_tests_properties(
 dssh_add_test(thread_errors test_thread_errors.c)
 target_link_libraries(dssh_test_thread_errors PRIVATE dssh_mock_io)
 dssh_add_variant_tests(dssh_thrd dssh_test_thread_errors)
+set(WAIT_CONTRACT_TESTS thrd/wait_contract_errors thrd/wait_contract_spurious
+	thrd/wait_contract_timeout_errors thrd/wait_contract_timeouts)
+dssh_add_individual_tests(dssh_test_thread_errors dssh_wait WAIT_CONTRACT_TESTS)
+if(UNIX)
+	foreach(path IN ITEMS primitive event limit eof close log-queue log-empty log-data wa-idle wa-zero wa-send)
+		foreach(mode IN ITEMS held released)
+			add_test(NAME dssh_unlock_fatal_${path}_${mode}
+				COMMAND dssh_test_fatal_driver $<TARGET_FILE:dssh_test_thread_errors>
+					--unlock-fatal ${path} ${mode})
+			set_tests_properties(dssh_unlock_fatal_${path}_${mode} PROPERTIES
+				FIXTURES_REQUIRED dssh_cached_keys ENVIRONMENT "${DSSH_TEST_KEY_ENV}"
+				TIMEOUT 60)
+		endforeach()
+	endforeach()
+	foreach(path IN ITEMS lock-tx lock-slot lock-accept lock-registry lock-channel
+		notify-tx notify-slot notify-accept notify-channel retry-notify)
+		foreach(mode IN ITEMS before after)
+			add_test(NAME dssh_wake_fatal_${path}_${mode}
+				COMMAND dssh_test_fatal_driver $<TARGET_FILE:dssh_test_thread_errors>
+					--wake-fatal ${path} ${mode})
+			set_tests_properties(dssh_wake_fatal_${path}_${mode} PROPERTIES TIMEOUT 30)
+		endforeach()
+	endforeach()
+endif()
 
 # ================================================================
 # Tier 3a: Self-test (integration) — one process per case and variant
 # ================================================================
 
 dssh_add_test(selftest test_selftest.c)
+target_link_libraries(dssh_test_selftest PRIVATE dssh_mock_comp)
+foreach(provider IN ITEMS test-growth zlib)
+	if(provider STREQUAL "zlib" AND NOT ZLIB_FOUND)
+		continue()
+	endif()
+	foreach(case IN ITEMS test_self_rekey_during_data test_self_rekey_manual
+		test_self_rekey_preserves_channels test_self_rekey_inflight_data
+		test_self_window_adjust_race)
+		set(test_name "dssh_self_compression_${provider}_${case}")
+		add_test(NAME "${test_name}" COMMAND dssh_test_selftest --exact "${case}")
+		set_tests_properties("${test_name}" PROPERTIES
+			ENVIRONMENT "${DSSH_TEST_KEY_ENV};DSSH_TEST_COMPRESSION=${provider}"
+			FIXTURES_REQUIRED dssh_cached_keys
+			PASS_REGULAR_EXPRESSION "1 tests: 1 passed, 0 failed, 0 skipped")
+	endforeach()
+endforeach()
 set(SELFTEST_TESTS
 	test_assertion_cleanup
 	test_self_handshake_curve25519

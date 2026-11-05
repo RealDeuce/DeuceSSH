@@ -149,27 +149,33 @@ Eurydice_slice_to_array3(uint8_t *dst_tag, char *dst_ok, Eurydice_slice src, siz
 
 // CORE STUFF (conversions, endianness, ...)
 
+/* Bytewise glue is independent of host byte order and object layout. */
 static inline void
 core_num__u64_9__to_le_bytes(uint64_t v, uint8_t buf[8])
 {
-	v = lcx_htole64(v);
-	memcpy(buf, &v, sizeof(v));
+	for (size_t i = 0; i < 8; i++) {
+		uint8_t octet = (uint8_t)(v & UINT64_C(0xff));
+		buf[i] = octet;
+		v >>= 8;
+	}
 }
 
 static inline uint64_t
 core_num__u64_9__from_le_bytes(uint8_t buf[8])
 {
-	uint64_t v;
-	memcpy(&v, buf, sizeof(v));
-	return lcx_le64toh(v);
+	uint64_t value = 0;
+	for (size_t i = 0; i < 8; i++)
+		value |= (uint64_t)buf[i] << (8 * i);
+	return value;
 }
 
 static inline uint32_t
 core_num__u32_8__from_le_bytes(uint8_t buf[4])
 {
-	uint32_t v;
-	memcpy(&v, buf, sizeof(v));
-	return lcx_le32toh(v);
+	uint32_t value = 0;
+	for (size_t i = 0; i < 4; i++)
+		value |= (uint32_t)buf[i] << (8 * i);
+	return value;
 }
 
 static inline uint32_t

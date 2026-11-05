@@ -23,6 +23,7 @@ struct dssh_tx_iov; /* full definition in deucessh.h */
 #include "deucessh-key-algo.h"
 #include "deucessh-lang.h"
 #include "deucessh-mac.h"
+#include "deucessh-result.h"
 
 /* Transport layer generic */
 #define SSH_MSG_DISCONNECT      UINT8_C(1)
@@ -63,7 +64,13 @@ struct dssh_tx_iov; /* full definition in deucessh.h */
  * We round up for alignment.
  */
 #define SSH_BPP_PACKET_SIZE_MIN 33280
-#define SSH_BPP_PACKET_SIZE_MAX (64 * 1024 * 1024) /* 64 MiB */
+#define SSH_BPP_PACKET_SIZE_MAX (UINT32_C(64) * UINT32_C(1024) * UINT32_C(1024)) /* 64 MiB */
+
+/* Immutable view into a saved KEXINIT name-list. */
+struct dssh_name_list {
+	const uint8_t *data;
+	size_t len;
+};
 
 /* Module type definitions are now in the public headers above. */
 
@@ -76,6 +83,7 @@ struct dssh_tx_iov; /* full definition in deucessh.h */
 struct dssh_rekey_msg {
 	struct dssh_rekey_msg *next;
 	uint8_t                msg_type;
+	uint32_t               sequence;
 	size_t                 len;
 	uint8_t                data[];
 };
@@ -90,7 +98,7 @@ struct dssh_rekey_msg {
  * Channel-level: wa (9 B), chan_fail (8 B).
  */
 struct dssh_tx_slot {
-	_Atomic bool ready;       /* demux sets true; drain clears        */
+	_Atomic bool ready;       /* preserved until sent or terminal   */
 	uint8_t      payload_len; /* bytes written at buf[9]              */
 	size_t       buf_sz;      /* current allocation (for rekey resize)*/
 	uint8_t     *buf;         /* packet buffer, or NULL before KEX    */
@@ -105,10 +113,14 @@ struct dssh_tx_slot {
 #define DSSH_REKEY_HARD_LIMIT UINT32_C(0x80000000) /* 2^31 packets */
 #define DSSH_REKEY_SECONDS    3600                 /* 1 hour */
 
+/* Aggregate bounds for peer messages in flight before its rekey response. */
+#define DSSH_REKEY_QUEUE_MAX_MESSAGES 128
+#define DSSH_REKEY_QUEUE_MAX_BYTES UINT32_C(1048576)
+
 struct dssh_transport_state_s {
 	/* 8-byte fixed */
 	uint64_t rx_bytes_since_rekey; /* bytes received since last (re)key (RX owner) */
-	time_t   rekey_time;           /* time of last (re)key */
+	time_t   rekey_time;           /* TIME_UTC seconds of last (re)key */
 
 				       /* Pointers and size_t (pointer-sized) */
 	size_t packet_buf_sz;
@@ -125,14 +137,16 @@ struct dssh_transport_state_s {
 	uint8_t               *rx_packet;
 	uint8_t               *rx_mac_buf;      /* received MAC from wire (digest_size bytes) */
 	uint8_t               *rx_mac_computed; /* computed MAC for comparison */
+	size_t                 rx_mac_capacity; /* retained capacity of each MAC buffer */
 	size_t                 id_str_sz;
 	size_t                 remote_id_str_sz;
 	char                 **remote_languages;
 	_Atomic dssh_kex       kex_selected;
-	size_t                 shared_secret_sz;
-	uint8_t               *shared_secret;
-	size_t                 exchange_hash_sz;
-	uint8_t               *exchange_hash;
+	/* Sole receive/packet-engine owner serializes the active KEX state and
+	 * result. Negotiation may replace kex_selected without changing creator. */
+	dssh_kex               kex_active;
+	void                  *kex_state;
+	struct dssh_kex_result  kex_result;
 	size_t                 session_id_sz;
 	uint8_t               *session_id;
 	size_t                 our_kexinit_sz;
@@ -141,6 +155,8 @@ struct dssh_transport_state_s {
 	uint8_t               *peer_kexinit;
 	struct dssh_rekey_msg *rekey_queue_head;  /* buffered msgs during kexinit */
 	struct dssh_rekey_msg *rekey_queue_tail;
+	size_t                 rekey_queue_count;
+	size_t                 rekey_queue_bytes;
 	struct dssh_tx_slot    global_reply_slot; /* REQUEST_SUCCESS/FAILURE (1 B) */
 	struct dssh_tx_slot    open_fail_slot;    /* CHANNEL_OPEN_FAILURE (16 B)   */
 	_Atomic dssh_key_algo  key_algo_selected;
@@ -152,10 +168,25 @@ struct dssh_transport_state_s {
 	_Atomic dssh_mac       mac_c2s_selected;
 	dssh_mac_ctx          *mac_s2c_ctx;
 	_Atomic dssh_mac       mac_s2c_selected;
+	/* Active context owners. Negotiation can select replacement modules
+	 * while packet processing must continue using the old key epoch.
+	 * Accessed by the receive owner or the exclusive packet-engine owner. */
+	dssh_enc               enc_c2s_active;
+	dssh_enc               enc_s2c_active;
+	dssh_mac               mac_c2s_active;
+	dssh_mac               mac_s2c_active;
 	dssh_comp_ctx         *comp_c2s_ctx;
 	_Atomic dssh_comp      comp_c2s_selected;
+	dssh_comp              comp_c2s_active;
 	dssh_comp_ctx         *comp_s2c_ctx;
 	_Atomic dssh_comp      comp_s2c_selected;
+	dssh_comp              comp_s2c_active;
+	/* Exclusive TX/RX owners use separate bounded transform scratch buffers.
+	 * The transmit buffer has the normal seq/header/payload layout; receive
+	 * scratch retains only compressed input while output goes to rx_packet. */
+	uint8_t               *comp_tx_packet;
+	uint8_t               *comp_rx_input;
+	size_t                 comp_tx_payload_limit;
 
 	/* C11 synchronization (platform-dependent size) */
 	cnd_t rekey_cnd;    /* wakes senders blocked by TX ownership/rekey */
@@ -174,7 +205,7 @@ struct dssh_transport_state_s {
 	uint32_t rx_seq;
 	uint32_t rx_since_rekey; /* packets received since last (re)key (RX owner) */
 	uint32_t last_rx_seq;    /* seq number of last received packet */
-	uint32_t rekey_seconds;  /* time-based rekey threshold; 0 = disabled */
+	atomic_uint_least32_t rekey_seconds; /* runtime-set threshold; 0 = disabled */
 
 				 /* Pointer-sized — round-robin index for fair channel slot drain */
 	size_t drain_next_ch;
@@ -217,7 +248,9 @@ struct dssh_transport_state_s {
  * applications.  DSSH_PRIVATE in shared builds.
  * ================================================================ */
 DSSH_PRIVATE int      tx_finalize(struct dssh_session_s *sess, uint8_t *buf, size_t payload_len);
-DSSH_PRIVATE void     drain_tx_slots(struct dssh_session_s *sess);
+DSSH_PRIVATE size_t   tx_payload_capacity(struct dssh_session_s *sess);
+DSSH_PRIVATE bool     dssh_result_callback_active(void);
+DSSH_PRIVATE int      drain_tx_slots(struct dssh_session_s *sess);
 DSSH_PRIVATE int      send_packet(struct dssh_session_s *sess, const uint8_t *payload, size_t payload_len,
 	 uint32_t *seq_out);
 DSSH_PRIVATE uint8_t *send_begin(struct dssh_session_s *sess, uint8_t msg_type, size_t *max_len, int *err_out);
@@ -230,6 +263,7 @@ DSSH_PRIVATE int      schedule_wa_slot(struct dssh_session_s *sess);
 DSSH_PRIVATE int      tx_acquire(struct dssh_session_s *sess, uint8_t msg_type);
 DSSH_PRIVATE bool     tx_owner_is_current(struct dssh_session_s *sess);
 DSSH_PRIVATE void     tx_unlock_with_slots(struct dssh_session_s *sess);
+DSSH_PRIVATE int      tx_unlock_with_result(struct dssh_session_s *sess, int result);
 DSSH_PRIVATE size_t   tx_slot_buf_size(size_t max_payload, size_t block_size, uint16_t mac_digest);
 DSSH_PRIVATE int      alloc_tx_slot(struct dssh_tx_slot *slot, size_t max_payload, size_t block_size,
 	 uint16_t mac_digest);
@@ -300,6 +334,8 @@ EVP_CIPHER_CTX *dssh_test_EVP_CIPHER_CTX_new(void);
 EVP_MAC_CTX    *dssh_test_EVP_MAC_CTX_new(EVP_MAC *mac);
 EVP_MAC        *dssh_test_EVP_MAC_fetch(OSSL_LIB_CTX *ctx, const char *algorithm, const char *properties);
 EVP_MD         *dssh_test_EVP_MD_fetch(OSSL_LIB_CTX *ctx, const char *algorithm, const char *properties);
+int             dssh_test_EVP_MD_get_size(const EVP_MD *md);
+int             dssh_test_EVP_EncodeBlock(unsigned char *out, const unsigned char *in, int length);
 EVP_PKEY_CTX   *dssh_test_EVP_PKEY_CTX_new(EVP_PKEY *pkey, ENGINE *e);
 EVP_PKEY_CTX   *dssh_test_EVP_PKEY_CTX_new_id(int id, ENGINE *e);
 EVP_PKEY_CTX   *dssh_test_EVP_PKEY_CTX_new_from_name(OSSL_LIB_CTX *ctx, const char *name, const char *propquery);
@@ -314,6 +350,8 @@ OSSL_PARAM     *dssh_test_OSSL_PARAM_BLD_to_param(OSSL_PARAM_BLD *bld);
  #define EVP_MAC_CTX_new(m)                      dssh_test_EVP_MAC_CTX_new(m)
  #define EVP_MAC_fetch(c, a, p)                  dssh_test_EVP_MAC_fetch(c, a, p)
  #define EVP_MD_fetch(c, a, p)                   dssh_test_EVP_MD_fetch(c, a, p)
+ #define EVP_MD_get_size(m)                     dssh_test_EVP_MD_get_size(m)
+ #define EVP_EncodeBlock(o, i, n)               dssh_test_EVP_EncodeBlock(o, i, n)
  #define EVP_PKEY_CTX_new(k, e)                  dssh_test_EVP_PKEY_CTX_new(k, e)
  #define EVP_PKEY_CTX_new_id(i, e)               dssh_test_EVP_PKEY_CTX_new_id(i, e)
  #define EVP_PKEY_CTX_new_from_name(c, n, p)     dssh_test_EVP_PKEY_CTX_new_from_name(c, n, p)
@@ -324,6 +362,7 @@ OSSL_PARAM     *dssh_test_OSSL_PARAM_BLD_to_param(OSSL_PARAM_BLD *bld);
  #define OSSL_PARAM_BLD_to_param(b)              dssh_test_OSSL_PARAM_BLD_to_param(b)
 /* Operation wrappers (return 0/<=0 on failure) */
 int dssh_test_EVP_DigestInit_ex(EVP_MD_CTX *ctx, const EVP_MD *type, ENGINE *impl);
+int dssh_test_EVP_MD_CTX_reset(EVP_MD_CTX *ctx);
 int dssh_test_EVP_DigestUpdate(EVP_MD_CTX *ctx, const void *d, size_t cnt);
 int dssh_test_EVP_DigestFinal_ex(EVP_MD_CTX *ctx, unsigned char *md, unsigned int *s);
 int dssh_test_EVP_DigestSignInit(EVP_MD_CTX *ctx, EVP_PKEY_CTX **pctx, const EVP_MD *type, ENGINE *e,
@@ -356,12 +395,14 @@ int dssh_test_RAND_bytes(unsigned char *buf, int num);
 int dssh_test_BN_mod_exp(BIGNUM *r, const BIGNUM *a, const BIGNUM *p, const BIGNUM *m, BN_CTX *ctx);
 int dssh_test_BN_rand(BIGNUM *rnd, int bits, int top, int bottom);
 BIGNUM *dssh_test_BN_bin2bn(const unsigned char *s, int len, BIGNUM *ret);
+int dssh_test_BN_bn2bin(const BIGNUM *value, unsigned char *out);
 int     dssh_test_OSSL_PARAM_BLD_push_BN(OSSL_PARAM_BLD *bld, const char *key, const BIGNUM *bn);
 int     dssh_test_EVP_CIPHER_CTX_set_padding(EVP_CIPHER_CTX *ctx, int pad);
 int     dssh_test_EVP_PKEY_CTX_set_params(EVP_PKEY_CTX *ctx, const OSSL_PARAM *params);
 
  #define EVP_Digest(d, c, m, s, t, i)         dssh_test_EVP_Digest(d, c, m, s, t, i)
  #define EVP_DigestInit_ex(c, t, i)           dssh_test_EVP_DigestInit_ex(c, t, i)
+ #define EVP_MD_CTX_reset(c)                 dssh_test_EVP_MD_CTX_reset(c)
  #define EVP_DigestUpdate(c, d, n)            dssh_test_EVP_DigestUpdate(c, d, n)
  #define EVP_DigestFinal_ex(c, m, s)          dssh_test_EVP_DigestFinal_ex(c, m, s)
  #define EVP_DigestSignInit(c, p, t, e, k)    dssh_test_EVP_DigestSignInit(c, p, t, e, k)
@@ -386,6 +427,7 @@ int     dssh_test_EVP_PKEY_CTX_set_params(EVP_PKEY_CTX *ctx, const OSSL_PARAM *p
  #define BN_mod_exp(r, a, p, m, c)            dssh_test_BN_mod_exp(r, a, p, m, c)
  #define BN_rand(r, b, t, bo)                 dssh_test_BN_rand(r, b, t, bo)
  #define BN_bin2bn(s, l, r)                   dssh_test_BN_bin2bn(s, l, r)
+ #define BN_bn2bin(v, o)                      dssh_test_BN_bn2bin(v, o)
  #define OSSL_PARAM_BLD_push_BN(b, k, bn)     dssh_test_OSSL_PARAM_BLD_push_BN(b, k, bn)
  #define EVP_CIPHER_CTX_set_padding(c, p)     dssh_test_EVP_CIPHER_CTX_set_padding(c, p)
  #define EVP_PKEY_CTX_set_params(c, p)        dssh_test_EVP_PKEY_CTX_set_params(c, p)

@@ -4,6 +4,7 @@
 #define DSSH_CONN_H
 
 #include "deucessh.h"
+#include "deucessh-result.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -12,9 +13,11 @@ extern "C" {
 /* Opaque channel handle.  Created by open/accept, freed by close.
 *
 * Lifetime rules:
-*   - After dssh_session_close(ch) or dssh_channel_close(ch),
-*     the handle is freed and MUST NOT be used again.
-*   - After dssh_session_stop(), ALL channel handles are freed.
+*   - After dssh_chan_close(ch),
+*     the handle MUST NOT be used again. Setup callback cancellation defers
+*     physical retirement until the callback returns (see below).
+*   - After dssh_session_stop() successfully joins the worker, all channel
+*     handles are freed (see the shutdown conditions below).
 *   - Passing a previously-closed handle is undefined behavior. */
 typedef struct dssh_channel_s *dssh_channel;
 
@@ -31,7 +34,13 @@ DSSH_PUBLIC int dssh_session_start(dssh_session sess);
 
 /*
  * Stop the demux thread and free all channel/demux resources.
- * Called automatically by dssh_session_cleanup().
+ * Called automatically by dssh_session_cleanup(). Stop application threads
+ * using the session or channels first, and serialize lifecycle calls.
+ * A failed join of the valid joinable demux is an unrecoverable internal
+ * ownership failure and calls abort(). Calls from the session's
+ * callbacks or a thread owning its zero-copy TX reservation only request
+ * termination; call stop again outside that context to release resources.
+ * Callback restrictions documented in deucessh.h still apply.
  */
 DSSH_PUBLIC void dssh_session_stop(dssh_session sess);
 
@@ -78,8 +87,9 @@ struct dssh_chan_mode_entry {
 
 /*
  * Channel parameters — populated via builder API, consumed at open time.
- * After dssh_chan_open() or dssh_chan_accept() returns, call
- * dssh_chan_params_free() to release heap storage.
+ * Caller-created builder storage is released with dssh_chan_params_free()
+ * after open returns. Server setup callback parameters are borrowed;
+ * applications must not free them.
  */
 struct dssh_chan_params {
 	/* Pointers */
@@ -132,19 +142,23 @@ DSSH_PUBLIC int  dssh_chan_params_add_env(struct dssh_chan_params *p, const char
 #define DSSH_EVENT_EXIT_SIGNAL   7
 
 /* Event struct — returned by dssh_chan_read_event().
- * String pointers are valid until the next dssh_chan_read_event() or
- * dssh_chan_poll() on the same channel. */
+ * Text fields are borrowed byte views of the complete accepted wire fields,
+ * including embedded zero bytes. No terminator or normalization is promised.
+ * Empty views have NULL data and zero len. Views remain valid until the next
+ * dssh_chan_read_event() or dssh_chan_poll() on the same channel. In an event
+ * callback, the event and its views are valid only for that invocation.
+ * Copy bytes needed beyond that interval; never free/release these views. */
 struct dssh_chan_event {
 	/* Pointer-sized */
-	size_t stdout_pos; /* bytes of stdout received before event */
-	size_t stderr_pos; /* bytes of stderr received before event */
+	size_t stdout_pos; /* callback: cumulative received; poll: unread bytes */
+	size_t stderr_pos; /* corresponding stderr position */
 			   /* 4-byte */
 	int type;
 
 	/* Union (mixed sizes, largest member determines layout) */
 	union {
 		struct {
-			const char *name;
+			struct dssh_bytes name;
 		} signal;
 
 		struct {
@@ -160,16 +174,19 @@ struct dssh_chan_event {
 		} exit_status;
 
 		struct {
-			const char *signal_name;
+			struct dssh_bytes signal_name;
 			bool        core_dumped;
-			const char *error_message;
+			struct dssh_bytes error_message;
+			struct dssh_bytes language;
 		} exit_signal;
 	};
 };
 
 /* ZC data callback — fires on demux thread for each inbound
  * CHANNEL_DATA / EXTENDED_DATA.  Returns bytes consumed for
- * WINDOW_ADJUST.
+ * WINDOW_ADJUST. stream is 0 for ordinary data and 1 for stderr.
+ * Unsupported nonzero extended data types are discarded with their window
+ * credit returned; they are not passed to the callback.
  *
  * `len` may be smaller than the wire packet's payload (or zero)
  * either because the library truncated to what the advertised
@@ -184,8 +201,12 @@ struct dssh_chan_event {
  * window truncation. */
 typedef uint32_t (*dssh_chan_zc_cb)(dssh_channel ch, int stream, const uint8_t *data, size_t len, void *cbdata);
 
-/* Event callback — fires from demux thread when an event is queued.
- * Optional alternative to poll + read_event. */
+/* Event callback — receives events on the demux thread in wire order.
+ * An event is consumed by this callback or queued for poll/read_event, never
+ * both. Positions count bytes delivered before the event, saturating at
+ * SIZE_MAX. The event and strings are valid only until this callback returns.
+ * No library mutex is held. Do not call channel I/O, poll/read_event, open,
+ * accept or TX functions here; enqueue application work for another thread. */
 typedef void (*dssh_chan_event_cb)(dssh_channel ch, const struct dssh_chan_event *event, void *cbdata);
 
 /* Server accept: result struct filled by terminal request callback */
@@ -257,7 +278,9 @@ DSSH_PUBLIC int dssh_chan_read_event(dssh_channel ch, struct dssh_chan_event *ev
 DSSH_PUBLIC int dssh_chan_shutwr(dssh_channel ch);
 
 /* Close: send exit-status (if exit_code >= 0) + EOF + CLOSE.
- * Frees the channel handle. */
+ * Frees the channel handle. In a server setup callback this records setup
+ * cancellation, with physical retirement deferred until the callback returns;
+ * see the accept callback contract below. */
 DSSH_PUBLIC int dssh_chan_close(dssh_channel ch, int64_t exit_code);
 
 /* Control: signal, window-change, break (RFC 4335). */
@@ -266,7 +289,8 @@ DSSH_PUBLIC int dssh_chan_send_window_change(dssh_channel ch, uint32_t cols, uin
     uint32_t hpx);
 DSSH_PUBLIC int dssh_chan_send_break(dssh_channel ch, uint32_t length);
 
-/* Getters -- valid after open or accept, until close. */
+/* Getters -- valid after open or accept until close, and on the borrowed
+ * handle during its server setup callback as described below. */
 DSSH_PUBLIC enum dssh_chan_type            dssh_chan_get_type(dssh_channel ch);
 DSSH_PUBLIC const char                    *dssh_chan_get_command(dssh_channel ch);
 DSSH_PUBLIC const char                    *dssh_chan_get_subsystem(dssh_channel ch);
@@ -293,6 +317,10 @@ DSSH_PUBLIC int dssh_chan_zc_send(dssh_channel ch, size_t len);
 DSSH_PUBLIC int dssh_chan_zc_cancel(dssh_channel ch);
 
 /* ---- Event callbacks (optional, alternative to poll + read_event) ---- */
+/* Replaces the callback/cbdata pair used by future delivery snapshots. An
+ * already snapshotted invocation may finish after this setter returns: keep
+ * its code and cbdata alive until it finishes. Existing queued/frozen poll
+ * events remain available; setting NULL routes future events to that queue. */
 DSSH_PUBLIC int dssh_chan_set_event_cb(dssh_channel ch, dssh_chan_event_cb cb, void *cbdata);
 
 /* Must be set before dssh_session_start(); returns DSSH_ERROR_TOOLATE
@@ -308,10 +336,30 @@ DSSH_PUBLIC int dssh_session_set_max_events(dssh_session sess, size_t max_events
 
 /* Per-channel override.  Returns DSSH_ERROR_INVALID if max_events is
  * less than the current number of queued events (drain events first).
- * Pass 0 to disable the cap. */
+ * Pass 0 to disable the event-count cap. Retained event memory is still bounded:
+ * the internal per-channel envelope uses the session packet limit and the
+ * configured count (64 for count 0), rounded up to at least eight power-of-two
+ * slots, plus frozen/replacement storage and ring metadata. Exceeding this
+ * envelope closes the channel as for count overflow. Lowering a limit does not
+ * evict events or immediately discard reusable storage. */
 DSSH_PUBLIC int dssh_chan_set_max_events(dssh_channel ch, size_t max_events);
 
-/* Server accept: callback struct */
+/* Server accept callbacks run on the thread calling dssh_chan_accept(),
+ * with no library mutex held. ch and params are borrowed for the invocation;
+ * do not pass the handle to other threads or retain parameter views beyond it.
+ * Getters on ch reflect the current accumulated params during the callback.
+ * Event-callback and event-limit setters are permitted. Same-session channel
+ * I/O, poll/read_event, TX/reservation and nested open/accept are rejected;
+ * work on independent sessions is unaffected. Session termination/lifecycle
+ * requests retain their documented deferred-cleanup behavior.
+ * Negative pty_req/env results reject that request; negative terminal results
+ * reject the channel. Return values otherwise retain their existing meanings.
+ * Calling dssh_chan_close(ch, exit_code) cancels this setup channel. It returns
+ * 0 for a recorded cancellation; exit_code is unused before program startup.
+ * Do not use ch again. After the callback returns, the acceptor sends any
+ * required rejection/CLOSE, retires the channel, and continues accepting.
+ * A cancellation takes precedence over a nonnegative callback return.
+ */
 struct dssh_chan_accept_cbs {
 	int (*pty_req)(dssh_channel ch, const struct dssh_chan_params *params, void *cbdata);
 	int (*env)(dssh_channel ch, const struct dssh_chan_params *params, void *cbdata);

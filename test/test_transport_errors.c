@@ -342,7 +342,7 @@ test_channel_slot_drain_fatal(void)
 		handshake_cleanup(&ctx);
 		return TEST_FAIL;
 	}
-	drain_tx_slots(ctx.client);
+	int drain_result = drain_tx_slots(ctx.client);
 	tx_unlock_with_slots(ctx.client);
 
 	bool terminated = dssh_session_is_terminated(ctx.client);
@@ -358,6 +358,7 @@ test_channel_slot_drain_fatal(void)
 	handshake_cleanup(&ctx);
 
 	ASSERT_FALSE(initially_terminated);
+	ASSERT_EQ(drain_result, DSSH_ERROR_TERMINATED);
 	ASSERT_TRUE(terminated);
 	ASSERT_FALSE(ready);
 	ASSERT_EQ(lock_result, thrd_success);
@@ -407,7 +408,7 @@ test_channel_slot_gather_fatal(void)
 	handshake_cleanup(&ctx);
 
 	ASSERT_FALSE(initially_terminated);
-	ASSERT_OK(gather_result);
+	ASSERT_EQ(gather_result, DSSH_ERROR_TERMINATED);
 	ASSERT_TRUE(terminated);
 	ASSERT_FALSE(ready);
 	ASSERT_EQ(lock_result, thrd_success);

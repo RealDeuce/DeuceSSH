@@ -1,9 +1,9 @@
 /*
  * test_thread_errors.c -- C11 threading failure injection tests.
  *
- * Tests that dssh_thrd_check() correctly terminates the session when
- * mtx_lock, mtx_unlock, cnd_wait, cnd_broadcast, or cnd_signal fail.
- * Uses the separate thrd countdown (dssh_test_thrd_fail_after).
+ * Recoverable lock/condition failures use the independent thread countdown.
+ * Unrecoverable owned-mutex release failures use provenance-checked fresh-exec
+ * fatal tests, including retained ownership and error after a real release.
  */
 
 #include <string.h>
@@ -239,40 +239,26 @@ test_send_lock_fail(void)
 	return TEST_PASS;
 }
 
-/*
- * send_packet mtx_unlock failure: the last thrd call in send_packet
- * is mtx_unlock(tx_mtx).  After a successful send, inject the unlock
- * failure and verify session terminates.
- */
+/* Normal real release keeps the session usable and peer packet intact. */
 static int
-test_send_unlock_fail(void)
+test_send_unlock_success(void)
 {
 	struct handshake_ctx ctx;
 	if (handshake_setup(&ctx) < 0) {
 		handshake_cleanup(&ctx);
-		return TEST_SKIP;
+		return TEST_FAIL;
 	}
-
-	ASSERT_FALSE(ctx.client->terminate);
-
-	/* Count how many thrd calls a normal send does */
-	dssh_test_thrd_fail_after(1000);
-	uint8_t msg[] = { SSH_MSG_SERVICE_REQUEST, 0x42 };
-	send_packet(ctx.client, msg, sizeof(msg), NULL);
-	int count = dssh_test_thrd_count();
-	dssh_test_thrd_reset();
-
-	ASSERT_FALSE(ctx.client->terminate);
-	ASSERT_TRUE(count >= 2);
-
-	/* Fail the last thrd call (mtx_unlock) */
-	dssh_test_thrd_fail_after(count - 1);
-	send_packet(ctx.client, msg, sizeof(msg), NULL);
-	dssh_test_thrd_reset();
-
-	ASSERT_TRUE(ctx.client->terminate);
-
+	uint8_t msg[] = {SSH_MSG_SERVICE_REQUEST, 0x42};
+	int ret = send_packet(ctx.client, msg, sizeof(msg), NULL);
+	uint8_t type = 0;
+	uint8_t *payload = NULL;
+	size_t len = 0;
+	int received = ret == 0 ? recv_packet(ctx.server, &type, &payload, &len) : ret;
+	bool valid = ret == 0 && received == 0 && !ctx.client->terminate
+	    && type == SSH_MSG_SERVICE_REQUEST && len == sizeof(msg)
+	    && memcmp(payload, msg, sizeof(msg)) == 0;
 	handshake_cleanup(&ctx);
+	ASSERT_TRUE(valid);
 	return TEST_PASS;
 }
 
@@ -310,11 +296,11 @@ test_recv_has_no_lock(void)
 }
 
 /*
- * set_terminate best-effort: verify set_terminate does not crash
- * when lock operations fail.  Fail the first lock call.
+ * Once termination finishes, repeated termination must perform no new
+ * synchronization or callback operations.
  */
 static int
-test_set_terminate_lock_fail(void)
+test_terminate_idempotent(void)
 {
 	struct handshake_ctx ctx;
 	if (handshake_setup(&ctx) < 0) {
@@ -329,11 +315,12 @@ test_set_terminate_lock_fail(void)
 
 	ASSERT_FALSE(ctx.client->terminate);
 
-	/* Fail the first lock/broadcast call inside set_terminate.
-	 * It should still set terminate and not crash. */
+	session_set_terminate(ctx.client);
 	dssh_test_thrd_fail_after(0);
 	session_set_terminate(ctx.client);
+	int calls = dssh_test_thrd_count();
 	dssh_test_thrd_reset();
+	ASSERT_EQ(calls, 0);
 
 	ASSERT_TRUE(ctx.client->terminate);
 
@@ -376,7 +363,11 @@ terminate_wakeup_owner(void *arg)
 
 	struct timespec deadline;
 
-	dssh_deadline_from_ms(&deadline, 2000);
+	if (dssh_deadline_from_ms(&deadline, 2000) < 0) {
+		atomic_store(&ctx->wait_result, thrd_error);
+		mtx_unlock(&ctx->sess->trans.tx_mtx);
+		return -1;
+	}
 	int wr = cnd_timedwait(&ctx->sess->trans.rekey_cnd,
 	    &ctx->sess->trans.tx_mtx, &deadline);
 
@@ -593,11 +584,123 @@ test_start_double(void)
  * Test list
  * ================================================================ */
 
+static void
+unused_event_cb(dssh_channel ch, const struct dssh_chan_event *event, void *data)
+{
+	(void)ch;
+	(void)event;
+	(void)data;
+}
+
+/* Check both the protected state and the acquisition/release discipline.
+ * The targeted reject hook suppresses an invalid native unlock in the before
+ * implementation, so the regression itself does not rely on undefined behavior. */
+static int
+channel_mutex_failure(unsigned operation)
+{
+	for (unsigned prior = 0; prior < 2; prior++) {
+		dssh_test_ossl_reset();
+		dssh_session sess = dssh_session_init(true, 0);
+		if (sess == NULL)
+			return TEST_FAIL;
+		struct dssh_channel_s ch = {
+			.sess = sess,
+			.open = true,
+			.event_cb = NULL,
+			.event_cbdata = NULL,
+		};
+		ch.eof_sent = prior != 0;
+		ch.close_sent = prior != 0;
+		ch.events.count = prior != 0 ? 50 : 0;
+		ch.events.max_events = 64;
+		int ret = mtx_init(&ch.buf_mtx, mtx_plain);
+		if (ret != thrd_success) {
+			dssh_session_cleanup(sess);
+			return TEST_FAIL;
+		}
+		ret = mtx_init(&ch.cb_mtx, mtx_plain);
+		if (ret != thrd_success) {
+			mtx_destroy(&ch.buf_mtx);
+			dssh_session_cleanup(sess);
+			return TEST_FAIL;
+		}
+		mtx_t *target = operation == 2 ? &ch.cb_mtx : &ch.buf_mtx;
+		dssh_test_mtx_reject_once(target);
+		if (operation == 0)
+			ret = send_eof(sess, &ch);
+		else if (operation == 1)
+			ret = conn_close(sess, &ch);
+		else if (operation == 2)
+			ret = dssh_chan_set_event_cb(&ch, unused_event_cb, &ch);
+		else
+			ret = dssh_chan_set_max_events(&ch, 40);
+		bool valid = ret == DSSH_ERROR_TERMINATED && sess->terminate
+		    && dssh_test_mtx_rejected_unlocks() == 0;
+		valid = valid && ch.eof_sent == (prior != 0)
+		    && ch.close_sent == (prior != 0) && ch.open
+		    && ch.event_cb == NULL && ch.event_cbdata == NULL
+		    && ch.events.max_events == 64;
+		dssh_test_ossl_reset();
+		mtx_destroy(&ch.cb_mtx);
+		mtx_destroy(&ch.buf_mtx);
+		dssh_session_cleanup(sess);
+		ASSERT_TRUE(valid);
+	}
+	return TEST_PASS;
+}
+
+static int
+test_eof_acquire(void)
+{
+	return channel_mutex_failure(0);
+}
+
+static int
+test_close_acquire(void)
+{
+	return channel_mutex_failure(1);
+}
+
+static int
+test_event_acquire(void)
+{
+	return channel_mutex_failure(2);
+}
+
+static int
+test_limit_acquire(void)
+{
+	return channel_mutex_failure(3);
+}
+
+#include "termination_wakeup_cases.h"
+#include "condition_wait_cases.h"
+
 static struct dssh_test_entry tests[] = {
+	{ "thrd/wait_contract_errors", test_wait_contract_errors },
+	{ "thrd/wait_contract_spurious", test_wait_contract_spurious },
+	{ "thrd/wait_contract_timeout_errors", test_wait_contract_timeout_errors },
+	{ "thrd/wait_contract_timeouts", test_wait_contract_timeouts },
+	{ "thrd/wake_rekey", test_wake_rekey },
+	{ "thrd/wake_slot", test_wake_slot },
+	{ "thrd/wake_accept", test_wake_accept },
+	{ "thrd/wake_poll", test_wake_poll },
+	{ "thrd/deferred_rekey", test_deferred_rekey },
+	{ "thrd/deferred_slot", test_deferred_slot },
+	{ "thrd/deferred_accept", test_deferred_accept },
+	{ "thrd/deferred_poll", test_deferred_poll },
+	{ "thrd/wake_retry", test_wake_retry },
+	{ "thrd/deferred_retry", test_deferred_retry },
+	{ "thrd/signal_retry", test_signal_retry },
+	{ "thrd/eof_acquire",          test_eof_acquire },
+	{ "thrd/close_acquire",        test_close_acquire },
+	{ "thrd/event_acquire",        test_event_acquire },
+	{ "thrd/limit_acquire",        test_limit_acquire },
+	{ "thrd/demux_exit_deferred",  test_demux_exit_deferred },
 	{ "thrd/send_lock_fail",      test_send_lock_fail },
-	{ "thrd/send_unlock_fail",    test_send_unlock_fail },
+	{ "thrd/send_unlock_success", test_send_unlock_success },
 	{ "thrd/recv_has_no_lock",    test_recv_has_no_lock },
-	{ "thrd/set_terminate_fail",  test_set_terminate_lock_fail },
+	{ "thrd/terminate_idempotent", test_terminate_idempotent },
 	{ "thrd/set_terminate_rekey_wakeup", test_set_terminate_rekey_wakeup },
 	{ "thrd/send_sweep",          test_send_sweep },
 	{ "thrd/recv_sweep",          test_recv_sweep },
@@ -606,5 +709,114 @@ static struct dssh_test_entry tests[] = {
 	{ "thrd/start_double",        test_start_double },
 };
 
+static dssh_log_action
+forward_test_log(const struct dssh_log_record *record, void *opaque)
+{
+	(void)record;
+	(void)opaque;
+	return DSSH_LOG_SEND_DEBUG;
+}
+
+/* Fresh exec only. An unexpected return exits without touching the retained
+ * mutex. The driver requires both fault provenance and actual SIGABRT. */
+static int
+unlock_fatal_child(const char *name, const char *mode)
+{
+	bool release_real = strcmp(mode, "released") == 0;
+	if (!release_real && strcmp(mode, "held") != 0)
+		return 2;
+	dssh_test_ossl_reset();
+	if (strcmp(name, "primitive") == 0) {
+		mtx_t mutex;
+		if (mtx_init(&mutex, mtx_plain) != thrd_success || mtx_lock(&mutex) != thrd_success)
+			return 3;
+		dssh_test_unlock_fail_after(&mutex, 0, release_real);
+		dssh_test_unlock_boundary(&mutex);
+		_Exit(4);
+	}
+	bool transport = strcmp(name, "log-empty") == 0 || strcmp(name, "log-data") == 0
+	    || strcmp(name, "wa-send") == 0;
+	struct handshake_ctx ctx;
+	dssh_session sess;
+	if (transport) {
+		if (handshake_setup(&ctx) != 0)
+			return 3;
+		sess = ctx.client;
+	}
+	else {
+		sess = dssh_session_init(true, 0);
+		if (sess == NULL)
+			return 3;
+	}
+	if (strncmp(name, "log-", 4) == 0) {
+		if (dssh_session_set_log_cb(sess, forward_test_log, NULL) != 0)
+			return 3;
+		if (strcmp(name, "log-data") == 0)
+			sess->log_forward->count = 1;
+		if (transport && tx_acquire(sess, SSH_MSG_DEBUG) != 0)
+			return 3;
+		dssh_test_unlock_fail_after(&sess->log_forward->mtx, 0, release_real);
+		if (strcmp(name, "log-queue") == 0)
+			dssh_log_emit(sess, DSSH_LOG_ERROR, DSSH_LOG_SOURCE_LIBRARY, 0, 0,
+			    false, false, NULL, 0, NULL, 0);
+		else if (transport)
+			drain_log_forwards(sess);
+		else
+			return 2;
+		_Exit(4);
+	}
+	struct dssh_channel_s ch = {.sess = sess, .open = true};
+	if (mtx_init(&ch.buf_mtx, mtx_plain) != thrd_success
+	    || mtx_init(&ch.cb_mtx, mtx_plain) != thrd_success
+	    || cnd_init(&ch.poll_cnd) != thrd_success)
+		return 3;
+	if (strncmp(name, "wa-", 3) == 0) {
+		bool idle = strcmp(name, "wa-idle") == 0;
+		bool wire = strcmp(name, "wa-send") == 0;
+		if (!idle && !wire && strcmp(name, "wa-zero") != 0)
+			return 2;
+		atomic_init(&ch.wa_slot.ready, !idle);
+		if (wire) {
+			ch.window_adjust_pending = 1;
+			ch.wa_slot.buf = malloc(sess->trans.packet_buf_sz);
+			if (ch.wa_slot.buf == NULL || tx_acquire(sess, SSH_MSG_CHANNEL_WINDOW_ADJUST) != 0)
+				return 3;
+		}
+		dssh_test_unlock_fail_after(&ch.buf_mtx, wire ? 1U : 0U, release_real);
+		bool progress = false;
+		int status = drain_one_wa_slot(sess, &ch, &progress);
+		_Exit(status == 0 ? 4 : 5);
+	}
+	mtx_t *target = strcmp(name, "event") == 0 ? &ch.cb_mtx : &ch.buf_mtx;
+	dssh_test_unlock_fail_after(target, 0, release_real);
+	if (strcmp(name, "event") == 0)
+		dssh_chan_set_event_cb(&ch, unused_event_cb, NULL);
+	else if (strcmp(name, "limit") == 0)
+		dssh_chan_set_max_events(&ch, 1);
+	else if (strcmp(name, "eof") == 0) {
+		ch.eof_sent = true;
+		send_eof(sess, &ch);
+	}
+	else if (strcmp(name, "close") == 0) {
+		ch.close_sent = true;
+		conn_close(sess, &ch);
+	}
+	else
+		return 2;
+	_Exit(4);
+}
+
+#define main dssh_test_thread_errors_main
 DSSH_TEST_NO_CLEANUP
 DSSH_TEST_MAIN(tests)
+#undef main
+
+int
+main(int argc, char **argv)
+{
+	if (argc == 4 && strcmp(argv[1], "--unlock-fatal") == 0)
+		return unlock_fatal_child(argv[2], argv[3]);
+	if (argc == 4 && strcmp(argv[1], "--wake-fatal") == 0)
+		return wake_fatal_child(argv[2], argv[3]);
+	return dssh_test_thread_errors_main(argc, argv);
+}

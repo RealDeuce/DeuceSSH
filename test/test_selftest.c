@@ -25,6 +25,8 @@
 #include "ssh-internal.h"
 #include "dssh_test_internal.h"
 #include "test_dhgex_provider.h"
+#include "test_comp.h"
+#include "compression_fixture.h"
 
 /* ================================================================
  * Socket I/O callbacks
@@ -32,6 +34,8 @@
  * cbdata is a pointer to the socket fd for this session.
  * Both client and server use the same callback functions.
  * ================================================================ */
+
+#include "auth_result_fixture.h"
 
 static dssh_session delayed_tx_sess;
 static atomic_int   delayed_tx_countdown;
@@ -208,6 +212,9 @@ register_all_algorithms(void)
 	res = test_register_mac_algos();
 	if (res < 0)
 		return res;
+	res = dssh_test_register_optional_comp();
+	if (res < 0)
+		return res;
 	res = dssh_register_none_comp();
 	if (res < 0)
 		return res;
@@ -287,10 +294,17 @@ selftest_start_thread(struct selftest_ctx *ctx,
 static int
 auth_password_cb(const uint8_t *username, size_t username_len,
     const uint8_t *password, size_t password_len,
-    uint8_t **change_prompt, size_t *change_prompt_len,
+    struct dssh_bytes_result *output_result,
     void *cbdata)
 {
-	return DSSH_AUTH_SUCCESS;
+	uint8_t *fixture_output = NULL;
+	size_t fixture_length = 0;
+	uint8_t **change_prompt = &fixture_output;
+	size_t *change_prompt_len = &fixture_length;
+	(void)change_prompt;
+	(void)change_prompt_len;
+
+	return test_auth_output_finish(output_result, fixture_output, fixture_length, DSSH_AUTH_SUCCESS);
 }
 
 static struct dssh_auth_server_cbs selftest_auth_cbs = {
@@ -405,7 +419,8 @@ selftest_setup(struct selftest_ctx *ctx)
 	thrd_join(ct, NULL);
 	thrd_join(st, NULL);
 
-	if (ctx->client_hs_result != 0 || ctx->server_hs_result != 0)
+	if (ctx->client_hs_result != 0 || ctx->server_hs_result != 0
+	    || !compression_fixture_selected(ctx->client, ctx->server))
 		goto fail;
 
 	/* Run auth in two threads */
@@ -1204,7 +1219,7 @@ test_self_signal(void)
 
 			if (dssh_chan_read_event(ch, &event) == 0
 			    && event.type == DSSH_EVENT_SIGNAL) {
-				ASSERT_STR_EQ(event.signal.name, "TERM");
+				ASSERT_TRUE(dssh_test_bytes_equal(event.signal.name, "TERM", 4));
 				got_signal = true;
 			}
 			continue;
@@ -1444,10 +1459,11 @@ test_self_rekey_during_data(void)
 	dssh_channel ch = open_shell(ctx.client, "xterm", 80, 24);
 	ASSERT_NOT_NULL(ch);
 
-	/* Force rx_bytes_since_rekey near threshold on the CLIENT.
-	 * Auto-rekey triggers in recv_packet's default path when
-	 * the client demux receives the echoed data. */
-	ctx.client->trans.rx_bytes_since_rekey = ctx.client->trans.enc_s2c_selected->bytes_per_key - 100;
+	/* Arm the exact threshold at the next client receive, independent of
+	 * compression ratio and encrypted packet overhead. */
+	unsigned resets_before = compression_fixture_reset_count();
+	uint64_t rx_count = ctx.client->trans.enc_s2c_selected->bytes_per_key;
+	dssh_test_arm_rx_bytes_before_count(ctx.client, rx_count);
 
 	dssh_chan_poll(ch, DSSH_POLL_WRITE, 5000);
 	uint8_t data[256];
@@ -1476,6 +1492,7 @@ test_self_rekey_during_data(void)
 	ASSERT_MEM_EQ(buf, data, sizeof(data));
 
 	/* Verify the connection survived rekey */
+	ASSERT_TRUE(compression_fixture_wait_reset(resets_before));
 	ASSERT_FALSE(dssh_session_is_terminated(ctx.client));
 
 	dssh_chan_close(ch, 0);
@@ -1488,7 +1505,7 @@ test_self_rekey_during_data(void)
 }
 
 /* ================================================================
- * Test: manual rekey -- trigger via tx_since_rekey threshold
+ * Test: explicit receive threshold triggers asynchronous rekey
  * ================================================================ */
 
 static int
@@ -1507,13 +1524,11 @@ test_self_rekey_manual(void)
 	dssh_channel ch = open_exec(ctx.client,"rekey");
 	ASSERT_NOT_NULL(ch);
 
-	/* Force rx_bytes_since_rekey just below threshold on the client.
-	 * A single encrypted CHANNEL_DATA packet adds ~60-80 bytes of
-	 * wire overhead (packet header + padding + MAC), so set headroom
-	 * small enough that one packet pushes it over. */
-	/* Only force threshold on the client.  The client's demux
-	 * will trigger rekey when it receives the echoed data. */
-	ctx.client->trans.rx_bytes_since_rekey = ctx.client->trans.enc_s2c_selected->bytes_per_key - 50;
+	/* Count at the exact threshold: even a compressed small packet must
+	 * trigger the next client demux rekey. */
+	unsigned resets_before = compression_fixture_reset_count();
+	uint64_t rx_count = ctx.client->trans.enc_s2c_selected->bytes_per_key;
+	dssh_test_arm_rx_bytes_before_count(ctx.client, rx_count);
 
 	dssh_chan_poll(ch, DSSH_POLL_WRITE, 5000);
 	const uint8_t data[] = "after-rekey";
@@ -1538,10 +1553,9 @@ test_self_rekey_manual(void)
 	}
 	ASSERT_EQ_U(recvd, sizeof(data) - 1);
 
-	/* Verify the echo itself worked -- the connection is alive
-	 * and data survived the threshold being near-exceeded.
-	 * Full auto-rekey with live demux threads is verified by
-	 * test_self_rekey_during_data and test_self_rekey_preserves_channels. */
+	/* The echo and both peers' compression resets must complete before
+	 * closing the channel can hide an unfinished key transition. */
+	ASSERT_TRUE(compression_fixture_wait_reset(resets_before));
 	ASSERT_FALSE(dssh_session_is_terminated(ctx.client));
 
 	dssh_chan_close(ch, 0);
@@ -1605,7 +1619,9 @@ test_self_rekey_preserves_channels(void)
 	memcpy(sid_before, ctx.client->trans.session_id, sid_sz);
 
 	/* Force rekey */
-	ctx.client->trans.rx_bytes_since_rekey = ctx.client->trans.enc_s2c_selected->bytes_per_key - 100;
+	unsigned resets_before = compression_fixture_reset_count();
+	uint64_t rx_count = ctx.client->trans.enc_s2c_selected->bytes_per_key;
+	dssh_test_arm_rx_bytes_before_count(ctx.client, rx_count);
 
 	/* Send data to trigger rekey */
 	const uint8_t after[] = "after-rekey-data!";
@@ -1631,6 +1647,8 @@ test_self_rekey_preserves_channels(void)
 	}
 	ASSERT_EQ_U(recvd, sizeof(after) - 1);
 	ASSERT_MEM_EQ(buf, after, sizeof(after) - 1);
+
+	ASSERT_TRUE(compression_fixture_wait_reset(resets_before));
 
 	/* Session ID must be unchanged after rekey */
 	ASSERT_EQ_U(ctx.client->trans.session_id_sz, sid_sz);
@@ -1715,13 +1733,13 @@ test_self_rekey_inflight_data(void)
 	dssh_channel ch = open_exec(ctx.client,"burst");
 	ASSERT_NOT_NULL(ch);
 
-	/* Force rx_bytes near threshold so the FIRST received packet
-	 * triggers rekey_pending.  The client's demux dispatches that
+	/* Arm the threshold so the FIRST received packet triggers
+	 * rekey_pending regardless of compression. The client dispatches that
 	 * packet, then on the next recv_packet call starts rekey.
 	 * Remaining packets in the socket buffer arrive during the
 	 * kexinit wait loop. */
-	uint64_t rx_count =
-	    ctx.client->trans.enc_s2c_selected->bytes_per_key - 50;
+	unsigned resets_before = compression_fixture_reset_count();
+	uint64_t rx_count = ctx.client->trans.enc_s2c_selected->bytes_per_key;
 	dssh_test_arm_rx_bytes_before_count(ctx.client, rx_count);
 	atomic_store_explicit(&sarg.start, true, memory_order_release);
 
@@ -1748,6 +1766,7 @@ test_self_rekey_inflight_data(void)
 	for (size_t i = 0; i < recvd; i++)
 		ASSERT_EQ(buf[i], 'D');
 
+	ASSERT_TRUE(compression_fixture_wait_reset(resets_before));
 	ASSERT_FALSE(dssh_session_is_terminated(ctx.client));
 
 	dssh_chan_close(ch, 0);

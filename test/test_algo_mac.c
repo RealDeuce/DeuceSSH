@@ -763,11 +763,72 @@ test_mac_session_creation(void)
 	return TEST_PASS;
 }
 
+/* Exercise the registered module callbacks, rather than only provider helpers.
+ * RFC 4231's short keys can be zero-padded to SSH's fixed key lengths without
+ * changing HMAC: both lengths are below the hash's key-padding block size. */
+static int
+test_mac_module_rfc4231_vectors(void)
+{
+	int (*registrations[])(void) = {
+		dssh_register_hmac_sha2_256,
+		dssh_register_hmac_sha2_512,
+	};
+	for (size_t algorithm = 0; algorithm < 2; algorithm++) {
+		dssh_test_reset_global_config();
+		ASSERT_OK(registrations[algorithm]());
+		dssh_mac mac = gconf.mac_head;
+		ASSERT_NOT_NULL(mac);
+		size_t digest_len = 32;
+		if (algorithm == 1)
+			digest_len = 64;
+		ASSERT_EQ_U(mac->key_size, digest_len);
+		ASSERT_EQ_U(mac->digest_size, digest_len);
+		ASSERT_STR_EQ(mac->name, algorithm == 0 ? "hmac-sha2-256" : "hmac-sha2-512");
+		const uint8_t *expected[] = {
+			algorithm == 0 ? rfc4231_tc1_hmac : rfc4231_tc1_hmac512,
+			algorithm == 0 ? rfc4231_tc2_hmac : rfc4231_tc2_hmac512,
+			algorithm == 0 ? rfc4231_tc3_hmac : rfc4231_tc3_hmac512,
+		};
+		uint8_t data3[50];
+		memset(data3, 0xdd, sizeof(data3));
+		const uint8_t *data[] = { rfc4231_tc1_data, rfc4231_tc2_data, data3 };
+		const size_t data_len[] = { rfc4231_tc1_data_len, rfc4231_tc2_data_len, sizeof(data3) };
+		for (size_t vector = 0; vector < 3; vector++) {
+			uint8_t key[64] = { 0 };
+			if (vector == 0)
+				memcpy(key, rfc4231_tc1_key, sizeof(rfc4231_tc1_key));
+			else if (vector == 1)
+				memcpy(key, rfc4231_tc2_key, rfc4231_tc2_key_len);
+			else
+				memset(key, 0xaa, 20);
+			dssh_mac_ctx *ctx = NULL;
+			ASSERT_OK(mac->init(key, &ctx));
+			ASSERT_NOT_NULL(ctx);
+			uint8_t output[2][66];
+			memset(output, 0x5a, sizeof(output));
+			int first = mac->generate(data[vector], data_len[vector], &output[0][1], ctx);
+			int second = first == 0
+			    ? mac->generate(data[vector], data_len[vector], &output[1][1], ctx) : first;
+			mac->cleanup(ctx);
+			ASSERT_OK(first);
+			ASSERT_OK(second);
+			for (size_t round = 0; round < 2; round++) {
+				ASSERT_EQ(output[round][0], 0x5a);
+				ASSERT_EQ(output[round][digest_len + 1], 0x5a);
+				ASSERT_MEM_EQ(&output[round][1], expected[vector], digest_len);
+			}
+		}
+	}
+	dssh_test_reset_global_config();
+	return TEST_PASS;
+}
+
 /* ================================================================
  * Test table
  * ================================================================ */
 
 static struct dssh_test_entry tests[] = {
+	{ "mac/module_rfc4231_vectors",       test_mac_module_rfc4231_vectors },
 	/* Registration */
 	{ "mac/dssh_register_hmac_sha2_256",      test_register_hmac_sha2_256 },
 	{ "mac/dssh_register_none_mac",           test_register_none_mac },

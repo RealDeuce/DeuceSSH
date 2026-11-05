@@ -7,6 +7,7 @@
 #include "deucessh-crypto.h"
 
 #include <string.h>
+#include <limits.h>
 
 /* SHA-256("") = e3b0c44298fc1c14... */
 static const uint8_t sha256_empty[32] = {
@@ -296,6 +297,21 @@ test_base64_small_buf(void)
 	return TEST_PASS;
 }
 
+static int
+test_base64_result_range(void)
+{
+	const uint8_t input[] = { 0 };
+	char output[] = { 'x' };
+	/* These lengths must be rejected before any buffer access. */
+	ASSERT_ERR(dssh_base64_encode(input, SIZE_MAX, output, SIZE_MAX), DSSH_ERROR_TOOLONG);
+#if SIZE_MAX > INT_MAX
+	size_t length = ((size_t)INT_MAX / 4) * 3 + 1;
+	ASSERT_ERR(dssh_base64_encode(input, length, output, SIZE_MAX), DSSH_ERROR_TOOLONG);
+#endif
+	ASSERT_EQ(output[0], 'x');
+	return TEST_PASS;
+}
+
 /* ---- Memcmp tests ---- */
 
 static int
@@ -483,9 +499,23 @@ test_memcmp_null_inputs(void)
 	return TEST_PASS;
 }
 
+#include "crypto_contract_cases.h"
+
 /* ---- Test table ---- */
 
 static struct dssh_test_entry tests[] = {
+	{ "contract/hash_binary", test_contract_hash_binary },
+	{ "contract/hash_million", test_contract_hash_million },
+	{ "contract/hash_rejections", test_contract_hash_rejections },
+	{ "contract/base64_vectors", test_contract_base64 },
+	{ "contract/zero_lengths", test_contract_zero_lengths },
+#ifdef DSSH_CRYPTO_OPENSSL
+	{ "contract/encoded_lengths", test_contract_encoded_lengths },
+	{ "contract/hash_failures", test_contract_hash_failures },
+	{ "contract/hash_reported_lengths", test_contract_hash_reported_lengths },
+	{ "contract/hash_publication", test_contract_hash_publication },
+	{ "contract/oneshot_rng_errors", test_contract_oneshot_rng_errors },
+#endif
 	{ "hash/sha256",           test_hash_sha256 },
 	{ "hash/sha256_data",      test_hash_sha256_data },
 	{ "hash/final_short_buf",  test_hash_final_short_buf },
@@ -500,6 +530,7 @@ static struct dssh_test_entry tests[] = {
 	{ "base64/basic",          test_base64_basic },
 	{ "base64/null",           test_base64_null },
 	{ "base64/small_buf",      test_base64_small_buf },
+	{ "base64/result_range",   test_base64_result_range },
 	{ "memcmp/equal",          test_memcmp_equal },
 	{ "memcmp/differ",         test_memcmp_differ },
 	{ "cleanse",               test_cleanse },

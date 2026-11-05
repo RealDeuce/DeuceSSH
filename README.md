@@ -12,7 +12,7 @@ A from-scratch SSH library in standard C17 implementing the core SSH protocol:
 - RFC 6668 — SHA-2 Data Integrity Verification
 - RFC 8160 — IUTF8 Terminal Mode
 - RFC 8308 — Extension Negotiation
-- RFC 8332 — rsa-sha2-256 Host Key Algorithm
+- RFC 8332 — RSA SHA-256 and SHA-512 Signature Algorithms
 - RFC 8709 — Ed25519 Host Key Algorithm
 - RFC 8731 — curve25519-sha256 Key Exchange
 - draft-ietf-sshm-ntruprime-ssh — sntrup761x25519-sha512 Key Exchange
@@ -48,9 +48,9 @@ Use `-S . -B build` to prevent cmake from discovering the parent
 | Category | Algorithms |
 |----------|-----------|
 | Key Exchange | `mlkem768x25519-sha256`, `sntrup761x25519-sha512`, `curve25519-sha256`, `diffie-hellman-group-exchange-sha256` |
-| Host Key | `ssh-ed25519`, `rsa-sha2-256` |
+| Host Key | `ssh-ed25519`, `rsa-sha2-256`, `rsa-sha2-512` |
 | Encryption | `aes256-ctr`, `aes128-cbc`*, `none` |
-| MAC | `hmac-sha2-256`, `none` |
+| MAC | `hmac-sha2-256`, `hmac-sha2-512`, `none` |
 | Compression | `none` |
 
 All algorithms support both client and server side.
@@ -176,7 +176,7 @@ dssh_chan_params_free(&cp);
 /* Server-side auth: accept any password */
 static int my_password_cb(const uint8_t *username, size_t username_len,
     const uint8_t *password, size_t password_len,
-    uint8_t **change_prompt, size_t *change_prompt_len, void *cbdata)
+    struct dssh_bytes_result *change_prompt, void *cbdata)
 {
     return DSSH_AUTH_SUCCESS;
 }
@@ -434,25 +434,52 @@ dssh_auth_password(sess, "user", "pass",
 If the server sends `SSH_MSG_USERAUTH_PASSWD_CHANGEREQ`, the callback
 receives the prompt and returns the new password:
 
-```c
-static int
-my_passwd_change(const uint8_t *prompt, size_t prompt_len,
-    const uint8_t *language, size_t language_len,
-    uint8_t **new_password, size_t *new_password_len,
-    void *cbdata)
-{
-    printf("%.*s", (int)prompt_len, prompt);
-    char buf[256];
-    fgets(buf, sizeof(buf), stdin);
-    size_t len = strlen(buf);
-    if (len > 0 && buf[len - 1] == '\n')
-        len--;
+Pass a separate zero-initialized `password_change_state` as callback data for
+each authentication operation, and keep it alive until `dssh_auth_password()`
+returns. The same storage is reused for repeated password-change requests.
+The library initializes `out` to zero and borrows its bytes until release,
+including when the callback or a later operation fails. The producer owns and
+clears its storage; the library never frees it.
 
-    *new_password = malloc(len);
-    if (*new_password == NULL)
-        return DSSH_ERROR_ALLOC;
-    memcpy(*new_password, buf, len);
-    *new_password_len = len;
+```c
+struct password_change_state {
+    char storage[256];
+    bool in_use;
+};
+
+static void
+release_new_password(void *owner)
+{
+    struct password_change_state *state = owner;
+    dssh_cleanse(state->storage, sizeof(state->storage));
+    state->in_use = false;
+}
+
+static int
+my_passwd_change_cb(const uint8_t *prompt, size_t prompt_len,
+    const uint8_t *language, size_t language_len,
+    struct dssh_bytes_result *out, void *cbdata)
+{
+    (void)language;
+    (void)language_len;
+    struct password_change_state *state = cbdata;
+    if (state == NULL || state->in_use)
+        return DSSH_ERROR_INVALID;
+    if (prompt_len > 0 && fwrite(prompt, 1, prompt_len, stdout) != prompt_len)
+        return DSSH_ERROR_INIT;
+    if (fgets(state->storage, sizeof(state->storage), stdin) == NULL) {
+        dssh_cleanse(state->storage, sizeof(state->storage));
+        return DSSH_ERROR_INIT;
+    }
+    size_t len = strlen(state->storage);
+    if (len > 0 && state->storage[len - 1] == '\n')
+        len--;
+    const uint8_t *bytes = (const uint8_t *)state->storage;
+    state->in_use = true;
+    out->bytes.data = bytes;
+    out->bytes.len = len;
+    out->lease.release = release_new_password;
+    out->lease.owner = state;
     return 0;
 }
 ```
@@ -475,46 +502,78 @@ Works with any registered key algorithm that supports signing.
 
 ### Keyboard-Interactive
 
-`dssh_auth_keyboard_interactive()` uses a callback to handle
-server prompts (RFC 4256).  The callback receives the server's name
-and instruction strings, plus an array of prompts with echo flags,
-and must fill in the responses:
+`dssh_auth_keyboard_interactive()` passes borrowed name, instruction and
+prompt spans to the application (RFC 4256). Return a `dssh_auth_responses`
+bundle with one `dssh_bytes` entry per prompt and a release lease covering
+all output storage. The library releases a present lease on every outcome,
+including callback errors and invalid metadata. It never clears or frees
+application storage.
+
+This example accepts one prompt and retains its answer buffer between rounds.
+Use a separate state for each authentication call; the application can support
+larger prompt sets with retained arrays, as in [examples/client.c](examples/client.c).
 
 ```c
+struct kbi_answer_state {
+    uint8_t answer[256];
+    struct dssh_bytes item;
+};
+
+/* Application UI: respect echo, return 0 and an explicit byte length,
+ * or a negative error. Never write beyond capacity. */
+int read_kbi_answer(uint8_t *buffer, size_t capacity, size_t *length, bool echo);
+
+static void
+release_kbi_answer(void *owner)
+{
+    struct kbi_answer_state *state = owner;
+    dssh_cleanse(state->answer, sizeof(state->answer));
+    state->item = (struct dssh_bytes){0};
+}
+
 static int
 my_kbi_prompt(const uint8_t *name, size_t name_len,
     const uint8_t *instruction, size_t instruction_len,
-    uint32_t num_prompts,
-    const uint8_t **prompts, const size_t *prompt_lens,
-    const bool *echo,
-    uint8_t **responses, size_t *response_lens,
-    void *cbdata)
+    uint32_t num_prompts, const uint8_t **prompts,
+    const size_t *prompt_lens, const bool *echo,
+    struct dssh_auth_responses *out, void *cbdata)
 {
-    for (uint32_t i = 0; i < num_prompts; i++) {
-        /* Display the prompt (prompt text is not NUL-terminated) */
-        printf("%.*s", (int)prompt_lens[i], prompts[i]);
-
-        /* Read the response (echo[i] indicates whether to echo) */
-        char buf[256];
-        fgets(buf, sizeof(buf), stdin);
-        size_t len = strlen(buf);
-        if (len > 0 && buf[len - 1] == '\n')
-            len--;
-
-        /* Each response must be malloc'd — the library frees it */
-        responses[i] = malloc(len);
-        if (responses[i] == NULL)
-            return DSSH_ERROR_ALLOC;
-        memcpy(responses[i], buf, len);
-        response_lens[i] = len;
-    }
+    (void)name;
+    (void)name_len;
+    (void)instruction;
+    (void)instruction_len;
+    struct kbi_answer_state *state = cbdata;
+    if (num_prompts > 1)
+        return DSSH_ERROR_TOOLONG;
+    if (num_prompts == 0)
+        return 0; /* An empty response bundle is valid. */
+    out->lease.release = release_kbi_answer;
+    out->lease.owner = state;
+    if (fwrite(prompts[0], 1, prompt_lens[0], stdout) != prompt_lens[0])
+        return DSSH_ERROR_INIT;
+    if (fflush(stdout) != 0)
+        return DSSH_ERROR_INIT;
+    size_t length = 0;
+    int ret = read_kbi_answer(state->answer, sizeof(state->answer), &length, echo[0]);
+    if (ret < 0)
+        return ret;
+    if (ret != 0 || length > sizeof(state->answer))
+        return DSSH_ERROR_INVALID;
+    state->item = (struct dssh_bytes){state->answer, length};
+    out->items = &state->item;
+    out->count = 1;
     return 0;
 }
 
 /* Usage: */
-dssh_auth_keyboard_interactive(sess, "user",
-    my_kbi_prompt, my_context);
+struct kbi_answer_state answers = {0};
+dssh_auth_keyboard_interactive(sess, "user", my_kbi_prompt, &answers);
 ```
+
+Returned arrays and bytes must remain valid until release, including on errors.
+Clear actual owned capacity in the producer's release callback; do not use a
+reported result length to decide how much storage to clear. Callback input spans
+are borrowed only for that callback and cannot back its returned result.
 
 ## Authentication — Server Side
 
@@ -571,12 +630,13 @@ dssh_auth_set_banner(sess, NULL, NULL);  /* cancel pending banner */
 static int
 my_password_cb(const uint8_t *username, size_t username_len,
     const uint8_t *password, size_t password_len,
-    uint8_t **change_prompt, size_t *change_prompt_len,
-    void *cbdata)
+    struct dssh_bytes_result *change_prompt, void *cbdata)
 {
     /* Validate credentials.
-     * To request a password change, set *change_prompt to a malloc'd
-     * prompt string and return DSSH_AUTH_CHANGE_PASSWORD. */
+     * To request a password change, set change_prompt->bytes.data/len
+     * and its producer-owned release lease, then return
+     * DSSH_AUTH_CHANGE_PASSWORD. Static prompt storage may use a no-op
+     * release callback. The library never clears or frees the result. */
     if (check_password(username, username_len, password, password_len))
         return DSSH_AUTH_SUCCESS;
     return DSSH_AUTH_FAILURE;
@@ -590,8 +650,7 @@ static int
 my_passwd_change_cb(const uint8_t *username, size_t username_len,
     const uint8_t *old_password, size_t old_password_len,
     const uint8_t *new_password, size_t new_password_len,
-    uint8_t **change_prompt, size_t *change_prompt_len,
-    void *cbdata)
+    struct dssh_bytes_result *change_prompt, void *cbdata)
 {
     /* Validate old password and set new one.
      * Return DSSH_AUTH_CHANGE_PASSWORD to re-prompt. */
@@ -625,44 +684,59 @@ my_pubkey_cb(const uint8_t *username, size_t username_len,
 
 ### Keyboard-Interactive Callback (Server)
 
-Called in a loop.  First call has `num_responses=0` and
-`responses=NULL` — provide initial prompts.  Subsequent calls
-have the client's answers.  Return `DSSH_AUTH_KBI_PROMPT` to
-send more prompts, or a final result to end the exchange.
+Called in a loop. The first call has `num_responses=0` and `responses=NULL`.
+Subsequent calls contain the client's answers. Return `DSSH_AUTH_KBI_PROMPT`
+with a `dssh_auth_challenge`, or a final authentication result. The challenge
+contains explicit name/instruction spans and an array of prompt text/echo pairs.
+One release lease covers the entire bundle. Static storage uses a no-op release.
 
 ```c
+struct kbi_server_state {
+    bool prompted;
+};
+
+static void
+release_static_challenge(void *owner)
+{
+    (void)owner;
+}
+
 static int
 my_kbi_cb(const uint8_t *username, size_t username_len,
-    uint32_t num_responses,
-    const uint8_t **responses, const size_t *response_lens,
-    char **name_out, char **instruction_out,
-    uint32_t *num_prompts_out,
-    char ***prompts_out, bool **echo_out,
+    uint32_t num_responses, const uint8_t **responses,
+    const size_t *response_lens, struct dssh_auth_challenge *out,
     void *cbdata)
 {
-    if (num_responses == 0) {
-        /* First call — send a prompt */
-        *name_out = strdup("Auth");
-        *instruction_out = strdup("Enter your token");
-        *num_prompts_out = 1;
-        *prompts_out = malloc(sizeof(char *));
-        *echo_out = malloc(sizeof(bool));
-        (*prompts_out)[0] = strdup("Token: ");
-        (*echo_out)[0] = false;
+    (void)username;
+    (void)username_len;
+    struct kbi_server_state *state = cbdata;
+    if (!state->prompted) {
+        static const uint8_t name[] = "Auth";
+        static const uint8_t instruction[] = "Enter your token";
+        static const uint8_t text[] = "Token: ";
+        static const struct dssh_auth_prompt prompts[] = {
+            {{text, sizeof(text) - 1}, false}
+        };
+        state->prompted = true;
+        out->name = (struct dssh_bytes){name, sizeof(name) - 1};
+        out->instruction = (struct dssh_bytes){instruction, sizeof(instruction) - 1};
+        out->prompts = prompts;
+        out->count = 1;
+        out->lease.release = release_static_challenge;
         return DSSH_AUTH_KBI_PROMPT;
     }
-    /* Check the response */
-    if (num_responses == 1
-        && response_lens[0] == 6
+    if (num_responses == 1 && response_lens[0] == 6
         && memcmp(responses[0], "secret", 6) == 0)
         return DSSH_AUTH_SUCCESS;
     return DSSH_AUTH_FAILURE;
 }
 ```
 
-The library frees all out params (`name_out`, `instruction_out`,
-`prompts_out[i]`, `prompts_out`, `echo_out`) after sending
-INFO_REQUEST.
+The library releases a present lease after its final read on every outcome.
+It never clears or frees producer storage. Text spans do not require NUL
+terminators. Name and instruction may be empty; prompt text must be nonempty.
+A zero-prompt challenge still requires a response, so track rounds in application
+state rather than treating every zero-response callback as the first call.
 
 ## Algorithm Registration
 
@@ -688,6 +762,13 @@ calling the corresponding `dssh_transport_register_*()` function.
 - After the first session init, registration is locked (`DSSH_ERROR_TOOLATE`).
 - Names must be 1–64 printable ASCII characters (no spaces, no control chars).
 - The `next` pointer must be NULL (the library manages the linked list).
+- Registered descriptors, names, configuration and callback code remain borrowed
+  for process lifetime; keep their storage and code alive. Do not modify registered
+  records or names directly. Use configuration setters before the first session;
+  the library manages links and freezes configuration pointers at session creation.
+  Mutable producer state referenced through configuration follows its module's
+  concurrency and lifetime contract. Successful registration neither transfers
+  allocation ownership nor copies the descriptor.
 - Registration order determines negotiation preference.
 
 ### Per-Session Algorithm Filters
@@ -790,10 +871,14 @@ int register_my_enc(void)
     enc->decrypt = my_decrypt;
     enc->cleanup = my_cleanup;
     enc->flags = 0;
+    enc->bytes_per_key = UINT64_C(1) << 36; /* 128-bit block limit */
     enc->blocksize = 16;  /* cipher block size in bytes */
     enc->key_size = 32;   /* key size in bytes */
     memcpy(enc->name, name, sizeof(name));
-    return dssh_transport_register_enc(enc);
+    int ret = dssh_transport_register_enc(enc);
+    if (ret < 0)
+        free(enc);
+    return ret;
 }
 ```
 
@@ -834,7 +919,10 @@ int register_my_mac(void)
     mac->digest_size = 32;  /* output tag size in bytes */
     mac->key_size = 32;     /* key size in bytes */
     memcpy(mac->name, name, sizeof(name));
-    return dssh_transport_register_mac(mac);
+    int ret = dssh_transport_register_mac(mac);
+    if (ret < 0)
+        free(mac);
+    return ret;
 }
 ```
 
@@ -842,36 +930,59 @@ The `struct dssh_mac_s` (typedef `dssh_mac`) is defined in `deucessh-mac.h`.
 
 ### Compression Module
 
+Compression modules provide five callbacks declared in `deucessh-comp.h`:
+
 ```c
-#include "deucessh-comp.h"
-
-static int my_compress(uint8_t *buf, size_t *bufsz, dssh_comp_ctx *ctx)
-{
-    /* Compress buf in place, update *bufsz.  Return 0 on success. */
-}
-
-static int my_uncompress(uint8_t *buf, size_t *bufsz, dssh_comp_ctx *ctx)
-{
-    /* Decompress buf in place, update *bufsz.  Return 0 on success. */
-}
-
-static void my_comp_cleanup(dssh_comp_ctx *ctx) { /* ... */ }
-
-int register_my_comp(void)
-{
-    static const char name[] = "my-comp";
-    struct dssh_comp_s *comp = malloc(sizeof(*comp) + sizeof(name));
-    if (comp == NULL) return DSSH_ERROR_ALLOC;
-    comp->next = NULL;
-    comp->compress = my_compress;
-    comp->uncompress = my_uncompress;
-    comp->cleanup = my_comp_cleanup;
-    memcpy(comp->name, name, sizeof(name));
-    return dssh_transport_register_comp(comp);
-}
+int init(bool compress, dssh_comp_ctx **ctx);
+int bound(size_t input_len, size_t *output_bound, dssh_comp_ctx *ctx);
+int compress(const uint8_t *input, size_t input_len,
+    uint8_t *output, size_t output_capacity, size_t *output_len,
+    dssh_comp_ctx *ctx);
+int uncompress(const uint8_t *input, size_t input_len,
+    uint8_t *output, size_t output_capacity, size_t *output_len,
+    dssh_comp_ctx *ctx);
+void cleanup(dssh_comp_ctx *ctx);
 ```
 
-The `struct dssh_comp_s` (typedef `dssh_comp`) is defined in `deucessh-comp.h`.
+`init` creates an independent context for each direction after key exchange;
+`compress` is true for local transmit. On same-module rekey, `*ctx` contains
+its existing context: reset stream history in place and reuse allocations.
+If replacement is necessary, the provider releases its old context itself.
+On failure, leave a valid cleanup target or NULL after releasing all resources.
+The transport uses each old context through NEWKEYS before resetting it.
+
+`bound` supplies a nondecreasing maximum compressed length, including flush
+overhead, valid for every input and all future states of that context.
+Compression may increase payload length. The transport computes a safe input
+capacity from this bound before exposing writable packet buffers. Return
+`DSSH_ERROR_TOOLONG` if the bound cannot be represented in `size_t`.
+
+Transforms receive disjoint library buffers borrowed only for that call. They
+return zero and set `*output_len <= output_capacity`, or a negative error;
+positive results are invalid. The receive output capacity is fixed by the
+session packet limit. A transform failure terminates the session because the
+stream may already have advanced. Callbacks run without library mutexes and
+must not reenter session/channel APIs. Clear private histories before releasing
+them. Provider allocations remain owned and released by the provider; library
+scratch buffers are retained and reused for the session.
+
+The optional [zlib module example](examples/zlib-comp.c) demonstrates the full
+contract, checked expansion bounds, packet flushes, private allocation cleanup,
+and stream reset without reallocating dictionaries. Compile that file in your
+application, add the public DeuceSSH include directory and link zlib; include
+[its example header](examples/zlib-comp.h) and call
+`dssh_example_register_zlib_comp()` before creating a session. It registers
+standard `zlib`; registration order determines negotiation preference.
+The example and zlib are not part of libdeucessh, its installed headers,
+exported API or dependency list. Only `none` is built into the library.
+
+The optional example can also be built as a separate CMake target:
+
+```sh
+cmake -S . -B build-example -DDEUCESSH_BUILD_ZLIB_EXAMPLE=ON
+cmake --build build-example --target dssh_example_zlib
+```
+
 
 ### Host Key Module
 
@@ -880,14 +991,27 @@ optional key management (generate, load, save).  They use the `ctx`
 field on the registered struct to store key material.
 
 ```c
+#include <stdlib.h>
+#include <string.h>
+#include "deucessh.h"
+#include "deucessh-algorithms.h"
 #include "deucessh-key-algo.h"
 
-static int my_sign(uint8_t **out, size_t *outlen,
+static int my_sign(struct dssh_bytes_result *out,
     const uint8_t *data, size_t data_len, dssh_key_algo_ctx *ctx)
 {
-    /* Sign data, malloc the SSH-encoded signature blob into *out.
-     * Set *outlen to the blob size.  Caller frees *out.
-     * Return 0 on success. */
+    /* Sign into producer-owned storage. Set out->bytes to the nonempty
+     * SSH-encoded blob, and out->lease to its producer release callback/owner.
+     * Retain capacity for reuse; each live result needs independent storage.
+     * Return 0 on success or a negative error. Publish partial resources
+     * through the lease on error, or release them before returning.
+     * The consumer releases every present lease; it never frees the blob.
+     * Implement the algorithm here; this outline reports unavailable. */
+    (void)out;
+    (void)data;
+    (void)data_len;
+    (void)ctx;
+    return DSSH_ERROR_INIT;
 }
 
 static int my_verify(const uint8_t *key_blob, size_t key_blob_len,
@@ -895,7 +1019,14 @@ static int my_verify(const uint8_t *key_blob, size_t key_blob_len,
     const uint8_t *data, size_t data_len)
 {
     /* Verify that sig_blob is a valid signature of data under
-     * the public key in key_blob.  Return 0 if valid. */
+     * the public key in key_blob. Return 0 only after verification. */
+    (void)key_blob;
+    (void)key_blob_len;
+    (void)sig_blob;
+    (void)sig_blob_len;
+    (void)data;
+    (void)data_len;
+    return DSSH_ERROR_INIT;
 }
 
 static int my_pubkey(const uint8_t **out, size_t *outlen,
@@ -903,15 +1034,25 @@ static int my_pubkey(const uint8_t **out, size_t *outlen,
 {
     /* Set *out to the SSH-encoded public key blob (internal pointer,
      * NOT malloc'd -- caller must not free).
-     * Set *outlen to the blob size.  Return 0 on success. */
+     * Set *outlen to the blob size. Return 0 on success. */
+    (void)out;
+    (void)outlen;
+    (void)ctx;
+    return DSSH_ERROR_INIT;
 }
 
 static int my_haskey(dssh_key_algo_ctx *ctx)
 {
-    /* Return true if a private key is loaded. */
+    /* Positive for a usable private key, zero for unavailable, negative error. */
+    (void)ctx;
+    return 0;
 }
 
-static void my_key_cleanup(dssh_key_algo_ctx *ctx) { /* ... */ }
+static void my_key_cleanup(dssh_key_algo_ctx *ctx)
+{
+    /* Release this producer's context; keep outstanding result leases valid. */
+    (void)ctx;
+}
 
 static unsigned int my_key_bits(const uint8_t *key_blob,
     size_t key_blob_len)
@@ -919,13 +1060,17 @@ static unsigned int my_key_bits(const uint8_t *key_blob,
     /* Return the key strength in bits from the wire-format public
      * key blob.  E.g. RSA: modulus bit count; Ed25519: 256.
      * Return 0 if the blob cannot be parsed. */
+    (void)key_blob;
+    (void)key_blob_len;
+    return 0;
 }
 
 int register_my_key_algo(void)
 {
     static const char name[] = "my-key-type";
     struct dssh_key_algo_s *ka = malloc(sizeof(*ka) + sizeof(name));
-    if (ka == NULL) return DSSH_ERROR_ALLOC;
+    if (ka == NULL)
+        return DSSH_ERROR_ALLOC;
     ka->next = NULL;
     ka->sign = my_sign;
     ka->verify = my_verify;
@@ -936,7 +1081,10 @@ int register_my_key_algo(void)
     ka->ctx = NULL;     /* set by generate/load */
     ka->flags = DSSH_KEY_ALGO_FLAG_SIGNATURE_CAPABLE;
     memcpy(ka->name, name, sizeof(name));
-    return dssh_transport_register_key_algo(ka);
+    int ret = dssh_transport_register_key_algo(ka);
+    if (ret < 0)
+        free(ka);
+    return ret;
 }
 ```
 
@@ -946,57 +1094,83 @@ format defined in the relevant RFC for the algorithm.  Use
 `dssh_key_algo_set_ctx()` (from `deucessh-algorithms.h`) to store key
 material on the registration entry.
 
+Signature results start zeroed and remain immutable until their release callback.
+The producer knows its actual capacities and clears owned storage before freeing
+or reusing it; reported result lengths never determine cleanup size. Consumers
+release on every outcome, including malformed metadata and downstream failures,
+and after their last copy before packet I/O. A static result also requires an
+explicit no-op release. The producer's release code must remain callable while
+any result is outstanding. Built-in key modules retain independent output buffers
+and preserve already returned signatures through key-context cleanup; this does
+not add a registry shutdown or change registration lifetime.
+
 ### KEX Module
 
 KEX modules drive the key exchange protocol after KEXINIT negotiation.
-A KEX handler receives a `struct dssh_kex_context *` (defined in
-`deucessh-kex.h`) containing all inputs, I/O function pointers, and
-output fields — no access to session internals.
+The handler receives borrowed inputs through a `const struct dssh_kex_context *`
+and returns a `struct dssh_kex_result` containing immutable K/H spans under one
+producer-owned lease. Modules need only the installed public headers.
+
+Every registration supplies an initializer, handler and cleanup callback:
 
 ```c
+#include <stdlib.h>
+#include <string.h>
 #include "deucessh-kex.h"
 
-static int my_kex_handler(struct dssh_kex_context *kctx)
-{
-    /* Inputs available on kctx:
-     *   client, v_c/v_c_len, v_s/v_s_len (version strings)
-     *   i_c/i_c_len, i_s/i_s_len (KEXINIT payloads)
-     *   key_algo (host key sign/verify/pubkey)
-     *   kex_data (from kex->ctx, set via dssh_kex_set_ctx())
-     *
-     * I/O:
-     *   kctx->send(payload, len, kctx->io_ctx)
-     *   kctx->recv(&msg_type, &payload, &len, kctx->io_ctx)
-     *
-     * Outputs (malloc'd, caller takes ownership):
-     *   kctx->shared_secret / shared_secret_sz
-     *   kctx->exchange_hash / exchange_hash_sz
-     */
-    return 0;
-}
-
-static void my_kex_cleanup(void *kex_data)
-{
-    /* Free any module-specific state. */
-}
+/* Application-defined functions implement the actual method and storage. */
+int my_method_reset(bool client, void *config, void **state);
+int my_method_exchange(const struct dssh_kex_context *ctx,
+    struct dssh_kex_result *out);
+void my_method_destroy(void *state);
 
 int register_my_kex(void)
 {
     static const char name[] = "my-kex-method";
     struct dssh_kex_s *kex = malloc(sizeof(*kex) + sizeof(name));
-    if (kex == NULL) return DSSH_ERROR_ALLOC;
+    if (kex == NULL)
+        return DSSH_ERROR_ALLOC;
     kex->next = NULL;
-    kex->handler = my_kex_handler;
-    kex->cleanup = my_kex_cleanup;
+    kex->init = my_method_reset;
+    kex->handler = my_method_exchange;
+    kex->cleanup = my_method_destroy;
     kex->flags = DSSH_KEX_FLAG_NEEDS_SIGNATURE_CAPABLE;
-    kex->hash_name = "SHA256";  /* OpenSSL digest name for key derivation */
+    kex->config = NULL;
+    kex->hash_name = "SHA-256";
     memcpy(kex->name, name, sizeof(name));
-    return dssh_transport_register_kex(kex);
+    int ret = dssh_transport_register_kex(kex);
+    if (ret < 0)
+        free(kex);
+    return ret;
 }
 ```
 
-The `struct dssh_kex_s` (typedef `dssh_kex`) and `struct dssh_kex_context`
-are defined in `deucessh-kex.h`.  KEX modules need no private headers.
+`init(client, config, &state)` receives NULL state on the first exchange and the
+same module's previous state on rekey. It can reset and reuse allocations; each
+exchange must generate fresh ephemeral material. If it replaces state, it must
+release the old state itself. Failure leaves NULL or a cleanup-valid state.
+Stateless success with NULL is valid. Cleanup accepts NULL and releases session
+state; it never owns global configuration. The library remembers the initialized
+creator separately from the next negotiated method, so cleanup always returns to
+the correct module, including partial initialization and method replacement.
+
+The input context supplies role, versions, KEXINIT payloads, host-key operations,
+`config`, `state`, host-key verification and `send`/`recv` callbacks. The handler
+initially receives a zero result. It publishes unsigned big-endian K without SSH
+length/sign encoding, the complete exchange hash matching `hash_name`, and one
+real release callback covering both spans. On failure, it either releases partial
+resources itself or publishes their lease. Return zero or a negative error;
+positive status is invalid. The library validates output metadata, copies the
+initial session identifier, derives directional keys and releases the result
+before resetting or cleaning state. The producer clears its actual secret
+capacity on release and may retain storage for the next exchange.
+
+Init/cleanup must not enter session, lifecycle or configuration APIs. The common
+result contract applies to release callbacks. No physical library mutex spans
+these callbacks. Registrations, their names, configuration and callback code
+remain borrowed for process lifetime. Set global configuration before the first
+session with `dssh_kex_set_ctx()`; session state is separate. See
+`deucessh-kex.h` and `deucessh-result.h` for the complete contracts.
 
 ## DH Group Exchange (Server)
 
@@ -1004,22 +1178,45 @@ DH-GEX works out of the box — the built-in default selects from
 RFC 3526 groups 14–18 (2048–8192-bit) based on the client's requested
 min/preferred/max range.
 
-To override with custom groups (e.g. from a moduli file), include
-`kex/dh-gex-sha256.h` and call `dssh_kex_set_ctx()` before
-`dssh_session_init()`:
+To override with custom groups (e.g. from a moduli file), use the provider and
+result types in the installed `deucessh-kex.h`. Configure a registered DH-GEX
+algorithm before `dssh_session_init()`:
 
 ```c
-#include "kex/dh-gex-sha256.h"
+#include "deucessh-algorithms.h"
+#include "deucessh-kex.h"
 
-struct dssh_dh_gex_provider prov = {
-    .select_group = my_group_selector,
-    .cbdata = NULL,
-};
-dssh_kex_set_ctx("diffie-hellman-group-exchange-sha256", &prov);
+/* Application implementation: select a group within min/preferred/max,
+ * set out->p and out->g to unsigned big-endian spans, and set out->lease.
+ * Return zero on success or a negative error. */
+int my_group_selector(uint32_t min, uint32_t preferred, uint32_t max,
+    struct dssh_dh_gex_group_result *out, void *cbdata);
+
+int configure_my_dh_groups(void)
+{
+    static struct dssh_dh_gex_provider provider = {
+        .select_group = my_group_selector,
+        .cbdata = NULL,
+    };
+    return dssh_kex_set_ctx("diffie-hellman-group-exchange-sha256", &provider);
+}
 ```
 
-The `select_group` callback receives the client's min/preferred/max
-bit sizes and returns p and g as big-endian byte arrays (caller frees).
+The callback receives the client's min/preferred/max bit sizes and a zeroed
+`dssh_dh_gex_group_result`. Its nonempty `p` and `g` spans contain unsigned
+big-endian integers, without SSH length prefixes or sign padding. One producer
+lease covers both spans. The library validates/imports the group and releases
+its lease before sending packets, on success and every failure. It never clears
+or frees provider storage; invalid reported lengths do not determine producer
+cleanup sizes. Publish partial resources through a lease on failure or release
+them before returning. Positive status and missing release functions are invalid.
+
+A static group needs an explicit no-op release. The built-in selector lends its
+immutable RFC tables this way, with no per-selection allocations or copies.
+Custom producers can retain their own capacities for reuse. Different sessions
+can select concurrently, so each live mutable result needs independent storage.
+Provider configuration and callback code have the borrowed process lifetime of
+the registration. The common result contract governs release restrictions.
 
 ## Key Management
 
@@ -1309,8 +1506,24 @@ demux thread also handles:
 - Data after peer EOF/CLOSE — discarded
 - Rekeying, global requests, IGNORE/DEBUG/UNIMPLEMENTED — transparent
 
-`dssh_session_stop()` terminates the demux thread and frees all
-channel resources.  Called automatically by `dssh_session_cleanup()`.
+`dssh_session_stop()` requests termination, joins the demux thread and
+frees channel resources. `dssh_session_cleanup()` also stops the session
+before freeing its transport state. First stop and join application threads
+using the session or its channels, and serialize start, stop and cleanup calls.
+The application's I/O callbacks must return promptly after termination.
+
+Failure of a required internal termination wake calls `abort()` because the
+library cannot safely return while hidden waiters may remain blocked. Ordinary
+notification errors terminate the session through this required wake path.
+
+A failed join of the valid joinable demux is an unrecoverable internal ownership
+failure and calls `abort()`, without invoking diagnostic callbacks or attempting
+uncertain cleanup. Ordinary initialization, peer and I/O errors keep their
+defined error handling.
+Lifecycle calls made during a callback on the session or while the caller
+owns its zero-copy TX reservation defer destruction; the owner must call
+stop or cleanup again after that context ends. The restrictions on I/O,
+logging and termination callbacks still apply.
 
 ## Event Model
 
@@ -1336,7 +1549,12 @@ if (ev & DSSH_POLL_EVENT) {
 
     switch (event.type) {
     case DSSH_EVENT_SIGNAL:
-        printf("Signal: SIG%s\n", event.signal.name);
+        printf("Signal bytes:");
+        for (size_t i = 0; i < event.signal.name.len; i++) {
+            unsigned int byte = event.signal.name.data[i];
+            printf(" %02x", byte);
+        }
+        printf("\n");
         break;
     case DSSH_EVENT_WINDOW_CHANGE:
         resize(event.window_change.cols, event.window_change.rows);
@@ -1356,8 +1574,11 @@ the next poll returns `DSSH_POLL_EVENT` immediately.
 Stream positions are advisory — the app can drain to the position for
 correlation, or ignore positions entirely.
 
-String pointers in events (`signal.name`, `exit_signal.signal_name`,
-`exit_signal.error_message`) are valid until the next
+Borrowed `dssh_bytes` views (`signal.name`, `exit_signal.signal_name`,
+`exit_signal.error_message`, `exit_signal.language`) preserve exact accepted
+bytes and lengths, including embedded zero bytes, without a terminator promise.
+Empty views have NULL data and zero length. Never free or release these views;
+copy bytes you retain beyond their lifetime. They are valid until the next
 `dssh_chan_read_event()` or `dssh_chan_poll()` on the same channel.
 
 ### Event callback (optional)
@@ -1372,9 +1593,19 @@ dssh_chan_set_event_cb(ch, my_event_cb, my_context);
 dssh_session_set_event_cb(sess, my_event_cb, my_context);
 ```
 
-The callback receives the full event struct with positions computed
-at queue time.  Same restrictions as ZC callbacks: cannot call TX
-functions, must be fast.
+The callback consumes each newly published event, in wire order, without also
+adding it to the poll queue. Its positions are cumulative bytes delivered on
+each stream before the event, saturating at `SIZE_MAX`. The event and its strings
+are valid only during that invocation. Callbacks run without library mutexes
+and must be fast; queue work for another thread instead of calling channel I/O,
+poll/read_event, open/accept, or TX functions.
+
+The setter replaces the callback and context as a pair. An invocation that
+already captured the old pair may finish after the setter returns; keep that
+code and context alive until it finishes. Installing a callback leaves existing
+queued or frozen poll events available. Removing it with a NULL callback sends
+future events to the poll queue. A poll event's positions retain their separate
+meaning: unread bytes when that event is frozen by poll.
 
 ## Zero-Copy API
 
@@ -1472,6 +1703,23 @@ my_shell_cb(dssh_channel ch,
 }
 ```
 
+Setup callbacks run on the accept caller thread with no library mutex held.
+The channel and accumulated parameters are borrowed for that invocation;
+getters on the callback handle show those parameters. Event callback and limit
+setters are available. Same-session channel I/O, polling, TX reservations and
+nested open/accept are rejected. Independent sessions remain available.
+Do not hand the handle to another thread before accept returns successfully.
+
+Calling `dssh_chan_close(ch, exit_code)` in its setup callback records whole-channel
+cancellation and returns 0; the exit code is unused before startup. Do not use the
+handle again. After the callback returns, the acceptor sends the required
+rejection/CLOSE, retires the channel and continues accepting. Cancellation takes
+precedence over a nonnegative callback return. A negative PTY/env return without
+cancellation rejects only that request; a negative terminal return rejects the
+channel. Session termination, stop and cleanup retain their deferred lifecycle
+behavior. Successful setup publishes owned parameters before normal callbacks
+can run, including callbacks that run before accept returns.
+
 ### NULL callback behavior
 
 | Callback | If NULL |
@@ -1527,6 +1775,11 @@ application I/O callbacks run after that mutex is released.
 
 During rekeying, application-layer sends (message type >= 50) are
 blocked until NEWKEYS completes.
+
+Failure to release a valid owned internal mutex, or to join the valid joinable
+owned demux under the lifecycle preconditions, calls `abort()`. These internal
+ownership failures have no retry or partial-cleanup contract. Ordinary resource,
+I/O, acquisition and timeout errors retain their documented error handling.
 
 **ZC callback restrictions:** The data callback and event callback
 run on the demux thread.  They MUST NOT call any TX function

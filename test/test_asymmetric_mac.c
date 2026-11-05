@@ -59,6 +59,8 @@
  * Socket I/O callbacks (same as test_selftest.c)
  * ================================================================ */
 
+#include "auth_result_fixture.h"
+
 static int
 sock_tx(uint8_t *buf, size_t bufsz, dssh_session sess, void *cbdata)
 {
@@ -125,14 +127,21 @@ sock_rxline(uint8_t *buf, size_t bufsz, size_t *bytes_received,
 static int
 auth_pw_cb(const uint8_t *username, size_t username_len,
     const uint8_t *password, size_t password_len,
-    uint8_t **change_prompt, size_t *change_prompt_len,
+    struct dssh_bytes_result *output_result,
     void *cbdata)
 {
+	uint8_t *fixture_output = NULL;
+	size_t fixture_length = 0;
+	uint8_t **change_prompt = &fixture_output;
+	size_t *change_prompt_len = &fixture_length;
+	(void)change_prompt;
+	(void)change_prompt_len;
+
 	(void)username; (void)username_len;
 	(void)password; (void)password_len;
 	(void)change_prompt; (void)change_prompt_len;
 	(void)cbdata;
-	return DSSH_AUTH_SUCCESS;
+	return test_auth_output_finish(output_result, fixture_output, fixture_length, DSSH_AUTH_SUCCESS);
 }
 
 static int

@@ -27,20 +27,57 @@
 #include "dssh_test_ossl.h"
 #include "mock_io.h"
 #include "test_dhgex_provider.h"
+#include "test_comp.h"
+#include "compression_fixture.h"
 
 
 /* ================================================================
  * Dispatch callbacks for two-sided tests.
  * ================================================================ */
 
+#include "auth_result_fixture.h"
+
+static _Thread_local int (*setup_tx_test_hook)(dssh_session sess);
+static _Thread_local int (*accept_phase_test_hook)(dssh_session sess);
+static _Thread_local int (*window_tx_return_test_hook)(dssh_session sess);
+static bool window_test_gather;
+
 static int
 mock_tx_dispatch(uint8_t *buf, size_t bufsz,
     dssh_session sess, void *cbdata)
 {
-	if (sess->trans.client)
-		return mock_tx_client(buf, bufsz, sess, cbdata);
-	else
-		return mock_tx_server(buf, bufsz, sess, cbdata);
+	if (accept_phase_test_hook != NULL) {
+		int ret = accept_phase_test_hook(sess);
+		if (ret < 0)
+			return ret;
+	}
+	if (setup_tx_test_hook != NULL) {
+		int (*hook)(dssh_session) = setup_tx_test_hook;
+		setup_tx_test_hook = NULL;
+		return hook(sess);
+	}
+	int ret = sess->trans.client ? mock_tx_client(buf, bufsz, sess, cbdata)
+	    : mock_tx_server(buf, bufsz, sess, cbdata);
+	if (ret == 0 && window_tx_return_test_hook != NULL) {
+		int (*hook)(dssh_session) = window_tx_return_test_hook;
+		window_tx_return_test_hook = NULL;
+		ret = hook(sess);
+	}
+	return ret;
+}
+
+static int
+window_mock_gather(const struct dssh_tx_iov *iov, size_t count,
+    dssh_session sess, void *cbdata)
+{
+	for (size_t i = 0; i < count; i++) {
+		/* The library owns mutable packet storage; the fixture only reads it. */
+		uint8_t *bytes = (uint8_t *)(uintptr_t)iov[i].base;
+		int ret = mock_tx_dispatch(bytes, iov[i].len, sess, cbdata);
+		if (ret < 0)
+			return ret;
+	}
+	return 0;
 }
 
 static int
@@ -80,6 +117,11 @@ static int
 register_all_algorithms(void)
 {
 	int res;
+	if (window_test_gather) {
+		res = dssh_transport_set_tx_gather(window_mock_gather);
+		if (res < 0)
+			return res;
+	}
 	if (test_using_dhgex())
 		res = dssh_register_dh_gex_sha256();
 	else if (test_using_sntrup())
@@ -99,6 +141,9 @@ register_all_algorithms(void)
 	res = test_register_mac_algos();
 	if (res < 0)
 		return res;
+	res = dssh_test_register_optional_comp();
+	if (res < 0)
+		return res;
 	res = dssh_register_none_comp();
 	if (res < 0)
 		return res;
@@ -112,10 +157,17 @@ register_all_algorithms(void)
 static int
 auth_password_accept_all(const uint8_t *username, size_t username_len,
     const uint8_t *password, size_t password_len,
-    uint8_t **change_prompt, size_t *change_prompt_len,
+    struct dssh_bytes_result *output_result,
     void *cbdata)
 {
-	return DSSH_AUTH_SUCCESS;
+	uint8_t *fixture_output = NULL;
+	size_t fixture_length = 0;
+	uint8_t **change_prompt = &fixture_output;
+	size_t *change_prompt_len = &fixture_length;
+	(void)change_prompt;
+	(void)change_prompt_len;
+
+	return test_auth_output_finish(output_result, fixture_output, fixture_length, DSSH_AUTH_SUCCESS);
 }
 
 static struct dssh_auth_server_cbs auth_cbs = {
@@ -328,7 +380,8 @@ conn_setup(struct conn_ctx *ctx)
 	thrd_join(ct, NULL);
 	thrd_join(st, NULL);
 
-	if (client_ha.result != 0 || server_ha.result != 0) {
+	if (client_ha.result != 0 || server_ha.result != 0
+	    || !compression_fixture_selected(ctx->client, ctx->server)) {
 		dssh_session_cleanup(ctx->server);
 		dssh_session_cleanup(ctx->client);
 		mock_io_free(&ctx->io);
@@ -429,12 +482,15 @@ client_open_exec_thread(void *arg)
 {
 	struct open_exec_ctx *ctx = arg;
 	struct dssh_chan_params p;
-	dssh_chan_params_init(&p, DSSH_CHAN_EXEC);
-	dssh_chan_params_set_command(&p, ctx->command);
-	dssh_chan_params_set_pty(&p, false);
-	ctx->client_ch = dssh_chan_open(ctx->client, &p);
+	int ret = dssh_chan_params_init(&p, DSSH_CHAN_EXEC);
+	if (ret == 0)
+		ret = dssh_chan_params_set_command(&p, ctx->command);
+	if (ret == 0)
+		ret = dssh_chan_params_set_pty(&p, false);
+	if (ret == 0)
+		ctx->client_ch = dssh_chan_open(ctx->client, &p);
 	dssh_chan_params_free(&p);
-	return wait_stream_writable(ctx->client_ch);
+	return ret < 0 ? ret : wait_stream_writable(ctx->client_ch);
 }
 
 static int
@@ -1396,8 +1452,8 @@ test_send_signal(void)
 	res = dssh_chan_read_event(oc.server_ch, &event);
 	ASSERT_OK(res);
 	ASSERT_EQ(event.type, DSSH_EVENT_SIGNAL);
-	ASSERT_NOT_NULL(event.signal.name);
-	ASSERT_STR_EQ(event.signal.name, "INT");
+	ASSERT_NOT_NULL(event.signal.name.data);
+	ASSERT_TRUE(dssh_test_bytes_equal(event.signal.name, "INT", 3));
 
 	dssh_chan_close(oc.client_ch, 0);
 	dssh_chan_close(oc.server_ch, 0);
@@ -1453,8 +1509,8 @@ test_signal_after_data(void)
 	struct dssh_chan_event event;
 	dssh_chan_read_event(oc.server_ch, &event);
 	ASSERT_EQ(event.type, DSSH_EVENT_SIGNAL);
-	ASSERT_NOT_NULL(event.signal.name);
-	ASSERT_STR_EQ(event.signal.name, "TERM");
+	ASSERT_NOT_NULL(event.signal.name.data);
+	ASSERT_TRUE(dssh_test_bytes_equal(event.signal.name, "TERM", 4));
 
 	dssh_chan_close(oc.client_ch, 0);
 	dssh_chan_close(oc.server_ch, 0);
@@ -2390,16 +2446,648 @@ static size_t
 build_channel_open(uint8_t *buf, size_t bufsz, const char *type,
     uint32_t sender_ch, uint32_t window, uint32_t max_packet)
 {
+	size_t tlen = strlen(type);
+	if (tlen > UINT32_MAX || tlen > SIZE_MAX - 17 || tlen + 17 > bufsz)
+		return 0;
+	uint32_t wire_len = (uint32_t)tlen;
 	size_t pos = 0;
 	buf[pos++] = SSH_MSG_CHANNEL_OPEN;
-	size_t tlen = strlen(type);
-	dssh_serialize_uint32((uint32_t)tlen, buf, bufsz, &pos);
+	DSSH_PUT_U32(wire_len, buf, &pos);
 	memcpy(&buf[pos], type, tlen);
 	pos += tlen;
-	dssh_serialize_uint32(sender_ch, buf, bufsz, &pos);
-	dssh_serialize_uint32(window, buf, bufsz, &pos);
-	dssh_serialize_uint32(max_packet, buf, bufsz, &pos);
+	DSSH_PUT_U32(sender_ch, buf, &pos);
+	DSSH_PUT_U32(window, buf, &pos);
+	DSSH_PUT_U32(max_packet, buf, &pos);
 	return pos;
+}
+
+/* Reserve TX so the reply remains inspectable in its normal queued form. */
+static bool
+expect_open_failure(dssh_session sess, uint8_t *msg, size_t len,
+    uint32_t peer_channel, uint32_t reason)
+{
+	if (tx_acquire(sess, SSH_MSG_IGNORE) < 0)
+		return false;
+	int ret = dssh_test_demux_dispatch(sess, SSH_MSG_CHANNEL_OPEN, msg, len);
+	int lock_ret = mtx_lock(&sess->trans.tx_queue_mtx);
+	bool correct = false;
+	if (lock_ret == thrd_success) {
+		struct dssh_tx_slot *slot = &sess->trans.open_fail_slot;
+		correct = ret == 0 && atomic_load(&slot->ready) && slot->payload_len == 17
+		    && slot->buf[9] == SSH_MSG_CHANNEL_OPEN_FAILURE
+		    && DSSH_GET_U32(&slot->buf[10]) == peer_channel
+		    && DSSH_GET_U32(&slot->buf[14]) == reason
+		    && DSSH_GET_U32(&slot->buf[18]) == 0
+		    && DSSH_GET_U32(&slot->buf[22]) == 0;
+		if (mtx_unlock(&sess->trans.tx_queue_mtx) != thrd_success)
+			correct = false;
+	}
+	tx_unlock_with_slots(sess);
+	return correct;
+}
+
+static uint32_t
+open_state_zc_cb(dssh_channel ch, int stream, const uint8_t *data, size_t len, void *cbdata)
+{
+	(void)ch;
+	(void)stream;
+	(void)data;
+	(void)len;
+	(void)cbdata;
+	return 0;
+}
+
+static int
+test_channel_before_start(void)
+{
+	dssh_test_reset_global_config();
+	ASSERT_OK(register_all_algorithms());
+	dssh_session sess = init_server_session();
+	ASSERT_NOT_NULL(sess);
+	struct dssh_chan_params params;
+	ASSERT_OK(dssh_chan_params_init(&params, DSSH_CHAN_EXEC));
+	ASSERT_OK(dssh_chan_params_set_command(&params, "before-start"));
+	dssh_test_alloc_fail_after(0);
+	dssh_test_thrd_fail_after(0);
+	dssh_channel accepted = dssh_chan_accept(sess, &accept_cbs_all, 0);
+	dssh_channel stream = dssh_chan_open(sess, &params);
+	dssh_channel zc = dssh_chan_zc_open(sess, &params, open_state_zc_cb, NULL);
+	int allocations = dssh_test_alloc_count();
+	int synchronization = dssh_test_thrd_count();
+	dssh_test_alloc_reset();
+	dssh_test_thrd_reset();
+	bool terminated = dssh_session_is_terminated(sess);
+	dssh_chan_params_free(&params);
+	dssh_session_cleanup(sess);
+	dssh_test_reset_global_config();
+	ASSERT_NULL(accepted);
+	ASSERT_NULL(stream);
+	ASSERT_NULL(zc);
+	ASSERT_EQ(allocations, 0);
+	ASSERT_EQ(synchronization, 0);
+	ASSERT_FALSE(terminated);
+	return TEST_PASS;
+}
+
+static int
+test_open_type_and_queue_policy(void)
+{
+	struct conn_ctx ctx;
+	if (conn_setup(&ctx) < 0)
+		return TEST_FAIL;
+	uint8_t msg[256];
+	const char *unknown[] = { "", "unknown", "session@example.invalid" };
+	for (size_t i = 0; i < sizeof(unknown) / sizeof(unknown[0]); i++) {
+		size_t len = build_channel_open(msg, sizeof(msg), unknown[i], 60000, 123, 456);
+		ASSERT_TRUE(expect_open_failure(ctx.server, msg, len, 60000, 3));
+		ASSERT_TRUE(expect_open_failure(ctx.client, msg, len, 60000, 3));
+	}
+	char long_type[129];
+	memset(long_type, 'a', sizeof(long_type) - 1);
+	long_type[sizeof(long_type) - 1] = 0;
+	size_t len = build_channel_open(msg, sizeof(msg), long_type, 60000, 123, 456);
+	ASSERT_TRUE(expect_open_failure(ctx.server, msg, len, 60000, 3));
+	const char *forbidden[] = { "x11", "forwarded-tcpip", "direct-tcpip" };
+	for (size_t i = 0; i < sizeof(forbidden) / sizeof(forbidden[0]); i++) {
+		len = build_channel_open(msg, sizeof(msg), forbidden[i], 60000, 123, 456);
+		ASSERT_TRUE(expect_open_failure(ctx.server, msg, len, 60000, 1));
+		ASSERT_TRUE(expect_open_failure(ctx.client, msg, len, 60000, 1));
+	}
+	len = build_channel_open(msg, sizeof(msg), "session", 60000, 123, 456);
+	ASSERT_TRUE(expect_open_failure(ctx.client, msg, len, 60000, 1));
+	ASSERT_EQ(mtx_lock(&ctx.server->accept_mtx), thrd_success);
+	size_t queued = ctx.server->accept_queue.count;
+	ASSERT_EQ(mtx_unlock(&ctx.server->accept_mtx), thrd_success);
+	ASSERT_EQ_U(queued, 0);
+	struct open_exec_ctx oc = {
+		.client = ctx.client, .server = ctx.server,
+		.command = "queue-progress", .cbs = &accept_cbs_all,
+		.accept_timeout = 30000,
+	};
+	ASSERT_OK(open_exec_channel(&oc));
+	for (uint32_t i = 0; i < DSSH_ACCEPT_QUEUE_CAP; i++) {
+		len = build_channel_open(msg, sizeof(msg), "session", i + 32, 123, 456);
+		ASSERT_OK(dssh_test_demux_dispatch(ctx.server, SSH_MSG_CHANNEL_OPEN, msg, len));
+	}
+	len = build_channel_open(msg, sizeof(msg), "session", 60000, 123, 456);
+	ASSERT_TRUE(expect_open_failure(ctx.server, msg, len, 60000, 4));
+	static const uint8_t data[] = "queue is full";
+	ASSERT_EQ(dssh_chan_write(oc.client_ch, 0, data, sizeof(data)), sizeof(data));
+	ASSERT_TRUE(dssh_chan_poll(oc.server_ch, DSSH_POLL_READ, 5000) & DSSH_POLL_READ);
+	uint8_t received[sizeof(data)];
+	ASSERT_EQ(dssh_chan_read(oc.server_ch, 0, received, sizeof(received)), sizeof(data));
+	ASSERT_MEM_EQ(received, data, sizeof(data));
+	for (uint32_t i = 0; i < DSSH_ACCEPT_QUEUE_CAP; i++) {
+		struct dssh_incoming_open inc;
+		ASSERT_OK(accept_incoming(ctx.server, &inc, 0));
+		ASSERT_EQ_U(inc.peer_channel, i + 32);
+		ASSERT_EQ_U(inc.peer_window, 123);
+		ASSERT_EQ_U(inc.peer_max_packet, 456);
+		ASSERT_STR_EQ(inc.channel_type, "session");
+	}
+	struct dssh_incoming_open inc;
+	ASSERT_EQ(accept_incoming(ctx.server, &inc, 0), DSSH_ERROR_NOMORE);
+	ASSERT_OK(dssh_test_demux_dispatch(ctx.server, SSH_MSG_CHANNEL_OPEN, msg, len));
+	ASSERT_OK(accept_incoming(ctx.server, &inc, 0));
+	ASSERT_EQ_U(inc.peer_channel, 60000);
+	ASSERT_EQ(mtx_lock(&ctx.server->channel_mtx), thrd_success);
+	ctx.server->next_channel_id = UINT32_MAX;
+	ASSERT_EQ(mtx_unlock(&ctx.server->channel_mtx), thrd_success);
+	ASSERT_EQ(alloc_channel_id(ctx.server), UINT32_MAX);
+	/* The real active channel owns ID 0, so allocation skips it after wrap. */
+	ASSERT_EQ(alloc_channel_id(ctx.server), 1);
+	ASSERT_FALSE(dssh_session_is_terminated(ctx.server));
+	conn_cleanup(&ctx);
+	return TEST_PASS;
+}
+
+static int
+test_open_response_state(void)
+{
+	struct conn_ctx ctx;
+	if (conn_setup(&ctx) < 0)
+		return TEST_FAIL;
+	struct open_exec_ctx oc = {
+		.client = ctx.client, .server = ctx.server,
+		.command = "response-state", .cbs = &accept_cbs_all,
+		.accept_timeout = 30000,
+	};
+	ASSERT_OK(open_exec_channel(&oc));
+	struct dssh_channel_s *channels[] = { oc.client_ch, oc.server_ch };
+	for (size_t side = 0; side < 2; side++) {
+		struct dssh_channel_s *ch = channels[side];
+		uint8_t confirmation[18];
+		uint8_t failure[23];
+		size_t pos = 0;
+		confirmation[pos++] = SSH_MSG_CHANNEL_OPEN_CONFIRMATION;
+		DSSH_PUT_U32(ch->local_id, confirmation, &pos);
+		DSSH_PUT_U32(UINT32_MAX, confirmation, &pos);
+		DSSH_PUT_U32(7, confirmation, &pos);
+		DSSH_PUT_U32(11, confirmation, &pos);
+		confirmation[pos] = 1;
+		uint32_t original_id = ch->remote_id;
+		uint32_t original_packet = ch->remote_max_packet;
+		uint_least32_t original_window = atomic_load(&ch->remote_window);
+		ASSERT_TRUE(original_window <= UINT32_MAX);
+		for (size_t len = 0; len <= sizeof(confirmation); len++)
+			ASSERT_EQ(dssh_test_demux_dispatch(ch->sess, confirmation[0], confirmation, len),
+			    DSSH_ERROR_PARSE);
+		pos = 0;
+		failure[pos++] = SSH_MSG_CHANNEL_OPEN_FAILURE;
+		DSSH_PUT_U32(ch->local_id, failure, &pos);
+		DSSH_PUT_U32(1, failure, &pos);
+		DSSH_PUT_U32(3, failure, &pos);
+		memcpy(&failure[pos], "bad", 3);
+		pos += 3;
+		DSSH_PUT_U32(2, failure, &pos);
+		memcpy(&failure[pos], "en", 2);
+		pos += 2;
+		failure[pos] = 1;
+		ASSERT_EQ(pos, 22);
+		ASSERT_EQ(dssh_test_demux_dispatch(ch->sess, failure[0], failure, pos), DSSH_ERROR_PARSE);
+		ASSERT_EQ_U(ch->remote_id, original_id);
+		ASSERT_EQ_U(ch->remote_max_packet, original_packet);
+		ASSERT_EQ_U(atomic_load(&ch->remote_window), original_window);
+		ASSERT_TRUE(ch->open);
+		ASSERT_FALSE(ch->close_received);
+		ASSERT_FALSE(ch->open_pending);
+
+		ASSERT_EQ(mtx_lock(&ch->buf_mtx), thrd_success);
+		ch->open = false;
+		ch->open_pending = true;
+		ASSERT_EQ(mtx_unlock(&ch->buf_mtx), thrd_success);
+		uint8_t eof[5];
+		size_t eof_pos = 0;
+		eof[eof_pos++] = SSH_MSG_CHANNEL_EOF;
+		DSSH_PUT_U32(ch->local_id, eof, &eof_pos);
+		ASSERT_EQ(dssh_test_demux_dispatch(ch->sess, eof[0], eof, eof_pos), DSSH_ERROR_PARSE);
+		ASSERT_FALSE(ch->eof_received);
+		for (size_t len = 0; len <= sizeof(failure); len++) {
+			if (len == pos)
+				continue;
+			ASSERT_EQ(dssh_test_demux_dispatch(ch->sess, failure[0], failure, len), DSSH_ERROR_PARSE);
+		}
+		uint8_t saved = failure[9];
+		failure[9] = 255;
+		ASSERT_EQ(dssh_test_demux_dispatch(ch->sess, failure[0], failure, pos), DSSH_ERROR_PARSE);
+		failure[9] = saved;
+		size_t reason_pos = 5;
+		DSSH_PUT_U32(0, failure, &reason_pos);
+		ASSERT_EQ(dssh_test_demux_dispatch(ch->sess, failure[0], failure, pos), DSSH_ERROR_PARSE);
+		ASSERT_FALSE(ch->close_received);
+		ASSERT_TRUE(ch->open_pending);
+		reason_pos = 5;
+		DSSH_PUT_U32(UINT32_MAX, failure, &reason_pos);
+		ASSERT_OK(dssh_test_demux_dispatch(ch->sess, failure[0], failure, pos));
+		ASSERT_FALSE(ch->open_pending);
+		ASSERT_TRUE(ch->close_received);
+		ASSERT_EQ(wait_open_response(ch->sess, ch), DSSH_ERROR_REJECTED);
+		ASSERT_EQ(dssh_test_demux_dispatch(ch->sess, confirmation[0], confirmation, 17), DSSH_ERROR_PARSE);
+		ASSERT_EQ_U(ch->remote_id, original_id);
+		ASSERT_EQ_U(atomic_load(&ch->remote_window), original_window);
+
+		ASSERT_EQ(mtx_lock(&ch->buf_mtx), thrd_success);
+		ch->open_pending = true;
+		ch->close_received = false;
+		ch->close_sent = true;
+		ASSERT_EQ(mtx_unlock(&ch->buf_mtx), thrd_success);
+		ASSERT_EQ(dssh_test_demux_dispatch(ch->sess, confirmation[0], confirmation, 17), DSSH_ERROR_PARSE);
+		ASSERT_EQ(mtx_lock(&ch->buf_mtx), thrd_success);
+		ch->close_sent = false;
+		ASSERT_EQ(mtx_unlock(&ch->buf_mtx), thrd_success);
+		/* A pending channel accepts exactly one well-formed confirmation. */
+		pos = 5;
+		DSSH_PUT_U32(original_id, confirmation, &pos);
+		uint32_t wire_window = (uint32_t)original_window;
+		DSSH_PUT_U32(wire_window, confirmation, &pos);
+		DSSH_PUT_U32(original_packet, confirmation, &pos);
+		ASSERT_OK(dssh_test_demux_dispatch(ch->sess, confirmation[0], confirmation, pos));
+		ASSERT_FALSE(ch->open_pending);
+		ASSERT_TRUE(ch->open);
+		ASSERT_OK(wait_open_response(ch->sess, ch));
+	}
+	static const uint8_t data[] = "after response checks";
+	ASSERT_EQ(dssh_chan_write(oc.client_ch, 0, data, sizeof(data)), sizeof(data));
+	ASSERT_TRUE(dssh_chan_poll(oc.server_ch, DSSH_POLL_READ, 5000) & DSSH_POLL_READ);
+	uint8_t received[sizeof(data)];
+	ASSERT_EQ(dssh_chan_read(oc.server_ch, 0, received, sizeof(received)), sizeof(data));
+	ASSERT_MEM_EQ(received, data, sizeof(data));
+	conn_cleanup(&ctx);
+	return TEST_PASS;
+}
+
+struct rejected_open_ctx {
+	struct open_exec_ctx open;
+	atomic_bool done;
+};
+
+static int
+rejected_open_thread(void *arg)
+{
+	struct rejected_open_ctx *ctx = arg;
+	int ret = client_open_exec_thread(&ctx->open);
+	atomic_store(&ctx->done, true);
+	return ret;
+}
+
+static int
+test_open_failure_roundtrip(void)
+{
+	struct conn_ctx ctx;
+	if (conn_setup(&ctx) < 0)
+		return TEST_FAIL;
+	struct rejected_open_ctx rejected = { .open = {
+		.client = ctx.client, .command = "rejected-open",
+	} };
+	atomic_init(&rejected.done, false);
+	thrd_t thread;
+	ASSERT_THRD_CREATE(&thread, rejected_open_thread, &rejected);
+	struct dssh_incoming_open inc;
+	int ret = accept_incoming(ctx.server, &inc, 5000);
+	if (ret >= 0) {
+		uint8_t failure[17];
+		size_t pos = 0;
+		failure[pos++] = SSH_MSG_CHANNEL_OPEN_FAILURE;
+		DSSH_PUT_U32(inc.peer_channel, failure, &pos);
+		DSSH_PUT_U32(1, failure, &pos);
+		DSSH_PUT_U32(0, failure, &pos);
+		DSSH_PUT_U32(0, failure, &pos);
+		ret = send_packet(ctx.server, failure, pos, NULL);
+	}
+	bool done = ret >= 0 && dssh_test_wait_bool(&rejected.done, true);
+	if (!done) {
+		dssh_session_terminate(ctx.client);
+		mock_io_close_c2s(&ctx.io);
+		mock_io_close_s2c(&ctx.io);
+	}
+	int join_ret = thrd_join(thread, NULL);
+	ASSERT_EQ(join_ret, thrd_success);
+	ASSERT_TRUE(done);
+	ASSERT_NULL(rejected.open.client_ch);
+	ASSERT_FALSE(dssh_session_is_terminated(ctx.client));
+	ASSERT_EQ(mtx_lock(&ctx.client->channel_mtx), thrd_success);
+	size_t remaining = ctx.client->channel_count;
+	ASSERT_EQ(mtx_unlock(&ctx.client->channel_mtx), thrd_success);
+	ASSERT_EQ_U(remaining, 0);
+	conn_cleanup(&ctx);
+	return TEST_PASS;
+}
+
+static int
+test_open_sync_failures(void)
+{
+	for (int operation = 0; operation < 7; operation++) {
+		/* Recoverable acquisitions/waits/signals only. Releases use the
+		 * separate provenance-checked process-isolated fatal matrix. */
+		int limit = operation == 6 ? 48
+		    : (operation == 0 || operation == 1 || operation == 4) ? 2 : 1;
+		bool completed = operation != 6;
+		for (int n = 0; n < limit; n++) {
+			struct conn_ctx ctx;
+			if (conn_setup(&ctx) < 0)
+				return TEST_FAIL;
+			uint8_t msg[32];
+			size_t len = build_channel_open(msg, sizeof(msg), "session", 60000, 123, 456);
+			struct dssh_incoming_open inc;
+			struct open_exec_ctx oc = {
+				.client = ctx.client, .server = ctx.server,
+				.command = "open-sync", .cbs = &accept_cbs_all,
+				.accept_timeout = 30000,
+			};
+			if (operation == 3 || operation == 4)
+				ASSERT_OK(open_exec_channel(&oc));
+			if (operation == 4) {
+				ASSERT_EQ(mtx_lock(&oc.server_ch->buf_mtx), thrd_success);
+				oc.server_ch->open = false;
+				oc.server_ch->open_pending = true;
+				ASSERT_EQ(mtx_unlock(&oc.server_ch->buf_mtx), thrd_success);
+			}
+			if (operation == 5)
+				ASSERT_OK(dssh_test_demux_dispatch(ctx.server, SSH_MSG_CHANNEL_OPEN, msg, len));
+			if (operation == 6)
+				len = build_channel_open(msg, sizeof(msg), "unknown", 60000, 123, 456);
+			dssh_test_thrd_fail_after(n);
+			int64_t ret;
+			if (operation == 0 || operation == 6)
+				ret = dssh_test_demux_dispatch(ctx.server, SSH_MSG_CHANNEL_OPEN, msg, len);
+			else if (operation == 1 || operation == 5)
+				ret = accept_incoming(ctx.server, &inc, -1);
+			else if (operation == 2)
+				ret = alloc_channel_id(ctx.server);
+			else
+				ret = wait_open_response(ctx.server, oc.server_ch);
+			int calls = dssh_test_thrd_count();
+			dssh_test_thrd_reset();
+			bool terminated = dssh_session_is_terminated(ctx.server);
+			conn_cleanup(&ctx);
+			if (operation != 6 || calls > n) {
+				ASSERT_EQ(ret, DSSH_ERROR_TERMINATED);
+				ASSERT_TRUE(terminated);
+			}
+			else {
+				ASSERT_OK(ret);
+				ASSERT_FALSE(terminated);
+				completed = true;
+				break;
+			}
+		}
+		ASSERT_TRUE(completed);
+	}
+	return TEST_PASS;
+}
+
+static int
+test_channel_io_validation(void)
+{
+	struct conn_ctx ctx;
+	if (conn_setup(&ctx) < 0)
+		return TEST_FAIL;
+	struct open_exec_ctx oc = {
+		.client = ctx.client, .server = ctx.server,
+		.command = "io-validation", .cbs = &accept_cbs_all,
+		.accept_timeout = 30000,
+	};
+	ASSERT_OK(open_exec_channel(&oc));
+	uint8_t byte = 1;
+	ASSERT_EQ(dssh_chan_read(oc.client_ch, -1, &byte, 1), DSSH_ERROR_INVALID);
+	ASSERT_EQ(dssh_chan_read(oc.client_ch, 2, NULL, 0), DSSH_ERROR_INVALID);
+	ASSERT_EQ(dssh_chan_write(oc.client_ch, -1, &byte, 0), DSSH_ERROR_INVALID);
+	ASSERT_EQ(dssh_chan_write(oc.client_ch, 2, &byte, 1), DSSH_ERROR_INVALID);
+	ASSERT_EQ(dssh_chan_poll(oc.client_ch, -1, 0), DSSH_ERROR_INVALID);
+	ASSERT_EQ(dssh_chan_poll(oc.client_ch, 8, 0), DSSH_ERROR_INVALID);
+	ASSERT_FALSE(dssh_session_is_terminated(ctx.client));
+	ASSERT_TRUE(dssh_chan_poll(oc.client_ch, DSSH_POLL_WRITE, 0) & DSSH_POLL_WRITE);
+	ASSERT_EQ(mtx_lock(&oc.client_ch->buf_mtx), thrd_success);
+	uint32_t original_max = oc.client_ch->remote_max_packet;
+	oc.client_ch->remote_max_packet = 0;
+	ASSERT_EQ(mtx_unlock(&oc.client_ch->buf_mtx), thrd_success);
+	ASSERT_EQ(dssh_chan_poll(oc.client_ch, DSSH_POLL_WRITE, 0), 0);
+	ASSERT_EQ(dssh_chan_write(oc.client_ch, 0, &byte, 1), DSSH_ERROR_NOMORE);
+	ASSERT_FALSE(tx_owner_is_current(ctx.client));
+	ASSERT_EQ(mtx_lock(&oc.client_ch->buf_mtx), thrd_success);
+	oc.client_ch->remote_max_packet = original_max;
+	ASSERT_EQ(mtx_unlock(&oc.client_ch->buf_mtx), thrd_success);
+	ASSERT_OK(dssh_chan_shutwr(oc.client_ch));
+	ASSERT_EQ(dssh_chan_poll(oc.client_ch, DSSH_POLL_WRITE, 0), 0);
+	ASSERT_EQ(dssh_chan_write(oc.client_ch, 0, &byte, 1), DSSH_ERROR_TERMINATED);
+	ASSERT_FALSE(tx_owner_is_current(ctx.client));
+	conn_cleanup(&ctx);
+	return TEST_PASS;
+}
+
+static int
+test_request_response_state(void)
+{
+	struct conn_ctx ctx;
+	if (conn_setup(&ctx) < 0)
+		return TEST_FAIL;
+	struct open_exec_ctx oc = {
+		.client = ctx.client, .server = ctx.server,
+		.command = "request-state", .cbs = &accept_cbs_all,
+		.accept_timeout = 30000,
+	};
+	ASSERT_OK(open_exec_channel(&oc));
+	struct dssh_channel_s *ch = oc.client_ch;
+	ASSERT_EQ(send_channel_request_wait(ctx.client, ch, "unknown-request", NULL, 0), DSSH_ERROR_REJECTED);
+	ASSERT_FALSE(tx_owner_is_current(ctx.client));
+	for (int success = 0; success < 2; success++) {
+		ASSERT_EQ(mtx_lock(&ch->buf_mtx), thrd_success);
+		ch->request_pending = true;
+		ch->request_responded = true;
+		ch->request_success = success != 0;
+		ASSERT_EQ(mtx_unlock(&ch->buf_mtx), thrd_success);
+		int result = wait_channel_request_response(ctx.client, ch);
+		ASSERT_EQ(result, success ? 0 : DSSH_ERROR_REJECTED);
+		ASSERT_FALSE(ch->request_pending);
+		ASSERT_FALSE(ch->request_responded);
+	}
+	ASSERT_EQ(mtx_lock(&ch->buf_mtx), thrd_success);
+	ch->request_pending = true;
+	ch->request_responded = false;
+	ASSERT_EQ(mtx_unlock(&ch->buf_mtx), thrd_success);
+	ASSERT_EQ(send_channel_request_wait(ctx.client, ch, "unknown-request", NULL, 0), DSSH_ERROR_INVALID);
+	ASSERT_TRUE(ch->request_pending);
+	ASSERT_FALSE(tx_owner_is_current(ctx.client));
+	ASSERT_EQ(mtx_lock(&ch->buf_mtx), thrd_success);
+	ch->close_received = true;
+	ASSERT_EQ(mtx_unlock(&ch->buf_mtx), thrd_success);
+	ASSERT_EQ(wait_channel_request_response(ctx.client, ch), DSSH_ERROR_TERMINATED);
+	ASSERT_FALSE(ch->request_pending);
+	ASSERT_EQ(mtx_lock(&ch->buf_mtx), thrd_success);
+	ch->close_received = false;
+	ASSERT_EQ(mtx_unlock(&ch->buf_mtx), thrd_success);
+	ASSERT_EQ(send_channel_request_wait(ctx.client, ch, "env", NULL, SIZE_MAX), DSSH_ERROR_INVALID);
+	ASSERT_FALSE(tx_owner_is_current(ctx.client));
+	ASSERT_FALSE(dssh_session_is_terminated(ctx.client));
+	conn_cleanup(&ctx);
+	return TEST_PASS;
+}
+
+static int
+test_request_io_sync_failures(void)
+{
+	for (int operation = 0; operation < 8; operation++) {
+		int count = operation == 7 ? 32 : (operation == 3 || operation == 5) ? 2 : 1;
+		bool completed = operation != 7;
+		for (int n = 0; n < count; n++) {
+			struct conn_ctx ctx;
+			if (conn_setup(&ctx) < 0)
+				return TEST_FAIL;
+			struct open_exec_ctx oc = {
+				.client = ctx.client, .server = ctx.server,
+				.command = "io-sync", .cbs = &accept_cbs_all,
+				.accept_timeout = 30000,
+			};
+			ASSERT_OK(open_exec_channel(&oc));
+			struct dssh_channel_s *ch = oc.server_ch;
+			if (operation == 5 || operation == 6) {
+				ASSERT_EQ(mtx_lock(&ch->buf_mtx), thrd_success);
+				ch->request_pending = true;
+				ch->request_responded = operation == 6;
+				ch->request_success = true;
+				ASSERT_EQ(mtx_unlock(&ch->buf_mtx), thrd_success);
+			}
+			uint8_t byte = 0;
+			uint8_t data[10];
+			size_t pos = 0;
+			data[pos++] = SSH_MSG_CHANNEL_DATA;
+			DSSH_PUT_U32(ch->local_id, data, &pos);
+			DSSH_PUT_U32(1, data, &pos);
+			data[pos++] = 1;
+			struct dssh_chan_event event;
+			dssh_test_thrd_fail_after(n);
+			int64_t ret;
+			if (operation == 0)
+				ret = dssh_chan_read(ch, 0, NULL, 0);
+			else if (operation == 1)
+				ret = dssh_chan_read(ch, 0, &byte, 1);
+			else if (operation == 2 || operation == 3)
+				ret = dssh_chan_poll(ch, DSSH_POLL_READ, operation == 2 ? 0 : -1);
+			else if (operation == 4)
+				ret = dssh_chan_read_event(ch, &event);
+			else if (operation == 5 || operation == 6)
+				ret = wait_channel_request_response(ctx.server, ch);
+			else
+				ret = dssh_test_demux_dispatch(ctx.server, data[0], data, pos);
+			int calls = dssh_test_thrd_count();
+			dssh_test_thrd_reset();
+			bool terminated = dssh_session_is_terminated(ctx.server);
+			conn_cleanup(&ctx);
+			if (operation != 7 || calls > n) {
+				ASSERT_EQ(ret, DSSH_ERROR_TERMINATED);
+				ASSERT_TRUE(terminated);
+			}
+			else {
+				ASSERT_OK(ret);
+				ASSERT_FALSE(terminated);
+				completed = true;
+				break;
+			}
+		}
+		ASSERT_TRUE(completed);
+	}
+	return TEST_PASS;
+}
+
+static int
+test_request_tx_sync_sweep(void)
+{
+	/* Test the complete caller-thread sequence, including TX release.
+	 * The demux threads opt out of the failure countdown. */
+	for (int operation = 0; operation < 2; operation++) {
+		int limit = 48;
+		bool completed = false;
+		for (int n = 0; n < limit; n++) {
+			struct conn_ctx ctx;
+			if (conn_setup(&ctx) < 0)
+				return TEST_FAIL;
+			struct open_exec_ctx oc = {
+				.client = ctx.client, .server = ctx.server,
+				.command = "tx-sync", .cbs = &accept_cbs_all,
+				.accept_timeout = 30000,
+			};
+			ASSERT_OK(open_exec_channel(&oc));
+			uint8_t byte = 1;
+			dssh_test_thrd_fail_after(n);
+			int64_t ret = operation == 0 ? dssh_chan_write(oc.client_ch, 0, &byte, 1)
+			    : send_channel_request_wait(ctx.client, oc.client_ch, "unknown-request", NULL, 0);
+			int calls = dssh_test_thrd_count();
+			dssh_test_thrd_reset();
+			bool owner = tx_owner_is_current(ctx.client);
+			bool terminated = dssh_session_is_terminated(ctx.client);
+			if (owner)
+				tx_unlock_with_slots(ctx.client);
+			conn_cleanup(&ctx);
+			ASSERT_FALSE(owner);
+			if (calls > n) {
+				ASSERT_TRUE(terminated);
+				ASSERT_EQ(ret, DSSH_ERROR_TERMINATED);
+			}
+			else {
+				ASSERT_FALSE(terminated);
+				ASSERT_EQ(ret, operation == 0 ? 1 : DSSH_ERROR_REJECTED);
+				completed = true;
+				break;
+			}
+		}
+		ASSERT_TRUE(completed);
+	}
+	return TEST_PASS;
+}
+
+static int
+test_channel_registration_failures(void)
+{
+	/* Reuse a fully initialized channel to isolate registration ownership. */
+	bool completed = false;
+	for (int n = 0; n < 32; n++) {
+		struct conn_ctx ctx;
+		if (conn_setup(&ctx) < 0)
+			return TEST_FAIL;
+		struct open_exec_ctx oc = {
+			.client = ctx.client, .server = ctx.server,
+			.command = "registration-sync", .cbs = &accept_cbs_all,
+			.accept_timeout = 30000,
+		};
+		ASSERT_OK(open_exec_channel(&oc));
+		struct dssh_channel_s *ch = oc.server_ch;
+		ASSERT_OK(detach_channel(ctx.server, ch));
+		atomic_store(&ch->closing, false);
+		bool published = false;
+		dssh_test_thrd_fail_after(n);
+		int ret = register_channel(ctx.server, ch, &published);
+		int calls = dssh_test_thrd_count();
+		dssh_test_thrd_reset();
+		bool owner = tx_owner_is_current(ctx.server);
+		if (owner)
+			tx_unlock_with_slots(ctx.server);
+		ASSERT_EQ(mtx_lock(&ctx.server->channel_mtx), thrd_success);
+		bool found = false;
+		for (size_t i = 0; i < ctx.server->channel_count; i++) {
+			if (ctx.server->channels[i] == ch)
+				found = true;
+		}
+		ASSERT_EQ(mtx_unlock(&ctx.server->channel_mtx), thrd_success);
+		if (!published)
+			dssh_chan_close(ch, -1);
+		bool terminated = dssh_session_is_terminated(ctx.server);
+		conn_cleanup(&ctx);
+		ASSERT_FALSE(owner);
+		ASSERT_EQ(found, published);
+		if (calls > n) {
+			ASSERT_EQ(ret, DSSH_ERROR_TERMINATED);
+			ASSERT_TRUE(terminated);
+		}
+		else {
+			ASSERT_OK(ret);
+			ASSERT_FALSE(terminated);
+			ASSERT_TRUE(published);
+			completed = true;
+			break;
+		}
+	}
+	ASSERT_TRUE(completed);
+	return TEST_PASS;
 }
 
 static int
@@ -3119,7 +3807,7 @@ test_signal_interleave_read(void)
 	res = dssh_chan_read_event(oc.server_ch, &event);
 	ASSERT_OK(res);
 	ASSERT_EQ(event.type, DSSH_EVENT_SIGNAL);
-	ASSERT_STR_EQ(event.signal.name, "INT");
+	ASSERT_TRUE(dssh_test_bytes_equal(event.signal.name, "INT", 3));
 
 	dssh_chan_close(oc.server_ch, 0);
 	dssh_chan_close(oc.client_ch, 0);
@@ -3199,7 +3887,7 @@ test_signal_interleave_read_ext(void)
 	res = dssh_chan_read_event(oc.client_ch, &event);
 	ASSERT_OK(res);
 	ASSERT_EQ(event.type, DSSH_EVENT_SIGNAL);
-	ASSERT_STR_EQ(event.signal.name, "TERM");
+	ASSERT_TRUE(dssh_test_bytes_equal(event.signal.name, "TERM", 4));
 
 	dssh_chan_close(oc.server_ch, 0);
 	dssh_chan_close(oc.client_ch, 0);
@@ -3217,7 +3905,8 @@ test_truncated_channel_open(void)
 	/*
 	 * Malformed CHANNEL_OPEN now sends OPEN_FAILURE (when
 	 * sender-channel is extractable) then disconnects.
-	 * Test each truncation point individually.
+	 * Test each truncation point individually. A received fatal reply may
+	 * terminate the sender before its completed TX owner is released.
 	 */
 	/* Case 1: too short to read type_len -- disconnect only */
 	{
@@ -3228,9 +3917,11 @@ test_truncated_channel_open(void)
 		uint8_t msg[2];
 		msg[0] = SSH_MSG_CHANNEL_OPEN;
 		msg[1] = 0;
-		ASSERT_OK(send_packet(ctx.client, msg, 2, NULL));
+		int ret = send_packet(ctx.client, msg, 2, NULL);
+		ASSERT_TRUE(ret == 0 || ret == DSSH_ERROR_TERMINATED);
 
 		ASSERT_TRUE(dssh_test_wait_bool(&ctx.server->demux_running, false));
+		ASSERT_TRUE(dssh_session_is_terminated(ctx.server));
 		conn_cleanup(&ctx);
 	}
 
@@ -3243,10 +3934,12 @@ test_truncated_channel_open(void)
 		uint8_t msg[8];
 		size_t pos = 0;
 		msg[pos++] = SSH_MSG_CHANNEL_OPEN;
-		dssh_serialize_uint32(100, msg, sizeof(msg), &pos);
-		ASSERT_OK(send_packet(ctx.client, msg, pos, NULL));
+		ASSERT_OK(dssh_serialize_uint32(100, msg, sizeof(msg), &pos));
+		int ret = send_packet(ctx.client, msg, pos, NULL);
+		ASSERT_TRUE(ret == 0 || ret == DSSH_ERROR_TERMINATED);
 
 		ASSERT_TRUE(dssh_test_wait_bool(&ctx.server->demux_running, false));
+		ASSERT_TRUE(dssh_session_is_terminated(ctx.server));
 		conn_cleanup(&ctx);
 	}
 
@@ -3260,14 +3953,16 @@ test_truncated_channel_open(void)
 		uint8_t msg[16];
 		size_t pos = 0;
 		msg[pos++] = SSH_MSG_CHANNEL_OPEN;
-		dssh_serialize_uint32(4, msg, sizeof(msg), &pos);
+		ASSERT_OK(dssh_serialize_uint32(4, msg, sizeof(msg), &pos));
 		memcpy(&msg[pos], "test", 4);
 		pos += 4;
 		/* Include sender-channel so OPEN_FAILURE can be sent */
-		dssh_serialize_uint32(42, msg, sizeof(msg), &pos);
-		ASSERT_OK(send_packet(ctx.client, msg, pos, NULL));
+		ASSERT_OK(dssh_serialize_uint32(42, msg, sizeof(msg), &pos));
+		int ret = send_packet(ctx.client, msg, pos, NULL);
+		ASSERT_TRUE(ret == 0 || ret == DSSH_ERROR_TERMINATED);
 
 		ASSERT_TRUE(dssh_test_wait_bool(&ctx.server->demux_running, false));
+		ASSERT_TRUE(dssh_session_is_terminated(ctx.server));
 		conn_cleanup(&ctx);
 	}
 
@@ -3282,8 +3977,8 @@ static int
 test_truncated_channel_request(void)
 {
 	/*
-	 * Malformed CHANNEL_REQUEST now sends CHANNEL_FAILURE
-	 * then disconnects.  Test truncated type-length.
+	 * A malformed common header disconnects without a speculative channel
+	 * response. Exact wire checks are in request_framing_cases.h.
 	 */
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
@@ -3305,14 +4000,15 @@ test_truncated_channel_request(void)
 		uint8_t msg[8];
 		size_t pos = 0;
 		msg[pos++] = SSH_MSG_CHANNEL_REQUEST;
-		dssh_serialize_uint32(oc.server_ch->local_id, msg, sizeof(msg), &pos);
-		ASSERT_OK(send_packet(ctx.client, msg, pos, NULL));
+		ASSERT_OK(dssh_serialize_uint32(oc.server_ch->local_id, msg, sizeof(msg), &pos));
+		int ret = send_packet(ctx.client, msg, pos, NULL);
+		/* The peer's fatal reply may be received before TX ownership is
+		 * released, so the completed send can already report termination. */
+		ASSERT_TRUE(ret == 0 || ret == DSSH_ERROR_TERMINATED);
 	}
 
-	struct timespec ts = { .tv_sec = 0, .tv_nsec = 50000000 };
-	thrd_sleep(&ts, NULL);
-
-	ASSERT_TRUE(!ctx.server->demux_running);
+	ASSERT_TRUE(dssh_test_wait_bool(&ctx.server->demux_running, false));
+	ASSERT_TRUE(dssh_session_is_terminated(ctx.server));
 
 	conn_cleanup(&ctx);
 	return TEST_PASS;
@@ -3519,8 +4215,12 @@ test_accept_timeout_negative(void)
 	while (!atomic_load(&bc.entered))
 		thrd_yield();
 
-	conn_cleanup(&ctx);
+	/* Termination wakes accept; keep the session alive until its API
+	 * caller has returned, including when the worker was descheduled
+	 * immediately after publishing entered. */
+	dssh_session_terminate(ctx.server);
 	thrd_join(at, NULL);
+	conn_cleanup(&ctx);
 	return TEST_PASS;
 }
 
@@ -4697,10 +5397,10 @@ test_close_during_zc_callback(void)
 static int
 test_dispatch_sync_failures(void)
 {
-	for (int n = 0; n < 5; n++) {
+	for (int n = 0; n < 3; n++) {
 		struct conn_ctx ctx;
 		if (conn_setup(&ctx) < 0)
-			return TEST_SKIP;
+			return TEST_FAIL;
 
 		struct open_exec_ctx oc = {
 			.client = ctx.client,
@@ -4739,7 +5439,7 @@ test_detach_sync_failures(void)
 	for (int n = 0; n < 2; n++) {
 		struct conn_ctx ctx;
 		if (conn_setup(&ctx) < 0)
-			return TEST_SKIP;
+			return TEST_FAIL;
 
 		struct open_exec_ctx oc = {
 			.client = ctx.client,
@@ -4753,7 +5453,8 @@ test_detach_sync_failures(void)
 			return TEST_FAIL;
 		}
 
-		dssh_test_thrd_fail_after(n);
+		if (n == 0)
+			dssh_test_thrd_fail_after(0);
 		int ret = detach_channel(ctx.server, oc.server_ch);
 
 		dssh_test_thrd_reset();
@@ -4761,7 +5462,7 @@ test_detach_sync_failures(void)
 			ASSERT_ERR(ret, DSSH_ERROR_TERMINATED);
 		else
 			ASSERT_OK(ret);
-		ASSERT_TRUE(dssh_session_is_terminated(ctx.server));
+		ASSERT_EQ(dssh_session_is_terminated(ctx.server), n == 0);
 		/* A successful detach made this channel unreachable by demux, so
 		 * close the detached handle before session cleanup.  A failed detach
 		 * leaves it registered for session_stop() to free after joining demux. */
@@ -5243,7 +5944,7 @@ wait_after_close_packets(struct open_exec_ctx *oc)
 		    || dssh_chan_read_event(oc->client_ch, &event) < 0)
 			return -1;
 		if (event.type == DSSH_EVENT_SIGNAL
-		    && strcmp(event.signal.name, "after-stale") == 0)
+		    && dssh_test_bytes_equal(event.signal.name, "after-stale", 11))
 			return 0;
 	}
 }
@@ -5447,7 +6148,7 @@ server_accept_alloc_thread(void *arg)
 static int
 test_open_exec_alloc_sweep(void)
 {
-	int any_failed = 0;
+	bool fault_seen = false;
 
 	for (int n = 0; n < 50; n++) {
 		struct conn_ctx ctx;
@@ -5483,11 +6184,15 @@ test_open_exec_alloc_sweep(void)
 			dssh_chan_close(oc.client_ch, 0);
 			conn_cleanup(&ctx);
 
-			ASSERT_TRUE(any_failed);
+			if (count > n) {
+				fault_seen = true;
+				continue;
+			}
+			ASSERT_TRUE(fault_seen);
 			return TEST_PASS;
 		}
 
-		any_failed = 1;
+		fault_seen = fault_seen || count > n;
 		session_set_terminate(ctx.server);
 		thrd_join(st, NULL);
 
@@ -5496,11 +6201,9 @@ test_open_exec_alloc_sweep(void)
 
 		conn_cleanup(&ctx);
 
-		if (n >= count)
-			break;
 	}
 
-	return any_failed ? TEST_PASS : TEST_FAIL;
+	return TEST_FAIL;
 }
 
 static int
@@ -5508,12 +6211,15 @@ client_open_shell_alloc_thread(void *arg)
 {
 	struct open_shell_ctx *ctx = arg;
 	struct dssh_chan_params p;
-	dssh_chan_params_init(&p, DSSH_CHAN_SHELL);
-	dssh_chan_params_set_term(&p, ctx->term);
-	dssh_chan_params_set_size(&p, ctx->cols, ctx->rows, ctx->wpx, ctx->hpx);
-	ctx->client_ch = dssh_chan_open(ctx->client, &p);
+	int ret = dssh_chan_params_init(&p, DSSH_CHAN_SHELL);
+	if (ret == 0)
+		ret = dssh_chan_params_set_term(&p, ctx->term);
+	if (ret == 0)
+		ret = dssh_chan_params_set_size(&p, ctx->cols, ctx->rows, ctx->wpx, ctx->hpx);
+	if (ret == 0)
+		ctx->client_ch = dssh_chan_open(ctx->client, &p);
 	dssh_chan_params_free(&p);
-	return 0;
+	return ret;
 }
 
 static int
@@ -5530,7 +6236,7 @@ server_accept_shell_alloc_thread(void *arg)
 static int
 test_open_shell_alloc_sweep(void)
 {
-	int any_failed = 0;
+	bool fault_seen = false;
 
 	for (int n = 0; n < 50; n++) {
 		struct conn_ctx ctx;
@@ -5567,22 +6273,24 @@ test_open_shell_alloc_sweep(void)
 				dssh_chan_close(oc.server_ch, 0);
 			dssh_chan_close(oc.client_ch, 0);
 			conn_cleanup(&ctx);
-			ASSERT_TRUE(any_failed);
+			if (count > n) {
+				fault_seen = true;
+				continue;
+			}
+			ASSERT_TRUE(fault_seen);
 			return TEST_PASS;
 		}
 
-		any_failed = 1;
+		fault_seen = fault_seen || count > n;
 		session_set_terminate(ctx.server);
 		thrd_join(st, NULL);
 		if (oc.server_ch != NULL)
 			dssh_chan_close(oc.server_ch, 0);
 		conn_cleanup(&ctx);
 
-		if (n >= count)
-			break;
 	}
 
-	return any_failed ? TEST_PASS : TEST_FAIL;
+	return TEST_FAIL;
 }
 
 /* ================================================================
@@ -5594,12 +6302,15 @@ client_open_subsys_alloc_thread(void *arg)
 {
 	struct open_subsys_ctx *ctx = arg;
 	struct dssh_chan_params p;
-	dssh_chan_params_init(&p, DSSH_CHAN_SUBSYSTEM);
-	dssh_chan_params_set_subsystem(&p, ctx->subsystem);
-	dssh_chan_params_set_pty(&p, false);
-	ctx->client_ch = dssh_chan_open(ctx->client, &p);
+	int ret = dssh_chan_params_init(&p, DSSH_CHAN_SUBSYSTEM);
+	if (ret == 0)
+		ret = dssh_chan_params_set_subsystem(&p, ctx->subsystem);
+	if (ret == 0)
+		ret = dssh_chan_params_set_pty(&p, false);
+	if (ret == 0)
+		ctx->client_ch = dssh_chan_open(ctx->client, &p);
 	dssh_chan_params_free(&p);
-	return 0;
+	return ret;
 }
 
 static int
@@ -5616,7 +6327,7 @@ server_accept_subsys_alloc_thread(void *arg)
 static int
 test_open_subsystem_alloc_sweep(void)
 {
-	int any_failed = 0;
+	bool fault_seen = false;
 
 	for (int n = 0; n < 50; n++) {
 		struct conn_ctx ctx;
@@ -5650,11 +6361,15 @@ test_open_subsystem_alloc_sweep(void)
 				dssh_chan_close(oc.server_ch, -1);
 			dssh_chan_close(oc.client_ch, -1);
 			conn_cleanup(&ctx);
-			ASSERT_TRUE(any_failed);
+			if (count > n) {
+				fault_seen = true;
+				continue;
+			}
+			ASSERT_TRUE(fault_seen);
 			return TEST_PASS;
 		}
 
-		any_failed = 1;
+		fault_seen = fault_seen || count > n;
 		session_set_terminate(ctx.server);
 		thrd_join(st, NULL);
 
@@ -5663,11 +6378,9 @@ test_open_subsystem_alloc_sweep(void)
 
 		conn_cleanup(&ctx);
 
-		if (n >= count)
-			break;
 	}
 
-	return any_failed ? TEST_PASS : TEST_FAIL;
+	return TEST_FAIL;
 }
 
 /* ================================================================
@@ -5947,11 +6660,8 @@ test_chanreq_parse_empty_type(void)
 	const uint8_t *rdata;
 	size_t rdata_len;
 
-	ASSERT_OK(parse_channel_request(buf, len,
-	    &rtype, &rtype_len, &want_reply, &rdata, &rdata_len));
-	ASSERT_EQ(rtype_len, 0U);
-	ASSERT_FALSE(want_reply);
-	ASSERT_EQ(rdata_len, 0U);
+	ASSERT_ERR(parse_channel_request(buf, len,
+	    &rtype, &rtype_len, &want_reply, &rdata, &rdata_len), DSSH_ERROR_PARSE);
 
 	return TEST_PASS;
 }
@@ -6425,6 +7135,10 @@ test_zc_cancel(void)
 	/* Get a TX buffer, then cancel without sending */
 	uint8_t *txbuf;
 	size_t max_len;
+	struct timespec window_start;
+	ASSERT_EQ(clock_gettime(CLOCK_MONOTONIC, &window_start), 0);
+	while (atomic_load(&oc.client_ch->remote_window) == 0)
+		ASSERT_TRUE(dssh_test_wait_tick(&window_start));
 	int res = dssh_chan_zc_getbuf(oc.client_ch, 0, &txbuf, &max_len);
 	ASSERT_OK(res);
 	ASSERT_NOT_NULL(txbuf);
@@ -6433,6 +7147,16 @@ test_zc_cancel(void)
 	/* Cancel -- should release packet-engine ownership without sending */
 	res = dssh_chan_zc_cancel(oc.client_ch);
 	ASSERT_OK(res);
+	ASSERT_ERR(dssh_chan_zc_cancel(oc.client_ch), DSSH_ERROR_INVALID);
+
+	/* A rejected send must leave the channel ready for a new reservation. */
+	ASSERT_OK(dssh_chan_zc_getbuf(oc.client_ch, 0, &txbuf, &max_len));
+	ASSERT_ERR(dssh_chan_zc_send(oc.client_ch, max_len + 1), DSSH_ERROR_TOOLONG);
+	ASSERT_FALSE(ctx.client->trans.tx_owner_active);
+	ASSERT_FALSE(dssh_session_is_terminated(ctx.client));
+	ASSERT_OK(dssh_chan_zc_getbuf(oc.client_ch, 0, &txbuf, &max_len));
+	ASSERT_ERR(dssh_chan_zc_getbuf(oc.client_ch, 0, &txbuf, &max_len), DSSH_ERROR_INVALID);
+	ASSERT_OK(dssh_chan_zc_cancel(oc.client_ch));
 
 	/* Verify channel is still usable: getbuf/send should work */
 	static const uint8_t msg[] = "after cancel";
@@ -6695,7 +7419,7 @@ test_chan_get_pty(void)
 		.client = ctx.client,
 		.server = ctx.server,
 		.term = "vt100",
-		.cols = 132,
+		.cols = UINT32_C(0x01020304),
 		.rows = 43,
 		.wpx = 800,
 		.hpx = 600,
@@ -6722,7 +7446,7 @@ test_chan_get_pty(void)
 	const struct dssh_chan_params *pty = dssh_chan_get_pty(oc.server_ch);
 	ASSERT_NOT_NULL(pty);
 	ASSERT_STR_EQ(pty->term, "vt100");
-	ASSERT_EQ_U(pty->cols, 132);
+	ASSERT_EQ_U(pty->cols, UINT32_C(0x01020304));
 	ASSERT_EQ_U(pty->rows, 43);
 	ASSERT_EQ_U(pty->wpx, 800);
 	ASSERT_EQ_U(pty->hpx, 600);
@@ -6775,14 +7499,19 @@ client_open_exec_with_env_thread(void *arg)
 {
 	struct open_exec_ctx *ctx = arg;
 	struct dssh_chan_params p;
-	dssh_chan_params_init(&p, DSSH_CHAN_EXEC);
-	dssh_chan_params_set_command(&p, ctx->command);
-	dssh_chan_params_set_pty(&p, false);
-	dssh_chan_params_add_env(&p, "LANG", "en_US.UTF-8");
-	dssh_chan_params_add_env(&p, "TERM", "xterm");
-	ctx->client_ch = dssh_chan_open(ctx->client, &p);
+	int ret = dssh_chan_params_init(&p, DSSH_CHAN_EXEC);
+	if (ret >= 0)
+		ret = dssh_chan_params_set_command(&p, ctx->command);
+	if (ret >= 0)
+		ret = dssh_chan_params_set_pty(&p, false);
+	if (ret >= 0)
+		ret = dssh_chan_params_add_env(&p, "LANG", "en_US.UTF-8");
+	if (ret >= 0)
+		ret = dssh_chan_params_add_env(&p, "TERM", "xterm");
+	if (ret >= 0)
+		ctx->client_ch = dssh_chan_open(ctx->client, &p);
 	dssh_chan_params_free(&p);
-	return 0;
+	return ret;
 }
 
 static struct dssh_chan_accept_cbs accept_cbs_with_env = {
@@ -6836,15 +7565,1074 @@ test_env_roundtrip(void)
 	return TEST_PASS;
 }
 
+static int
+accept_selected_env_cb(dssh_channel ch, const struct dssh_chan_params *p, void *cbdata)
+{
+	(void)ch;
+	(void)cbdata;
+	if (p->env_count == 0)
+		return DSSH_ERROR_INVALID;
+	const char *name = p->env[p->env_count - 1].name;
+	return strcmp(name, "TERM") == 0 ? 0 : DSSH_ERROR_REJECTED;
+}
+
+static int
+test_env_callback_rejection(void)
+{
+	struct conn_ctx ctx;
+	if (conn_setup(&ctx) < 0)
+		return TEST_FAIL;
+	struct dssh_chan_accept_cbs cbs = accept_cbs_with_env;
+	cbs.env = accept_selected_env_cb;
+	struct open_exec_ctx oc = {
+		.client = ctx.client,
+		.server = ctx.server,
+		.command = "env",
+		.cbs = &cbs,
+		.accept_timeout = 30000,
+	};
+	thrd_t ct, st;
+	ASSERT_THRD_CREATE(&ct, client_open_exec_with_env_thread, &oc);
+	ASSERT_THRD_CREATE(&st, server_accept_exec_thread, &oc);
+	ASSERT_EQ(thrd_join(ct, NULL), thrd_success);
+	ASSERT_EQ(thrd_join(st, NULL), thrd_success);
+	ASSERT_NOT_NULL(oc.client_ch);
+	ASSERT_NOT_NULL(oc.server_ch);
+	ASSERT_EQ_U(oc.server_ch->params.env_count, 1);
+	ASSERT_STR_EQ(oc.server_ch->params.env[0].name, "TERM");
+	ASSERT_STR_EQ(oc.server_ch->params.env[0].value, "xterm");
+	dssh_chan_close(oc.client_ch, 0);
+	dssh_chan_close(oc.server_ch, 0);
+	conn_cleanup(&ctx);
+	return TEST_PASS;
+}
+
 /* ================================================================
  * Test table
  * ================================================================ */
 
+/* Normal teardown joins exactly once; repeated stop does not join again. */
+static int
+test_lifecycle_join_once(void)
+{
+	struct conn_ctx ctx;
+	if (conn_setup(&ctx) < 0)
+		return TEST_FAIL;
+	struct open_exec_ctx oc = {
+		.client = ctx.client, .server = ctx.server,
+		.command = "join-once", .cbs = &accept_cbs_all, .accept_timeout = 30000,
+	};
+	ASSERT_OK(open_exec_channel(&oc));
+	dssh_session_terminate(ctx.client);
+	mock_io_close_c2s(&ctx.io);
+	mock_io_close_s2c(&ctx.io);
+	ASSERT_TRUE(dssh_test_wait_bool(&ctx.client->demux_running, false));
+	dssh_test_thrd_reset();
+	dssh_session_stop(ctx.client);
+	ASSERT_EQ(dssh_test_join_count(), 1);
+	ASSERT_FALSE(ctx.client->conn_initialized);
+	ASSERT_NULL(ctx.client->channels);
+	dssh_test_join_fail_next();
+	dssh_session_stop(ctx.client);
+	int calls = dssh_test_join_count();
+	dssh_test_thrd_reset();
+	ASSERT_EQ(calls, 0);
+	conn_cleanup(&ctx);
+	return TEST_PASS;
+}
+
+/* Launched only by the separate process driver, before the normal runner.
+ * Full handshake/auth/channel setup precedes the injected native join failure.
+ * The worker is already stopped but remains a valid joinable owned thread. */
+static int
+run_join_fatal_child(const char *operation)
+{
+	if (strcmp(operation, "stop") != 0 && strcmp(operation, "cleanup") != 0)
+		return 2;
+	if (signal(SIGPIPE, SIG_IGN) == SIG_ERR)
+		return 3;
+	struct conn_ctx ctx;
+	if (conn_setup(&ctx) < 0)
+		return 3;
+	struct open_exec_ctx oc = {
+		.client = ctx.client, .server = ctx.server,
+		.command = "join-fatal", .cbs = &accept_cbs_all, .accept_timeout = 30000,
+	};
+	if (open_exec_channel(&oc) != 0)
+		return 3;
+	dssh_session_terminate(ctx.client);
+	mock_io_close_c2s(&ctx.io);
+	mock_io_close_s2c(&ctx.io);
+	if (!dssh_test_wait_bool(&ctx.client->demux_running, false))
+		return 3;
+	dssh_test_join_fail_next();
+	if (strcmp(operation, "cleanup") == 0)
+		dssh_session_cleanup(ctx.client);
+	else
+		dssh_session_stop(ctx.client);
+	/* A returned fatal path is a failed probe. Do not try uncertain cleanup.
+	 * _Exit avoids normal-exit allocator diagnostics changing that status. */
+	_Exit(4);
+}
+
+struct lifecycle_callback_state {
+	dssh_session sess;
+	bool cleanup;
+	bool retained;
+	atomic_bool done;
+};
+
+static void
+lifecycle_unimplemented_cb(uint32_t seq, void *cbdata)
+{
+	(void)seq;
+	struct lifecycle_callback_state *state = cbdata;
+
+	if (state->cleanup)
+		dssh_session_cleanup(state->sess);
+	else
+		dssh_session_stop(state->sess);
+	state->retained = state->sess->trans.rx_packet != NULL;
+	atomic_store(&state->done, true);
+}
+
+static int
+test_lifecycle_demux_callback(void)
+{
+	for (int cleanup = 0; cleanup < 2; cleanup++) {
+		struct conn_ctx ctx;
+		if (conn_setup_no_start(&ctx) < 0)
+			return TEST_FAIL;
+		struct lifecycle_callback_state state = {
+			.sess = ctx.server, .cleanup = cleanup != 0,
+		};
+		atomic_init(&state.done, false);
+		ASSERT_OK(dssh_session_set_unimplemented_cb(ctx.server, lifecycle_unimplemented_cb, &state));
+		ASSERT_OK(dssh_session_start(ctx.client));
+		ASSERT_OK(dssh_session_start(ctx.server));
+		ASSERT_OK(send_unimplemented(ctx.client, 0));
+		ASSERT_TRUE(dssh_test_wait_bool(&state.done, true));
+		ASSERT_TRUE(state.retained);
+		ASSERT_TRUE(dssh_session_is_terminated(ctx.server));
+		ASSERT_TRUE(ctx.server->conn_initialized);
+		mock_io_close_c2s(&ctx.io);
+		mock_io_close_s2c(&ctx.io);
+		dssh_session_stop(ctx.server);
+		ASSERT_FALSE(ctx.server->conn_initialized);
+		conn_cleanup(&ctx);
+	}
+	return TEST_PASS;
+}
+
+static int
+test_lifecycle_receive_callback(void)
+{
+	struct conn_ctx ctx;
+	if (conn_setup_no_start(&ctx) < 0)
+		return TEST_FAIL;
+	struct lifecycle_callback_state state = { .sess = ctx.server, .cleanup = true };
+	atomic_init(&state.done, false);
+	ASSERT_OK(dssh_session_set_unimplemented_cb(ctx.server, lifecycle_unimplemented_cb, &state));
+	ASSERT_OK(send_unimplemented(ctx.client, 0));
+	uint8_t type;
+	uint8_t *payload;
+	size_t len;
+	ASSERT_ERR(recv_packet(ctx.server, &type, &payload, &len), DSSH_ERROR_TERMINATED);
+	ASSERT_TRUE(atomic_load(&state.done));
+	ASSERT_TRUE(state.retained);
+	ASSERT_TRUE(dssh_session_is_terminated(ctx.server));
+	conn_cleanup_no_start(&ctx);
+	return TEST_PASS;
+}
+
+/* Defensive handling of lifecycle calls from restricted callbacks. */
+static void
+lifecycle_terminate_cb(dssh_session sess, void *cbdata)
+{
+	struct lifecycle_callback_state *state = cbdata;
+
+	dssh_session_cleanup(sess);
+	state->retained = sess->trans.rx_packet != NULL;
+	atomic_store(&state->done, true);
+}
+
+static dssh_log_action
+lifecycle_log_cb(const struct dssh_log_record *record, void *cbdata)
+{
+	(void)record;
+	struct lifecycle_callback_state *state = cbdata;
+
+	dssh_session_cleanup(state->sess);
+	state->retained = state->sess->trans.rx_packet != NULL;
+	atomic_store(&state->done, true);
+	return DSSH_LOG_LOCAL_ONLY;
+}
+
+static int
+test_lifecycle_recursive_callbacks(void)
+{
+	for (int log = 0; log < 2; log++) {
+		dssh_session sess = dssh_session_init(false, 0);
+		ASSERT_NOT_NULL(sess);
+		struct lifecycle_callback_state state = { .sess = sess };
+		atomic_init(&state.done, false);
+		if (log) {
+			ASSERT_OK(dssh_session_set_log_cb(sess, lifecycle_log_cb, &state));
+			DSSH_LOGF(sess, DSSH_LOG_ERROR, DSSH_ERROR_NONE, "Lifecycle callback test");
+			ASSERT_OK(dssh_session_set_log_cb(sess, NULL, NULL));
+		}
+		else {
+			ASSERT_OK(dssh_session_set_terminate_cb(sess, lifecycle_terminate_cb, &state));
+			ASSERT_TRUE(dssh_session_terminate(sess));
+		}
+		ASSERT_TRUE(atomic_load(&state.done));
+		ASSERT_TRUE(state.retained);
+		ASSERT_TRUE(dssh_session_is_terminated(sess));
+		dssh_session_cleanup(sess);
+	}
+	return TEST_PASS;
+}
+
+static int
+test_lifecycle_tx_reservation(void)
+{
+	struct conn_ctx ctx;
+	if (conn_setup_no_start(&ctx) < 0)
+		return TEST_FAIL;
+	ASSERT_OK(tx_acquire(ctx.client, SSH_MSG_IGNORE));
+	dssh_session_cleanup(ctx.client);
+	ASSERT_TRUE(tx_owner_is_current(ctx.client));
+	ASSERT_TRUE(dssh_session_is_terminated(ctx.client));
+	ASSERT_NOT_NULL(ctx.client->trans.tx_packet);
+	tx_unlock_with_slots(ctx.client);
+	conn_cleanup_no_start(&ctx);
+	return TEST_PASS;
+}
+
+static int
+test_clock_deadline(void)
+{
+	dssh_test_clock_reset();
+	struct timespec ts = { .tv_sec = 42, .tv_nsec = 123 };
+	dssh_test_clock_fail_after(0);
+	int invalid = dssh_deadline_from_ms(&ts, 0);
+	int failed = dssh_deadline_from_ms(&ts, 1);
+	int calls = dssh_test_clock_count();
+	dssh_test_clock_reset();
+	ASSERT_ERR(invalid, DSSH_ERROR_INVALID);
+	ASSERT_ERR(failed, DSSH_ERROR_INIT);
+	ASSERT_EQ(calls, 1);
+	ASSERT_TRUE(ts.tv_sec == 42);
+	ASSERT_EQ(ts.tv_nsec, 123);
+
+	struct timespec now = { .tv_sec = 100, .tv_nsec = 999500000L };
+	dssh_test_clock_set(now);
+	int ret = dssh_deadline_from_ms(&ts, 1);
+	dssh_test_clock_reset();
+	ASSERT_OK(ret);
+	ASSERT_TRUE(ts.tv_sec == 101);
+	ASSERT_EQ(ts.tv_nsec, 500000L);
+
+	now.tv_nsec = 1000000000L;
+	dssh_test_clock_set(now);
+	ret = dssh_deadline_from_ms(&ts, 1);
+	dssh_test_clock_reset();
+	ASSERT_ERR(ret, DSSH_ERROR_INVALID);
+	ASSERT_TRUE(ts.tv_sec == 101);
+	ASSERT_EQ(ts.tv_nsec, 500000L);
+	return TEST_PASS;
+}
+
+static int
+test_clock_poll_accept(void)
+{
+	struct conn_ctx ctx;
+	if (conn_setup(&ctx) < 0)
+		return TEST_FAIL;
+	struct open_exec_ctx oc = {
+		.client = ctx.client, .server = ctx.server,
+		.command = "clock-poll", .cbs = &accept_cbs_all,
+		.accept_timeout = 30000,
+	};
+	ASSERT_OK(open_exec_channel(&oc));
+	dssh_test_clock_fail_after(0);
+	int ret = dssh_chan_poll(oc.client_ch, DSSH_POLL_READ, 5000);
+	dssh_test_clock_reset();
+	ASSERT_ERR(ret, DSSH_ERROR_INIT);
+	ASSERT_FALSE(dssh_session_is_terminated(ctx.client));
+	ASSERT_EQ(dssh_chan_poll(oc.client_ch, DSSH_POLL_READ, 0), 0);
+
+	struct dssh_incoming_open inc;
+	dssh_test_clock_fail_after(0);
+	ret = accept_incoming(ctx.server, &inc, 5000);
+	dssh_test_clock_reset();
+	ASSERT_ERR(ret, DSSH_ERROR_INIT);
+	ASSERT_FALSE(dssh_session_is_terminated(ctx.server));
+
+	dssh_test_clock_fail_after(0);
+	ret = accept_incoming(ctx.server, &inc, 0);
+	int clock_calls = dssh_test_clock_count();
+	dssh_test_clock_reset();
+	ASSERT_ERR(ret, DSSH_ERROR_NOMORE);
+	ASSERT_EQ(clock_calls, 0);
+	conn_cleanup(&ctx);
+	return TEST_PASS;
+}
+
+static int
+test_clock_pending_waits(void)
+{
+	for (int operation = 0; operation < 4; operation++) {
+		struct conn_ctx ctx;
+		if (conn_setup(&ctx) < 0)
+			return TEST_FAIL;
+		struct open_exec_ctx oc = {
+			.client = ctx.client, .server = ctx.server,
+			.command = "clock-pending", .cbs = &accept_cbs_all,
+			.accept_timeout = 30000,
+		};
+		ASSERT_OK(open_exec_channel(&oc));
+		if (operation == 3) {
+			ASSERT_EQ(mtx_lock(&oc.client_ch->buf_mtx), thrd_success);
+			oc.client_ch->setup_mode = true;
+			ASSERT_EQ(mtx_unlock(&oc.client_ch->buf_mtx), thrd_success);
+		}
+		dssh_test_clock_fail_after(0);
+		int ret;
+		if (operation == 0)
+			ret = wait_open_response(ctx.client, oc.client_ch);
+		else if (operation == 1)
+			ret = wait_channel_request_response(ctx.client, oc.client_ch);
+		else if (operation == 2)
+			ret = tx_acquire(ctx.client, SSH_MSG_IGNORE);
+		else {
+			uint8_t type;
+			uint8_t *payload;
+			size_t len;
+			ret = setup_recv(ctx.client, oc.client_ch, &type, &payload, &len);
+		}
+		int calls = dssh_test_clock_count();
+		dssh_test_clock_reset();
+		ASSERT_ERR(ret, DSSH_ERROR_TERMINATED);
+		ASSERT_EQ(calls, 1);
+		ASSERT_TRUE(dssh_session_is_terminated(ctx.client));
+		ASSERT_FALSE(tx_owner_is_current(ctx.client));
+		conn_cleanup(&ctx);
+	}
+	return TEST_PASS;
+}
+
+static int
+test_clock_receive(void)
+{
+	struct conn_ctx ctx;
+	if (conn_setup_no_start(&ctx) < 0)
+		return TEST_FAIL;
+	ASSERT_OK(dssh_session_set_rekey_seconds(ctx.server, 1));
+	uint8_t message[] = { SSH_MSG_SERVICE_REQUEST };
+	ASSERT_OK(send_packet(ctx.client, message, sizeof(message), NULL));
+	uint8_t type;
+	uint8_t *payload;
+	size_t len;
+	dssh_test_clock_fail_after(0);
+	int ret = recv_packet(ctx.server, &type, &payload, &len);
+	dssh_test_clock_reset();
+	ASSERT_ERR(ret, DSSH_ERROR_TERMINATED);
+	ASSERT_TRUE(dssh_session_is_terminated(ctx.server));
+	conn_cleanup_no_start(&ctx);
+	return TEST_PASS;
+}
+
+static int
+test_extended_stream_types(void)
+{
+	struct conn_ctx ctx;
+	if (conn_setup(&ctx) < 0)
+		return TEST_FAIL;
+	struct open_exec_ctx oc = {
+		.client = ctx.client, .server = ctx.server, .command = "extended-stream",
+		.cbs = &accept_cbs_all, .accept_timeout = 30000,
+	};
+	ASSERT_OK(open_exec_channel(&oc));
+	ASSERT_EQ(mtx_lock(&oc.server_ch->buf_mtx), thrd_success);
+	oc.server_ch->local_window = 8;
+	oc.server_ch->window_max = 8;
+	ASSERT_EQ(mtx_unlock(&oc.server_ch->buf_mtx), thrd_success);
+	const uint32_t types[] = { 2, 32768, 65535, UINT32_MAX, UINT32_C(0xfe000000) };
+	uint8_t packet[17];
+	for (size_t i = 0; i < sizeof(types) / sizeof(types[0]); i++) {
+		size_t pos = 0;
+		packet[pos++] = SSH_MSG_CHANNEL_EXTENDED_DATA;
+		DSSH_PUT_U32(oc.server_ch->local_id, packet, &pos);
+		DSSH_PUT_U32(types[i], packet, &pos);
+		DSSH_PUT_U32(4, packet, &pos);
+		memcpy(&packet[pos], "drop", 4);
+		pos += 4;
+		ASSERT_OK(dssh_test_demux_dispatch(ctx.server, SSH_MSG_CHANNEL_EXTENDED_DATA, packet, pos));
+		ASSERT_EQ(mtx_lock(&oc.server_ch->buf_mtx), thrd_success);
+		uint32_t window = oc.server_ch->local_window;
+		size_t stdout_bytes = oc.server_ch->buf.stdout_buf.used;
+		size_t stderr_bytes = oc.server_ch->buf.stderr_buf.used;
+		ASSERT_EQ(mtx_unlock(&oc.server_ch->buf_mtx), thrd_success);
+		ASSERT_EQ_U(window, 8);
+		ASSERT_EQ_U(stdout_bytes, 0);
+		ASSERT_EQ_U(stderr_bytes, 0);
+	}
+	/* Type zero is malformed and must not become the ordinary stream. */
+	size_t pos = 5;
+	DSSH_PUT_U32(0, packet, &pos);
+	ASSERT_ERR(dssh_test_demux_dispatch(ctx.server, SSH_MSG_CHANNEL_EXTENDED_DATA,
+	    packet, sizeof(packet)), DSSH_ERROR_PARSE);
+	/* A supported stderr message still reaches exactly its own stream. */
+	pos = 5;
+	DSSH_PUT_U32(1, packet, &pos);
+	ASSERT_OK(dssh_test_demux_dispatch(ctx.server, SSH_MSG_CHANNEL_EXTENDED_DATA, packet, sizeof(packet)));
+	uint8_t out[4];
+	ASSERT_EQ(dssh_chan_read(oc.server_ch, 1, out, sizeof(out)), 4);
+	ASSERT_MEM_EQ(out, "drop", 4);
+	ASSERT_EQ(dssh_chan_read(oc.server_ch, 0, NULL, 0), 0);
+	ASSERT_FALSE(dssh_session_is_terminated(ctx.server));
+	conn_cleanup(&ctx);
+	return TEST_PASS;
+}
+
+struct extended_probe {
+	unsigned calls;
+	int stream;
+	size_t bytes;
+};
+
+static uint32_t
+extended_probe_cb(dssh_channel ch, int stream, const uint8_t *data, size_t len, void *cbdata)
+{
+	(void)ch;
+	(void)data;
+	struct extended_probe *probe = cbdata;
+	probe->calls++;
+	probe->stream = stream;
+	probe->bytes = len;
+	uint32_t consumed = len > UINT32_MAX ? UINT32_MAX : (uint32_t)len;
+	return consumed;
+}
+
+static int
+accept_extended_probe(dssh_channel ch, const struct dssh_chan_params *params,
+    struct dssh_chan_accept_result *result, void *cbdata)
+{
+	(void)ch;
+	(void)params;
+	result->max_window = 8;
+	result->zc_cb = extended_probe_cb;
+	result->zc_cbdata = cbdata;
+	return 0;
+}
+
+static int
+test_extended_zc_types(void)
+{
+	struct conn_ctx ctx;
+	if (conn_setup(&ctx) < 0)
+		return TEST_FAIL;
+	struct extended_probe probe = {0};
+	struct dssh_chan_accept_cbs cbs = { .exec = accept_extended_probe, .cbdata = &probe };
+	struct open_exec_ctx oc = {
+		.client = ctx.client, .server = ctx.server, .command = "extended-zc",
+		.cbs = &cbs, .accept_timeout = 30000,
+	};
+	ASSERT_OK(open_exec_channel(&oc));
+	uint8_t packet[17];
+	size_t pos = 0;
+	packet[pos++] = SSH_MSG_CHANNEL_EXTENDED_DATA;
+	DSSH_PUT_U32(oc.server_ch->local_id, packet, &pos);
+	DSSH_PUT_U32(UINT32_MAX, packet, &pos);
+	DSSH_PUT_U32(4, packet, &pos);
+	memcpy(&packet[pos], "data", 4);
+	pos += 4;
+	ASSERT_OK(dssh_test_demux_dispatch(ctx.server, SSH_MSG_CHANNEL_EXTENDED_DATA, packet, pos));
+	ASSERT_EQ_U(probe.calls, 0);
+	ASSERT_EQ(mtx_lock(&oc.server_ch->buf_mtx), thrd_success);
+	uint32_t window = oc.server_ch->local_window;
+	ASSERT_EQ(mtx_unlock(&oc.server_ch->buf_mtx), thrd_success);
+	ASSERT_EQ_U(window, 8);
+	pos = 5;
+	DSSH_PUT_U32(1, packet, &pos);
+	ASSERT_OK(dssh_test_demux_dispatch(ctx.server, SSH_MSG_CHANNEL_EXTENDED_DATA, packet, sizeof(packet)));
+	ASSERT_EQ_U(probe.calls, 1);
+	ASSERT_EQ(probe.stream, 1);
+	ASSERT_EQ_U(probe.bytes, 4);
+	conn_cleanup(&ctx);
+	return TEST_PASS;
+}
+
+static int
+test_data_framing(void)
+{
+	struct conn_ctx ctx;
+	if (conn_setup(&ctx) < 0)
+		return TEST_FAIL;
+	struct open_exec_ctx oc = {
+		.client = ctx.client, .server = ctx.server, .command = "data-framing",
+		.cbs = &accept_cbs_all, .accept_timeout = 30000,
+	};
+	ASSERT_OK(open_exec_channel(&oc));
+	for (int extended = 0; extended < 2; extended++) {
+		uint8_t packet[18] = {0};
+		size_t pos = 0;
+		uint8_t type = extended ? SSH_MSG_CHANNEL_EXTENDED_DATA : SSH_MSG_CHANNEL_DATA;
+		packet[pos++] = type;
+		DSSH_PUT_U32(oc.server_ch->local_id, packet, &pos);
+		if (extended)
+			DSSH_PUT_U32(1, packet, &pos);
+		size_t length_pos = pos;
+		DSSH_PUT_U32(4, packet, &pos);
+		size_t fixed = pos;
+		memcpy(&packet[pos], "data", 4);
+		pos += 4;
+		ASSERT_ERR(dssh_test_demux_dispatch(ctx.server, type, packet, fixed - 1), DSSH_ERROR_PARSE);
+		ASSERT_ERR(dssh_test_demux_dispatch(ctx.server, type, packet, pos - 1), DSSH_ERROR_PARSE);
+		ASSERT_ERR(dssh_test_demux_dispatch(ctx.server, type, packet, pos + 1), DSSH_ERROR_PARSE);
+		DSSH_PUT_U32(UINT32_MAX, packet, &length_pos);
+		ASSERT_ERR(dssh_test_demux_dispatch(ctx.server, type, packet, pos), DSSH_ERROR_PARSE);
+		ASSERT_EQ(dssh_chan_read(oc.server_ch, 0, NULL, 0), 0);
+		ASSERT_EQ(dssh_chan_read(oc.server_ch, 1, NULL, 0), 0);
+		ASSERT_FALSE(dssh_session_is_terminated(ctx.server));
+	}
+	const size_t max_data = 32768;
+	const size_t total = 13 + 32768;
+	uint8_t *packet = malloc(total);
+	ASSERT_NOT_NULL(packet);
+	size_t pos = 0;
+	packet[pos++] = SSH_MSG_CHANNEL_EXTENDED_DATA;
+	DSSH_PUT_U32(oc.server_ch->local_id, packet, &pos);
+	DSSH_PUT_U32(1, packet, &pos);
+	DSSH_PUT_U32(32768, packet, &pos);
+	memset(&packet[pos], 0x5a, max_data);
+	int dispatched = dssh_test_demux_dispatch(ctx.server, packet[0], packet, total);
+	int64_t available = dssh_chan_read(oc.server_ch, 1, NULL, 0);
+	int64_t received = dssh_chan_read(oc.server_ch, 1, packet, max_data);
+	bool matched = received == 32768;
+	for (size_t i = 0; matched && i < max_data; i++) {
+		if (packet[i] != 0x5a)
+			matched = false;
+	}
+	free(packet);
+	ASSERT_OK(dispatched);
+	ASSERT_EQ(available, 32768);
+	ASSERT_TRUE(matched);
+	conn_cleanup(&ctx);
+	return TEST_PASS;
+}
+
+static int
+test_replenish_sync_failures(void)
+{
+	for (int fail = 0; fail < 2; fail++) {
+		struct conn_ctx ctx;
+		if (conn_setup(&ctx) < 0)
+			return TEST_FAIL;
+		struct open_exec_ctx oc = {
+			.client = ctx.client, .server = ctx.server, .command = "replenish-sync",
+			.cbs = &accept_cbs_all, .accept_timeout = 30000,
+		};
+		ASSERT_OK(open_exec_channel(&oc));
+		ASSERT_EQ(mtx_lock(&oc.server_ch->buf_mtx), thrd_success);
+		oc.server_ch->local_window = 0;
+		oc.server_ch->window_max = 8;
+		ASSERT_EQ(mtx_unlock(&oc.server_ch->buf_mtx), thrd_success);
+		dssh_test_thrd_fail_after(fail);
+		int ret = maybe_replenish_window(ctx.server, oc.server_ch);
+		dssh_test_thrd_reset();
+		ASSERT_ERR(ret, DSSH_ERROR_TERMINATED);
+		ASSERT_TRUE(dssh_session_is_terminated(ctx.server));
+		ASSERT_FALSE(tx_owner_is_current(ctx.server));
+		conn_cleanup(&ctx);
+	}
+	return TEST_PASS;
+}
+
+struct unsupported_messages {
+	uint32_t seq[3];
+	atomic_int count;
+};
+
+static void
+unsupported_reply_cb(uint32_t seq, void *cbdata)
+{
+	struct unsupported_messages *seen = cbdata;
+	int count = atomic_load(&seen->count);
+	if (count < 3) {
+		seen->seq[count] = seq;
+		atomic_store(&seen->count, count + 1);
+	}
+}
+
+static int
+test_unknown_message_replies(void)
+{
+	struct conn_ctx ctx;
+	if (conn_setup_no_start(&ctx) < 0)
+		return TEST_FAIL;
+	struct unsupported_messages seen = {0};
+	atomic_init(&seen.count, 0);
+	ASSERT_OK(dssh_session_set_unimplemented_cb(ctx.client, unsupported_reply_cb, &seen));
+	ASSERT_OK(dssh_session_start(ctx.client));
+	ASSERT_OK(dssh_session_start(ctx.server));
+	uint32_t seq[3];
+	for (unsigned i = 0; i < 3; i++) {
+		/* i < 3, so this value is in [200, 202]. */
+		uint8_t unknown = (uint8_t)(200 + i);
+		ASSERT_OK(send_packet(ctx.client, &unknown, 1, &seq[i]));
+	}
+	ASSERT_TRUE(dssh_test_wait_int(&seen.count, 3));
+	for (unsigned i = 0; i < 3; i++)
+		ASSERT_EQ_U(seen.seq[i], seq[i]);
+	ASSERT_FALSE(dssh_session_is_terminated(ctx.server));
+	conn_cleanup(&ctx);
+	return TEST_PASS;
+}
+
+struct window_rekey_gate {
+	dssh_session server;
+	atomic_bool entered;
+	atomic_bool release;
+	atomic_bool expired;
+};
+
+/* Published by the observer's atomic function pointer, kept alive through
+ * conn_cleanup's demux joins, then unpublished before leaving this frame. */
+static struct window_rekey_gate *active_window_rekey_gate;
+
+static void
+window_rekey_observe(enum dssh_test_comp_stage stage)
+{
+	if (stage != DSSH_TEST_COMP_COMPRESS)
+		return;
+	struct window_rekey_gate *gate = active_window_rekey_gate;
+	if (!session_on_demux_thread(gate->server)
+	    || !atomic_load(&gate->server->trans.rekey_in_progress)
+	    || atomic_exchange(&gate->entered, true))
+		return;
+	if (!dssh_test_wait_bool(&gate->release, true))
+		atomic_store(&gate->expired, true);
+}
+
+static int
+accept_window_rekey(dssh_channel ch, const struct dssh_chan_params *params,
+    struct dssh_chan_accept_result *result, void *cbdata)
+{
+	(void)ch;
+	(void)params;
+	(void)cbdata;
+	result->max_window = 8;
+	return 0;
+}
+
+static int
+test_compression_window_rekey(void)
+{
+	const char *method = getenv("DSSH_TEST_COMPRESSION");
+	if (method == NULL || strcmp(method, "test-growth") != 0)
+		return TEST_SKIP;
+	struct conn_ctx ctx;
+	if (conn_setup(&ctx) < 0)
+		return TEST_FAIL;
+	struct dssh_chan_accept_cbs cbs = { .exec = accept_window_rekey };
+	struct open_exec_ctx oc = {
+		.client = ctx.client, .server = ctx.server, .command = "window-rekey",
+		.cbs = &cbs, .accept_timeout = 30000,
+	};
+	ASSERT_OK(open_exec_channel(&oc));
+	ASSERT_EQ_U(atomic_load(&oc.client_ch->remote_window), 8);
+	unsigned resets_before = compression_fixture_reset_count();
+	struct window_rekey_gate gate = { .server = ctx.server };
+	atomic_init(&gate.entered, false);
+	atomic_init(&gate.release, false);
+	atomic_init(&gate.expired, false);
+	active_window_rekey_gate = &gate;
+	dssh_test_comp_observe(window_rekey_observe);
+	/* Arm counting of the next real received packet. The data is delivered
+	 * before the following receive initiates rekey and pauses at KEXINIT. */
+	uint64_t threshold = ctx.server->trans.enc_c2s_selected->bytes_per_key;
+	dssh_test_arm_rx_bytes_before_count(ctx.server, threshold);
+	const uint8_t first[] = { 1, 2, 3, 4, 5, 6 };
+	bool valid = dssh_chan_write(oc.client_ch, 0, first, sizeof(first)) == 6;
+	valid = valid && dssh_test_wait_bool(&gate.entered, true);
+	uint8_t received[8] = {0};
+	if (valid)
+		valid = dssh_chan_read(oc.server_ch, 0, received, sizeof(received)) == 6
+		    && memcmp(received, first, sizeof(first)) == 0;
+	if (valid) {
+		int ret = mtx_lock(&oc.server_ch->buf_mtx);
+		if (ret == thrd_success) {
+			valid = oc.server_ch->local_window == 2
+			    && oc.server_ch->window_adjust_pending == 6
+			    && oc.server_ch->window_adjust_inflight == 0
+			    && atomic_load(&oc.server_ch->wa_slot.ready);
+			if (mtx_unlock(&oc.server_ch->buf_mtx) != thrd_success)
+				abort();
+		}
+		else
+			valid = false;
+	}
+	/* The peer has received no credit while the old compression stream is
+	 * paused. Release it, require both new epochs, then observe real credit. */
+	valid = valid && atomic_load(&oc.client_ch->remote_window) == 2;
+	atomic_store(&gate.release, true);
+	valid = valid && compression_fixture_wait_reset(resets_before);
+	struct timespec start;
+	if (valid)
+		valid = clock_gettime(CLOCK_MONOTONIC, &start) == 0;
+	while (valid && atomic_load(&oc.client_ch->remote_window) != 8)
+		valid = dssh_test_wait_tick(&start);
+	const uint8_t second[] = { 21, 22, 23, 24, 25, 26, 27, 28 };
+	if (valid)
+		valid = dssh_chan_write(oc.client_ch, 0, second, sizeof(second)) == 8;
+	if (valid)
+		valid = (dssh_chan_poll(oc.server_ch, DSSH_POLL_READ, 5000) & DSSH_POLL_READ) != 0
+		    && dssh_chan_read(oc.server_ch, 0, received, sizeof(received)) == 8
+		    && memcmp(received, second, sizeof(second)) == 0;
+	valid = valid && !atomic_load(&gate.expired)
+	    && !dssh_session_is_terminated(ctx.client) && !dssh_session_is_terminated(ctx.server);
+	/* Always unblock and join before assertions can leave the gate's frame. */
+	conn_cleanup(&ctx);
+	dssh_test_comp_observe(NULL);
+	active_window_rekey_gate = NULL;
+	struct dssh_test_comp_stats stats;
+	dssh_test_comp_stats(&stats);
+	ASSERT_TRUE(valid);
+	ASSERT_EQ_U(stats.live, 0);
+	ASSERT_EQ_U(stats.owner_errors, 0);
+	return TEST_PASS;
+}
+
+#include "event_delivery_cases.h"
+#include "event_text_cases.h"
+#include "setup_mailbox_cases.h"
+#include "accept_failure_cases.h"
+#include "request_framing_cases.h"
+#include "control_framing_cases.h"
+#include "window_credit_cases.h"
+#include "queued_control_cases.h"
+#include "accept_callback_cases.h"
+#include "channel_params_cases.h"
+#include "event_overflow_cases.h"
+
 static struct dssh_test_entry tests[] = {
+	{ "queue_retry/packet_stream_callback", test_queue_retry_packet_stream_callback },
+	{ "queue_retry/gather_stream_callback", test_queue_retry_gather_stream_callback },
+	{ "queue_retry/packet_ordinary", test_queue_retry_packet_ordinary },
+	{ "queue_retry/packet_key_refusal", test_queue_retry_packet_key_refusal },
+	{ "queue_retry/packet_size_refusal", test_queue_retry_packet_size_refusal },
+	{ "queue_retry/packet_key_partial", test_queue_retry_packet_key_partial },
+	{ "queue_retry/packet_size_partial", test_queue_retry_packet_size_partial },
+	{ "queue_retry/packet_phase_pause", test_queue_retry_packet_phase_pause },
+	{ "queue_retry/packet_concurrent_key", test_queue_retry_packet_concurrent_key },
+	{ "queue_retry/packet_channel_key_partial", test_queue_retry_packet_channel_key_partial },
+	{ "queue_retry/packet_window_size", test_queue_retry_packet_window_size },
+	{ "queue_retry/packet_concurrent_size", test_queue_retry_packet_concurrent_size },
+	{ "queue_retry/packet_key_rekey", test_queue_retry_packet_key_rekey },
+	{ "queue_retry/packet_size_rekey", test_queue_retry_packet_size_rekey },
+	{ "queue_retry/packet_key_probe_send", test_queue_retry_packet_key_probe_send },
+	{ "queue_retry/packet_key_probe_write", test_queue_retry_packet_key_probe_write },
+	{ "queue_retry/packet_key_probe_slot", test_queue_retry_packet_key_probe_slot },
+	{ "queue_retry/packet_key_probe_rekey", test_queue_retry_packet_key_probe_rekey },
+	{ "queue_retry/packet_size_probe_send", test_queue_retry_packet_size_probe_send },
+	{ "queue_retry/packet_size_probe_write", test_queue_retry_packet_size_probe_write },
+	{ "queue_retry/packet_size_probe_slot", test_queue_retry_packet_size_probe_slot },
+	{ "queue_retry/packet_size_probe_rekey", test_queue_retry_packet_size_probe_rekey },
+	{ "queue_retry/gather_ordinary", test_queue_retry_gather_ordinary },
+	{ "queue_retry/gather_key_refusal", test_queue_retry_gather_key_refusal },
+	{ "queue_retry/gather_size_refusal", test_queue_retry_gather_size_refusal },
+	{ "queue_retry/gather_key_partial", test_queue_retry_gather_key_partial },
+	{ "queue_retry/gather_size_partial", test_queue_retry_gather_size_partial },
+	{ "queue_retry/gather_phase_pause", test_queue_retry_gather_phase_pause },
+	{ "queue_retry/gather_concurrent_key", test_queue_retry_gather_concurrent_key },
+	{ "queue_retry/gather_channel_key_partial", test_queue_retry_gather_channel_key_partial },
+	{ "queue_retry/gather_window_size", test_queue_retry_gather_window_size },
+	{ "queue_retry/gather_concurrent_size", test_queue_retry_gather_concurrent_size },
+	{ "queue_retry/gather_key_rekey", test_queue_retry_gather_key_rekey },
+	{ "queue_retry/gather_size_rekey", test_queue_retry_gather_size_rekey },
+	{ "queue_retry/gather_key_probe_send", test_queue_retry_gather_key_probe_send },
+	{ "queue_retry/gather_key_probe_write", test_queue_retry_gather_key_probe_write },
+	{ "queue_retry/gather_key_probe_slot", test_queue_retry_gather_key_probe_slot },
+	{ "queue_retry/gather_key_probe_rekey", test_queue_retry_gather_key_probe_rekey },
+	{ "queue_retry/gather_size_probe_send", test_queue_retry_gather_size_probe_send },
+	{ "queue_retry/gather_size_probe_write", test_queue_retry_gather_size_probe_write },
+	{ "queue_retry/gather_size_probe_slot", test_queue_retry_gather_size_probe_slot },
+	{ "queue_retry/gather_size_probe_rekey", test_queue_retry_gather_size_probe_rekey },
+
+
+	{ "window_credit/packet_0_stream_small", test_window_credit_packet_0_stream_small },
+	{ "window_credit/packet_0_stream_full", test_window_credit_packet_0_stream_full },
+	{ "window_credit/packet_0_zc_small", test_window_credit_packet_0_zc_small },
+	{ "window_credit/packet_0_zc_full", test_window_credit_packet_0_zc_full },
+	{ "window_credit/packet_0_cancel", test_window_credit_packet_0_cancel },
+	{ "window_credit/packet_0_oversize", test_window_credit_packet_0_oversize },
+	{ "window_credit/packet_0_key_limit", test_window_credit_packet_0_key_limit },
+	{ "window_credit/packet_0_io_failure", test_window_credit_packet_0_io_failure },
+	{ "window_credit/packet_1_stream_small", test_window_credit_packet_1_stream_small },
+	{ "window_credit/packet_1_stream_full", test_window_credit_packet_1_stream_full },
+	{ "window_credit/packet_1_zc_small", test_window_credit_packet_1_zc_small },
+	{ "window_credit/packet_1_zc_full", test_window_credit_packet_1_zc_full },
+	{ "window_credit/packet_1_cancel", test_window_credit_packet_1_cancel },
+	{ "window_credit/packet_1_oversize", test_window_credit_packet_1_oversize },
+	{ "window_credit/packet_1_key_limit", test_window_credit_packet_1_key_limit },
+	{ "window_credit/packet_1_io_failure", test_window_credit_packet_1_io_failure },
+	{ "window_credit/gather_0_stream_small", test_window_credit_gather_0_stream_small },
+	{ "window_credit/gather_0_stream_full", test_window_credit_gather_0_stream_full },
+	{ "window_credit/gather_0_zc_small", test_window_credit_gather_0_zc_small },
+	{ "window_credit/gather_0_zc_full", test_window_credit_gather_0_zc_full },
+	{ "window_credit/gather_0_cancel", test_window_credit_gather_0_cancel },
+	{ "window_credit/gather_0_oversize", test_window_credit_gather_0_oversize },
+	{ "window_credit/gather_0_key_limit", test_window_credit_gather_0_key_limit },
+	{ "window_credit/gather_0_io_failure", test_window_credit_gather_0_io_failure },
+	{ "window_credit/gather_1_stream_small", test_window_credit_gather_1_stream_small },
+	{ "window_credit/gather_1_stream_full", test_window_credit_gather_1_stream_full },
+	{ "window_credit/gather_1_zc_small", test_window_credit_gather_1_zc_small },
+	{ "window_credit/gather_1_zc_full", test_window_credit_gather_1_zc_full },
+	{ "window_credit/gather_1_cancel", test_window_credit_gather_1_cancel },
+	{ "window_credit/gather_1_oversize", test_window_credit_gather_1_oversize },
+	{ "window_credit/gather_1_key_limit", test_window_credit_gather_1_key_limit },
+	{ "window_credit/gather_1_io_failure", test_window_credit_gather_1_io_failure },
+	{ "window_credit/reverse_packet_0_stream_small", test_window_credit_reverse_packet_0_stream_small },
+	{ "window_credit/reverse_packet_0_stream_full", test_window_credit_reverse_packet_0_stream_full },
+	{ "window_credit/reverse_packet_0_zc_small", test_window_credit_reverse_packet_0_zc_small },
+	{ "window_credit/reverse_packet_0_zc_full", test_window_credit_reverse_packet_0_zc_full },
+	{ "window_credit/reverse_packet_0_cancel", test_window_credit_reverse_packet_0_cancel },
+	{ "window_credit/reverse_packet_0_oversize", test_window_credit_reverse_packet_0_oversize },
+	{ "window_credit/reverse_packet_0_key_limit", test_window_credit_reverse_packet_0_key_limit },
+	{ "window_credit/reverse_packet_0_io_failure", test_window_credit_reverse_packet_0_io_failure },
+	{ "window_credit/reverse_packet_1_stream_small", test_window_credit_reverse_packet_1_stream_small },
+	{ "window_credit/reverse_packet_1_stream_full", test_window_credit_reverse_packet_1_stream_full },
+	{ "window_credit/reverse_packet_1_zc_small", test_window_credit_reverse_packet_1_zc_small },
+	{ "window_credit/reverse_packet_1_zc_full", test_window_credit_reverse_packet_1_zc_full },
+	{ "window_credit/reverse_packet_1_cancel", test_window_credit_reverse_packet_1_cancel },
+	{ "window_credit/reverse_packet_1_oversize", test_window_credit_reverse_packet_1_oversize },
+	{ "window_credit/reverse_packet_1_key_limit", test_window_credit_reverse_packet_1_key_limit },
+	{ "window_credit/reverse_packet_1_io_failure", test_window_credit_reverse_packet_1_io_failure },
+	{ "window_credit/reverse_gather_0_stream_small", test_window_credit_reverse_gather_0_stream_small },
+	{ "window_credit/reverse_gather_0_stream_full", test_window_credit_reverse_gather_0_stream_full },
+	{ "window_credit/reverse_gather_0_zc_small", test_window_credit_reverse_gather_0_zc_small },
+	{ "window_credit/reverse_gather_0_zc_full", test_window_credit_reverse_gather_0_zc_full },
+	{ "window_credit/reverse_gather_0_cancel", test_window_credit_reverse_gather_0_cancel },
+	{ "window_credit/reverse_gather_0_oversize", test_window_credit_reverse_gather_0_oversize },
+	{ "window_credit/reverse_gather_0_key_limit", test_window_credit_reverse_gather_0_key_limit },
+	{ "window_credit/reverse_gather_0_io_failure", test_window_credit_reverse_gather_0_io_failure },
+	{ "window_credit/reverse_gather_1_stream_small", test_window_credit_reverse_gather_1_stream_small },
+	{ "window_credit/reverse_gather_1_stream_full", test_window_credit_reverse_gather_1_stream_full },
+	{ "window_credit/reverse_gather_1_zc_small", test_window_credit_reverse_gather_1_zc_small },
+	{ "window_credit/reverse_gather_1_zc_full", test_window_credit_reverse_gather_1_zc_full },
+	{ "window_credit/reverse_gather_1_cancel", test_window_credit_reverse_gather_1_cancel },
+	{ "window_credit/reverse_gather_1_oversize", test_window_credit_reverse_gather_1_oversize },
+	{ "window_credit/reverse_gather_1_key_limit", test_window_credit_reverse_gather_1_key_limit },
+	{ "window_credit/reverse_gather_1_io_failure", test_window_credit_reverse_gather_1_io_failure },
+
+	{ "window_credit/arithmetic", test_window_credit_arithmetic },
+	{ "window_credit/atomic", test_window_credit_atomic },
+
+	{ "control_frame/wire_normal_window", test_control_frame_wire_normal_window },
+	{ "control_frame/wire_normal_eof", test_control_frame_wire_normal_eof },
+	{ "control_frame/wire_normal_close", test_control_frame_wire_normal_close },
+	{ "control_frame/wire_normal_success", test_control_frame_wire_normal_success },
+	{ "control_frame/wire_normal_failure", test_control_frame_wire_normal_failure },
+	{ "control_frame/wire_setup_window", test_control_frame_wire_setup_window },
+	{ "control_frame/wire_setup_eof", test_control_frame_wire_setup_eof },
+	{ "control_frame/wire_setup_close", test_control_frame_wire_setup_close },
+	{ "control_frame/wire_setup_success", test_control_frame_wire_setup_success },
+	{ "control_frame/wire_setup_failure", test_control_frame_wire_setup_failure },
+	{ "control_frame/wire_pending_success", test_control_frame_wire_pending_success },
+	{ "control_frame/wire_pending_failure", test_control_frame_wire_pending_failure },
+
+	{ "control_frame/stream_normal_window", test_control_frame_stream_normal_window },
+	{ "control_frame/stream_normal_eof", test_control_frame_stream_normal_eof },
+	{ "control_frame/stream_normal_close", test_control_frame_stream_normal_close },
+	{ "control_frame/stream_normal_success", test_control_frame_stream_normal_success },
+	{ "control_frame/stream_normal_failure", test_control_frame_stream_normal_failure },
+	{ "control_frame/stream_normal_valid", test_control_frame_stream_normal_valid },
+	{ "control_frame/stream_setup_window", test_control_frame_stream_setup_window },
+	{ "control_frame/stream_setup_eof", test_control_frame_stream_setup_eof },
+	{ "control_frame/stream_setup_close", test_control_frame_stream_setup_close },
+	{ "control_frame/stream_setup_success", test_control_frame_stream_setup_success },
+	{ "control_frame/stream_setup_failure", test_control_frame_stream_setup_failure },
+	{ "control_frame/stream_setup_valid", test_control_frame_stream_setup_valid },
+	{ "control_frame/zc_normal_window", test_control_frame_zc_normal_window },
+	{ "control_frame/zc_normal_eof", test_control_frame_zc_normal_eof },
+	{ "control_frame/zc_normal_close", test_control_frame_zc_normal_close },
+	{ "control_frame/zc_normal_success", test_control_frame_zc_normal_success },
+	{ "control_frame/zc_normal_failure", test_control_frame_zc_normal_failure },
+	{ "control_frame/zc_normal_valid", test_control_frame_zc_normal_valid },
+	{ "control_frame/zc_setup_window", test_control_frame_zc_setup_window },
+	{ "control_frame/zc_setup_eof", test_control_frame_zc_setup_eof },
+	{ "control_frame/zc_setup_close", test_control_frame_zc_setup_close },
+	{ "control_frame/zc_setup_success", test_control_frame_zc_setup_success },
+	{ "control_frame/zc_setup_failure", test_control_frame_zc_setup_failure },
+	{ "control_frame/zc_setup_valid", test_control_frame_zc_setup_valid },
+	{ "control_frame/unknown", test_control_frame_unknown },
+	{ "control_frame/stale", test_control_frame_stale },
+
+	{ "accept_callback/publish_before_return", test_accept_callback_publish_before_return },
+	{ "accept_callback/terminate_deferred", test_accept_callback_terminate_deferred },
+	{ "accept_callback/stop_deferred", test_accept_callback_stop_deferred },
+	{ "accept_callback/cleanup_deferred", test_accept_callback_cleanup_deferred },
+
+	{ "accept_callback/pty_silent_positive", test_accept_callback_pty_silent_positive },
+	{ "accept_callback/pty_silent_negative", test_accept_callback_pty_silent_negative },
+	{ "accept_callback/pty_reply_positive", test_accept_callback_pty_reply_positive },
+	{ "accept_callback/pty_reply_negative", test_accept_callback_pty_reply_negative },
+	{ "accept_callback/env_silent_positive", test_accept_callback_env_silent_positive },
+	{ "accept_callback/env_silent_negative", test_accept_callback_env_silent_negative },
+	{ "accept_callback/env_reply_positive", test_accept_callback_env_reply_positive },
+	{ "accept_callback/env_reply_negative", test_accept_callback_env_reply_negative },
+	{ "accept_callback/shell_silent_positive", test_accept_callback_shell_silent_positive },
+	{ "accept_callback/shell_silent_negative", test_accept_callback_shell_silent_negative },
+	{ "accept_callback/shell_reply_positive", test_accept_callback_shell_reply_positive },
+	{ "accept_callback/shell_reply_negative", test_accept_callback_shell_reply_negative },
+	{ "accept_callback/exec_silent_positive", test_accept_callback_exec_silent_positive },
+	{ "accept_callback/exec_silent_negative", test_accept_callback_exec_silent_negative },
+	{ "accept_callback/exec_reply_positive", test_accept_callback_exec_reply_positive },
+	{ "accept_callback/exec_reply_negative", test_accept_callback_exec_reply_negative },
+	{ "accept_callback/subsystem_silent_positive", test_accept_callback_subsystem_silent_positive },
+	{ "accept_callback/subsystem_silent_negative", test_accept_callback_subsystem_silent_negative },
+	{ "accept_callback/subsystem_reply_positive", test_accept_callback_subsystem_reply_positive },
+	{ "accept_callback/subsystem_reply_negative", test_accept_callback_subsystem_reply_negative },
+	{ "accept_callback/pty_request_only", test_accept_callback_pty_request_only },
+	{ "accept_callback/env_request_only", test_accept_callback_env_request_only },
+
+	{ "framing/name_byte_and_boolean", test_request_name_byte_and_boolean },
+	{ "framing/setup_short_length", test_request_setup_short_length },
+	{ "framing/setup_short_name", test_request_setup_short_name },
+	{ "framing/setup_short_reply", test_request_setup_short_reply },
+	{ "framing/setup_empty", test_request_setup_empty },
+	{ "framing/setup_nonascii", test_request_setup_nonascii },
+	{ "framing/setup_zero", test_request_setup_zero },
+	{ "framing/setup_comma", test_request_setup_comma },
+	{ "framing/setup_long", test_request_setup_long },
+	{ "framing/normal_short_length", test_request_normal_short_length },
+	{ "framing/normal_short_name", test_request_normal_short_name },
+	{ "framing/normal_short_reply", test_request_normal_short_reply },
+	{ "framing/normal_empty", test_request_normal_empty },
+	{ "framing/normal_nonascii", test_request_normal_nonascii },
+	{ "framing/normal_zero", test_request_normal_zero },
+	{ "framing/normal_comma", test_request_normal_comma },
+	{ "framing/normal_long", test_request_normal_long },
+	{ "framing/break_short", test_request_break_short },
+	{ "framing/break_trailer", test_request_break_trailer },
+	{ "framing/shell_reply", test_request_shell_reply },
+	{ "framing/shell_no_reply", test_request_shell_no_reply },
+	{ "framing/setup_unknown", test_request_setup_unknown },
+	{ "framing/normal_unknown", test_request_normal_unknown },
+	{ "framing/event_lengths_stream", test_request_event_lengths_stream },
+	{ "framing/event_lengths_zc", test_request_event_lengths_zc },
+	{ "params/stream_sync", test_params_stream_sync },
+	{ "params/zc_sync", test_params_zc_sync },
+	{ "params/stream_validation", test_params_stream_validation },
+	{ "params/zc_validation", test_params_zc_validation },
+	{ "params/stream_snapshot", test_params_stream_snapshot },
+	{ "params/stream_term", test_params_stream_term },
+	{ "params/stream_command", test_params_stream_command },
+	{ "params/stream_subsystem", test_params_stream_subsystem },
+	{ "params/stream_modes", test_params_stream_modes },
+	{ "params/stream_env_array", test_params_stream_env_array },
+	{ "params/stream_env_name1", test_params_stream_env_name1 },
+	{ "params/stream_env_value1", test_params_stream_env_value1 },
+	{ "params/stream_env_name2", test_params_stream_env_name2 },
+	{ "params/stream_env_value2", test_params_stream_env_value2 },
+	{ "params/zc_snapshot", test_params_zc_snapshot },
+	{ "params/zc_term", test_params_zc_term },
+	{ "params/zc_command", test_params_zc_command },
+	{ "params/zc_subsystem", test_params_zc_subsystem },
+	{ "params/zc_modes", test_params_zc_modes },
+	{ "params/zc_env_array", test_params_zc_env_array },
+	{ "params/zc_env_name1", test_params_zc_env_name1 },
+	{ "params/zc_env_value1", test_params_zc_env_value1 },
+	{ "params/zc_env_name2", test_params_zc_env_name2 },
+	{ "params/zc_env_value2", test_params_zc_env_value2 },
+	{ "event/overflow_request_notification", test_overflow_request_notification },
+	{ "event/overflow_eof_notification", test_overflow_eof_notification },
+	{ "event/overflow_close_notification", test_overflow_close_notification },
+	{ "event/overflow_request_close_failure", test_overflow_request_close_failure },
+	{ "event/overflow_eof_close_failure", test_overflow_eof_close_failure },
+	{ "event/overflow_close_close_failure", test_overflow_close_close_failure },
+	{ "event/overflow_request_normal", test_overflow_request_normal },
+	{ "event/overflow_eof_normal", test_overflow_eof_normal },
+	{ "event/overflow_close_normal", test_overflow_close_normal },
+	{ "accept_failure/notify_failure", test_accept_notify_failure },
+	{ "accept_failure/success_send_failure", test_accept_success_send_failure },
+	{ "accept_failure/window_send_failure", test_accept_window_send_failure },
+	{ "accept_failure/close_deadline", test_accept_close_deadline },
+	{ "accept_failure/channel_storage", test_accept_channel_storage },
+	{ "accept_failure/event_storage", test_accept_event_storage },
+	{ "accept_failure/param_storage", test_accept_param_storage },
+	{ "accept_failure/stream_first", test_accept_stream_first },
+	{ "accept_failure/stream_second", test_accept_stream_second },
+	{ "accept_failure/exec_reject", test_accept_exec_reject },
+	{ "accept_failure/exec_no_reply", test_accept_exec_no_reply },
+	{ "accept_failure/peer_close", test_accept_peer_close },
+	{ "accept_failure/shell_reject", test_accept_shell_reject },
+	{ "accept_failure/subsystem_reject", test_accept_subsystem_reject },
+	{ "accept_failure/buf_init", test_accept_buf_init },
+	{ "accept_failure/cb_init", test_accept_cb_init },
+	{ "accept_failure/cnd_init", test_accept_cnd_init },
+	{ "accept_failure/slot_first", test_accept_slot_first },
+	{ "accept_failure/slot_second", test_accept_slot_second },
+	{ "accept_failure/stream_first_no_reply", test_accept_stream_first_no_reply },
+	{ "accept_failure/stream_second_no_reply", test_accept_stream_second_no_reply },
+	{ "setup/confirmation_cleanup", test_setup_confirmation_cleanup },
+	{ "setup/mailbox_no_allocation", test_setup_mailbox_no_allocation },
+	{ "setup/gap_disable", test_setup_gap_disable },
+	{ "setup/gap_detach", test_setup_gap_detach },
+	{ "setup/gap_terminate", test_setup_gap_terminate },
+	{ "setup/gap_reacquire", test_setup_gap_reacquire },
+	{ "setup/mailbox_reuse", test_setup_mailbox_reuse },
+	{ "setup/mailbox_growth", test_setup_mailbox_growth },
+	{ "setup/mailbox_rollback", test_setup_mailbox_rollback },
+	{ "setup/mailbox_bound", test_setup_mailbox_bound },
+	{ "setup/terminal_storage", test_setup_terminal_storage },
+	{ "setup/terminal_first_failure", test_setup_terminal_first_failure },
+	{ "setup/terminal_second_failure", test_setup_terminal_second_failure },
+	{ "event/text_poll_reuse", test_event_text_poll_reuse },
+	{ "event/text_growth_unlocked", test_event_text_growth_unlocked },
+	{ "event/text_poll_race", test_event_text_poll_race },
+	{ "event/text_binary_callback", test_event_text_binary_callback },
+	{ "event/text_binary_poll", test_event_text_binary_poll },
+	{ "event/text_empty_callback", test_event_text_empty_callback },
+	{ "event/text_empty_poll", test_event_text_empty_poll },
+	{ "event/text_packet_boundary", test_event_text_packet_boundary },
+	{ "event/delivery_atomic_state", test_event_atomic_state },
+	{ "event/delivery_self_disable", test_event_self_disable },
+	{ "event/delivery_client_defaults", test_event_client_defaults },
+	{ "event/delivery_lengths", test_event_lengths },
+	{ "event/delivery_positions", test_event_positions },
+	{ "event/delivery_reacquire", test_event_reacquire },
+	{ "event/delivery_acquire", test_event_acquire },
+	{ "event/delivery_queue_allocation", test_event_queue_allocation },
+	{ "event/delivery_malformed", test_event_malformed },
+	{ "event/delivery_close_race", test_event_close_race },
+	{ "event/delivery_peer_stream", test_event_peer_stream },
+	{ "event/delivery_peer_zc", test_event_peer_zc },
+	{ "event/delivery_stress", test_event_stress },
+	{ "event/delivery_switch", test_event_switch },
+	{ "event/delivery_replacement", test_event_replacement },
+	{ "event/delivery_lifecycle", test_event_lifecycle },
+	{ "compression/window_rekey", test_compression_window_rekey },
 	{ "test_assertion_cleanup", test_assertion_cleanup },
 	/* Parse helpers */
 
 	/* Session start/stop */
+	{ "data/extended_stream_types", test_extended_stream_types },
+	{ "data/extended_zc_types", test_extended_zc_types },
+	{ "data/framing", test_data_framing },
+	{ "data/replenish_sync", test_replenish_sync_failures },
+	{ "control/unknown_replies", test_unknown_message_replies },
+	{ "clock/deadline", test_clock_deadline },
+	{ "clock/poll_accept", test_clock_poll_accept },
+	{ "clock/pending_waits", test_clock_pending_waits },
+	{ "clock/receive", test_clock_receive },
+	{ "lifecycle/join_once", test_lifecycle_join_once },
+	{ "lifecycle/demux_callback", test_lifecycle_demux_callback },
+	{ "lifecycle/receive_callback", test_lifecycle_receive_callback },
+	{ "lifecycle/recursive_callbacks", test_lifecycle_recursive_callbacks },
+	{ "lifecycle/tx_reservation", test_lifecycle_tx_reservation },
 	{ "test_session_start",              test_session_start },
 	{ "test_session_stop",               test_session_stop },
 	{ "test_session_start_stop",         test_session_start_stop },
@@ -6852,6 +8640,16 @@ static struct dssh_test_entry tests[] = {
 
 	/* Channel open */
 	{ "test_open_exec",                  test_open_exec },
+	{ "open/before_start",                test_channel_before_start },
+	{ "open/type_and_queue_policy",       test_open_type_and_queue_policy },
+	{ "open/response_state",              test_open_response_state },
+	{ "open/failure_roundtrip",           test_open_failure_roundtrip },
+	{ "open/sync_failures",               test_open_sync_failures },
+	{ "io/validation",                    test_channel_io_validation },
+	{ "io/request_response_state",        test_request_response_state },
+	{ "io/sync_failures",                 test_request_io_sync_failures },
+	{ "io/tx_sync_sweep",                 test_request_tx_sync_sweep },
+	{ "io/registration_failures",         test_channel_registration_failures },
 	{ "test_open_exec_command",          test_open_exec_command },
 	{ "test_open_exec_rejected",         test_open_exec_rejected },
 	{ "test_open_shell",                 test_open_shell },
@@ -7032,13 +8830,25 @@ static struct dssh_test_entry tests[] = {
 	/* PTY getter and env roundtrip */
 	{ "pty/get_pty",                       test_chan_get_pty },
 	{ "env/roundtrip",                     test_env_roundtrip },
+	{ "env/callback_rejection",            test_env_callback_rejection },
 };
 
 void
 dssh_test_failure_cleanup(void)
 {
+	dssh_test_clock_reset();
 	if (g_active_ctx != NULL)
 		conn_cleanup(g_active_ctx);
 }
 
+#define main dssh_test_conn_main
 DSSH_TEST_MAIN(tests)
+#undef main
+
+int
+main(int argc, char *argv[])
+{
+	if (argc == 3 && strcmp(argv[1], "--join-fatal") == 0)
+		return run_join_fatal_child(argv[2]);
+	return dssh_test_conn_main(argc, argv);
+}

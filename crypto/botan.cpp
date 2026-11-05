@@ -12,16 +12,31 @@
 
 #include <climits>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
+#include <new>
 #include <string>
 
 #include "deucessh-crypto.h"
 #include "deucessh.h"
+#ifdef DSSH_TESTING
+ #include "test/dssh_test_botan_hash.h"
+#endif
 
 struct dssh_hash_ctx {
 	std::unique_ptr<Botan::HashFunction> hash;
 	size_t                               digest_len;
 };
+
+static std::unique_ptr<Botan::HashFunction>
+create_hash(const char *name)
+{
+#ifdef DSSH_TESTING
+	return dssh_test_botan_hash_create(name);
+#else
+	return Botan::HashFunction::create_or_throw(name);
+#endif
+}
 
 DSSH_PUBLIC int
 dssh_hash_init(dssh_hash_ctx **ctx, const char *name, size_t *out_digest_len)
@@ -29,41 +44,46 @@ dssh_hash_init(dssh_hash_ctx **ctx, const char *name, size_t *out_digest_len)
 	if (ctx == NULL || name == NULL || out_digest_len == NULL)
 		return DSSH_ERROR_INVALID;
 
-	std::unique_ptr<Botan::HashFunction> h;
-
 	try {
-		h = Botan::HashFunction::create_or_throw(name);
+		auto h = create_hash(name);
+		size_t digest_len = h->output_length();
+		if (digest_len == 0)
+			return DSSH_ERROR_INIT;
+		std::unique_ptr<dssh_hash_ctx> hctx(new (std::nothrow) dssh_hash_ctx);
+		if (hctx == nullptr)
+			return DSSH_ERROR_ALLOC;
+		hctx->digest_len = digest_len;
+		hctx->hash = std::move(h);
+		*ctx = hctx.release();
+		*out_digest_len = digest_len;
+		return 0;
+	}
+	catch (const std::bad_alloc&) {
+		return DSSH_ERROR_ALLOC;
 	}
 	catch (...) {
 		return DSSH_ERROR_INIT;
 	}
-
-	size_t digest_len = h->output_length();
-
-	dssh_hash_ctx *hctx = new (std::nothrow) dssh_hash_ctx;
-
-	if (hctx == NULL)
-		return DSSH_ERROR_ALLOC;
-
-	hctx->digest_len = digest_len;
-	hctx->hash       = std::move(h);
-
-	*ctx            = hctx;
-	*out_digest_len = digest_len;
-	return 0;
 }
 
 DSSH_PUBLIC int
 dssh_hash_update(dssh_hash_ctx *ctx, const uint8_t *data, size_t len)
 {
-	if (ctx == NULL)
+	if (ctx == NULL || ctx->hash == nullptr)
 		return DSSH_ERROR_INVALID;
 	if (data == NULL && len > 0)
 		return DSSH_ERROR_INVALID;
+	if (len == 0)
+		return 0;
 	try {
 		ctx->hash->update(data, len);
 	}
+	catch (const std::bad_alloc&) {
+		ctx->hash.reset();
+		return DSSH_ERROR_ALLOC;
+	}
 	catch (...) {
+		ctx->hash.reset();
 		return DSSH_ERROR_INIT;
 	}
 	return 0;
@@ -72,7 +92,7 @@ dssh_hash_update(dssh_hash_ctx *ctx, const uint8_t *data, size_t len)
 DSSH_PUBLIC int
 dssh_hash_final(dssh_hash_ctx *ctx, uint8_t *out, size_t outlen)
 {
-	if (ctx == NULL || out == NULL)
+	if (ctx == NULL || ctx->hash == nullptr || out == NULL)
 		return DSSH_ERROR_INVALID;
 	if (outlen < ctx->digest_len)
 		return DSSH_ERROR_INVALID;
@@ -81,7 +101,12 @@ dssh_hash_final(dssh_hash_ctx *ctx, uint8_t *out, size_t outlen)
 		/* final() resets the context for reuse. */
 		ctx->hash->final(out);
 	}
+	catch (const std::bad_alloc&) {
+		ctx->hash.reset();
+		return DSSH_ERROR_ALLOC;
+	}
 	catch (...) {
+		ctx->hash.reset();
 		return DSSH_ERROR_INIT;
 	}
 
@@ -102,22 +127,19 @@ dssh_hash_oneshot(const char *name, const uint8_t *data, size_t len, uint8_t *ou
 	if (data == NULL && len > 0)
 		return DSSH_ERROR_INVALID;
 
-	std::unique_ptr<Botan::HashFunction> h;
-
 	try {
-		h = Botan::HashFunction::create_or_throw(name);
-	}
-	catch (...) {
-		return DSSH_ERROR_INIT;
-	}
-
-	if (outlen < h->output_length())
-		return DSSH_ERROR_INVALID;
-
-	try {
+		auto h = create_hash(name);
+		size_t digest_len = h->output_length();
+		if (digest_len == 0)
+			return DSSH_ERROR_INIT;
+		if (outlen < digest_len)
+			return DSSH_ERROR_INVALID;
 		if (data != NULL && len > 0)
 			h->update(data, len);
 		h->final(out);
+	}
+	catch (const std::bad_alloc&) {
+		return DSSH_ERROR_ALLOC;
 	}
 	catch (...) {
 		return DSSH_ERROR_INIT;
@@ -151,7 +173,9 @@ dssh_random(uint8_t *buf, size_t len)
 DSSH_PUBLIC int
 dssh_crypto_memcmp(const void *a, const void *b, size_t len)
 {
-	if (len > 0 && (a == NULL || b == NULL))
+	if (len == 0)
+		return 0;
+	if (a == NULL || b == NULL)
 		return 1;
 	return Botan::constant_time_compare(static_cast<const uint8_t *>(a), static_cast<const uint8_t *>(b), len)
 	           ? 0
@@ -164,14 +188,14 @@ dssh_base64_encode(const uint8_t *in, size_t len, char *out, size_t outlen)
 	if (in == NULL || out == NULL)
 		return DSSH_ERROR_INVALID;
 
-	/* Guard against size_t overflow in base64 length calculation.
-	 * On 32-bit, len near SIZE_MAX makes 4*ceil(len/3) wrap. */
-	if (len > (SIZE_MAX - 3) / 4)
+	/* Check the arithmetic and the API's int result before encoding. */
+	if (len > SIZE_MAX - 2)
 		return DSSH_ERROR_TOOLONG;
-
-	size_t needed = Botan::base64_encode_max_output(len);
-
-	if (needed > SIZE_MAX - 1)
+	size_t groups = (len + 2) / 3;
+	if (groups > (SIZE_MAX - 1) / 4)
+		return DSSH_ERROR_TOOLONG;
+	size_t needed = 4 * groups;
+	if (needed > INT_MAX)
 		return DSSH_ERROR_TOOLONG;
 	if (outlen < needed + 1)
 		return DSSH_ERROR_TOOLONG;
@@ -193,5 +217,6 @@ dssh_base64_encode(const uint8_t *in, size_t len, char *out, size_t outlen)
 		return DSSH_ERROR_TOOLONG;
 
 	memcpy(out, encoded.c_str(), count + 1);
-	return (int)count;
+	int result = static_cast<int>(count);
+	return result;
 }

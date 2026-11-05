@@ -4,6 +4,7 @@
 #define DSSH_AUTH_H
 
 #include "deucessh.h"
+#include "deucessh-result.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -22,27 +23,54 @@ extern "C" {
 #define SSH_MSG_USERAUTH_INFO_REQUEST     UINT8_C(60)
 #define SSH_MSG_USERAUTH_INFO_RESPONSE    UINT8_C(61)
 
+struct dssh_auth_responses {
+	const struct dssh_bytes *items;
+	uint32_t count;
+	struct dssh_result_lease lease;
+};
+
+struct dssh_auth_prompt {
+	struct dssh_bytes text;
+	bool echo;
+};
+
+struct dssh_auth_challenge {
+	struct dssh_bytes name;
+	struct dssh_bytes instruction;
+	const struct dssh_auth_prompt *prompts;
+	uint32_t count;
+	struct dssh_result_lease lease;
+};
+
 /*
  * Keyboard-interactive prompt callback (RFC 4256).
  * Called once per INFO_REQUEST with the name, instruction, and
- * individual prompts.  The callback must fill in responses[i] for
- * each prompt.  Each response must be a malloc'd string that the
- * library will free after sending the INFO_RESPONSE.
+ * individual prompts. out starts zeroed. Set out->count to num_prompts,
+ * out->items to a producer-owned array of byte spans, and its release lease.
+ * Each item is one response; empty responses are permitted. A zero-prompt
+ * request has count zero and still causes an INFO_RESPONSE to be sent.
+ * Input strings and prompt arrays are borrowed for this callback only.
+ * Returned storage must remain valid until release and must not alias inputs
+ * whose lifetime ends on callback return. The library releases the single
+ * bundle lease on every outcome, without clearing/freeing returned storage.
+ * The producer clears actual owned secret capacity before release/reuse.
+ * Lengths and aggregate wire size must fit the session packet limit. Validate
+ * counts/metadata before reading; malformed results still receive release.
  *
  * name/name_len:    server-provided name string (may be empty)
  * instruction/instruction_len: server-provided instruction (may be empty)
  * num_prompts:      number of prompts
  * prompts[i]/prompt_lens[i]: the prompt text for each prompt
  * echo[i]:          true if the response should be echoed (not a password)
- * responses[i]:     OUT -- caller sets each to a malloc'd string
- * response_lens[i]: OUT -- caller sets each to the string length
+ * out:             OUT -- response spans, count and producer release lease
  * cbdata:           opaque pointer from the caller
  *
  * Return 0 to continue authentication, negative to abort.
+ * Positive return values are invalid.
  */
 typedef int (*dssh_auth_kbi_prompt_cb)(const uint8_t *name, size_t name_len, const uint8_t *instruction,
     size_t instruction_len, uint32_t num_prompts, const uint8_t **prompts, const size_t *prompt_lens,
-    const bool *echo, uint8_t **responses, size_t *response_lens, void *cbdata);
+    const bool *echo, struct dssh_auth_responses *out, void *cbdata);
 
 /* dssh_auth_banner_cb is defined in deucessh.h */
 
@@ -67,15 +95,19 @@ DSSH_PUBLIC int dssh_auth_get_methods(dssh_session sess, const char *username, c
  *
  * prompt/prompt_len: the server's prompt text (UTF-8, not NUL-terminated).
  * language/language_len: the language tag (may be empty).
- * new_password: OUT -- caller sets to a malloc'd string containing the
- *               new password.  The library frees it after sending.
- * new_password_len: OUT -- length of the new password.
+ * out: zero-initialized producer-owned new password and its release lease.
+ *      The library borrows the bytes until it has copied the request, then
+ *      releases the lease on every outcome, including callback/length errors.
+ *      The producer clears its actual owned capacity before releasing/reusing
+ *      storage. Length must fit the session packet limit. Empty passwords are
+ *      permitted. Input strings are borrowed only during this callback.
  * cbdata: opaque pointer from the caller.
  *
  * Return 0 to send the new password, negative to abort authentication.
+ * Positive return values are invalid.
  */
 typedef int (*dssh_auth_passwd_change_cb)(const uint8_t *prompt, size_t prompt_len, const uint8_t *language,
-    size_t language_len, uint8_t **new_password, size_t *new_password_len, void *cbdata);
+    size_t language_len, struct dssh_bytes_result *out, void *cbdata);
 
 /*
  * Authenticate with a password (RFC 4252 s8).
@@ -105,6 +137,8 @@ DSSH_PUBLIC int dssh_auth_keyboard_interactive(dssh_session sess, const char *us
 /*
  * Server auth callback results.
  * Return from the verify callbacks to indicate the outcome.
+ * Username, credential and response inputs are borrowed for the callback
+ * only. Retain a copy if the application needs them after it returns.
  */
 #define DSSH_AUTH_SUCCESS         0  /* User authenticated */
 #define DSSH_AUTH_FAILURE         -1 /* Wrong credentials */
@@ -118,24 +152,30 @@ DSSH_PUBLIC int dssh_auth_keyboard_interactive(dssh_session sess, const char *us
  * Return DSSH_AUTH_SUCCESS, DSSH_AUTH_FAILURE,
  * DSSH_AUTH_PARTIAL, or DSSH_AUTH_CHANGE_PASSWORD.
  *
- * When DSSH_AUTH_CHANGE_PASSWORD is returned, set
- * *change_prompt to a malloc'd prompt string (the library frees it).
+ * When DSSH_AUTH_CHANGE_PASSWORD is returned, set change_prompt->bytes
+ * to the prompt and provide its producer-owned release lease. The prompt
+ * pointer must be nonnull; a zero-length prompt is valid. The result starts
+ * zeroed and its lease is released on every outcome, including other auth
+ * results and invalid output. The library never clears or frees its storage.
  * The library will send PASSWD_CHANGEREQ and call passwd_change_cb
  * (below) when the client responds.
+ * Input credentials are borrowed only for this call and cannot back the prompt.
  */
 typedef int (*dssh_auth_server_password_cb)(const uint8_t *username, size_t username_len, const uint8_t *password,
-    size_t password_len, uint8_t **change_prompt, size_t *change_prompt_len, void *cbdata);
+    size_t password_len, struct dssh_bytes_result *change_prompt, void *cbdata);
 
 /*
  * Server-side password change callback.
  * Called when the client sends a password change request (boolean TRUE).
  * Validate the old password and set the new one.
+ * May be configured independently of the normal password callback.
  * Return DSSH_AUTH_SUCCESS, DSSH_AUTH_FAILURE, or
- * DSSH_AUTH_CHANGE_PASSWORD (to re-prompt).
+ * DSSH_AUTH_CHANGE_PASSWORD (to re-prompt). change_prompt uses the same
+ * producer-owned result/release contract as the normal password callback.
  */
 typedef int (*dssh_auth_server_passwd_change_cb)(const uint8_t *username, size_t username_len,
     const uint8_t *old_password, size_t old_password_len, const uint8_t *new_password, size_t new_password_len,
-    uint8_t **change_prompt, size_t *change_prompt_len, void *cbdata);
+    struct dssh_bytes_result *change_prompt, void *cbdata);
 
 /*
  * Server-side public key verification callback.
@@ -175,24 +215,33 @@ typedef int (*dssh_auth_server_none_cb)(const uint8_t *username, size_t username
  *   DSSH_AUTH_FAILURE    -- authentication failed
  *   DSSH_AUTH_PARTIAL    -- partial success, more auth needed
  *
- * When returning 0, set the out params:
- *   *name_out, *instruction_out -- malloc'd strings (library frees)
- *   *num_prompts_out -- number of prompts
- *   *prompts_out -- malloc'd array of malloc'd strings (library frees)
- *   *echo_out -- malloc'd bool array (library frees)
+ * out starts zeroed. When returning DSSH_AUTH_KBI_PROMPT, provide name and
+ * instruction spans (either may be empty), the count and a producer-owned
+ * prompt array. Each prompt has an explicit text span and echo flag. Provide
+ * one release lease for the entire bundle, including static storage (a no-op
+ * release is valid). Returned spans do not require NUL terminators.
  *
- * Out params are ignored when returning non-zero.
+ * All output remains producer-owned until release after the final read.
+ * The library releases a present lease on every callback/auth outcome and
+ * downstream failure, without clearing/freeing the array or bytes. Partial
+ * resources on error must either be released by the producer or published
+ * through the lease. Prompt texts must be nonempty. A zero prompt count is
+ * valid and still requires a client response; track rounds in cbdata, since
+ * a zero-response round can also have responses == NULL. Input credentials
+ * and arrays remain borrowed only for the callback and cannot back outputs.
  */
 typedef int (*dssh_auth_server_kbi_cb)(const uint8_t *username, size_t username_len, uint32_t num_responses,
-    const uint8_t **responses, const size_t *response_lens, char **name_out, char **instruction_out,
-    uint32_t *num_prompts_out, char ***prompts_out, bool **echo_out, void *cbdata);
+    const uint8_t **responses, const size_t *response_lens,
+    struct dssh_auth_challenge *out, void *cbdata);
 
 /*
  * Server-side authentication callbacks and configuration.
  * Set the callbacks you support; leave others NULL.
  * methods_str is a comma-separated list of supported method names
  * (e.g., "publickey,password,keyboard-interactive") sent in FAILURE
- * responses.
+ * responses. Each name must be nonempty printable ASCII without commas
+ * or spaces, at most 64 bytes. The reserved "none" query is not listed.
+ * An empty string advertises no methods.
  */
 struct dssh_auth_server_cbs {
 	const char                       *methods_str;
@@ -225,7 +274,8 @@ DSSH_PUBLIC int dssh_auth_server(dssh_session sess, const struct dssh_auth_serve
 
 /*
  * Set a pending banner to be sent before the next auth response.
- * message is copied (strdup'd).  Pass NULL to cancel a pending banner.
+ * message and language are copied. A failed replacement preserves the
+ * existing pending banner. Pass NULL for message to cancel a pending banner.
  * language may be NULL (defaults to empty string per RFC 4252 s5.4).
  * Can be called before dssh_auth_server() or from within auth callbacks.
  */

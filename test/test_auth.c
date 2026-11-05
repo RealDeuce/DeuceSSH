@@ -26,6 +26,8 @@
 #include "mock_io.h"
 #include "test_dhgex_provider.h"
 #include "dssh_test_alloc.h"
+#include "test_comp.h"
+#include "compression_fixture.h"
 
 
 /* ================================================================
@@ -36,10 +38,54 @@
  * client flag to route I/O through the correct pipe direction.
  * ================================================================ */
 
+struct auth_test_io_watch {
+	dssh_session target;
+	const uint8_t *secret;
+	size_t secret_len;
+	const uint8_t *second_secret;
+	size_t second_secret_len;
+	bool armed;
+	bool checked;
+	bool clean;
+	bool fail_enabled;
+	unsigned fail_at;
+	unsigned calls;
+	const unsigned *produced_results;
+	const unsigned *released_results;
+};
+#include "auth_result_fixture.h"
+
+#include "signature_copy_fixture.h"
+
+static struct auth_test_io_watch *auth_test_io_watch;
+
+static bool
+auth_test_bytes_zero(const uint8_t *bytes, size_t length)
+{
+	for (size_t i = 0; i < length; i++) {
+		if (bytes[i] != 0)
+			return false;
+	}
+	return true;
+}
+
 static int
 mock_tx_dispatch(uint8_t *buf, size_t bufsz,
     dssh_session sess, void *cbdata)
 {
+	if (auth_test_io_watch != NULL && auth_test_io_watch->target == sess) {
+		struct auth_test_io_watch *watch = auth_test_io_watch;
+		if (watch->armed) {
+			watch->checked = true;
+			watch->clean = watch->clean && auth_test_bytes_zero(watch->secret, watch->secret_len)
+			    && auth_test_bytes_zero(watch->second_secret, watch->second_secret_len)
+			    && (watch->produced_results == NULL || (watch->released_results != NULL
+			    && *watch->produced_results == *watch->released_results));
+		}
+		unsigned call = watch->calls++;
+		if (watch->fail_enabled && call == watch->fail_at)
+			return DSSH_ERROR_INIT;
+	}
 	if (sess->trans.client)
 		return mock_tx_client(buf, bufsz, sess, cbdata);
 	else
@@ -100,6 +146,9 @@ register_all_algorithms(void)
 	if (res < 0)
 		return res;
 	res = test_register_mac_algos();
+	if (res < 0)
+		return res;
+	res = dssh_test_register_optional_comp();
 	if (res < 0)
 		return res;
 	res = dssh_register_none_comp();
@@ -201,7 +250,8 @@ handshake_setup(struct handshake_ctx *ctx)
 	thrd_join(ct, NULL);
 	thrd_join(st, NULL);
 
-	if (ctx->client_result != 0 || ctx->server_result != 0)
+	if (ctx->client_result != 0 || ctx->server_result != 0
+	    || !compression_fixture_selected(ctx->client, ctx->server))
 		return -1;
 
 	return 0;
@@ -240,9 +290,16 @@ struct test_auth_cbdata {
 static int
 test_password_cb(const uint8_t *username, size_t username_len,
     const uint8_t *password, size_t password_len,
-    uint8_t **change_prompt, size_t *change_prompt_len,
+    struct dssh_bytes_result *output_result,
     void *cbdata)
 {
+	uint8_t *fixture_output = NULL;
+	size_t fixture_length = 0;
+	uint8_t **change_prompt = &fixture_output;
+	size_t *change_prompt_len = &fixture_length;
+	(void)change_prompt;
+	(void)change_prompt_len;
+
 	struct test_auth_cbdata *d = cbdata;
 	d->password_called = true;
 
@@ -263,11 +320,11 @@ test_password_cb(const uint8_t *username, size_t username_len,
 		    memcmp(username, d->expect_user, username_len) == 0 &&
 		    password_len == strlen(d->expect_pass) &&
 		    memcmp(password, d->expect_pass, password_len) == 0)
-			return d->password_result;
-		return DSSH_AUTH_FAILURE;
+			return test_auth_output_finish(output_result, fixture_output, fixture_length, d->password_result);
+		return test_auth_output_finish(output_result, fixture_output, fixture_length, DSSH_AUTH_FAILURE);
 	}
 
-	return d->password_result;
+	return test_auth_output_finish(output_result, fixture_output, fixture_length, d->password_result);
 }
 
 static int
@@ -396,9 +453,23 @@ test_kbi_prompt_cb(const uint8_t *name, size_t name_len,
     uint32_t num_prompts,
     const uint8_t **prompts, const size_t *prompt_lens,
     const bool *echo,
-    uint8_t **responses, size_t *response_lens,
+    struct dssh_auth_responses *out,
     void *cbdata)
 {
+	struct dssh_bytes *answers = NULL;
+	out->count = num_prompts;
+	if (num_prompts > 0) {
+#if SIZE_MAX < UINT32_MAX
+		if (num_prompts > SIZE_MAX)
+			return DSSH_ERROR_TOOLONG;
+#endif
+		size_t answer_count = (size_t)num_prompts;
+		answers = test_auth_lease_calloc(&out->lease, answer_count, sizeof(*answers));
+		if (answers == NULL)
+			return DSSH_ERROR_ALLOC;
+		out->items = answers;
+	}
+
 	struct test_kbi_cbdata *d = cbdata;
 	d->called = true;
 	d->num_prompts_seen = num_prompts;
@@ -418,11 +489,12 @@ test_kbi_prompt_cb(const uint8_t *name, size_t name_len,
 
 	for (uint32_t i = 0; i < num_prompts; i++) {
 		size_t rlen = strlen(d->response);
-		responses[i] = malloc(rlen);
-		if (responses[i] == NULL)
+		uint8_t *response = test_auth_lease_alloc(&out->lease, rlen);
+		answers[i].data = response;
+		if (response == NULL)
 			return -1;
-		memcpy(responses[i], d->response, rlen);
-		response_lens[i] = rlen;
+		memcpy(response, d->response, rlen);
+		answers[i].len = rlen;
 	}
 
 	return 0;
@@ -737,7 +809,7 @@ test_auth_server_none_accept(void)
 
 	struct auth_server_arg sa = {0};
 	sa.ctx = &ctx;
-	sa.cbs.methods_str = "none";
+	sa.cbs.methods_str = "";
 	sa.cbs.none_cb = test_none_cb;
 	sa.cbs.cbdata = &cbdata;
 
@@ -1857,9 +1929,16 @@ static int
 test_passwd_change_cb(const uint8_t *username, size_t username_len,
     const uint8_t *old_password, size_t old_password_len,
     const uint8_t *new_password, size_t new_password_len,
-    uint8_t **change_prompt, size_t *change_prompt_len,
+    struct dssh_bytes_result *output_result,
     void *cbdata)
 {
+	uint8_t *fixture_output = NULL;
+	size_t fixture_length = 0;
+	uint8_t **change_prompt = &fixture_output;
+	size_t *change_prompt_len = &fixture_length;
+	(void)change_prompt;
+	(void)change_prompt_len;
+
 	(void)username;
 	(void)username_len;
 	(void)old_password;
@@ -1870,16 +1949,23 @@ test_passwd_change_cb(const uint8_t *username, size_t username_len,
 	/* Accept the password change if new password is "newpass" */
 	if (new_password_len == 7 &&
 	    memcmp(new_password, "newpass", 7) == 0)
-		return DSSH_AUTH_SUCCESS;
-	return DSSH_AUTH_FAILURE;
+		return test_auth_output_finish(output_result, fixture_output, fixture_length, DSSH_AUTH_SUCCESS);
+	return test_auth_output_finish(output_result, fixture_output, fixture_length, DSSH_AUTH_FAILURE);
 }
 
 static int
 test_password_change_cb_server(const uint8_t *username, size_t username_len,
     const uint8_t *password, size_t password_len,
-    uint8_t **change_prompt, size_t *change_prompt_len,
+    struct dssh_bytes_result *output_result,
     void *cbdata)
 {
+	uint8_t *fixture_output = NULL;
+	size_t fixture_length = 0;
+	uint8_t **change_prompt = &fixture_output;
+	size_t *change_prompt_len = &fixture_length;
+	(void)change_prompt;
+	(void)change_prompt_len;
+
 	struct test_password_change_banner *banner = cbdata;
 
 	(void)username;
@@ -1890,18 +1976,25 @@ test_password_change_cb_server(const uint8_t *username, size_t username_len,
 	    "Password change required\r\n", NULL);
 
 	/* Signal password change needed */
-	*change_prompt = malloc(16);
+	*change_prompt = test_auth_output_alloc(output_result, 16);
 	memcpy(*change_prompt, "Change password", 15);
 	*change_prompt_len = 15;
-	return DSSH_AUTH_CHANGE_PASSWORD;
+	return test_auth_output_finish(output_result, fixture_output, fixture_length, DSSH_AUTH_CHANGE_PASSWORD);
 }
 
 static int
 test_client_passwd_change_cb(const uint8_t *prompt, size_t prompt_len,
     const uint8_t *language, size_t language_len,
-    uint8_t **new_password, size_t *new_password_len,
+    struct dssh_bytes_result *output_result,
     void *cbdata)
 {
+	uint8_t *fixture_output = NULL;
+	size_t fixture_length = 0;
+	uint8_t **new_password = &fixture_output;
+	size_t *new_password_len = &fixture_length;
+	(void)new_password;
+	(void)new_password_len;
+
 	(void)prompt;
 	(void)prompt_len;
 	(void)language;
@@ -1912,10 +2005,10 @@ test_client_passwd_change_cb(const uint8_t *prompt, size_t prompt_len,
 		banner->seen_before_change = banner_received;
 	}
 
-	*new_password = malloc(7);
+	*new_password = test_auth_output_alloc(output_result, 7);
 	memcpy(*new_password, "newpass", 7);
 	*new_password_len = 7;
-	return 0;
+	return test_auth_output_finish(output_result, fixture_output, fixture_length, 0);
 }
 
 static int
@@ -2554,12 +2647,12 @@ kbi_cb_unreachable(const uint8_t *name, size_t name_len,
     uint32_t num_prompts,
     const uint8_t **prompts, const size_t *prompt_lens,
     const bool *echo,
-    uint8_t **responses, size_t *response_lens,
+    struct dssh_auth_responses *out,
     void *cbdata)
 {
 	(void)name; (void)name_len; (void)instruction; (void)instruction_len;
 	(void)num_prompts; (void)prompts; (void)prompt_lens; (void)echo;
-	(void)responses; (void)response_lens; (void)cbdata;
+	(void)out; (void)cbdata;
 	/* If called, something is wrong -- the parse should have failed */
 	return -1;
 }
@@ -2571,17 +2664,34 @@ kbi_cb_abort(const uint8_t *name, size_t name_len,
     uint32_t num_prompts,
     const uint8_t **prompts, const size_t *prompt_lens,
     const bool *echo,
-    uint8_t **responses, size_t *response_lens,
+    struct dssh_auth_responses *out,
     void *cbdata)
 {
+	struct dssh_bytes *answers = NULL;
+	out->count = num_prompts;
+	if (num_prompts > 0) {
+#if SIZE_MAX < UINT32_MAX
+		if (num_prompts > SIZE_MAX)
+			return DSSH_ERROR_TOOLONG;
+#endif
+		size_t answer_count = (size_t)num_prompts;
+		answers = test_auth_lease_calloc(&out->lease, answer_count, sizeof(*answers));
+		if (answers == NULL)
+			return DSSH_ERROR_ALLOC;
+		out->items = answers;
+	}
+
 	(void)name; (void)name_len; (void)instruction; (void)instruction_len;
 	(void)prompts; (void)prompt_lens; (void)echo; (void)cbdata;
 
 	/* Allocate responses so the cleanup path frees them */
 	for (uint32_t i = 0; i < num_prompts; i++) {
-		responses[i] = malloc(1);
-		responses[i][0] = 'x';
-		response_lens[i] = 1;
+		uint8_t *response = test_auth_lease_alloc(&out->lease, 1);
+		answers[i].data = response;
+		if (response == NULL)
+			return DSSH_ERROR_ALLOC;
+		response[0] = 'x';
+		answers[i].len = 1;
 	}
 	return -42;
 }
@@ -2752,12 +2862,12 @@ kbi_cb_zero_prompts(const uint8_t *name, size_t name_len,
     uint32_t num_prompts,
     const uint8_t **prompts, const size_t *prompt_lens,
     const bool *echo,
-    uint8_t **responses, size_t *response_lens,
+    struct dssh_auth_responses *out,
     void *cbdata)
 {
 	(void)name; (void)name_len; (void)instruction; (void)instruction_len;
 	(void)prompts; (void)prompt_lens; (void)echo;
-	(void)responses; (void)response_lens;
+	(void)out;
 	bool *called = cbdata;
 	*called = true;
 	ASSERT_EQ_U(num_prompts, 0);
@@ -2907,6 +3017,11 @@ kbi_unexpected_server_thread(void *arg)
 	dssh_serialize_uint32(1, msg, sizeof(msg), &pos);
 	msg[pos++] = 'x';
 	a->result = send_packet(sess, msg, pos, NULL);
+	if (a->result == 0) {
+		/* An unrecognized message leaves the authentication pending. */
+		const uint8_t failure[6] = { SSH_MSG_USERAUTH_FAILURE, 0, 0, 0, 0, 0 };
+		a->result = send_packet(sess, failure, sizeof(failure), NULL);
+	}
 	return 0;
 }
 
@@ -2932,7 +3047,7 @@ test_kbi_unexpected_message(void)
 	mock_io_close_s2c(&ctx.io);
 	thrd_join(st, NULL);
 
-	ASSERT_EQ(res, DSSH_ERROR_PARSE);
+	ASSERT_EQ(res, DSSH_ERROR_AUTH_REJECTED);
 
 	handshake_cleanup(&ctx);
 	return TEST_PASS;
@@ -3802,14 +3917,21 @@ static int
 test_passwd_change_cb_failure(const uint8_t *username, size_t username_len,
     const uint8_t *old_pw, size_t old_pw_len,
     const uint8_t *new_pw, size_t new_pw_len,
-    uint8_t **prompt, size_t *prompt_len, void *cbdata)
+    struct dssh_bytes_result *output_result, void *cbdata)
 {
+	uint8_t *fixture_output = NULL;
+	size_t fixture_length = 0;
+	uint8_t **prompt = &fixture_output;
+	size_t *prompt_len = &fixture_length;
+	(void)prompt;
+	(void)prompt_len;
+
 	(void)username; (void)username_len;
 	(void)old_pw; (void)old_pw_len;
 	(void)new_pw; (void)new_pw_len;
 	(void)prompt; (void)prompt_len;
 	(void)cbdata;
-	return DSSH_AUTH_FAILURE;
+	return test_auth_output_finish(output_result, fixture_output, fixture_length, DSSH_AUTH_FAILURE);
 }
 
 static int
@@ -4139,27 +4261,41 @@ test_server_publickey_verify_bad_sig(void)
 static int
 changereq_loop_password_cb(const uint8_t *username, size_t username_len,
     const uint8_t *password, size_t password_len,
-    uint8_t **change_prompt, size_t *change_prompt_len,
+    struct dssh_bytes_result *output_result,
     void *cbdata)
 {
+	uint8_t *fixture_output = NULL;
+	size_t fixture_length = 0;
+	uint8_t **change_prompt = &fixture_output;
+	size_t *change_prompt_len = &fixture_length;
+	(void)change_prompt;
+	(void)change_prompt_len;
+
 	(void)username; (void)username_len;
 	(void)password; (void)password_len;
-	*change_prompt = malloc(6);
+	*change_prompt = test_auth_output_alloc(output_result, 6);
 	if (*change_prompt == NULL) {
 		*change_prompt_len = 0;
-		return DSSH_AUTH_FAILURE;
+		return test_auth_output_finish(output_result, fixture_output, fixture_length, DSSH_AUTH_FAILURE);
 	}
 	memcpy(*change_prompt, "retry!", 6);
 	*change_prompt_len = 6;
-	return DSSH_AUTH_CHANGE_PASSWORD;
+	return test_auth_output_finish(output_result, fixture_output, fixture_length, DSSH_AUTH_CHANGE_PASSWORD);
 }
 
 static int
 changereq_loop_change_cb(const uint8_t *username, size_t username_len,
     const uint8_t *old_pw, size_t old_pw_len,
     const uint8_t *new_pw, size_t new_pw_len,
-    uint8_t **prompt, size_t *prompt_len, void *cbdata)
+    struct dssh_bytes_result *output_result, void *cbdata)
 {
+	uint8_t *fixture_output = NULL;
+	size_t fixture_length = 0;
+	uint8_t **prompt = &fixture_output;
+	size_t *prompt_len = &fixture_length;
+	(void)prompt;
+	(void)prompt_len;
+
 	(void)username; (void)username_len;
 	(void)old_pw; (void)old_pw_len;
 	(void)new_pw; (void)new_pw_len;
@@ -4167,32 +4303,39 @@ changereq_loop_change_cb(const uint8_t *username, size_t username_len,
 	(*count)++;
 	if (*count < 2) {
 		/* First attempt: ask for another change */
-		*prompt = malloc(10);
+		*prompt = test_auth_output_alloc(output_result, 10);
 		if (*prompt == NULL) {
 			*prompt_len = 0;
-			return DSSH_AUTH_FAILURE;
+			return test_auth_output_finish(output_result, fixture_output, fixture_length, DSSH_AUTH_FAILURE);
 		}
 		memcpy(*prompt, "try again!", 10);
 		*prompt_len = 10;
-		return DSSH_AUTH_CHANGE_PASSWORD;
+		return test_auth_output_finish(output_result, fixture_output, fixture_length, DSSH_AUTH_CHANGE_PASSWORD);
 	}
 	/* Second attempt: accept */
-	return DSSH_AUTH_SUCCESS;
+	return test_auth_output_finish(output_result, fixture_output, fixture_length, DSSH_AUTH_SUCCESS);
 }
 
 static int
 test_client_changereq_cb(const uint8_t *prompt, size_t prompt_len,
     const uint8_t *language, size_t language_len,
-    uint8_t **new_password, size_t *new_password_len,
+    struct dssh_bytes_result *output_result,
     void *cbdata)
 {
+	uint8_t *fixture_output = NULL;
+	size_t fixture_length = 0;
+	uint8_t **new_password = &fixture_output;
+	size_t *new_password_len = &fixture_length;
+	(void)new_password;
+	(void)new_password_len;
+
 	(void)prompt; (void)prompt_len;
 	(void)language; (void)language_len;
 	(void)cbdata;
-	*new_password = malloc(7);
+	*new_password = test_auth_output_alloc(output_result, 7);
 	memcpy(*new_password, "newpass", 7);
 	*new_password_len = 7;
-	return 0;
+	return test_auth_output_finish(output_result, fixture_output, fixture_length, 0);
 }
 
 static int
@@ -4346,9 +4489,10 @@ test_banner_truncated_variants(void)
 	    NULL, NULL);
 
 	thrd_join(st, NULL);
-	ASSERT_EQ(res, 0);  /* auth succeeded */
-	/* The valid banner (line 33-34 variant) should have invoked cb */
-	ASSERT_TRUE(banner_trunc_cb_called);
+	ASSERT_EQ(res, DSSH_ERROR_PARSE);
+	/* A malformed banner is rejected before callback dispatch. The full
+	 * per-field matrix is exercised independently below. */
+	ASSERT_FALSE(banner_trunc_cb_called);
 
 	handshake_cleanup(&ctx);
 	return TEST_PASS;
@@ -4383,7 +4527,7 @@ test_get_methods_none_accepted(void)
 	cbdata.none_result = DSSH_AUTH_SUCCESS;
 	struct auth_server_arg sa = {0};
 	sa.ctx = &ctx;
-	sa.cbs.methods_str = "none";
+	sa.cbs.methods_str = "";
 	sa.cbs.none_cb = test_none_cb;
 	sa.cbs.cbdata = &cbdata;
 
@@ -4766,23 +4910,40 @@ service_bogus_server_thread(void *arg)
 static int
 test_service_accept_unexpected(void)
 {
-	struct handshake_ctx ctx;
-	if (handshake_setup(&ctx) < 0) {
+	for (unsigned which = 0; which < 6; which++) {
+		struct handshake_ctx ctx;
+		if (handshake_setup(&ctx) < 0) {
+			handshake_cleanup(&ctx);
+			return TEST_FAIL;
+		}
+		uint8_t resp[32] = { SSH_MSG_SERVICE_ACCEPT, 0, 0, 0, 12 };
+		memcpy(&resp[5], "ssh-userauth", 12);
+		size_t len = 17;
+		if (which == 0) {
+			resp[0] = 99;
+			len = 1;
+		}
+		else if (which == 1)
+			len = 1;
+		else if (which == 2)
+			len = 4;
+		else if (which == 3)
+			resp[4] = 0;
+		else if (which == 4)
+			resp[5] = 'x';
+		else
+			len++;
+		struct crafted_response_ctx cr = { &ctx, resp, len };
+		thrd_t st;
+		ASSERT_THRD_CREATE(&st, service_bogus_server_thread, &cr);
+		char methods[256];
+		int res = dssh_auth_get_methods(ctx.client, "user", methods, sizeof(methods));
+		thrd_join(st, NULL);
+		bool accepted = ctx.client->auth_service_requested;
 		handshake_cleanup(&ctx);
-		return TEST_FAIL;
+		ASSERT_TRUE(res < 0);
+		ASSERT_FALSE(accepted);
 	}
-
-	uint8_t resp[] = { 99 }; /* not SERVICE_ACCEPT(6) */
-	struct crafted_response_ctx cr = { &ctx, resp, sizeof(resp) };
-	thrd_t st;
-	ASSERT_THRD_CREATE(&st, service_bogus_server_thread, &cr);
-
-	char methods[256];
-	int res = dssh_auth_get_methods(ctx.client, "user", methods, sizeof(methods));
-	thrd_join(st, NULL);
-	ASSERT_TRUE(res < 0);
-
-	handshake_cleanup(&ctx);
 	return TEST_PASS;
 }
 
@@ -4809,7 +4970,7 @@ test_server_send_fail_service_accept(void)
 
 	struct auth_server_arg sa = {0};
 	sa.ctx = &ctx;
-	sa.cbs.methods_str = "none";
+	sa.cbs.methods_str = "";
 	sa.cbs.none_cb = test_none_cb;
 	sa.cbs.cbdata = &cbdata;
 
@@ -4851,7 +5012,7 @@ test_server_send_fail_none_success(void)
 
 	struct auth_server_arg sa = {0};
 	sa.ctx = &ctx;
-	sa.cbs.methods_str = "none";
+	sa.cbs.methods_str = "";
 	sa.cbs.none_cb = test_none_cb;
 	sa.cbs.cbdata = &cbdata;
 
@@ -5201,22 +5362,29 @@ test_server_send_fail_password_no_cb(void)
 static int
 send_fail_changereq_password_cb(const uint8_t *username, size_t username_len,
     const uint8_t *password, size_t password_len,
-    uint8_t **change_prompt, size_t *change_prompt_len,
+    struct dssh_bytes_result *output_result,
     void *cbdata)
 {
+	uint8_t *fixture_output = NULL;
+	size_t fixture_length = 0;
+	uint8_t **change_prompt = &fixture_output;
+	size_t *change_prompt_len = &fixture_length;
+	(void)change_prompt;
+	(void)change_prompt_len;
+
 	(void)username;
 	(void)username_len;
 	(void)password;
 	(void)password_len;
 	(void)cbdata;
-	*change_prompt = malloc(12);
+	*change_prompt = test_auth_output_alloc(output_result, 12);
 	if (*change_prompt == NULL) {
 		*change_prompt_len = 0;
-		return DSSH_AUTH_FAILURE;
+		return test_auth_output_finish(output_result, fixture_output, fixture_length, DSSH_AUTH_FAILURE);
 	}
 	memcpy(*change_prompt, "change pass!", 12);
 	*change_prompt_len = 12;
-	return DSSH_AUTH_CHANGE_PASSWORD;
+	return test_auth_output_finish(output_result, fixture_output, fixture_length, DSSH_AUTH_CHANGE_PASSWORD);
 }
 
 static int
@@ -5731,7 +5899,7 @@ test_get_methods_zero_buffer(void)
 	cbdata.none_result = DSSH_AUTH_SUCCESS;
 	struct auth_server_arg sa = {0};
 	sa.ctx = &ctx;
-	sa.cbs.methods_str = "none";
+	sa.cbs.methods_str = "";
 	sa.cbs.none_cb = test_none_cb;
 	sa.cbs.cbdata = &cbdata;
 
@@ -5884,21 +6052,28 @@ test_server_method_9_not_publickey(void)
 
 /*
  * Server: password_cb returns CHANGE_PASSWORD but prompt is NULL.
- * Exercises line 309 False (prompt != NULL when auth_res==CHANGE_PASSWORD).
+ * Invalid callback output must return an error without a protocol reply.
  */
 static int
 changereq_null_prompt_password_cb(const uint8_t *username, size_t username_len,
     const uint8_t *password, size_t password_len,
-    uint8_t **change_prompt, size_t *change_prompt_len,
+    struct dssh_bytes_result *output_result,
     void *cbdata)
 {
+	uint8_t *fixture_output = NULL;
+	size_t fixture_length = 0;
+	uint8_t **change_prompt = &fixture_output;
+	size_t *change_prompt_len = &fixture_length;
+	(void)change_prompt;
+	(void)change_prompt_len;
+
 	(void)username; (void)username_len;
 	(void)password; (void)password_len;
 	(void)cbdata;
 	/* Return CHANGE_PASSWORD but leave prompt NULL */
 	*change_prompt = NULL;
 	*change_prompt_len = 0;
-	return DSSH_AUTH_CHANGE_PASSWORD;
+	return test_auth_output_finish(output_result, fixture_output, fixture_length, DSSH_AUTH_CHANGE_PASSWORD);
 }
 
 static int
@@ -5928,7 +6103,7 @@ test_server_change_password_null_prompt(void)
 		uint8_t msg[64];
 		size_t pos = 0;
 		msg[pos++] = SSH_MSG_SERVICE_REQUEST;
-		dssh_serialize_uint32((uint32_t)(sizeof(svc) - 1), msg, sizeof(msg), &pos);
+		ASSERT_OK(dssh_serialize_uint32((uint32_t)(sizeof(svc) - 1), msg, sizeof(msg), &pos));
 		memcpy(&msg[pos], svc, sizeof(svc) - 1);
 		pos += sizeof(svc) - 1;
 		ASSERT_OK(send_packet(ctx.client, msg, pos, NULL));
@@ -5946,51 +6121,42 @@ test_server_change_password_null_prompt(void)
 		uint8_t msg[128];
 		size_t pos = build_auth_prefix(msg, sizeof(msg), "password");
 		msg[pos++] = 0; /* change = false */
-		dssh_serialize_uint32(4, msg, sizeof(msg), &pos);
+		ASSERT_OK(dssh_serialize_uint32(4, msg, sizeof(msg), &pos));
 		memcpy(&msg[pos], "pass", 4);
 		pos += 4;
 		ASSERT_OK(send_packet(ctx.client, msg, pos, NULL));
 	}
 
-	/* Should get USERAUTH_FAILURE (prompt was NULL, so falls through) */
-	{
-		uint8_t msg_type;
-		uint8_t *payload;
-		size_t payload_len;
-		ASSERT_OK(recv_packet(ctx.client, &msg_type, &payload, &payload_len));
-		ASSERT_EQ(msg_type, SSH_MSG_USERAUTH_FAILURE);
-	}
+	/* The callback contract requires prompt storage for CHANGE_PASSWORD.
+	 * Close the request direction so a regression cannot leave the worker
+	 * waiting for another auth attempt. No response should be emitted. */
+	mock_io_close_c2s_write(&ctx.io);
+	ASSERT_EQ(thrd_join(st, NULL), thrd_success);
+	ASSERT_EQ(sa.result, DSSH_ERROR_INVALID);
+	uint8_t unexpected;
+	ASSERT_EQ_U(mock_io_drain(&ctx.io.s2c, &unexpected, 1), 0);
 
-	/* Send none to finish */
-	{
-		uint8_t nmsg[64];
-		size_t npos = build_auth_prefix(nmsg, sizeof(nmsg), "none");
-		ASSERT_OK(send_packet(ctx.client, nmsg, npos, NULL));
-	}
-	{
-		uint8_t msg_type;
-		uint8_t *payload;
-		size_t payload_len;
-		ASSERT_OK(recv_packet(ctx.client, &msg_type, &payload, &payload_len));
-		ASSERT_EQ(msg_type, SSH_MSG_USERAUTH_SUCCESS);
-	}
-
-	thrd_join(st, NULL);
-	ASSERT_EQ(sa.result, 0);
 	handshake_cleanup(&ctx);
 	return TEST_PASS;
 }
 
 /*
  * Server: passwd_change_cb returns CHANGE_PASSWORD but prompt is NULL.
- * Exercises line 284 False (prompt != NULL for the change path).
+ * The change path must reject the same invalid callback output.
  */
 static int
 changereq_null_prompt_change_cb(const uint8_t *username, size_t username_len,
     const uint8_t *old_pw, size_t old_pw_len,
     const uint8_t *new_pw, size_t new_pw_len,
-    uint8_t **prompt, size_t *prompt_len, void *cbdata)
+    struct dssh_bytes_result *output_result, void *cbdata)
 {
+	uint8_t *fixture_output = NULL;
+	size_t fixture_length = 0;
+	uint8_t **prompt = &fixture_output;
+	size_t *prompt_len = &fixture_length;
+	(void)prompt;
+	(void)prompt_len;
+
 	(void)username; (void)username_len;
 	(void)old_pw; (void)old_pw_len;
 	(void)new_pw; (void)new_pw_len;
@@ -5998,7 +6164,7 @@ changereq_null_prompt_change_cb(const uint8_t *username, size_t username_len,
 	/* Return CHANGE_PASSWORD but with NULL prompt */
 	*prompt = NULL;
 	*prompt_len = 0;
-	return DSSH_AUTH_CHANGE_PASSWORD;
+	return test_auth_output_finish(output_result, fixture_output, fixture_length, DSSH_AUTH_CHANGE_PASSWORD);
 }
 
 static int
@@ -6029,7 +6195,7 @@ test_server_change_password_null_prompt_change(void)
 		uint8_t msg[64];
 		size_t pos = 0;
 		msg[pos++] = SSH_MSG_SERVICE_REQUEST;
-		dssh_serialize_uint32((uint32_t)(sizeof(svc) - 1), msg, sizeof(msg), &pos);
+		ASSERT_OK(dssh_serialize_uint32((uint32_t)(sizeof(svc) - 1), msg, sizeof(msg), &pos));
 		memcpy(&msg[pos], svc, sizeof(svc) - 1);
 		pos += sizeof(svc) - 1;
 		ASSERT_OK(send_packet(ctx.client, msg, pos, NULL));
@@ -6047,51 +6213,30 @@ test_server_change_password_null_prompt_change(void)
 		uint8_t msg[128];
 		size_t pos = build_auth_prefix(msg, sizeof(msg), "password");
 		msg[pos++] = 1; /* change = true */
-		dssh_serialize_uint32(3, msg, sizeof(msg), &pos);
+		ASSERT_OK(dssh_serialize_uint32(3, msg, sizeof(msg), &pos));
 		memcpy(&msg[pos], "old", 3);
 		pos += 3;
-		dssh_serialize_uint32(3, msg, sizeof(msg), &pos);
+		ASSERT_OK(dssh_serialize_uint32(3, msg, sizeof(msg), &pos));
 		memcpy(&msg[pos], "new", 3);
 		pos += 3;
 		ASSERT_OK(send_packet(ctx.client, msg, pos, NULL));
 	}
 
-	/* Should get USERAUTH_FAILURE (change cb returned CHANGE_PASSWORD
-	 * but prompt is NULL, so falls through to failure path) */
-	{
-		uint8_t msg_type;
-		uint8_t *payload;
-		size_t payload_len;
-		ASSERT_OK(recv_packet(ctx.client, &msg_type, &payload, &payload_len));
-		ASSERT_EQ(msg_type, SSH_MSG_USERAUTH_FAILURE);
-	}
+	/* The callback contract requires prompt storage for CHANGE_PASSWORD.
+	 * Close the request direction so a regression cannot leave the worker
+	 * waiting for another auth attempt. No response should be emitted. */
+	mock_io_close_c2s_write(&ctx.io);
+	ASSERT_EQ(thrd_join(st, NULL), thrd_success);
+	ASSERT_EQ(sa.result, DSSH_ERROR_INVALID);
+	uint8_t unexpected;
+	ASSERT_EQ_U(mock_io_drain(&ctx.io.s2c, &unexpected, 1), 0);
 
-	/* Send none to finish */
-	{
-		uint8_t nmsg[64];
-		size_t npos = build_auth_prefix(nmsg, sizeof(nmsg), "none");
-		ASSERT_OK(send_packet(ctx.client, nmsg, npos, NULL));
-	}
-	{
-		uint8_t msg_type;
-		uint8_t *payload;
-		size_t payload_len;
-		ASSERT_OK(recv_packet(ctx.client, &msg_type, &payload, &payload_len));
-		ASSERT_EQ(msg_type, SSH_MSG_USERAUTH_SUCCESS);
-	}
-
-	thrd_join(st, NULL);
-	ASSERT_EQ(sa.result, 0);
 	handshake_cleanup(&ctx);
 	return TEST_PASS;
 }
 
-/*
- * Send a publickey auth with algo name > 64 bytes.
- * Exercises line 357 False (algo_len >= sizeof(algo_name)-1 truncation).
- */
 static int
-test_server_long_algo_name(void)
+check_server_invalid_algo_name(const uint8_t *name, uint32_t name_len)
 {
 	struct parse_error_ctx pe;
 	if (parse_error_setup(&pe) < 0) {
@@ -6099,23 +6244,19 @@ test_server_long_algo_name(void)
 		return TEST_FAIL;
 	}
 
-	/* Reject publickey so server sends FAILURE, not PK_OK */
-	pe.cbdata.publickey_result = DSSH_AUTH_FAILURE;
+	/* Invalid names must be rejected before consulting the application. */
+	pe.cbdata.publickey_result = DSSH_AUTH_SUCCESS;
 
 	uint8_t msg[256];
 	size_t pos = build_auth_prefix(msg, sizeof(msg), "publickey");
 	msg[pos++] = 0; /* has_sig = false */
 
-	/* Algo name of 80 bytes (> 64 limit) -- exercises truncation path */
-	char long_algo[81];
-	memset(long_algo, 'z', 80);
-	long_algo[80] = 0;
-	dssh_serialize_uint32(80, msg, sizeof(msg), &pos);
-	memcpy(&msg[pos], long_algo, 80);
-	pos += 80;
+	ASSERT_OK(dssh_serialize_uint32(name_len, msg, sizeof(msg), &pos));
+	memcpy(&msg[pos], name, name_len);
+	pos += name_len;
 
 	/* Short pubkey blob */
-	dssh_serialize_uint32(4, msg, sizeof(msg), &pos);
+	ASSERT_OK(dssh_serialize_uint32(4, msg, sizeof(msg), &pos));
 	memcpy(&msg[pos], "blob", 4);
 	pos += 4;
 	ASSERT_OK(send_packet(pe.hctx.client, msg, pos, NULL));
@@ -6131,6 +6272,25 @@ test_server_long_algo_name(void)
 	}
 
 	parse_error_cleanup(&pe);
+	ASSERT_FALSE(pe.cbdata.publickey_called);
+	return TEST_PASS;
+}
+
+static int
+test_server_long_algo_name(void)
+{
+	uint8_t long_name[80];
+	memset(long_name, 'z', sizeof(long_name));
+	ASSERT_EQ(check_server_invalid_algo_name(long_name, sizeof(long_name)), TEST_PASS);
+	static const uint8_t embedded_null[] = "ssh-ed25519\0suffix";
+	ASSERT_EQ(check_server_invalid_algo_name(embedded_null, sizeof(embedded_null) - 1), TEST_PASS);
+	static const uint8_t space[] = "ssh ed25519";
+	ASSERT_EQ(check_server_invalid_algo_name(space, sizeof(space) - 1), TEST_PASS);
+	static const uint8_t comma[] = "ssh-ed25519,rsa-sha2-256";
+	ASSERT_EQ(check_server_invalid_algo_name(comma, sizeof(comma) - 1), TEST_PASS);
+	static const uint8_t high[] = "ssh-ed25519\x80";
+	ASSERT_EQ(check_server_invalid_algo_name(high, sizeof(high) - 1), TEST_PASS);
+	ASSERT_EQ(check_server_invalid_algo_name(high, 0), TEST_PASS);
 	return TEST_PASS;
 }
 
@@ -6223,14 +6383,21 @@ test_client_get_methods_send_fail(void)
 static int
 failing_passwd_change_cb(const uint8_t *prompt, size_t prompt_len,
     const uint8_t *language, size_t language_len,
-    uint8_t **new_password, size_t *new_password_len,
+    struct dssh_bytes_result *output_result,
     void *cbdata)
 {
+	uint8_t *fixture_output = NULL;
+	size_t fixture_length = 0;
+	uint8_t **new_password = &fixture_output;
+	size_t *new_password_len = &fixture_length;
+	(void)new_password;
+	(void)new_password_len;
+
 	(void)prompt; (void)prompt_len;
 	(void)language; (void)language_len;
 	(void)new_password; (void)new_password_len;
 	(void)cbdata;
-	return -42; /* error */
+	return test_auth_output_finish(output_result, fixture_output, fixture_length, -42); /* error */
 }
 
 static int
@@ -6481,12 +6648,17 @@ stub_pubkey_fail(const uint8_t **out, size_t *outlen,
 }
 
 static int
-stub_sign_fail(uint8_t **out, size_t *outlen,
+stub_sign_fail(struct dssh_bytes_result *output_result,
     const uint8_t *data, size_t data_len, dssh_key_algo_ctx *ctx)
 {
+	uint8_t *fixture_output = NULL;
+	size_t fixture_length = 0;
+	uint8_t **out = &fixture_output;
+	size_t *outlen = &fixture_length;
+
 	(void)out; (void)outlen;
 	(void)data; (void)data_len; (void)ctx;
-	return DSSH_ERROR_INIT;
+	return test_auth_output_finish(output_result, fixture_output, fixture_length, DSSH_ERROR_INIT);
 }
 
 static int
@@ -6797,16 +6969,7 @@ test_client_publickey_banner(void)
 	return TEST_PASS;
 }
 
-/*
- * Client: banner with no language field (handle_banner line 28 False).
- * The banner_trunc_server_thread already tests banner with no room for
- * msg_len (line 17-18) and banner with truncated lang data (line 33-34).
- * We need to also test a banner where msg is valid but there is
- * NO room for lang_len at all (rpos+4 > payload_len, line 28 False).
- * This is already covered by the third variant in banner_trunc_server_thread
- * which has lang_len=100 but sets it.  We need a variant where the payload
- * ends right after msg data with no lang_len field at all.
- */
+/* Client: a complete banner with an empty language tag. */
 static int
 banner_no_lang_server_thread(void *arg)
 {
@@ -6834,7 +6997,7 @@ banner_no_lang_server_thread(void *arg)
 		send_packet(server, accept, pos, NULL);
 	}
 
-	/* Send banner with valid msg but no room for lang_len at all */
+	/* An empty tag still has its required string-length field. */
 	{
 		uint8_t b[16];
 		size_t bp = 0;
@@ -6842,7 +7005,7 @@ banner_no_lang_server_thread(void *arg)
 		dssh_serialize_uint32(2, b, sizeof(b), &bp);
 		b[bp++] = 'h';
 		b[bp++] = 'i';
-		/* Payload ends here -- no room for lang_len (4 bytes) */
+		DSSH_PUT_U32(0, b, &bp);
 		send_packet(server, b, bp, NULL);
 	}
 
@@ -6881,9 +7044,7 @@ test_server_banner_no_lang(void)
 
 	thrd_join(st, NULL);
 	ASSERT_EQ(res, 0);
-	/* Banner callback should have been called (msg is valid even
-	 * though language is missing -- line 28 is False, language
-	 * stays NULL/0 but cb still fires). */
+	/* The empty language tag is valid and reaches the callback. */
 	ASSERT_TRUE(banner_received);
 
 	handshake_cleanup(&ctx);
@@ -7007,13 +7168,14 @@ static int
 test_parse_prefix_no_method(void)
 {
 	/* Valid username + service, no method length */
-	uint8_t payload[16];
+	uint8_t payload[48];
 	size_t pos = 0;
 	payload[pos++] = 50;
 	dssh_serialize_uint32(1, payload, sizeof(payload), &pos);
 	payload[pos++] = 'u';
-	dssh_serialize_uint32(1, payload, sizeof(payload), &pos);
-	payload[pos++] = 's';
+	dssh_serialize_uint32(14, payload, sizeof(payload), &pos);
+	memcpy(&payload[pos], "ssh-connection", 14);
+	pos += 14;
 	const uint8_t *user, *method;
 	size_t user_len, method_len;
 	int64_t res = parse_userauth_prefix(payload, pos,
@@ -7026,13 +7188,14 @@ static int
 test_parse_prefix_trunc_method(void)
 {
 	/* method_len=100 but only 2 bytes */
-	uint8_t payload[20];
+	uint8_t payload[48];
 	size_t pos = 0;
 	payload[pos++] = 50;
 	dssh_serialize_uint32(1, payload, sizeof(payload), &pos);
 	payload[pos++] = 'u';
-	dssh_serialize_uint32(1, payload, sizeof(payload), &pos);
-	payload[pos++] = 's';
+	dssh_serialize_uint32(14, payload, sizeof(payload), &pos);
+	memcpy(&payload[pos], "ssh-connection", 14);
+	pos += 14;
 	dssh_serialize_uint32(100, payload, sizeof(payload), &pos);
 	payload[pos++] = 'm';
 	payload[pos++] = 'x';
@@ -7047,14 +7210,15 @@ test_parse_prefix_trunc_method(void)
 static int
 test_parse_prefix_valid(void)
 {
-	/* Valid: user="u", service="s", method="m" */
-	uint8_t payload[20];
+	/* Valid: user="u", service="ssh-connection", method="m" */
+	uint8_t payload[48];
 	size_t pos = 0;
 	payload[pos++] = 50;
 	dssh_serialize_uint32(1, payload, sizeof(payload), &pos);
 	payload[pos++] = 'u';
-	dssh_serialize_uint32(1, payload, sizeof(payload), &pos);
-	payload[pos++] = 's';
+	dssh_serialize_uint32(14, payload, sizeof(payload), &pos);
+	memcpy(&payload[pos], "ssh-connection", 14);
+	pos += 14;
 	dssh_serialize_uint32(1, payload, sizeof(payload), &pos);
 	payload[pos++] = 'm';
 	const uint8_t *user, *method;
@@ -7084,14 +7248,21 @@ static int
 send_fail_change_success_cb(const uint8_t *username, size_t username_len,
     const uint8_t *old_pw, size_t old_pw_len,
     const uint8_t *new_pw, size_t new_pw_len,
-    uint8_t **prompt, size_t *prompt_len, void *cbdata)
+    struct dssh_bytes_result *output_result, void *cbdata)
 {
+	uint8_t *fixture_output = NULL;
+	size_t fixture_length = 0;
+	uint8_t **prompt = &fixture_output;
+	size_t *prompt_len = &fixture_length;
+	(void)prompt;
+	(void)prompt_len;
+
 	(void)username; (void)username_len;
 	(void)old_pw; (void)old_pw_len;
 	(void)new_pw; (void)new_pw_len;
 	(void)prompt; (void)prompt_len;
 	(void)cbdata;
-	return DSSH_AUTH_SUCCESS;
+	return test_auth_output_finish(output_result, fixture_output, fixture_length, DSSH_AUTH_SUCCESS);
 }
 
 static int
@@ -7164,20 +7335,27 @@ static int
 send_fail_change_changereq_cb(const uint8_t *username, size_t username_len,
     const uint8_t *old_pw, size_t old_pw_len,
     const uint8_t *new_pw, size_t new_pw_len,
-    uint8_t **prompt, size_t *prompt_len, void *cbdata)
+    struct dssh_bytes_result *output_result, void *cbdata)
 {
+	uint8_t *fixture_output = NULL;
+	size_t fixture_length = 0;
+	uint8_t **prompt = &fixture_output;
+	size_t *prompt_len = &fixture_length;
+	(void)prompt;
+	(void)prompt_len;
+
 	(void)username; (void)username_len;
 	(void)old_pw; (void)old_pw_len;
 	(void)new_pw; (void)new_pw_len;
 	(void)cbdata;
-	*prompt = malloc(6);
+	*prompt = test_auth_output_alloc(output_result, 6);
 	if (*prompt == NULL) {
 		*prompt_len = 0;
-		return DSSH_AUTH_FAILURE;
+		return test_auth_output_finish(output_result, fixture_output, fixture_length, DSSH_AUTH_FAILURE);
 	}
 	memcpy(*prompt, "retry!", 6);
 	*prompt_len = 6;
-	return DSSH_AUTH_CHANGE_PASSWORD;
+	return test_auth_output_finish(output_result, fixture_output, fixture_length, DSSH_AUTH_CHANGE_PASSWORD);
 }
 
 static int
@@ -7524,10 +7702,12 @@ pk_reject_send_fail_server_thread(void *arg)
 static int
 test_server_send_fail_pk_reject_sig(void)
 {
+	struct test_signature_copies fixture_copies = {0};
+
 	struct handshake_ctx ctx;
 	if (handshake_setup(&ctx) < 0) {
 		handshake_cleanup(&ctx);
-		return TEST_FAIL;
+		return test_signature_copies_finish(&fixture_copies, TEST_FAIL);
 	}
 
 	struct test_auth_cbdata cbdata = {0};
@@ -7569,7 +7749,7 @@ test_server_send_fail_pk_reject_sig(void)
 		mock_io_close_s2c(&ctx.io);
 		thrd_join(st, NULL);
 		handshake_cleanup(&ctx);
-		return TEST_SKIP;
+		return test_signature_copies_finish(&fixture_copies, TEST_SKIP);
 	}
 	const uint8_t *pub_buf = NULL;
 	size_t pub_len;
@@ -7606,14 +7786,14 @@ test_server_send_fail_pk_reject_sig(void)
 
 	uint8_t *sig_buf = NULL;
 	size_t sig_len;
-	int sres = ka->sign(&sig_buf, &sig_len, sign_data, sp, ka->ctx);
+	int sres = test_signature_copy(&fixture_copies, ka->sign, &sig_buf, &sig_len, sign_data, sp, ka->ctx);
 	free(sign_data);
 	if (sres < 0) {
 		mock_io_close_c2s(&ctx.io);
 		mock_io_close_s2c(&ctx.io);
 		thrd_join(st, NULL);
 		handshake_cleanup(&ctx);
-		return TEST_SKIP;
+		return test_signature_copies_finish(&fixture_copies, TEST_SKIP);
 	}
 
 	/* Send publickey request with valid signature */
@@ -7630,7 +7810,7 @@ test_server_send_fail_pk_reject_sig(void)
 		dssh_serialize_uint32((uint32_t)sig_len, msg, sizeof(msg), &pos);
 		memcpy(&msg[pos], sig_buf, sig_len);
 		pos += sig_len;
-		free(sig_buf);
+		test_signature_copy_free(&fixture_copies, sig_buf);
 		ASSERT_OK(send_packet(ctx.client, msg, pos, NULL));
 	}
 
@@ -7641,7 +7821,7 @@ test_server_send_fail_pk_reject_sig(void)
 	thrd_join(st, NULL);
 	ASSERT_TRUE(sa.result < 0);
 	handshake_cleanup(&ctx);
-	return TEST_PASS;
+	return test_signature_copies_finish(&fixture_copies, TEST_PASS);
 }
 
 /* ================================================================
@@ -7658,15 +7838,12 @@ static int
 kbi_immediate_success_cb(const uint8_t *username, size_t username_len,
     uint32_t num_responses,
     const uint8_t **responses, const size_t *response_lens,
-    char **name_out, char **instruction_out,
-    uint32_t *num_prompts_out,
-    char ***prompts_out, bool **echo_out,
+    struct dssh_auth_challenge *out,
     void *cbdata)
 {
 	(void)username; (void)username_len;
 	(void)num_responses; (void)responses; (void)response_lens;
-	(void)name_out; (void)instruction_out;
-	(void)num_prompts_out; (void)prompts_out; (void)echo_out;
+	(void)out;
 	mock_io_close_s2c_write(cbdata);
 	return DSSH_AUTH_SUCCESS;
 }
@@ -7735,15 +7912,12 @@ static int
 kbi_immediate_failure_cb(const uint8_t *username, size_t username_len,
     uint32_t num_responses,
     const uint8_t **responses, const size_t *response_lens,
-    char **name_out, char **instruction_out,
-    uint32_t *num_prompts_out,
-    char ***prompts_out, bool **echo_out,
+    struct dssh_auth_challenge *out,
     void *cbdata)
 {
 	(void)username; (void)username_len;
 	(void)num_responses; (void)responses; (void)response_lens;
-	(void)name_out; (void)instruction_out;
-	(void)num_prompts_out; (void)prompts_out; (void)echo_out;
+	(void)out;
 	(void)cbdata;
 	return DSSH_AUTH_FAILURE;
 }
@@ -7811,22 +7985,25 @@ static int
 kbi_prompt_cb_for_send_fail(const uint8_t *username, size_t username_len,
     uint32_t num_responses,
     const uint8_t **responses, const size_t *response_lens,
-    char **name_out, char **instruction_out,
-    uint32_t *num_prompts_out,
-    char ***prompts_out, bool **echo_out,
+    struct dssh_auth_challenge *out,
     void *cbdata)
 {
+	struct dssh_auth_prompt *items = NULL;
+
 	(void)username; (void)username_len;
 	(void)num_responses; (void)responses; (void)response_lens;
 	(void)cbdata;
 
-	*name_out = strdup("Test");
-	*instruction_out = strdup("Enter code");
-	*num_prompts_out = 1;
-	*prompts_out = malloc(sizeof(char *));
-	*echo_out = malloc(sizeof(bool));
-	(*prompts_out)[0] = strdup("Code: ");
-	(*echo_out)[0] = false;
+	out->name = test_auth_lease_text(&out->lease, "Test");
+	out->instruction = test_auth_lease_text(&out->lease, "Enter code");
+	out->count = 1;
+	items = test_auth_lease_calloc(&out->lease, 1, sizeof(*items));
+		out->prompts = items;
+		if (items == NULL)
+			return DSSH_AUTH_DISCONNECT;
+
+	items[0].text = test_auth_lease_text(&out->lease, "Code: ");
+	items[0].echo = false;
 	return DSSH_AUTH_KBI_PROMPT;
 }
 
@@ -7955,142 +8132,55 @@ test_server_send_fail_kbi_no_cb(void)
  * empty response (line 932).
  * ================================================================ */
 
-/*
- * SERVER: SERVICE_REQUEST with only 5 bytes (msg_type + 4-byte slen
- * where slen is 0).  Exercises line 181 False (payload_len > 5 is false
- * when payload_len == 5).
- */
 static int
-test_server_tiny_service_request(void)
+check_invalid_service_request(unsigned which)
 {
 	struct handshake_ctx ctx;
 	if (handshake_setup(&ctx) < 0) {
 		handshake_cleanup(&ctx);
 		return TEST_FAIL;
 	}
-
-	struct test_auth_cbdata cbdata = {0};
-	cbdata.password_result = DSSH_AUTH_SUCCESS;
-
-	struct auth_server_arg sa = {0};
-	sa.ctx = &ctx;
-	sa.cbs.methods_str = "password";
-	sa.cbs.password_cb = test_password_cb;
-	sa.cbs.cbdata = &cbdata;
-
-	thrd_t st;
-	ASSERT_TRUE(thrd_create(&st, auth_server_thread, &sa) == thrd_success);
-
-	/* Send SERVICE_REQUEST with exactly 5 bytes: msg_type + slen=0 */
-	{
-		uint8_t msg[5];
-		size_t pos = 0;
-		msg[pos++] = SSH_MSG_SERVICE_REQUEST;
-		dssh_serialize_uint32(0, msg, sizeof(msg), &pos);
-		ASSERT_OK(send_packet(ctx.client, msg, pos, NULL));
+	uint8_t msg[32] = { SSH_MSG_SERVICE_REQUEST, 0, 0, 0, 12 };
+	memcpy(&msg[5], "ssh-userauth", 12);
+	size_t len = 17;
+	if (which == 0) {
+		msg[4] = 0;
+		len = 5;
 	}
-
-	/* Server sends SERVICE_ACCEPT with just the msg_type (no service
-	 * name echoed).  Then we can send auth request. */
-	{
-		uint8_t msg_type;
-		uint8_t *payload;
-		size_t payload_len;
-		ASSERT_OK(recv_packet(ctx.client, &msg_type, &payload, &payload_len));
-		ASSERT_EQ(msg_type, SSH_MSG_SERVICE_ACCEPT);
-	}
-
-	/* Send a valid password auth to let server succeed */
-	{
-		uint8_t msg[128];
-		size_t pos = build_auth_prefix(msg, sizeof(msg), "password");
-		msg[pos++] = 0;
-		dssh_serialize_uint32(4, msg, sizeof(msg), &pos);
-		memcpy(&msg[pos], "pass", 4);
-		pos += 4;
-		ASSERT_OK(send_packet(ctx.client, msg, pos, NULL));
-	}
-	{
-		uint8_t msg_type;
-		uint8_t *payload;
-		size_t payload_len;
-		ASSERT_OK(recv_packet(ctx.client, &msg_type, &payload, &payload_len));
-		ASSERT_EQ(msg_type, SSH_MSG_USERAUTH_SUCCESS);
-	}
-
-	thrd_join(st, NULL);
-	ASSERT_EQ(sa.result, 0);
-
+	else if (which == 1)
+		len = 4;
+	else if (which == 2)
+		msg[5] = 'x';
+	else if (which == 3)
+		msg[5] = 0;
+	else if (which == 4)
+		len++;
+	else
+		msg[4] = 13;
+	int sent = send_packet(ctx.client, msg, len, NULL);
+	struct dssh_auth_server_cbs cbs = { .methods_str = "" };
+	int ret = auth_server_impl(ctx.server, &cbs, NULL, NULL);
 	handshake_cleanup(&ctx);
+	ASSERT_OK(sent);
+	ASSERT_TRUE(ret < 0);
 	return TEST_PASS;
 }
 
-/*
- * SERVER: SERVICE_REQUEST with 4 bytes only (msg_type + 3 partial
- * bytes of slen).  Exercises line 181 False (payload_len <= 5).
- * Server sends SERVICE_ACCEPT with just msg_type byte.
- */
+static int
+test_server_tiny_service_request(void)
+{
+	for (unsigned which = 0; which < 6; which++) {
+		int ret = check_invalid_service_request(which);
+		if (ret != TEST_PASS)
+			return ret;
+	}
+	return TEST_PASS;
+}
+
 static int
 test_server_short_service_request(void)
 {
-	struct handshake_ctx ctx;
-	if (handshake_setup(&ctx) < 0) {
-		handshake_cleanup(&ctx);
-		return TEST_FAIL;
-	}
-
-	struct test_auth_cbdata cbdata = {0};
-	cbdata.password_result = DSSH_AUTH_SUCCESS;
-
-	struct auth_server_arg sa = {0};
-	sa.ctx = &ctx;
-	sa.cbs.methods_str = "password";
-	sa.cbs.password_cb = test_password_cb;
-	sa.cbs.cbdata = &cbdata;
-
-	thrd_t st;
-	ASSERT_TRUE(thrd_create(&st, auth_server_thread, &sa) == thrd_success);
-
-	/* Send SERVICE_REQUEST with 4 bytes: msg_type + 3 junk bytes */
-	{
-		uint8_t msg[4];
-		msg[0] = SSH_MSG_SERVICE_REQUEST;
-		msg[1] = 0;
-		msg[2] = 0;
-		msg[3] = 0;
-		ASSERT_OK(send_packet(ctx.client, msg, 4, NULL));
-	}
-	{
-		uint8_t msg_type;
-		uint8_t *payload;
-		size_t payload_len;
-		ASSERT_OK(recv_packet(ctx.client, &msg_type, &payload, &payload_len));
-		ASSERT_EQ(msg_type, SSH_MSG_SERVICE_ACCEPT);
-	}
-
-	/* Send password auth */
-	{
-		uint8_t msg[128];
-		size_t pos = build_auth_prefix(msg, sizeof(msg), "password");
-		msg[pos++] = 0;
-		dssh_serialize_uint32(4, msg, sizeof(msg), &pos);
-		memcpy(&msg[pos], "pass", 4);
-		pos += 4;
-		ASSERT_OK(send_packet(ctx.client, msg, pos, NULL));
-	}
-	{
-		uint8_t msg_type;
-		uint8_t *payload;
-		size_t payload_len;
-		ASSERT_OK(recv_packet(ctx.client, &msg_type, &payload, &payload_len));
-		ASSERT_EQ(msg_type, SSH_MSG_USERAUTH_SUCCESS);
-	}
-
-	thrd_join(st, NULL);
-	ASSERT_EQ(sa.result, 0);
-
-	handshake_cleanup(&ctx);
-	return TEST_PASS;
+	return check_invalid_service_request(1);
 }
 
 /*
@@ -8177,17 +8267,31 @@ kbi_cb_empty_response(const uint8_t *name, size_t name_len,
     uint32_t num_prompts,
     const uint8_t **prompts, const size_t *prompt_lens,
     const bool *echo,
-    uint8_t **responses, size_t *response_lens,
+    struct dssh_auth_responses *out,
     void *cbdata)
 {
+	struct dssh_bytes *answers = NULL;
+	out->count = num_prompts;
+	if (num_prompts > 0) {
+#if SIZE_MAX < UINT32_MAX
+		if (num_prompts > SIZE_MAX)
+			return DSSH_ERROR_TOOLONG;
+#endif
+		size_t answer_count = (size_t)num_prompts;
+		answers = test_auth_lease_calloc(&out->lease, answer_count, sizeof(*answers));
+		if (answers == NULL)
+			return DSSH_ERROR_ALLOC;
+		out->items = answers;
+	}
+
 	(void)name; (void)name_len;
 	(void)instruction; (void)instruction_len;
 	(void)prompts; (void)prompt_lens; (void)echo;
 	(void)cbdata;
 
 	for (uint32_t i = 0; i < num_prompts; i++) {
-		responses[i] = NULL;
-		response_lens[i] = 0;
+		answers[i].data = NULL;
+		answers[i].len = 0;
 	}
 	return 0;
 }
@@ -8701,7 +8805,7 @@ dclient_server_thread(void *arg)
 	return 0;
 }
 
-/* L508: Wrong reply to SERVICE_REQUEST */
+/* An unknown reply does not complete the pending SERVICE_REQUEST. */
 static int
 dclient_wrong_svc_server(void *arg)
 {
@@ -8710,15 +8814,46 @@ dclient_wrong_svc_server(void *arg)
 	uint8_t msg_type;
 	uint8_t *payload;
 	size_t payload_len;
-	int res = recv_packet(server, &msg_type, &payload,
-	    &payload_len);
-	if (res < 0) {
+	int res = recv_packet(server, &msg_type, &payload, &payload_len);
+	if (res < 0 || msg_type != SSH_MSG_SERVICE_REQUEST) {
 		a->result = -1;
+		mock_io_close_s2c_write(&a->ctx->io);
 		return 0;
 	}
-	uint8_t bogus[] = { 99 };
-	send_packet(server, bogus, sizeof(bogus), NULL);
-	a->result = 0;
+	uint8_t bogus = 99;
+	res = send_packet(server, &bogus, 1, NULL);
+	if (res < 0) {
+		a->result = res;
+		mock_io_close_s2c_write(&a->ctx->io);
+		return 0;
+	}
+	uint8_t accept[17];
+	size_t pos = 0;
+	accept[pos++] = SSH_MSG_SERVICE_ACCEPT;
+	DSSH_PUT_U32(12, accept, &pos);
+	memcpy(&accept[pos], "ssh-userauth", 12);
+	pos += 12;
+	res = send_packet(server, accept, pos, NULL);
+	if (res < 0) {
+		a->result = res;
+		mock_io_close_s2c_write(&a->ctx->io);
+		return 0;
+	}
+	res = recv_packet(server, &msg_type, &payload, &payload_len);
+	if (res < 0 || msg_type != SSH_MSG_USERAUTH_REQUEST) {
+		a->result = -2;
+		mock_io_close_s2c_write(&a->ctx->io);
+		return 0;
+	}
+	uint8_t failure[14];
+	pos = 0;
+	failure[pos++] = SSH_MSG_USERAUTH_FAILURE;
+	DSSH_PUT_U32(8, failure, &pos);
+	memcpy(&failure[pos], "password", 8);
+	pos += 8;
+	failure[pos++] = 0;
+	a->result = send_packet(server, failure, pos, NULL);
+	mock_io_close_s2c_write(&a->ctx->io);
 	return 0;
 }
 
@@ -8742,9 +8877,13 @@ test_dclient_wrong_svc_reply(void)
 	int res = get_methods_impl(ctx.client, "user", methods, sizeof(methods));
 
 	mock_io_close_c2s(&ctx.io);
-	mock_io_close_s2c(&ctx.io);
-	thrd_join(st, NULL);
-	ASSERT_TRUE(res < 0);
+	int joined = thrd_join(st, NULL);
+	ASSERT_EQ(joined, thrd_success);
+	ASSERT_OK(sa.result);
+	ASSERT_EQ(res, DSSH_AUTH_METHODS_AVAILABLE);
+	ASSERT_EQ(strcmp(methods, "password"), 0);
+	ASSERT_TRUE(ctx.client->auth_service_requested);
+	ASSERT_FALSE(dssh_session_is_terminated(ctx.client));
 
 	handshake_cleanup(&ctx);
 	return TEST_PASS;
@@ -8897,15 +9036,22 @@ test_dclient_changereq_no_lang(void)
 static int
 dclient_error_change_cb(const uint8_t *prompt, size_t prompt_len,
     const uint8_t *language, size_t language_len,
-    uint8_t **new_password, size_t *new_password_len,
+    struct dssh_bytes_result *output_result,
     void *cbdata)
 {
+	uint8_t *fixture_output = NULL;
+	size_t fixture_length = 0;
+	uint8_t **new_password = &fixture_output;
+	size_t *new_password_len = &fixture_length;
+	(void)new_password;
+	(void)new_password_len;
+
 	(void)prompt; (void)prompt_len;
 	(void)language; (void)language_len;
 	(void)cbdata;
 	*new_password = NULL;
 	*new_password_len = 0;
-	return -42;
+	return test_auth_output_finish(output_result, fixture_output, fixture_length, -42);
 }
 
 static int
@@ -9590,23 +9736,26 @@ static int
 test_server_kbi_cb(const uint8_t *username, size_t username_len,
     uint32_t num_responses,
     const uint8_t **responses, const size_t *response_lens,
-    char **name_out, char **instruction_out,
-    uint32_t *num_prompts_out,
-    char ***prompts_out, bool **echo_out,
+    struct dssh_auth_challenge *out,
     void *cbdata)
 {
+	struct dssh_auth_prompt *items = NULL;
+
 	struct test_server_kbi_data *d = cbdata;
 	d->called = true;
 
 	if (num_responses == 0 && responses == NULL) {
 		/* First call -- send prompt */
-		*name_out = strdup("Test");
-		*instruction_out = strdup("Enter the code");
-		*num_prompts_out = 1;
-		*prompts_out = malloc(sizeof(char *));
-		*echo_out = malloc(sizeof(bool));
-		(*prompts_out)[0] = strdup(d->prompt_text);
-		(*echo_out)[0] = false;
+		out->name = test_auth_lease_text(&out->lease, "Test");
+		out->instruction = test_auth_lease_text(&out->lease, "Enter the code");
+		out->count = 1;
+		items = test_auth_lease_calloc(&out->lease, 1, sizeof(*items));
+		out->prompts = items;
+		if (items == NULL)
+			return DSSH_AUTH_DISCONNECT;
+
+		items[0].text = test_auth_lease_text(&out->lease, d->prompt_text);
+		items[0].echo = false;
 		return DSSH_AUTH_KBI_PROMPT;
 	}
 
@@ -9727,28 +9876,36 @@ struct test_server_kbi_multi_data {
 	int round;
 	bool got_first;
 	bool got_second;
+	bool identity_ok;
 };
 
 static int
 test_server_kbi_multi_cb(const uint8_t *username, size_t username_len,
     uint32_t num_responses,
     const uint8_t **responses, const size_t *response_lens,
-    char **name_out, char **instruction_out,
-    uint32_t *num_prompts_out,
-    char ***prompts_out, bool **echo_out,
+    struct dssh_auth_challenge *out,
     void *cbdata)
 {
+	struct dssh_auth_prompt *items = NULL;
+
 	struct test_server_kbi_multi_data *d = cbdata;
+	if (username_len != 8 || memcmp(username, "testuser", 8) != 0) {
+		d->identity_ok = false;
+		return DSSH_AUTH_FAILURE;
+	}
 
 	if (d->round == 0) {
 		d->round = 1;
-		*name_out = strdup("Round 1");
-		*instruction_out = strdup("");
-		*num_prompts_out = 1;
-		*prompts_out = malloc(sizeof(char *));
-		*echo_out = malloc(sizeof(bool));
-		(*prompts_out)[0] = strdup("First: ");
-		(*echo_out)[0] = true;
+		out->name = test_auth_lease_text(&out->lease, "Round 1");
+		out->instruction = test_auth_lease_text(&out->lease, "");
+		out->count = 1;
+		items = test_auth_lease_calloc(&out->lease, 1, sizeof(*items));
+		out->prompts = items;
+		if (items == NULL)
+			return DSSH_AUTH_DISCONNECT;
+
+		items[0].text = test_auth_lease_text(&out->lease, "First: ");
+		items[0].echo = true;
 		return DSSH_AUTH_KBI_PROMPT;
 	}
 
@@ -9757,13 +9914,16 @@ test_server_kbi_multi_cb(const uint8_t *username, size_t username_len,
 		    && memcmp(responses[0], "aaa", 3) == 0)
 			d->got_first = true;
 		d->round = 2;
-		*name_out = strdup("Round 2");
-		*instruction_out = strdup("Almost there");
-		*num_prompts_out = 1;
-		*prompts_out = malloc(sizeof(char *));
-		*echo_out = malloc(sizeof(bool));
-		(*prompts_out)[0] = strdup("Second: ");
-		(*echo_out)[0] = false;
+		out->name = test_auth_lease_text(&out->lease, "Round 2");
+		out->instruction = test_auth_lease_text(&out->lease, "Almost there");
+		out->count = 1;
+		items = test_auth_lease_calloc(&out->lease, 1, sizeof(*items));
+		out->prompts = items;
+		if (items == NULL)
+			return DSSH_AUTH_DISCONNECT;
+
+		items[0].text = test_auth_lease_text(&out->lease, "Second: ");
+		items[0].echo = false;
 		return DSSH_AUTH_KBI_PROMPT;
 	}
 
@@ -9788,9 +9948,23 @@ test_kbi_multi_prompt_cb(const uint8_t *name, size_t name_len,
     uint32_t num_prompts,
     const uint8_t **prompts, const size_t *prompt_lens,
     const bool *echo,
-    uint8_t **responses, size_t *response_lens,
+    struct dssh_auth_responses *out,
     void *cbdata)
 {
+	struct dssh_bytes *answers = NULL;
+	out->count = num_prompts;
+	if (num_prompts > 0) {
+#if SIZE_MAX < UINT32_MAX
+		if (num_prompts > SIZE_MAX)
+			return DSSH_ERROR_TOOLONG;
+#endif
+		size_t answer_count = (size_t)num_prompts;
+		answers = test_auth_lease_calloc(&out->lease, answer_count, sizeof(*answers));
+		if (answers == NULL)
+			return DSSH_ERROR_ALLOC;
+		out->items = answers;
+	}
+
 	struct test_kbi_multi_client *d = cbdata;
 	const char *ans = (d->round == 0) ? "aaa" : "bbb";
 	size_t alen = strlen(ans);
@@ -9798,9 +9972,12 @@ test_kbi_multi_prompt_cb(const uint8_t *name, size_t name_len,
 	d->round++;
 
 	for (uint32_t i = 0; i < num_prompts; i++) {
-		responses[i] = malloc(alen);
-		memcpy(responses[i], ans, alen);
-		response_lens[i] = alen;
+		uint8_t *response = test_auth_lease_alloc(&out->lease, alen);
+		answers[i].data = response;
+		if (response == NULL)
+			return DSSH_ERROR_ALLOC;
+		memcpy(response, ans, alen);
+		answers[i].len = alen;
 	}
 	return 0;
 }
@@ -9814,7 +9991,7 @@ test_auth_server_kbi_multi_round(void)
 		return TEST_FAIL;
 	}
 
-	struct test_server_kbi_multi_data kbi_sdata = {0};
+	struct test_server_kbi_multi_data kbi_sdata = { .identity_ok = true };
 
 	struct auth_server_arg sa = {0};
 	sa.ctx = &ctx;
@@ -9845,6 +10022,7 @@ test_auth_server_kbi_multi_round(void)
 	ASSERT_EQ(sa.result, 0);
 	ASSERT_TRUE(kbi_sdata.got_first);
 	ASSERT_TRUE(kbi_sdata.got_second);
+	ASSERT_TRUE(kbi_sdata.identity_ok);
 
 	handshake_cleanup(&ctx);
 	return TEST_PASS;
@@ -10241,22 +10419,25 @@ static int
 test_server_kbi_banner_cb(const uint8_t *username, size_t username_len,
     uint32_t num_responses,
     const uint8_t **responses, const size_t *response_lens,
-    char **name_out, char **instruction_out,
-    uint32_t *num_prompts_out,
-    char ***prompts_out, bool **echo_out,
+    struct dssh_auth_challenge *out,
     void *cbdata)
 {
+	struct dssh_auth_prompt *items = NULL;
+
 	dssh_session sess = cbdata;
 
 	if (num_responses == 0 && responses == NULL) {
 		dssh_auth_set_banner(sess, "KBI banner!\r\n", NULL);
-		*name_out = strdup("Test");
-		*instruction_out = strdup("");
-		*num_prompts_out = 1;
-		*prompts_out = malloc(sizeof(char *));
-		*echo_out = malloc(sizeof(bool));
-		(*prompts_out)[0] = strdup("Code: ");
-		(*echo_out)[0] = false;
+		out->name = test_auth_lease_text(&out->lease, "Test");
+		out->instruction = test_auth_lease_text(&out->lease, "");
+		out->count = 1;
+		items = test_auth_lease_calloc(&out->lease, 1, sizeof(*items));
+		out->prompts = items;
+		if (items == NULL)
+			return DSSH_AUTH_DISCONNECT;
+
+		items[0].text = test_auth_lease_text(&out->lease, "Code: ");
+		items[0].echo = false;
 		return DSSH_AUTH_KBI_PROMPT;
 	}
 	return DSSH_AUTH_SUCCESS;
@@ -10406,7 +10587,7 @@ test_auth_server_none_disconnect(void)
 
 	struct auth_server_arg sa = {0};
 	sa.ctx = &ctx;
-	sa.cbs.methods_str = "none,password";
+	sa.cbs.methods_str = "password";
 	sa.cbs.none_cb = test_none_cb;
 	sa.cbs.password_cb = test_password_cb;
 	sa.cbs.cbdata = &cbdata;
@@ -10640,11 +10821,11 @@ static int
 test_kbi_disconnect_cb(const uint8_t *username, size_t username_len,
     uint32_t num_responses,
     const uint8_t **responses, const size_t *response_lens,
-    char **name_out, char **instruction_out,
-    uint32_t *num_prompts_out,
-    char ***prompts_out, bool **echo_out,
+    struct dssh_auth_challenge *out,
     void *cbdata)
 {
+	struct dssh_auth_prompt *items = NULL;
+
 	struct test_kbi_disconnect_data *d = cbdata;
 	(void)username;
 	(void)username_len;
@@ -10654,13 +10835,16 @@ test_kbi_disconnect_cb(const uint8_t *username, size_t username_len,
 	if (num_responses == 0) {
 		/* First call -- send prompt */
 		d->called = true;
-		*name_out = strdup("Test");
-		*instruction_out = strdup("");
-		*num_prompts_out = 1;
-		*prompts_out = malloc(sizeof(char *));
-		*echo_out = malloc(sizeof(bool));
-		(*prompts_out)[0] = strdup(d->prompt_text);
-		(*echo_out)[0] = false;
+		out->name = test_auth_lease_text(&out->lease, "Test");
+		out->instruction = test_auth_lease_text(&out->lease, "");
+		out->count = 1;
+		items = test_auth_lease_calloc(&out->lease, 1, sizeof(*items));
+		out->prompts = items;
+		if (items == NULL)
+			return DSSH_AUTH_DISCONNECT;
+
+		items[0].text = test_auth_lease_text(&out->lease, d->prompt_text);
+		items[0].echo = false;
 		return DSSH_AUTH_KBI_PROMPT;
 	}
 
@@ -10723,9 +10907,16 @@ test_passwd_change_disconnect_cb(const uint8_t *username,
     size_t username_len,
     const uint8_t *old_password, size_t old_password_len,
     const uint8_t *new_password, size_t new_password_len,
-    uint8_t **change_prompt, size_t *change_prompt_len,
+    struct dssh_bytes_result *output_result,
     void *cbdata)
 {
+	uint8_t *fixture_output = NULL;
+	size_t fixture_length = 0;
+	uint8_t **change_prompt = &fixture_output;
+	size_t *change_prompt_len = &fixture_length;
+	(void)change_prompt;
+	(void)change_prompt_len;
+
 	(void)username;
 	(void)username_len;
 	(void)old_password;
@@ -10735,7 +10926,7 @@ test_passwd_change_disconnect_cb(const uint8_t *username,
 	(void)change_prompt;
 	(void)change_prompt_len;
 	(void)cbdata;
-	return DSSH_AUTH_DISCONNECT;
+	return test_auth_output_finish(output_result, fixture_output, fixture_length, DSSH_AUTH_DISCONNECT);
 }
 
 static int
@@ -11044,10 +11235,8 @@ test_direct_kbi_resp_parse_error(void)
 	return TEST_PASS;
 }
 
-/* dssh_auth_set_banner strdup alloc failures: not testable because
- * strdup() is a C library function, not intercepted by the macro-based
- * alloc injection.  The paths at ssh-auth.c:971 and 974 are
- * defense-in-depth for real OOM. */
+/* Banner replacement allocation failures and aliasing are exercised by
+ * callbacks/banner_transaction below using library-only injection. */
 
 /* ================================================================
  * Client publickey: no key loaded (haskey returns false)
@@ -11277,8 +11466,8 @@ test_dclient_pk_banner_parse_error(void)
 	}
 
 	int res = auth_publickey_impl(ctx.client, "user", algo);
-	/* Should succeed -- parse error in banner is tolerated */
-	ASSERT_EQ(res, 0);
+	/* Reject incomplete framing even when no banner callback is set. */
+	ASSERT_EQ(res, DSSH_ERROR_PARSE);
 
 	mock_io_close_c2s(&ctx.io);
 	thrd_join(st, NULL);
@@ -11295,9 +11484,23 @@ kbi_cb_huge_response(const uint8_t *name, size_t name_len,
     uint32_t num_prompts,
     const uint8_t **prompts, const size_t *prompt_lens,
     const bool *echo,
-    uint8_t **responses, size_t *response_lens,
+    struct dssh_auth_responses *out,
     void *cbdata)
 {
+	struct dssh_bytes *answers = NULL;
+	out->count = num_prompts;
+	if (num_prompts > 0) {
+#if SIZE_MAX < UINT32_MAX
+		if (num_prompts > SIZE_MAX)
+			return DSSH_ERROR_TOOLONG;
+#endif
+		size_t answer_count = (size_t)num_prompts;
+		answers = test_auth_lease_calloc(&out->lease, answer_count, sizeof(*answers));
+		if (answers == NULL)
+			return DSSH_ERROR_ALLOC;
+		out->items = answers;
+	}
+
 	(void)name;
 	(void)name_len;
 	(void)instruction;
@@ -11308,14 +11511,15 @@ kbi_cb_huge_response(const uint8_t *name, size_t name_len,
 	(void)cbdata;
 
 	for (uint32_t i = 0; i < num_prompts; i++) {
-		responses[i] = malloc(1);
-		if (responses[i] == NULL)
+		uint8_t *response = test_auth_lease_alloc(&out->lease, 1);
+		answers[i].data = response;
+		if (response == NULL)
 			return -1;
-		responses[i][0] = 'x';
+		response[0] = 'x';
 #if SIZE_MAX > UINT32_MAX
-		response_lens[i] = (size_t)UINT32_MAX + 1;
+		answers[i].len = (size_t)UINT32_MAX + 1;
 #else
-		response_lens[i] = SIZE_MAX;
+		answers[i].len = SIZE_MAX;
 #endif
 	}
 	return 0;
@@ -11372,9 +11576,23 @@ kbi_cb_size_overflow(const uint8_t *name, size_t name_len,
     uint32_t num_prompts,
     const uint8_t **prompts, const size_t *prompt_lens,
     const bool *echo,
-    uint8_t **responses, size_t *response_lens,
+    struct dssh_auth_responses *out,
     void *cbdata)
 {
+	struct dssh_bytes *answers = NULL;
+	out->count = num_prompts;
+	if (num_prompts > 0) {
+#if SIZE_MAX < UINT32_MAX
+		if (num_prompts > SIZE_MAX)
+			return DSSH_ERROR_TOOLONG;
+#endif
+		size_t answer_count = (size_t)num_prompts;
+		answers = test_auth_lease_calloc(&out->lease, answer_count, sizeof(*answers));
+		if (answers == NULL)
+			return DSSH_ERROR_ALLOC;
+		out->items = answers;
+	}
+
 	(void)name;
 	(void)name_len;
 	(void)instruction;
@@ -11385,13 +11603,14 @@ kbi_cb_size_overflow(const uint8_t *name, size_t name_len,
 	(void)cbdata;
 
 	for (uint32_t i = 0; i < num_prompts; i++) {
-		responses[i] = malloc(1);
-		if (responses[i] == NULL)
+		uint8_t *response = test_auth_lease_alloc(&out->lease, 1);
+		answers[i].data = response;
+		if (response == NULL)
 			return -1;
-		responses[i][0] = 'x';
+		response[0] = 'x';
 		/* Each response claims SIZE_MAX - 4 bytes, so the second
 		 * accumulation overflows even if individual fits in u32. */
-		response_lens[i] = SIZE_MAX - 4;
+		answers[i].len = SIZE_MAX - 4;
 	}
 	return 0;
 }
@@ -12062,10 +12281,16 @@ test_kbi_server_trunc_resp_body(void)
  * Client sends INFO_RESPONSE with num_responses=100 when only 1
  * prompt was sent.  Server should reject with DSSH_ERROR_PARSE.
  * ================================================================ */
+struct kbi_response_case {
+	struct handshake_ctx *ctx;
+	uint32_t count;
+};
+
 static int
 kbi_excess_responses_thread(void *arg)
 {
-	struct handshake_ctx *ctx = arg;
+	struct kbi_response_case *response_case = arg;
+	struct handshake_ctx *ctx = response_case->ctx;
 	dssh_session client = ctx->client;
 
 	int res = dssh_auth_get_methods(client, "testuser", NULL, 0);
@@ -12100,17 +12325,22 @@ kbi_excess_responses_thread(void *arg)
 		return 0;
 
 	/* Send INFO_RESPONSE with num_responses=100 (exceeds 1 prompt) */
-	uint8_t resp[8];
+	uint8_t resp[16];
 	size_t rp = 0;
 	resp[rp++] = 61; /* SSH_MSG_USERAUTH_INFO_RESPONSE */
-	dssh_serialize_uint32(100, resp, sizeof(resp), &rp);
+	dssh_serialize_uint32(response_case->count, resp, sizeof(resp), &rp);
+	if (response_case->count == 1) {
+		dssh_serialize_uint32(1, resp, sizeof(resp), &rp);
+		resp[rp++] = 'x';
+		resp[rp++] = 0;
+	}
 	send_packet(client, resp, rp, NULL);
 
 	return 0;
 }
 
 static int
-test_kbi_server_responses_exceed_prompts(void)
+check_kbi_server_response_count(uint32_t count)
 {
 	struct handshake_ctx ctx;
 	if (handshake_setup(&ctx) < 0) {
@@ -12129,9 +12359,10 @@ test_kbi_server_responses_exceed_prompts(void)
 	sa.cbs.keyboard_interactive_cb = test_server_kbi_cb;
 	sa.cbs.cbdata = &kbi_sdata;
 
+	struct kbi_response_case response_case = { &ctx, count };
 	thrd_t ct, st;
 	ASSERT_TRUE(thrd_create(&st, auth_server_thread, &sa) == thrd_success);
-	ASSERT_TRUE(thrd_create(&ct, kbi_excess_responses_thread, &ctx) == thrd_success);
+	ASSERT_TRUE(thrd_create(&ct, kbi_excess_responses_thread, &response_case) == thrd_success);
 
 	thrd_join(ct, NULL);
 	mock_io_close_c2s_write(&ctx.io);
@@ -12141,6 +12372,18 @@ test_kbi_server_responses_exceed_prompts(void)
 	ASSERT_TRUE(sa.result < 0);
 
 	handshake_cleanup(&ctx);
+	return TEST_PASS;
+}
+
+static int
+test_kbi_server_responses_exceed_prompts(void)
+{
+	static const uint32_t counts[] = { 100, 0, 1 };
+	for (size_t i = 0; i < sizeof(counts) / sizeof(counts[0]); i++) {
+		int ret = check_kbi_server_response_count(counts[i]);
+		if (ret != TEST_PASS)
+			return ret;
+	}
 	return TEST_PASS;
 }
 
@@ -12191,7 +12434,73 @@ test_kbi_client_too_many_prompts(void)
  * Test table and main
  * ================================================================ */
 
+static int
+capacity_io(uint8_t *buf, size_t bufsz, dssh_session sess, void *cbdata)
+{
+	(void)buf;
+	(void)bufsz;
+	(void)sess;
+	size_t *calls = cbdata;
+	(*calls)++;
+	return DSSH_ERROR_INVALID;
+}
+
+static int
+test_auth_request_capacity(void)
+{
+	dssh_test_reset_global_config();
+	ASSERT_OK(dssh_transport_set_callbacks(capacity_io, capacity_io, NULL, NULL));
+	dssh_session sess = dssh_session_init(true, 0);
+	ASSERT_NOT_NULL(sess);
+	size_t calls = 0;
+	ASSERT_OK(dssh_session_set_cbdata(sess, &calls, &calls, &calls, NULL));
+	/* Isolate request construction from the already-completed service
+	 * exchange; none of these oversized inputs should reach I/O. */
+	sess->auth_service_requested = true;
+	size_t input_len = sess->trans.packet_buf_sz;
+	char *input = malloc(input_len + 1);
+	ASSERT_NOT_NULL(input);
+	memset(input, 'x', input_len);
+	input[input_len] = 0;
+	char methods[16];
+	ASSERT_EQ(dssh_auth_get_methods(sess, input, methods, sizeof(methods)), DSSH_ERROR_TOOLONG);
+	ASSERT_EQ(dssh_auth_password(sess, input, "password", NULL, NULL), DSSH_ERROR_TOOLONG);
+	ASSERT_EQ(dssh_auth_password(sess, "testuser", input, NULL, NULL), DSSH_ERROR_TOOLONG);
+	ASSERT_EQ(dssh_auth_keyboard_interactive(sess, input, kbi_cb_unreachable, NULL), DSSH_ERROR_TOOLONG);
+	ASSERT_EQ_U(calls, 0);
+	ASSERT_FALSE(dssh_session_is_terminated(sess));
+	ASSERT_FALSE(sess->trans.tx_owner_active);
+	free(input);
+	dssh_session_cleanup(sess);
+	dssh_test_reset_global_config();
+	return TEST_PASS;
+}
+
+#include "auth_framing_cases.h"
+#include "auth_callback_cases.h"
+#include "password_result_cases.h"
+#include "kbi_result_cases.h"
+#include "signature_auth_result_cases.h"
+
 static struct dssh_test_entry tests[] = {
+	{ "callbacks/banner_transaction", test_auth_callback_banner_transaction },
+	{ "callbacks/output_pairs", test_auth_callback_output_pairs },
+	{ "callbacks/password_lifetime", test_auth_callback_password_lifetime },
+	{ "callbacks/password_result", test_password_result_contract },
+	{ "callbacks/signature_result", test_auth_signature_result_contract },
+	{ "callbacks/kbi_client_result", test_kbi_result_client_contract },
+	{ "callbacks/kbi_server_result", test_kbi_result_server_contract },
+	{ "callbacks/kbi_lifetime", test_auth_callback_kbi_lifetime },
+	{ "callbacks/client_cleanup", test_auth_callback_client_cleanup },
+	{ "callbacks/results", test_auth_callback_results },
+	{ "callbacks/reply_failures", test_auth_callback_reply_failures },
+
+	{ "framing/client_results", test_auth_frame_results },
+	{ "framing/client_text", test_auth_frame_text },
+	{ "framing/client_kbi", test_auth_frame_kbi },
+	{ "framing/server_requests", test_auth_frame_server },
+	{ "framing/server_config_update", test_auth_frame_config_update },
+	{ "release/request_capacity", test_auth_request_capacity },
 	/* Password auth */
 	{ "auth/password/success",         test_auth_password_success },
 	{ "auth/password/failure",         test_auth_password_failure },

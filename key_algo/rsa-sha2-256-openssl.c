@@ -466,13 +466,13 @@ cleanup(dssh_key_algo_ctx *ctx)
 static int
 install_key(EVP_PKEY *pkey)
 {
-	struct dssh_openssl_key_context *replacement = calloc(1, sizeof(*replacement));
+	struct dssh_openssl_key_context *replacement = malloc(sizeof(*replacement));
 
 	if (replacement == NULL) {
 		EVP_PKEY_free(pkey);
 		return DSSH_ERROR_ALLOC;
 	}
-	replacement->pkey = pkey;
+	*replacement = (struct dssh_openssl_key_context){.pkey = pkey};
 	dssh_key_algo_ctx *opaque = (dssh_key_algo_ctx *)replacement;
 	const uint8_t *blob;
 	size_t blob_len;

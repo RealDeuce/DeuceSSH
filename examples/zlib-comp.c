@@ -107,11 +107,11 @@ zlib_init(bool compress, dssh_comp_ctx **ctx)
 		state = zlib_calloc(1, sizeof(*state));
 		if (state == NULL)
 			return DSSH_ERROR_ALLOC;
+		*state = (struct zlib_context){.compress = compress};
 		dssh_comp_ctx *opaque = (dssh_comp_ctx *)state;
 		*ctx = opaque;
 		OBSERVE_ADD(zlib_allocations, 1);
 		OBSERVE_ADD(zlib_live, 1);
-		state->compress = compress;
 		state->stream.zalloc = zlib_allocate;
 		state->stream.zfree = zlib_release;
 		/* Fix window/memory parameters to match the bound below. */

@@ -1672,6 +1672,26 @@ alloc_channel_id(struct dssh_session_s *sess)
  * Channel buffer initialization
  * ================================================================ */
 
+/* Only for a fresh, unpublished channel: native objects are constructed below
+ * and atomic initialization must precede every operation/publication. */
+static struct dssh_channel_s *
+new_channel(void)
+{
+	struct dssh_channel_s *ch = malloc(sizeof(*ch));
+	if (ch == NULL)
+		return NULL;
+	*ch = (struct dssh_channel_s){0};
+	atomic_init(&ch->closing, false);
+	atomic_init(&ch->terminate_woken, false);
+	atomic_init(&ch->tx_refs, 0);
+	atomic_init(&ch->dispatch_state, DSSH_CHANNEL_DISPATCH_IDLE);
+	atomic_init(&ch->remote_window, 0);
+	atomic_init(&ch->setup_complete, false);
+	atomic_init(&ch->wa_slot.ready, false);
+	atomic_init(&ch->chan_fail_slot.ready, false);
+	return ch;
+}
+
 static int
 /*
  * Phase 1: init sync primitives only.  Called before CHANNEL_OPEN
@@ -1682,14 +1702,6 @@ init_channel_sync(struct dssh_session_s *sess, struct dssh_channel_s *ch)
 	ch->chan_type          = DSSH_CHAN_SESSION;
 	ch->exit_code          = 0;
 	ch->exit_code_received = false;
-	atomic_store(&ch->closing, false);
-	atomic_init(&ch->terminate_woken, false);
-	atomic_init(&ch->dispatch_state, DSSH_CHANNEL_DISPATCH_IDLE);
-	atomic_init(&ch->tx_refs, 0);
-
-	/* TX slots start empty; allocated below */
-	memset(&ch->wa_slot, 0, sizeof(ch->wa_slot));
-	memset(&ch->chan_fail_slot, 0, sizeof(ch->chan_fail_slot));
 
 	if (mtx_init(&ch->buf_mtx, mtx_plain) != thrd_success)
 		return DSSH_ERROR_INIT;
@@ -3291,13 +3303,10 @@ setup_finish(struct dssh_session_s *sess, struct dssh_channel_s *ch,
 DSSH_TESTABLE struct dssh_channel_s *
 accept_channel_init(struct dssh_session_s *sess, struct dssh_incoming_open *inc)
 {
-	struct dssh_channel_s *ch = calloc(1, sizeof(*ch));
+	struct dssh_channel_s *ch = new_channel();
 
 	if (ch == NULL)
 		return NULL;
-	ch->setup_payload = NULL;
-	ch->setup_payload_len = 0;
-	ch->setup_payload_capacity = 0;
 	int64_t cid = alloc_channel_id(sess);
 	if (cid < 0) {
 		free(ch);
@@ -3306,20 +3315,13 @@ accept_channel_init(struct dssh_session_s *sess, struct dssh_incoming_open *inc)
 	ch->local_id     = (uint32_t)cid;
 	ch->local_window = 0; /* initial_window=0; WINDOW_ADJUST after setup */
 	ch->remote_id    = inc->peer_channel;
-	atomic_init(&ch->remote_window, inc->peer_window);
-	atomic_init(&ch->terminate_woken, false);
-	atomic_init(&ch->dispatch_state, DSSH_CHANNEL_DISPATCH_IDLE);
-	atomic_init(&ch->tx_refs, 0);
+	atomic_store(&ch->remote_window, inc->peer_window);
 	ch->remote_max_packet = inc->peer_max_packet;
 	ch->sess = sess;
 	ch->io_model = DSSH_IO_STREAM;
 	ch->zc_cb = stream_zc_cb;
 	ch->event_cb = sess->default_event_cb;
 	ch->event_cbdata = sess->default_event_cbdata;
-	ch->params = (struct dssh_chan_params){0};
-
-	memset(&ch->wa_slot, 0, sizeof(ch->wa_slot));
-	memset(&ch->chan_fail_slot, 0, sizeof(ch->chan_fail_slot));
 
 	if (mtx_init(&ch->buf_mtx, mtx_plain) != thrd_success) {
 		free(ch);
@@ -3798,14 +3800,10 @@ dssh_chan_open(struct dssh_session_s *sess, const struct dssh_chan_params *param
 	    && params->type != DSSH_CHAN_SHELL && params->type != DSSH_CHAN_EXEC)
 		return NULL;
 
-	struct dssh_channel_s *ch = calloc(1, sizeof(*ch));
+	struct dssh_channel_s *ch = new_channel();
 
 	if (ch == NULL)
 		return NULL;
-	ch->params = (struct dssh_chan_params){0};
-	ch->setup_payload = NULL;
-	ch->setup_payload_len = 0;
-	ch->setup_payload_capacity = 0;
 
 	uint32_t winsz = params->max_window != 0 ? params->max_window : INITIAL_WINDOW_SIZE;
 
@@ -4339,14 +4337,10 @@ dssh_chan_zc_open(struct dssh_session_s *sess, const struct dssh_chan_params *pa
 	    && params->type != DSSH_CHAN_SHELL && params->type != DSSH_CHAN_EXEC)
 		return NULL;
 
-	struct dssh_channel_s *ch = calloc(1, sizeof(*ch));
+	struct dssh_channel_s *ch = new_channel();
 
 	if (ch == NULL)
 		return NULL;
-	ch->params = (struct dssh_chan_params){0};
-	ch->setup_payload = NULL;
-	ch->setup_payload_len = 0;
-	ch->setup_payload_capacity = 0;
 
 	uint32_t winsz = params->max_window != 0 ? params->max_window : INITIAL_WINDOW_SIZE;
 

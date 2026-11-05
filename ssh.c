@@ -463,10 +463,11 @@ dssh_session_set_log_cb(struct dssh_session_s *sess, dssh_log_cb cb, void *cbdat
 	if (sess->demux_running)
 		return DSSH_ERROR_TOOLATE;
 	if (cb != NULL && sess->log_forward == NULL) {
-		struct dssh_log_forward_queue *queue = calloc(1, sizeof(*queue));
+		struct dssh_log_forward_queue *queue = malloc(sizeof(*queue));
 
 		if (queue == NULL)
 			return DSSH_ERROR_ALLOC;
+		*queue = (struct dssh_log_forward_queue){0};
 		if (mtx_init(&queue->mtx, mtx_plain) != thrd_success) {
 			free(queue);
 			return DSSH_ERROR_INIT;

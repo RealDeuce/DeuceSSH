@@ -3674,21 +3674,8 @@ transport_init(struct dssh_session_s *sess, size_t max_packet_size)
 	if (cnd_init(&sess->trans.rekey_cnd) != thrd_success)
 		goto init_cleanup;
 
-	sess->trans.rekey_in_progress = false;
-	atomic_init(&sess->trans.tx_owner_active, false);
 	sess->trans.rekey_pending     = false;
 
-	sess->trans.kex_selected      = NULL;
-	sess->trans.key_algo_selected = NULL;
-	sess->trans.enc_c2s_selected  = NULL;
-	sess->trans.enc_s2c_selected  = NULL;
-	sess->trans.mac_c2s_selected  = NULL;
-	sess->trans.mac_s2c_selected  = NULL;
-	sess->trans.comp_c2s_selected = NULL;
-	sess->trans.comp_s2c_selected = NULL;
-	/* TX slots start empty; buffers allocated in newkeys() after KEX */
-	memset(&sess->trans.global_reply_slot, 0, sizeof(sess->trans.global_reply_slot));
-	memset(&sess->trans.open_fail_slot, 0, sizeof(sess->trans.open_fail_slot));
 	sess->trans.session_id    = NULL;
 	sess->trans.our_kexinit   = NULL;
 	sess->trans.peer_kexinit  = NULL;
@@ -3698,9 +3685,7 @@ transport_init(struct dssh_session_s *sess, size_t max_packet_size)
 	sess->trans.tx_seq        = 0;
 	sess->trans.rx_seq        = 0;
 	sess->trans.drain_next_ch = 0;
-	atomic_init(&sess->trans.tx_since_rekey, 0);
 	sess->trans.rx_since_rekey = 0;
-	atomic_init(&sess->trans.tx_bytes_since_rekey, (uint64_t)0);
 	sess->trans.rx_bytes_since_rekey = 0;
 	sess->trans.rekey_time           = key_time.tv_sec;
 
@@ -3831,19 +3816,48 @@ dssh_session_init(bool client, size_t max_packet_size)
 {
 	if (dssh_result_callback_active())
 		return NULL;
-	struct dssh_session_s *sess = calloc(1, sizeof(*sess));
+	struct dssh_session_s *sess = malloc(sizeof(*sess));
 
 	if (sess == NULL)
 		return NULL;
 
-	sess->trans.client = client;
+	/* This unpublished object needs C pointer/scalar values, not a byte
+	 * pattern. Initialize each atomic's additional implementation state
+	 * before any atomic operation, native construction or publication. */
+	*sess = (struct dssh_session_s){.trans = {.client = client},
+	    .timeout_ms = 75000, .default_max_events = DSSH_DEFAULT_MAX_EVENTS};
+	atomic_init(&sess->initialized, false);
+	atomic_init(&sess->terminate, false);
+	atomic_init(&sess->demux_running, false);
+	atomic_init(&sess->conn_initialized, false);
+	atomic_init(&sess->log_level, DSSH_LOG_ERROR);
+	atomic_init(&sess->termination_logged, false);
+	atomic_init(&sess->terminate_notified, false);
+	atomic_init(&sess->terminate_wake_started, false);
+	atomic_init(&sess->lifecycle_busy, false);
+	atomic_init(&sess->log_mirror_suppressed, false);
+	atomic_init(&sess->trans.kex_selected, NULL);
+	atomic_init(&sess->trans.key_algo_selected, NULL);
+	atomic_init(&sess->trans.enc_c2s_selected, NULL);
+	atomic_init(&sess->trans.enc_s2c_selected, NULL);
+	atomic_init(&sess->trans.mac_c2s_selected, NULL);
+	atomic_init(&sess->trans.mac_s2c_selected, NULL);
+	atomic_init(&sess->trans.comp_c2s_selected, NULL);
+	atomic_init(&sess->trans.comp_s2c_selected, NULL);
+	atomic_init(&sess->trans.tx_since_rekey, 0);
+	atomic_init(&sess->trans.tx_bytes_since_rekey, 0);
+	atomic_init(&sess->trans.rekey_in_progress, false);
+	atomic_init(&sess->trans.tx_owner_active, false);
+	/* TX slots remain empty until newkeys allocates their byte buffers. */
+	atomic_init(&sess->trans.global_reply_slot.ready, false);
+	atomic_init(&sess->trans.open_fail_slot.ready, false);
 	/* Time-based rekey is OFF by default: the byte and packet
 	 * thresholds cover key-material wear, and some peers (Cryptlib-
 	 * based servers like Mystic BBS) refuse mid-stream KEXINIT
 	 * outright.  RFC 4253 s9 calls time rekey RECOMMENDED, not
 	 * required.  Apps that need it can opt in via
 	 * dssh_session_set_rekey_seconds(). */
-	sess->trans.rekey_seconds = 0;
+	atomic_init(&sess->trans.rekey_seconds, 0);
 
 	int res = mtx_init(&sess->mtx, mtx_plain);
 
@@ -3858,15 +3872,6 @@ dssh_session_init(bool client, size_t max_packet_size)
 		free(sess);
 		return NULL;
 	}
-
-	sess->timeout_ms         = 75000;
-	sess->default_max_events = DSSH_DEFAULT_MAX_EVENTS;
-	atomic_init(&sess->log_level, DSSH_LOG_ERROR);
-	atomic_init(&sess->termination_logged, false);
-	atomic_init(&sess->terminate_notified, false);
-	atomic_init(&sess->terminate_wake_started, false);
-	atomic_init(&sess->lifecycle_busy, false);
-	atomic_init(&sess->log_mirror_suppressed, false);
 	sess->initialized        = true;
 	return sess;
 }
@@ -4161,7 +4166,7 @@ tx_gather_enabled(void)
 
 /*
  * Reset the global configuration for test isolation.
- * Frees all registered algorithm entries, zeros the config,
+ * Frees all registered algorithm entries, restores typed defaults,
  * and unlocks registration.
  */
 DSSH_PRIVATE void
@@ -4190,9 +4195,8 @@ dssh_test_reset_global_config(void)
 	FREE_LIST(dssh_language, gconf.lang_head);
  #undef FREE_LIST
 
-	memset(&gconf, 0, sizeof(gconf));
-	gconf.software_version = sw_ver;
-	gconf.used = false;
+	gconf = (struct dssh_transport_global_config){.software_version = sw_ver};
+	atomic_init(&gconf.used, false);
 	atomic_store(&dssh_test_rx_count_sess, NULL);
 }
 

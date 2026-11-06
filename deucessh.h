@@ -230,6 +230,19 @@ DSSH_PUBLIC const char *dssh_strerror(int error_code);
  */
 DSSH_PUBLIC int dssh_serialize_uint32(uint32_t val, uint8_t *buf, size_t bufsz, size_t *pos);
 
+/* Process-global setup is application-serialized: complete all registration,
+ * global callback/version/context setters and builtin key replacement before
+ * any session initialization begins. Synchronize builtin key utilities with
+ * key replacement before that boundary. Separate sessions may then be created
+ * concurrently. Calls rejected by callback-entry rules do not freeze setup;
+ * every other session-init attempt freezes it before allocation, even if it
+ * later returns NULL. A failed attempt never reopens setup.
+ * Do not begin first-session initialization from a password callback while
+ * mutable setup is active. Same-thread nested key replacement during a key-file
+ * password callback is allowed; existing callback restrictions still apply.
+ * After freeze, builtin key reads/exports may overlap with sessions and each
+ * other; callers must coordinate destination files. Arbitrary module state
+ * follows that module's concurrency contract. */
 /*
  * Create a new session.  Allocates all internal state including
  * packet buffers sized to max_packet_size (pass 0 for the RFC
@@ -402,7 +415,7 @@ DSSH_PUBLIC int dssh_session_set_comp_filter(dssh_session sess,
  * already been initialized.
  *
  * The strings are not copied -- caller must ensure they remain
- * valid for the lifetime of the library's global configuration.
+ * valid and immutable for the lifetime of the global configuration.
  */
 DSSH_PUBLIC int dssh_transport_set_version(const char *software_version, const char *comment);
 

@@ -40,6 +40,8 @@ typedef struct dssh_enc_s {
 	char               name[];
 } *dssh_enc;
 
+/* Application-serialized global setup; finish before the first session-init
+ * attempt. Descriptor/name/code stay borrowed for process lifetime. */
 DSSH_PUBLIC int dssh_transport_register_enc(dssh_enc enc);
 
 #ifdef __cplusplus

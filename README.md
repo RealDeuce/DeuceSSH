@@ -1780,8 +1780,17 @@ my_subsystem_cb(dssh_channel ch,
 
 ## Thread Safety
 
-**Before `dssh_session_start()`**: single-threaded.  Handshake and auth
-are sequential — no concurrent calls.
+**Global setup:** serialize registration, global setters and builtin key
+replacement in the application, and finish before the first session-init attempt.
+Before freeze, serialize key utilities with replacement; same-thread password
+callback replacement remains allowed. First-session initialization must not be
+nested inside mutable setup. A permitted session-init attempt permanently freezes
+setup before allocation, even if it returns NULL. After setup, independent
+sessions may be constructed concurrently. After freeze, builtin key reads/exports
+may run concurrently using immutable keys; coordinate destination files.
+
+**Each session before `dssh_session_start()`**: serialize its handshake and auth
+calls. Different sessions are independent.
 
 **After `dssh_session_start()`**: the demux thread handles all receiving.
 The application calls `poll()` / `read()` / `write()` from any

@@ -59,6 +59,8 @@ typedef struct dssh_key_algo_s {
 	char                    name[];
 } *dssh_key_algo;
 
+/* Application-serialized global setup; finish before the first session-init
+ * attempt. Descriptor/name/code stay borrowed for process lifetime. */
 DSSH_PUBLIC int dssh_transport_register_key_algo(dssh_key_algo key_algo);
 
 #ifdef __cplusplus

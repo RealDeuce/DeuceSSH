@@ -27,6 +27,14 @@ extern "C" {
  */
 typedef int (*dssh_pem_password_cb)(char *buf, int size, int rwflag, void *userdata);
 
+/* Global registration and key replacement use application-serialized setup;
+ * complete them before any session-init attempt. Before freeze, serialize key
+ * utilities with replacement, including work on other application threads.
+ * Same-thread password-callback key replacement is allowed; key-file export
+ * uses the native key selected on entry. After freeze, key reads/exports can
+ * overlap with sessions and each other, with caller-coordinated destinations.
+ * See the process-global setup contract at dssh_session_init(). */
+
 /* Key exchange */
 DSSH_PUBLIC int dssh_register_curve25519_sha256(void);
 DSSH_PUBLIC int dssh_register_dh_gex_sha256(void);

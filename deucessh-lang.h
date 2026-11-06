@@ -24,6 +24,8 @@ typedef struct dssh_language_s {
 	char                    name[];
 } *dssh_language;
 
+/* Application-serialized global setup; finish before the first session-init
+ * attempt. Descriptor/name/code stay borrowed for process lifetime. */
 DSSH_PUBLIC int dssh_transport_register_lang(dssh_language lang);
 
 #ifdef __cplusplus

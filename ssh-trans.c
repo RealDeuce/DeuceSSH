@@ -3825,8 +3825,6 @@ send_server_ext_info(struct dssh_session_s *sess)
 static int
 transport_init(struct dssh_session_s *sess, size_t max_packet_size)
 {
-	gconf.used = true;
-
 	struct timespec key_time;
 	int clock_ret = dssh_clock_read(&key_time);
 	if (clock_ret < 0)
@@ -4010,6 +4008,9 @@ dssh_session_init(bool client, size_t max_packet_size)
 {
 	if (dssh_result_callback_active())
 		return NULL;
+	/* Application-serialized mutable setup is complete before this entry.
+	 * Freeze every accepted attempt before its first fallible allocation. */
+	gconf.used = true;
 	struct dssh_session_s *sess = malloc(sizeof(*sess));
 
 	if (sess == NULL)

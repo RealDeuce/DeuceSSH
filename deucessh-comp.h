@@ -66,6 +66,8 @@ typedef struct dssh_comp_s {
 /* All five callbacks are required. The registered entry and name remain valid
  * and immutable for the global registry's lifetime (except its next link).
  * Failed registration leaves the entry with its caller. */
+/* Application-serialized global setup; finish before the first session-init
+ * attempt. Descriptor/name/code stay borrowed for process lifetime. */
 DSSH_PUBLIC int dssh_transport_register_comp(dssh_comp comp);
 
 #ifdef __cplusplus

@@ -30,6 +30,8 @@ typedef struct dssh_mac_s {
 	char               name[];
 } *dssh_mac;
 
+/* Application-serialized global setup; finish before the first session-init
+ * attempt. Descriptor/name/code stay borrowed for process lifetime. */
 DSSH_PUBLIC int dssh_transport_register_mac(dssh_mac mac);
 
 #ifdef __cplusplus

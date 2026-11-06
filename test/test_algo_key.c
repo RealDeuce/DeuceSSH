@@ -3058,8 +3058,10 @@ test_rsa_pubkey_n_zero(void)
 	const uint8_t *blob = NULL;
 	size_t blob_len;
 	int res = ka->pubkey(&blob, &blob_len, ka->ctx);
-	/* Either succeeds with n_bytes=0 or fails -- both are fine */
-	(void)res;
+	ASSERT_EQ(res, DSSH_ERROR_INVALID);
+	ASSERT_NULL(blob);
+	ASSERT_NULL(cbd->pub_blob);
+	ASSERT_EQ(cbd->pub_blob_len, 0);
 
 	dssh_test_reset_global_config();
 	return TEST_PASS;

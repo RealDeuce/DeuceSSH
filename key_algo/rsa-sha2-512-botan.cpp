@@ -24,6 +24,9 @@
 #include "key-wire.h"
 #include "key-file-common.h"
 #include "key-text.h"
+#define DSSH_RSA_CACHE_BOTAN
+#include "key-rsa-cache.h"
+#undef DSSH_RSA_CACHE_BOTAN
 
 struct dssh_key_algo_ctx;
 
@@ -94,76 +97,41 @@ pubkey_impl(const uint8_t **out, size_t *outlen, struct dssh_botan_key_context *
 {
 	if (cbd == NULL || cbd->privkey == NULL)
 		return DSSH_ERROR_INIT;
-
 	if (cbd->pub_blob != NULL) {
-		*out    = cbd->pub_blob;
+		*out = cbd->pub_blob;
 		*outlen = cbd->pub_blob_len;
 		return 0;
 	}
-
 	try {
-		auto *rsa_priv = dynamic_cast<Botan::RSA_PrivateKey *>(cbd->privkey.get());
-		if (rsa_priv == NULL)
+		auto *rsa = dynamic_cast<Botan::RSA_PrivateKey *>(cbd->privkey.get());
+		if (rsa == NULL)
 			return DSSH_ERROR_INIT;
-
-		auto   e_raw = rsa_priv->get_e().serialize();
-		auto   n_raw = rsa_priv->get_n().serialize();
-		size_t e_sz  = e_raw.size();
-		size_t n_sz  = n_raw.size();
-
-		bool e_pad = (e_sz > 0 && (e_raw[0] & DSSH_MPINT_SIGN_BIT));
-		bool n_pad = (n_sz > 0 && (n_raw[0] & DSSH_MPINT_SIGN_BIT));
-
-		if (e_sz > UINT32_MAX - 1 || n_sz > UINT32_MAX - 1)
-			return DSSH_ERROR_INVALID;
-		uint32_t e_u32  = static_cast<uint32_t>(e_sz);
-		uint32_t n_u32  = static_cast<uint32_t>(n_sz);
-		uint32_t e_wire = e_u32 + (e_pad ? 1 : 0);
-		uint32_t n_wire = n_u32 + (n_pad ? 1 : 0);
-
-		if (!dssh_buffer_has(SIZE_MAX - 19, e_wire, n_wire))
-			return DSSH_ERROR_INVALID;
-		size_t needed = 19 + e_wire + n_wire;
-
-		uint8_t *buf = static_cast<uint8_t *>(malloc(needed));
-
-		if (buf == NULL)
+		const Botan::BigInt &e = rsa->get_e();
+		const Botan::BigInt &n = rsa->get_n();
+		struct dssh_rsa_cache_number exponent, modulus;
+		struct dssh_rsa_cache_layout layout;
+		int ret = dssh_rsa_cache_native_number(e, &exponent);
+		if (ret < 0)
+			return ret;
+		ret = dssh_rsa_cache_native_number(n, &modulus);
+		if (ret < 0)
+			return ret;
+		ret = dssh_rsa_cache_size_native(exponent, modulus, &layout);
+		if (ret < 0)
+			return ret;
+		std::unique_ptr<uint8_t, dssh_rsa_cache_deleter> buf(dssh_rsa_cache_allocate(layout.length));
+		if (buf == nullptr)
 			return DSSH_ERROR_ALLOC;
-
-		size_t pos = 0;
-		int    sret;
-
-#define PK_SER(v)                                                     \
-	do {                                                          \
-		sret = dssh_serialize_uint32((v), buf, needed, &pos); \
-		if (sret < 0) {                                       \
-			free(buf);                                    \
-			return sret;                                  \
-		}                                                     \
-	} while (0)
-
-		PK_SER(RSA_KEY_TYPE_NAME_LEN);
-		memcpy(&buf[pos], RSA_KEY_TYPE_NAME, RSA_KEY_TYPE_NAME_LEN);
-		pos += RSA_KEY_TYPE_NAME_LEN;
-
-		PK_SER(e_wire);
-		if (e_pad)
-			buf[pos++] = 0;
-		memcpy(&buf[pos], e_raw.data(), e_sz);
-		pos += e_sz;
-
-		PK_SER(n_wire);
-		if (n_pad)
-			buf[pos++] = 0;
-		memcpy(&buf[pos], n_raw.data(), n_sz);
-		pos += n_sz;
-
-#undef PK_SER
-
-		cbd->pub_blob     = buf;
-		cbd->pub_blob_len = pos;
-		*out              = buf;
-		*outlen           = pos;
+		uint8_t *e_slot, *n_slot;
+		ret = dssh_rsa_cache_prefix(buf.get(), &layout, &e_slot, &n_slot);
+		if (ret < 0)
+			return ret;
+		e.serialize_to(std::span<uint8_t>(e_slot, exponent.bytes));
+		n.serialize_to(std::span<uint8_t>(n_slot, modulus.bytes));
+		cbd->pub_blob = buf.release();
+		cbd->pub_blob_len = layout.length;
+		*out = cbd->pub_blob;
+		*outlen = layout.length;
 		return 0;
 	}
 	catch (...) {

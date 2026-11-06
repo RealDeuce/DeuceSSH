@@ -838,6 +838,15 @@ test_rsa_cache_native(void)
 					const uint8_t *blob = &marker;
 					size_t length = 42;
 					dssh_test_alloc_reset();
+					dssh_test_alloc_fail_after(0);
+					dssh_test_cpp_new_fail_after(0);
+					int rejected = callback(&blob, &length, opaque);
+					dssh_test_cpp_new_disable();
+					bool failure = rejected == DSSH_ERROR_ALLOC && dssh_test_alloc_count() == 1
+					    && dssh_test_cpp_new_count() == 0 && !dssh_test_cpp_new_failed()
+					    && blob == &marker && length == 42 && context.pub_blob == nullptr && context.pub_blob_len == 0;
+					dssh_test_alloc_reset();
+					dssh_test_alloc_fail_after(INT_MAX);
 					dssh_test_cpp_new_fail_after(0);
 					int ret = DSSH_ERROR_INIT;
 					try {
@@ -848,9 +857,18 @@ test_rsa_cache_native(void)
 					}
 					dssh_test_cpp_new_disable();
 					int allocations = dssh_test_alloc_count();
-					bool one = ret == 0 && allocations == 1 && dssh_test_cpp_new_count() == 0
+					bool one = failure && ret == 0 && allocations == 1 && dssh_test_cpp_new_count() == 0
 					    && !dssh_test_cpp_new_failed() && length == expected_len && blob != nullptr
 					    && memcmp(blob, expected, expected_len) == 0;
+					dssh_test_alloc_reset();
+					const uint8_t *again = nullptr;
+					size_t again_len = 0;
+					dssh_test_alloc_fail_after(0);
+					dssh_test_cpp_new_fail_after(0);
+					ret = callback(&again, &again_len, opaque);
+					dssh_test_cpp_new_disable();
+					one = one && ret == 0 && again == blob && again_len == length && dssh_test_alloc_count() == 0
+					    && dssh_test_cpp_new_count() == 0 && !dssh_test_cpp_new_failed();
 					dssh_test_alloc_reset();
 					dssh_rsa_cache_release(context.pub_blob);
 					context.pub_blob = nullptr;

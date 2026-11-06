@@ -7,9 +7,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include "deucessh.h"
-#if defined(DSSH_CRYPTO_OPENSSL)
+#if (defined(DSSH_RSA_CACHE_OPENSSL) || defined(DSSH_CRYPTO_OPENSSL))
 #include <openssl/bn.h>
-#elif defined(DSSH_CRYPTO_BOTAN) && defined(__cplusplus)
+#elif (defined(DSSH_RSA_CACHE_BOTAN) || defined(DSSH_CRYPTO_BOTAN)) && defined(__cplusplus)
 #include <botan/bigint.h>
 #endif
 
@@ -52,7 +52,7 @@ dssh_rsa_cache_number_size(uint64_t bits, size_t limit, struct dssh_rsa_cache_nu
 	return 0;
 }
 
-#if defined(DSSH_CRYPTO_OPENSSL)
+#if (defined(DSSH_RSA_CACHE_OPENSSL) || defined(DSSH_CRYPTO_OPENSSL))
 static inline int
 dssh_rsa_cache_native_number(const BIGNUM *number, struct dssh_rsa_cache_number *out)
 {
@@ -68,7 +68,7 @@ dssh_rsa_cache_native_number(const BIGNUM *number, struct dssh_rsa_cache_number 
 	uint64_t count = (uint64_t)bits;
 	return dssh_rsa_cache_number_size(count, SIZE_MAX, out);
 }
-#elif defined(DSSH_CRYPTO_BOTAN) && defined(__cplusplus)
+#elif (defined(DSSH_RSA_CACHE_BOTAN) || defined(DSSH_CRYPTO_BOTAN)) && defined(__cplusplus)
 static inline int
 dssh_rsa_cache_native_number(const Botan::BigInt &number, struct dssh_rsa_cache_number *out)
 {
@@ -106,6 +106,18 @@ dssh_rsa_cache_size(struct dssh_rsa_cache_number exponent,
 	struct dssh_rsa_cache_layout layout = {exponent, modulus, efield, nfield, length};
 	*out = layout;
 	return 0;
+}
+
+/* The complete key is itself carried in an SSH string. */
+static inline int
+dssh_rsa_cache_size_native(struct dssh_rsa_cache_number exponent,
+    struct dssh_rsa_cache_number modulus, struct dssh_rsa_cache_layout *out)
+{
+	size_t limit = SIZE_MAX;
+#if SIZE_MAX > UINT32_MAX
+	limit = UINT32_MAX;
+#endif
+	return dssh_rsa_cache_size(exponent, modulus, limit, UINT32_MAX, out);
 }
 
 /* buf is owned storage of layout.length bytes; layout was checked above.
@@ -151,6 +163,8 @@ dssh_rsa_cache_allocate(size_t length)
 static inline void
 dssh_rsa_cache_release(void *buf)
 {
+	if (buf == NULL)
+		return;
 #ifdef DSSH_TESTING
 	dssh_test_free(buf);
 #else

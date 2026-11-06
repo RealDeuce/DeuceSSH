@@ -18,6 +18,9 @@
 #include "key-wire.h"
 #include "key-file-common.h"
 #include "key-text.h"
+#define DSSH_RSA_CACHE_OPENSSL
+#include "key-rsa-cache.h"
+#undef DSSH_RSA_CACHE_OPENSSL
 #ifdef DSSH_TESTING
  #include "ssh-internal.h"
 #endif
@@ -205,148 +208,66 @@ sign(struct dssh_bytes_result *out, const uint8_t *data, size_t data_len, dssh_k
 static int
 pubkey(const uint8_t **out, size_t *outlen, dssh_key_algo_ctx *ctx)
 {
-	/* cbd->pkey always set before pubkey is callable. */
 	struct dssh_openssl_key_context *cbd = (struct dssh_openssl_key_context *)ctx;
-#ifdef DSSH_TESTING
-	if (cbd == NULL)
-#else
 	if (cbd == NULL || cbd->pkey == NULL)
-#endif
 		return DSSH_ERROR_INIT;
-
-	/* Return cached blob if already computed */
 	if (cbd->pub_blob != NULL) {
-		*out    = cbd->pub_blob;
+		*out = cbd->pub_blob;
 		*outlen = cbd->pub_blob_len;
 		return 0;
 	}
-
-	BIGNUM *e_bn = NULL, *n_bn = NULL;
-	if (EVP_PKEY_get_bn_param(cbd->pkey, OSSL_PKEY_PARAM_RSA_E, &e_bn) != 1
-	    || EVP_PKEY_get_bn_param(cbd->pkey, OSSL_PKEY_PARAM_RSA_N, &n_bn) != 1) {
-		BN_free(e_bn);
-		BN_free(n_bn);
-		return DSSH_ERROR_INIT;
-	}
-
-	int e_bytes = BN_num_bytes(e_bn);
-	int n_bytes = BN_num_bytes(n_bn);
-
-	if (e_bytes < 0 || n_bytes < 0) {
-		BN_free(e_bn);
-		BN_free(n_bn);
-		return DSSH_ERROR_PARSE;
-	}
-#if INT_MAX > SIZE_MAX
-	if (e_bytes > SIZE_MAX || n_bytes > SIZE_MAX) {
-		BN_free(e_bn);
-		BN_free(n_bn);
-		return DSSH_ERROR_INVALID;
-	}
-#endif
-	size_t e_sz = (size_t)e_bytes;
-	size_t n_sz = (size_t)n_bytes;
-
-	uint8_t *e_buf = malloc(e_sz);
-	if (!e_buf) {
-		BN_free(e_bn);
-		BN_free(n_bn);
-		return DSSH_ERROR_ALLOC;
-	}
-	uint8_t *n_buf = malloc(n_sz);
-	if (!n_buf) {
-		free(e_buf);
-		BN_free(e_bn);
-		BN_free(n_bn);
-		return DSSH_ERROR_ALLOC;
-	}
-	BN_bn2bin(e_bn, e_buf);
-	BN_bn2bin(n_bn, n_buf);
-
-	/* mpint encoding: add leading zero if MSB is set.
-	 * RSA public exponent is typically 65537 (0x010001), so e_pad
-	 * is never true in practice. */
-#ifdef DSSH_TESTING
-	bool e_pad = (e_buf[0] & DSSH_MPINT_SIGN_BIT);
-#else
-	bool e_pad = (e_bytes > 0 && (e_buf[0] & DSSH_MPINT_SIGN_BIT));
-#endif
-	bool n_pad = (n_bytes > 0 && (n_buf[0] & DSSH_MPINT_SIGN_BIT));
-
-	if (e_sz > UINT32_MAX - 1 || n_sz > UINT32_MAX - 1) {
-		free(e_buf);
-		free(n_buf);
-		BN_free(e_bn);
-		BN_free(n_bn);
-		return DSSH_ERROR_INVALID;
-	}
-	uint32_t e_u32  = (uint32_t)e_sz;
-	uint32_t n_u32  = (uint32_t)n_sz;
-	uint32_t e_wire = e_u32 + (e_pad ? 1 : 0);
-	uint32_t n_wire = n_u32 + (n_pad ? 1 : 0);
-
-	if (!dssh_buffer_has(SIZE_MAX - 19, e_wire, n_wire)) {
-		free(e_buf);
-		free(n_buf);
-		BN_free(e_bn);
-		BN_free(n_bn);
-		return DSSH_ERROR_INVALID;
-	}
-	size_t needed = 19 + e_wire + n_wire;
-
-	uint8_t *buf = malloc(needed);
+	BIGNUM *e = NULL, *n = NULL;
+	uint8_t *buf = NULL;
+	int ret = DSSH_ERROR_INIT;
+	if (EVP_PKEY_get_bn_param(cbd->pkey, OSSL_PKEY_PARAM_RSA_E, &e) != 1 || e == NULL
+	    || EVP_PKEY_get_bn_param(cbd->pkey, OSSL_PKEY_PARAM_RSA_N, &n) != 1 || n == NULL)
+		goto done;
+	struct dssh_rsa_cache_number exponent, modulus;
+	struct dssh_rsa_cache_layout layout;
+	ret = dssh_rsa_cache_native_number(e, &exponent);
+	if (ret < 0)
+		goto done;
+	ret = dssh_rsa_cache_native_number(n, &modulus);
+	if (ret < 0)
+		goto done;
+	ret = dssh_rsa_cache_size_native(exponent, modulus, &layout);
+	if (ret < 0)
+		goto done;
+	buf = dssh_rsa_cache_allocate(layout.length);
 	if (buf == NULL) {
-		free(e_buf);
-		free(n_buf);
-		BN_free(e_bn);
-		BN_free(n_bn);
-		return DSSH_ERROR_ALLOC;
+		ret = DSSH_ERROR_ALLOC;
+		goto done;
 	}
-
-	size_t pos = 0;
-	int    sret;
-
-#define PK_SER(v)                                                     \
-	do {                                                          \
-		sret = dssh_serialize_uint32((v), buf, needed, &pos); \
-		if (sret < 0) {                                       \
-			free(buf);                                    \
-			free(e_buf);                                  \
-			free(n_buf);                                  \
-			BN_free(e_bn);                                \
-			BN_free(n_bn);                                \
-			return sret;                                  \
-		}                                                     \
-	} while (0)
-
-	PK_SER(RSA_KEY_TYPE_NAME_LEN);
-	memcpy(&buf[pos], RSA_KEY_TYPE_NAME, RSA_KEY_TYPE_NAME_LEN);
-	pos += RSA_KEY_TYPE_NAME_LEN;
-
-	PK_SER(e_wire);
-	if (e_pad)
-		buf[pos++] = 0;
-	memcpy(&buf[pos], e_buf, e_sz);
-	pos += e_sz;
-
-	PK_SER(n_wire);
-	if (n_pad)
-		buf[pos++] = 0;
-	memcpy(&buf[pos], n_buf, n_sz);
-	pos += n_sz;
-
-#undef PK_SER
-
-	free(e_buf);
-	free(n_buf);
-	BN_free(e_bn);
-	BN_free(n_bn);
-
-	cbd->pub_blob     = buf;
-	cbd->pub_blob_len = pos;
-	*out              = buf;
-	*outlen           = pos;
-	return 0;
+	uint8_t *slots[2];
+	ret = dssh_rsa_cache_prefix(buf, &layout, &slots[0], &slots[1]);
+	if (ret < 0)
+		goto done;
+	const BIGNUM *numbers[] = {e, n};
+	const size_t sizes[] = {exponent.bytes, modulus.bytes};
+	for (unsigned int i = 0; i < 2; i++) {
+		int written = BN_bn2bin(numbers[i], slots[i]);
+		ret = DSSH_ERROR_INIT;
+		if (written < 0)
+			goto done;
+#if INT_MAX > SIZE_MAX
+		if (written > SIZE_MAX)
+			goto done;
+#endif
+		size_t count = (size_t)written;
+		if (count != sizes[i])
+			goto done;
+	}
+	cbd->pub_blob = buf;
+	cbd->pub_blob_len = layout.length;
+	*out = buf;
+	*outlen = layout.length;
+	buf = NULL;
+	ret = 0;
+done:
+	dssh_rsa_cache_release(buf);
+	BN_free(e);
+	BN_free(n);
+	return ret;
 }
 
 static unsigned int

@@ -67,7 +67,18 @@ test_layout_models(void)
 	ASSERT_EQ(out.length, 42);
 	ASSERT_EQ(dssh_rsa_cache_size(one, edge, SIZE_MAX, UINT32_MAX, &out), DSSH_ERROR_INVALID);
 	ASSERT_EQ(out.length, 42);
-	printf("RSA cache layouts: sizes=65535 pads=4 buffers=5 wires=2 cases=%lu native-edges=2\n", cases);
+	size_t native_limit = SIZE_MAX;
+#if SIZE_MAX > UINT32_MAX
+	native_limit = UINT32_MAX;
+#endif
+	struct dssh_rsa_cache_number maximum = {(size_t)(native_limit - 20), false};
+	ASSERT_EQ(dssh_rsa_cache_size_native(maximum, one, &out), 0);
+	ASSERT_EQ(out.length, native_limit);
+	maximum.bytes++;
+	out.length = 42;
+	ASSERT_EQ(dssh_rsa_cache_size_native(maximum, one, &out), DSSH_ERROR_INVALID);
+	ASSERT_EQ(out.length, 42);
+	printf("RSA cache layouts: sizes=65535 pads=4 buffers=5 wires=2 cases=%lu native-edges=4\n", cases);
 	return TEST_PASS;
 }
 
@@ -131,7 +142,18 @@ cache_case(unsigned int algorithm, const uint8_t *e, size_t esize,
 	size_t length = 42, expected_len = 0;
 	if (!zero && !rsa_cache_reference(expected, sizeof(expected), e, esize, n, nsize, &expected_len))
 		goto done;
+	if (!zero) {
+		dssh_test_alloc_fail_after(0);
+		ret = key->pubkey(&blob, &length, key->ctx);
+		struct dssh_openssl_key_context *actual = (struct dssh_openssl_key_context *)key->ctx;
+		bool rejected = ret == DSSH_ERROR_ALLOC && dssh_test_alloc_count() == 1
+		    && blob == &marker && length == 42 && actual->pub_blob == NULL && actual->pub_blob_len == 0;
+		dssh_test_alloc_reset();
+		if (!rejected)
+			goto done;
+	}
 	dssh_test_alloc_reset();
+	dssh_test_alloc_fail_after(INT_MAX);
 	ret = key->pubkey(&blob, &length, key->ctx);
 	int allocations = dssh_test_alloc_count();
 	dssh_test_alloc_reset();
@@ -224,6 +246,93 @@ test_native_numbers(void)
 	ASSERT_TRUE(valid);
 	return TEST_PASS;
 }
+static int
+test_zero_exponent(void)
+{
+	const uint8_t empty[] = {0}, modulus[] = {127, 0xab, 1};
+	bool a = cache_case(0, empty, 0, modulus, sizeof(modulus), true);
+	bool b = cache_case(1, empty, 0, modulus, sizeof(modulus), true);
+	printf("RSA zero exponent: algorithms=2 rejected=%u\n", (a ? 1U : 0U) + (b ? 1U : 0U));
+	ASSERT_TRUE(a && b);
+	return TEST_PASS;
+}
+
+static bool
+signable(dssh_key_algo key, const uint8_t *public_blob, size_t public_len)
+{
+	const uint8_t message[] = {'c', 'a', 'c', 'h', 'e'};
+	struct dssh_bytes_result result = {0};
+	int ret = key->sign(&result, message, sizeof(message), key->ctx);
+	bool valid = ret == 0 && result.bytes.data != NULL && result.bytes.len != 0 && result.lease.release != NULL;
+	if (valid)
+		valid = key->verify(public_blob, public_len, result.bytes.data, result.bytes.len, message, sizeof(message)) == 0;
+	dssh_result_release(&result.lease);
+	return valid;
+}
+
+static int
+test_publication_errors(void)
+{
+	bool valid = true;
+	unsigned int rejected = 0;
+	const char *cache = getenv("DSSH_TEST_RSA_KEY");
+	for (unsigned int algorithm = 0; algorithm < 2; algorithm++) {
+		dssh_test_reset_global_config();
+		int ret = algorithm == 0 ? dssh_register_rsa_sha2_256() : dssh_register_rsa_sha2_512();
+		int (*load)(const char *, dssh_pem_password_cb, void *) = algorithm == 0 ? dssh_rsa_sha2_256_load_key_file : dssh_rsa_sha2_512_load_key_file;
+		int (*generate)(unsigned int) = algorithm == 0 ? dssh_rsa_sha2_256_generate_key : dssh_rsa_sha2_512_generate_key;
+		dssh_key_algo key = find_key_algo(algorithm == 0 ? "rsa-sha2-256" : "rsa-sha2-512");
+		if (cache == NULL || ret != 0 || key == NULL || load(cache, NULL, NULL) != 0) {
+			valid = false;
+			continue;
+		}
+		uint8_t candidate[1024];
+		const uint8_t *candidate_blob = NULL;
+		size_t candidate_len = 0;
+		if (key->pubkey(&candidate_blob, &candidate_len, key->ctx) != 0 || candidate_blob == NULL
+		    || candidate_len == 0 || candidate_len > sizeof(candidate)) {
+			valid = false;
+			continue;
+		}
+		memcpy(candidate, candidate_blob, candidate_len);
+		if (generate(2048) != 0) {
+			valid = false;
+			continue;
+		}
+		uint8_t before[1024];
+		const uint8_t *blob = NULL;
+		size_t length = 0;
+		if (key->pubkey(&blob, &length, key->ctx) != 0 || blob == NULL || length == 0 || length > sizeof(before)) {
+			valid = false;
+			continue;
+		}
+		memcpy(before, blob, length);
+		if (candidate_len == length && memcmp(candidate, before, length) == 0) {
+			valid = false;
+			continue;
+		}
+		dssh_key_algo_ctx *prior = key->ctx;
+		for (int index = 0; index < 4; index++) {
+			dssh_test_ossl_fail_after(index);
+			ret = load(cache, NULL, NULL);
+			int calls = dssh_test_ossl_count();
+			dssh_test_ossl_reset();
+			const uint8_t *after = NULL;
+			size_t after_len = 0;
+			bool one = ret == DSSH_ERROR_INIT && calls == index + 1 && key->ctx == prior
+			    && key->pubkey(&after, &after_len, key->ctx) == 0 && after != NULL
+			    && after_len == length && memcmp(after, before, length) == 0 && signable(key, before, length);
+			rejected += one ? 1U : 0U;
+			valid = one && valid;
+		}
+	}
+	dssh_test_ossl_reset();
+	dssh_test_alloc_reset();
+	dssh_test_reset_global_config();
+	printf("RSA cache publication: algorithms=2 native-points=4 rejected=%u valid=%u\n", rejected, valid ? 1U : 0U);
+	ASSERT_TRUE(valid && rejected == 8);
+	return TEST_PASS;
+}
 #endif
 
 static struct dssh_test_entry tests[] = {
@@ -233,6 +342,8 @@ static struct dssh_test_entry tests[] = {
 	{"native_numbers", test_native_numbers},
 	{"public_values", test_public_values},
 	{"zero_modulus", test_zero_modulus},
+	{"zero_exponent", test_zero_exponent},
+	{"publication_errors", test_publication_errors},
 #endif
 };
 DSSH_TEST_NO_CLEANUP

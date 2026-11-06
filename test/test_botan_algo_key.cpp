@@ -18,6 +18,8 @@
 #include <botan/rsa.h>
 #include <botan/ed25519.h>
 #include <botan/bigint.h>
+#include <botan/data_src.h>
+#include <botan/pkcs8.h>
 #include <botan/system_rng.h>
 
 extern "C" {
@@ -468,6 +470,7 @@ test_rsa_key_roundtrip(void)
 /* Match the library helper's native C++ path and stdio controls only here. */
 #define DSSH_TESTING
 #include "key_algo/key-text.h"
+#include "key_algo/key-rsa-cache.h"
 #undef DSSH_TESTING
 #undef free
 #undef fread
@@ -783,12 +786,98 @@ test_key_text_reuse(void)
 	return TEST_PASS;
 }
 
+#include "rsa_cache_reference.h"
+extern "C" int dssh_botan_rsa512_pubkey(const uint8_t **out,
+    size_t *length, dssh_key_algo_ctx *ctx);
+
+static int
+test_rsa_cache_native(void)
+{
+	bool valid = true;
+	unsigned int positive = 0, negative = 0, completed = 0;
+	const size_t bits[] = {1, 7, 8, 9, 15, 16, 31, 32, 63, 64, 255, 256, 2047, 2048, 4096};
+	try {
+		for (size_t bit : bits) {
+			Botan::BigInt number;
+			number.set_bit(bit - 1);
+			struct dssh_rsa_cache_number output = {42, false};
+			int ret = dssh_rsa_cache_native_number(number, &output);
+			if (ret == 0 && output.bytes == (bit + 7) / 8 && output.pad == (bit % 8 == 0))
+				positive++;
+			number.set_sign(Botan::BigInt::Negative);
+			output = {42, false};
+			if (dssh_rsa_cache_native_number(number, &output) == DSSH_ERROR_INVALID
+			    && output.bytes == 42 && !output.pad)
+				negative++;
+		}
+		Botan::BigInt zero;
+		struct dssh_rsa_cache_number output = {42, false};
+		valid = positive == 15 && negative == 15
+		    && dssh_rsa_cache_native_number(zero, &output) == DSSH_ERROR_INVALID && output.bytes == 42;
+		const char *path = getenv("DSSH_TEST_RSA_KEY");
+		if (path == nullptr)
+			valid = false;
+		else {
+			Botan::DataSource_Stream source(path);
+			std::shared_ptr<Botan::Private_Key> key = Botan::PKCS8::load_key(source);
+			auto *rsa = dynamic_cast<Botan::RSA_PrivateKey *>(key.get());
+			if (rsa == nullptr)
+				valid = false;
+			else {
+				auto e = rsa->get_e().serialize();
+				auto n = rsa->get_n().serialize();
+				uint8_t expected[1024];
+				size_t expected_len = 0;
+				valid = rsa_cache_reference(expected, sizeof(expected), e.data(), e.size(), n.data(), n.size(), &expected_len) && valid;
+				const auto callbacks = {dssh_botan_rsa256_pubkey, dssh_botan_rsa512_pubkey};
+				for (auto callback : callbacks) {
+					dssh_botan_key_context context;
+					context.privkey = key;
+					auto *opaque = reinterpret_cast<dssh_key_algo_ctx *>(&context);
+					uint8_t marker = 0;
+					const uint8_t *blob = &marker;
+					size_t length = 42;
+					dssh_test_alloc_reset();
+					dssh_test_cpp_new_fail_after(0);
+					int ret = DSSH_ERROR_INIT;
+					try {
+						ret = callback(&blob, &length, opaque);
+					}
+					catch (...) {
+						valid = false;
+					}
+					dssh_test_cpp_new_disable();
+					int allocations = dssh_test_alloc_count();
+					bool one = ret == 0 && allocations == 1 && dssh_test_cpp_new_count() == 0
+					    && !dssh_test_cpp_new_failed() && length == expected_len && blob != nullptr
+					    && memcmp(blob, expected, expected_len) == 0;
+					dssh_test_alloc_reset();
+					dssh_rsa_cache_release(context.pub_blob);
+					context.pub_blob = nullptr;
+					completed += one ? 1U : 0U;
+					valid = one && valid;
+				}
+			}
+		}
+	}
+	catch (...) {
+		valid = false;
+	}
+	dssh_test_cpp_new_disable();
+	dssh_test_alloc_reset();
+	printf("RSA native cache: positives=%u negatives=%u zero=1 algorithms=2 completed=%u valid=%u\n",
+	    positive, negative, completed, valid ? 1U : 0U);
+	ASSERT_TRUE(valid && completed == 2);
+	return TEST_PASS;
+}
+
 /* ================================================================
  * Test table
  * ================================================================ */
 
 static struct dssh_test_entry tests[] = {
 	{ "key_file_cpp_oom", test_key_file_cpp_oom },
+	{ "rsa_cache_native", test_rsa_cache_native },
 	{ "key_text_reuse", test_key_text_reuse },
 	/* RSA pubkey serialization */
 	{ "rsa_pubkey_e_pad",            test_rsa_pubkey_e_pad },

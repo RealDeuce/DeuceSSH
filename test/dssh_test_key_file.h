@@ -92,6 +92,16 @@ int dssh_test_key_acl_set(int fd, acl_t acl, acl_type_t type);
 int dssh_test_key_acl_free(void *acl);
 #endif
 
+#ifdef __APPLE__
+struct dssh_test_key_darwin_report {
+	unsigned int allocations, properties, applications, retired, injected;
+};
+void dssh_test_key_darwin_case(unsigned int kind);
+int dssh_test_key_darwin_permission(unsigned int step);
+void dssh_test_key_darwin_retired(void);
+struct dssh_test_key_darwin_report dssh_test_key_darwin_report(void);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

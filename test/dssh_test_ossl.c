@@ -1226,6 +1226,52 @@ static _Thread_local int key_failed_fd = -1;
 static _Thread_local bool key_permission_error, key_truncate_error, key_raw_close_error;
 static _Thread_local bool key_target_error, key_status_error, key_different_owner;
 #endif
+#ifdef __APPLE__
+static _Thread_local struct dssh_test_key_darwin_report key_darwin_report;
+static _Thread_local unsigned int key_darwin_case;
+
+static void
+key_darwin_count(unsigned int *count)
+{
+	if (*count < UINT_MAX)
+		(*count)++;
+}
+
+void
+dssh_test_key_darwin_case(unsigned int kind)
+{
+	key_darwin_case = kind;
+}
+
+int
+dssh_test_key_darwin_permission(unsigned int step)
+{
+	if (step == 1)
+		key_darwin_count(&key_darwin_report.allocations);
+	else if (step == 2)
+		key_darwin_count(&key_darwin_report.properties);
+	else if (step == 3)
+		key_darwin_count(&key_darwin_report.applications);
+	if (key_darwin_case != 0 && key_darwin_case == step) {
+		key_darwin_count(&key_darwin_report.injected);
+		errno = step == 1 ? ENOMEM : EIO;
+		return -1;
+	}
+	return 0;
+}
+
+void
+dssh_test_key_darwin_retired(void)
+{
+	key_darwin_count(&key_darwin_report.retired);
+}
+
+struct dssh_test_key_darwin_report
+dssh_test_key_darwin_report(void)
+{
+	return key_darwin_report;
+}
+#endif
 #ifdef __FreeBSD__
 static void
 key_acl_count(unsigned int *count)
@@ -1547,6 +1593,10 @@ dssh_test_key_stdio_reset(void)
 	key_acl_report = (struct dssh_test_key_acl_report){0};
 	key_acl_case = 0;
 	key_permission_noop = false;
+#endif
+#ifdef __APPLE__
+	key_darwin_report = (struct dssh_test_key_darwin_report){0};
+	key_darwin_case = 0;
 #endif
 	key_stream_watch = false;
 	key_setvbuf_error = false;

@@ -4,12 +4,21 @@
 #undef _POSIX_SOURCE
 #undef _XOPEN_SOURCE
 #endif
+#ifdef __APPLE__
+#ifndef _DARWIN_C_SOURCE
+#define _DARWIN_C_SOURCE
+#endif
+#endif
 /* Selected direct-overwrite contract, using only private nonsensitive fixtures. */
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <sys/acl.h>
+#include <uuid/uuid.h>
+#endif
 #include "dssh_test.h"
 #include "dssh_test_internal.h"
 #include "dssh_test_alloc.h"
@@ -32,6 +41,59 @@ static const struct policy_ops operations[] = {
 };
 static const char marker[] = "private output policy fixture";
 static bool policy_workspace;
+
+#ifdef __APPLE__
+static bool
+darwin_acl_prepare(const char *path)
+{
+	int fd = open(path, O_RDWR | O_CLOEXEC | O_NOFOLLOW);
+	if (fd < 0)
+		return false;
+	acl_t acl = acl_init(1);
+	acl_entry_t entry;
+	acl_permset_t permissions;
+	uuid_t principal;
+	bool valid = acl != NULL && fchmod(fd, 0600) == 0
+	    && uuid_parse("FFFFEEEE-DDDD-CCCC-BBBB-AAAA0000FFFE", principal) == 0
+	    && acl_create_entry(&acl, &entry) == 0 && acl_set_tag_type(entry, ACL_EXTENDED_ALLOW) == 0
+	    && acl_set_qualifier(entry, principal) == 0 && acl_get_permset(entry, &permissions) == 0
+	    && acl_add_perm(permissions, ACL_READ_DATA) == 0 && acl_set_fd(fd, acl) == 0;
+	if (acl != NULL && acl_free(acl) != 0)
+		valid = false;
+	if (close(fd) != 0)
+		valid = false;
+	return valid;
+}
+
+static int
+darwin_acl_state(const char *path)
+{
+	int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+	if (fd < 0)
+		return -1;
+	struct stat info;
+	int result = -1;
+	errno = 0;
+	acl_t acl = acl_get_fd(fd);
+	bool empty = acl == NULL && errno == ENOENT;
+	if (acl != NULL) {
+		acl_entry_t entry;
+		errno = 0;
+		int ret = acl_get_entry(acl, ACL_FIRST_ENTRY, &entry);
+		if (ret == 0)
+			result = 0;
+		else if (ret == -1 && errno == EINVAL)
+			empty = true;
+	}
+	if (empty && fstat(fd, &info) == 0)
+		result = (info.st_mode & 0777) == 0600 && info.st_uid == geteuid() ? 1 : 0;
+	if (acl != NULL && acl_free(acl) != 0)
+		result = -1;
+	if (close(fd) != 0)
+		result = -1;
+	return result;
+}
+#endif
 
 #ifdef __FreeBSD__
 static bool
@@ -141,11 +203,14 @@ policy_case(const struct policy_ops *ops, unsigned int kind, bool encrypted)
 	char actual[128] = {0}, alias[128] = {0}, inner[128] = {0}, chosen[128] = {0};
 	bool created = false, alias_created = false, inner_created = false, had_target = false;
 	bool valid = false, retired = false;
-	bool accepted = kind < 4 || kind == 10 || kind == 15;
+	bool accepted = kind < 4 || kind == 10 || kind == 15 || kind == 20;
 	bool acl_case = kind >= 10;
 	int acl_after = -2;
 #ifdef __FreeBSD__
 	struct dssh_test_key_acl_report acl_report = {0};
+#endif
+#ifdef __APPLE__
+	struct dssh_test_key_darwin_report darwin_report = {0};
 #endif
 	int peer = -1, status = DSSH_ERROR_INIT;
 	struct stat before, after, alias_before, alias_after;
@@ -210,6 +275,10 @@ policy_case(const struct policy_ops *ops, unsigned int kind, bool encrypted)
 	if (acl_case && (!acl_prepare(actual) || acl_state(actual) != 0))
 		goto done;
 #endif
+#ifdef __APPLE__
+	if (acl_case && (!darwin_acl_prepare(actual) || darwin_acl_state(actual) != 0))
+		goto done;
+#endif
 	if (kind == 2 && chmod(root, 0500) != 0)
 		goto done;
 	had_target = kind != 1 && kind != 8;
@@ -236,6 +305,10 @@ policy_case(const struct policy_ops *ops, unsigned int kind, bool encrypted)
 		if (kind != 15)
 			dssh_test_key_permission_noop_once();
 	}
+#endif
+#ifdef __APPLE__
+	if (acl_case)
+		dssh_test_key_darwin_case(kind - 20);
 #endif
 	status = ops->save(path, encrypted ? password : NULL, &pw);
 	report = dssh_test_key_open_report();
@@ -270,6 +343,18 @@ policy_case(const struct policy_ops *ops, unsigned int kind, bool encrypted)
 		    && acl_report.mode_noops == (kind == 15 ? 0U : 1U)
 		    && acl_report.native_free_errors == 0
 		    && acl_after == (accepted || kind == 14 ? 1 : 0);
+	}
+#endif
+#ifdef __APPLE__
+	if (acl_case) {
+		darwin_report = dssh_test_key_darwin_report();
+		acl_after = darwin_acl_state(actual);
+		valid = valid && darwin_report.allocations == 1
+		    && darwin_report.properties == (kind == 21 ? 0U : 1U)
+		    && darwin_report.applications == (kind == 21 || kind == 22 ? 0U : 1U)
+		    && darwin_report.retired == (kind == 21 ? 0U : 1U)
+		    && darwin_report.injected == (kind == 20 ? 0U : 1U)
+		    && acl_after == (accepted ? 1 : 0);
 	}
 #endif
 	dssh_test_key_stdio_reset();
@@ -348,6 +433,13 @@ done:
 		    acl_report.queries, acl_report.allocations, acl_report.produced, acl_report.sets,
 		    acl_report.frees, acl_report.retired, acl_report.injected, acl_report.mode_noops, acl_after, valid ? 1U : 0U);
 #endif
+#ifdef __APPLE__
+	if (acl_case)
+		printf("key Darwin ACL: algorithm=%s kind=%u encrypted=%u allocations=%u properties=%u "
+		    "applications=%u retired=%u injected=%u private=%d valid=%u\n", ops->name, kind, encrypted ? 1U : 0U,
+		    darwin_report.allocations, darwin_report.properties, darwin_report.applications,
+		    darwin_report.retired, darwin_report.injected, acl_after, valid ? 1U : 0U);
+#endif
 	return valid;
 }
 static int
@@ -364,7 +456,8 @@ cases(unsigned int first, unsigned int last, bool both)
 			}
 		}
 	}
-	unsigned int expected = first == 0 ? 24U : first == 4 ? 15U : first == 9 ? 3U : first == 11 ? 36U : 6U;
+	unsigned int expected = first == 0 ? 24U : first == 4 ? 15U : first == 9 ? 3U
+	    : first == 11 ? 36U : first == 21 ? 18U : 6U;
 	printf("key save policy summary: first=%u last=%u expected=%u completed=%u\n", first, last, expected, completed);
 	ASSERT_EQ(completed, expected);
 	return TEST_PASS;
@@ -426,6 +519,26 @@ test_acl_workspace(void)
 	return acl_cases(10, 10, true);
 }
 #endif
+#ifdef __APPLE__
+static int
+test_darwin_acl_owner_only(void)
+{
+	return cases(20, 20, true);
+}
+static int
+test_darwin_acl_failures(void)
+{
+	return cases(21, 23, true);
+}
+static int
+test_darwin_acl_workspace(void)
+{
+	policy_workspace = true;
+	int ret = cases(20, 20, true);
+	policy_workspace = false;
+	return ret;
+}
+#endif
 static struct dssh_test_entry tests[] = {
 	{"identity", test_identity},
 	{"rejected", test_rejected},
@@ -435,6 +548,11 @@ static struct dssh_test_entry tests[] = {
 	{"acl_failures", test_acl_failures},
 	{"acl_capability_absent", test_acl_capability_absent},
 	{"acl_workspace", test_acl_workspace},
+#endif
+#ifdef __APPLE__
+	{"darwin_acl_owner_only", test_darwin_acl_owner_only},
+	{"darwin_acl_failures", test_darwin_acl_failures},
+	{"darwin_acl_workspace", test_darwin_acl_workspace},
 #endif
 };
 DSSH_TEST_NO_CLEANUP

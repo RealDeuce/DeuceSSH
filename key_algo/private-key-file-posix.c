@@ -5,6 +5,11 @@
 #undef _POSIX_SOURCE
 #undef _XOPEN_SOURCE
 #endif
+#ifdef __APPLE__
+#ifndef _DARWIN_C_SOURCE
+#define _DARWIN_C_SOURCE
+#endif
+#endif
 /* Native key-file streams. Each descriptor is non-inheritable on creation. */
 #include "private-key-file.h"
 #include <errno.h>
@@ -29,6 +34,13 @@
 #define acl_from_text(text) dssh_test_key_acl_from_text(text)
 #define acl_set_fd_np(fd, acl, type) dssh_test_key_acl_set(fd, acl, type)
 #define acl_free(acl) dssh_test_key_acl_free(acl)
+#endif
+#ifdef __APPLE__
+#define filesec_init() (dssh_test_key_darwin_permission(1) != 0 ? NULL : filesec_init())
+#define filesec_set_property(sec, property, value) \
+	(dssh_test_key_darwin_permission(2) != 0 ? -1 : filesec_set_property(sec, property, value))
+#define fchmodx_np(fd, sec) (dssh_test_key_darwin_permission(3) != 0 ? -1 : fchmodx_np(fd, sec))
+#define filesec_free(sec) (filesec_free(sec), dssh_test_key_darwin_retired())
 #endif
 #endif
 
@@ -56,6 +68,19 @@ private_permissions(int fd)
 	int saved_error = errno;
 	if (acl_free(acl) != 0)
 		return false;
+	errno = saved_error;
+	return ret == 0;
+#elif defined(__APPLE__)
+	/* Darwin's extended ACL is independent of the mode bits. Remove it on
+	 * the same validated descriptor, preserving its existing owner/group. */
+	filesec_t security = filesec_init();
+	if (security == NULL)
+		return false;
+	int ret = filesec_set_property(security, FILESEC_ACL, _FILESEC_REMOVE_ACL);
+	if (ret == 0)
+		ret = fchmodx_np(fd, security);
+	int saved_error = errno;
+	filesec_free(security);
 	errno = saved_error;
 	return ret == 0;
 #else

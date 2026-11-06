@@ -17,6 +17,12 @@
 #ifdef fread
 #undef fread
 #endif
+#ifdef fwrite
+#undef fwrite
+#endif
+#ifdef fputc
+#undef fputc
+#endif
 
 struct key_file_ops {
 	int (*reg)(void);

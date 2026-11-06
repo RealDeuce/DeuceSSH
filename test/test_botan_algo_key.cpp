@@ -464,6 +464,17 @@ test_rsa_key_roundtrip(void)
 }
 
 
+#include "key_text_reference.h"
+/* Match the library helper's native C++ path and stdio controls only here. */
+#define DSSH_TESTING
+#include "key_algo/key-text.h"
+#undef DSSH_TESTING
+#undef free
+#undef fread
+#undef fwrite
+#undef fclose
+#undef fputc
+
 struct cpp_password_probe {
 	bool observe = false;
 	bool watching = false;
@@ -663,12 +674,122 @@ test_key_file_cpp_oom(void)
 	return TEST_PASS;
 }
 
+static void
+key_text_free_observer(const void *ptr, void *opaque)
+{
+	if (ptr != nullptr) {
+		auto *count = static_cast<size_t *>(opaque);
+		(*count)++;
+	}
+}
+
+static int
+test_key_text_reuse(void)
+{
+	const struct {
+		int (*reg)(void);
+		int (*load)(const char *, dssh_pem_password_cb, void *);
+		int64_t (*format)(char *, size_t);
+		int (*save)(const char *);
+		const char *cache;
+	} ops[] = {
+		{dssh_register_ssh_ed25519, dssh_ed25519_load_key_file, dssh_ed25519_get_pub_str,
+		    dssh_ed25519_save_pub_file, "DSSH_TEST_ED25519_KEY"},
+		{dssh_register_rsa_sha2_256, dssh_rsa_sha2_256_load_key_file, dssh_rsa_sha2_256_get_pub_str,
+		    dssh_rsa_sha2_256_save_pub_file, "DSSH_TEST_RSA_KEY"},
+		{dssh_register_rsa_sha2_512, dssh_rsa_sha2_512_load_key_file, dssh_rsa_sha2_512_get_pub_str,
+		    dssh_rsa_sha2_512_save_pub_file, "DSSH_TEST_RSA_KEY"},
+	};
+	char path[] = "/tmp/dssh-text-reuse-XXXXXX";
+	bool created = false;
+	bool valid = cpp_temporary(path, &created);
+	for (size_t a = 0; valid && a < sizeof(ops) / sizeof(ops[0]); a++) {
+		dssh_test_reset_global_config();
+		dssh_test_alloc_reset();
+		dssh_test_key_stdio_reset();
+		const char *cache = getenv(ops[a].cache);
+		char expected[1024], output[1024];
+		int64_t length = 0;
+		valid = cache != nullptr && ops[a].reg() == 0 && ops[a].load(cache, nullptr, nullptr) == 0;
+		if (valid)
+			length = ops[a].format(expected, sizeof(expected));
+		valid = length > 0 && length <= 1024 && valid;
+		if (!valid)
+			break;
+		size_t count = static_cast<size_t>(length);
+		size_t frees = 0;
+		dssh_test_key_stdio_reset();
+		dssh_test_alloc_observe_frees(key_text_free_observer, &frees);
+		dssh_test_cpp_new_fail_after(0);
+		try {
+			for (unsigned int repeat = 0; valid && repeat < 16; repeat++) {
+				valid = ops[a].format(nullptr, 0) == length
+				    && ops[a].format(output, count) == length
+				    && memcmp(output, expected, count) == 0 && ops[a].save(path) == 0;
+			}
+		}
+		catch (...) {
+			valid = false;
+		}
+		dssh_test_cpp_new_disable();
+		dssh_test_alloc_observe_frees(nullptr, nullptr);
+		size_t calls = dssh_test_cpp_new_count();
+		valid = !dssh_test_cpp_new_failed() && calls == 0 && frees == 0
+		    && dssh_test_key_close_calls() == 16 && dssh_test_key_write_calls() == 32
+		    && dssh_test_key_put_calls() == 32 && valid;
+		printf("key-text native reuse: family=%zu repeats=16 ordinary-new=%zu explicit-frees=%zu valid=%u\n",
+		    a, calls, frees, valid ? 1U : 0U);
+	}
+	uint8_t binary[2306];
+	char reference_text[3200], file_text[3200];
+	for (size_t i = 0; i < sizeof(binary); i++) {
+		uint8_t value = static_cast<uint8_t>(i % 256);
+		binary[i] = value;
+	}
+	const size_t lengths[] = {0, 1, 2, 3, 767, 768, 769, 770, 1536, 2306};
+	unsigned int chunks = 0;
+	for (size_t i = 0; valid && i < sizeof(lengths) / sizeof(lengths[0]); i++) {
+		size_t length = 0;
+		valid = key_text_reference(binary, lengths[i], "ssh-rsa", reference_text, sizeof(reference_text), &length);
+		if (!valid)
+			break;
+		dssh_test_key_stdio_reset();
+		dssh_test_cpp_new_fail_after(0);
+		int ret = dssh_key_text_write(path, binary, lengths[i], "ssh-rsa", 7);
+		dssh_test_cpp_new_disable();
+		valid = ret == 0 && dssh_test_cpp_new_count() == 0 && !dssh_test_cpp_new_failed()
+		    && dssh_test_key_close_calls() == 1;
+		FILE *fp = fopen(path, "rb");
+		if (fp == nullptr) {
+			valid = false;
+			break;
+		}
+		size_t count = fread(file_text, 1, sizeof(file_text), fp);
+		valid = count == length && ferror(fp) == 0 && memcmp(file_text, reference_text, length - 1) == 0
+		    && file_text[length - 1] == '\n' && valid;
+		if (fclose(fp) != 0)
+			valid = false;
+		chunks += valid ? 1U : 0U;
+	}
+	printf("key-text native chunks: cases=10 completed=%u valid=%u\n", chunks, valid ? 1U : 0U);
+	valid = chunks == 10 && valid;
+	dssh_test_cpp_new_disable();
+	dssh_test_alloc_reset();
+	dssh_test_key_stdio_reset();
+	dssh_test_reset_global_config();
+	if (created && unlink(path) != 0)
+		valid = false;
+	ASSERT_TRUE(valid);
+	return TEST_PASS;
+}
+
 /* ================================================================
  * Test table
  * ================================================================ */
 
 static struct dssh_test_entry tests[] = {
 	{ "key_file_cpp_oom", test_key_file_cpp_oom },
+	{ "key_text_reuse", test_key_text_reuse },
 	/* RSA pubkey serialization */
 	{ "rsa_pubkey_e_pad",            test_rsa_pubkey_e_pad },
 	{ "rsa_pubkey_n_no_pad",         test_rsa_pubkey_n_no_pad },

@@ -11,6 +11,7 @@
 #include "key-context-openssl.h"
 #include "key-wire.h"
 #include "key-file-common.h"
+#include "key-text.h"
 #ifdef DSSH_TESTING
  #include "ssh-internal.h"
 #endif
@@ -345,24 +346,12 @@ DSSH_PUBLIC int64_t
 dssh_ed25519_get_pub_str(char *buf, size_t bufsz)
 {
 	const uint8_t *blob;
-	size_t         blob_len;
-	int            res = pubkey(&blob, &blob_len, (dssh_key_algo_ctx *)ed25519_ctx);
-	if (res < 0)
-		return res;
-
-	size_t b64_len = 4 * ((blob_len + 2) / 3);
-	/* "ssh-ed25519 " + base64 + NUL */
-	size_t needed = ED25519_NAME_LEN + 1 + b64_len + 1;
-
-	if (buf == NULL || bufsz == 0)
-		return (int64_t)needed;
-	if (bufsz < needed)
-		return DSSH_ERROR_TOOLONG;
-
-	memcpy(buf, ED25519_NAME, ED25519_NAME_LEN);
-	buf[ED25519_NAME_LEN] = ' ';
-	EVP_EncodeBlock((unsigned char *)&buf[ED25519_NAME_LEN + 1], blob, (int)blob_len);
-	return (int64_t)needed;
+	size_t length;
+	dssh_key_algo_ctx *context = (dssh_key_algo_ctx *)ed25519_ctx;
+	int ret = pubkey(&blob, &length, context);
+	if (ret < 0)
+		return ret;
+	return dssh_key_text_format(blob, length, ED25519_NAME, ED25519_NAME_LEN, buf, bufsz);
 }
 
 DSSH_PUBLIC int
@@ -370,18 +359,13 @@ dssh_ed25519_save_pub_file(const char *path)
 {
 	if (path == NULL)
 		return DSSH_ERROR_INIT;
-	char    str[256];
-	int64_t len = dssh_ed25519_get_pub_str(str, sizeof(str));
-	if (len < 0)
-		return (int)len;
-
-	FILE *fp = fopen(path, "w");
-	if (fp == NULL)
-		return DSSH_ERROR_INIT;
-	int wok = fprintf(fp, "%s\n", str) >= 0;
-	if (fclose(fp) != 0)
-		wok = 0;
-	return wok ? 0 : DSSH_ERROR_INIT;
+	const uint8_t *blob;
+	size_t length;
+	dssh_key_algo_ctx *context = (dssh_key_algo_ctx *)ed25519_ctx;
+	int ret = pubkey(&blob, &length, context);
+	if (ret < 0)
+		return ret;
+	return dssh_key_text_write(path, blob, length, ED25519_NAME, ED25519_NAME_LEN);
 }
 
 DSSH_PUBLIC int

@@ -3215,36 +3215,56 @@ test_rsa_load_calloc_fail(void)
 }
 
 /* ================================================================
- * RSA save_pub_file alloc failure (malloc for str buffer)
+ * Cached RSA public export needs no library-owned temporary allocation.
  * ================================================================ */
 
 static int
-test_rsa_save_pub_alloc_fail(void)
+test_rsa_save_pub_reuse(void)
 {
 	dssh_test_reset_global_config();
 	dssh_test_alloc_reset();
-	ASSERT_EQ(dssh_register_rsa_sha2_256(), 0);
-	ASSERT_EQ(dssh_rsa_sha2_256_generate_key(2048), 0);
-
-	char tmppath[] = "/tmp/dssh_test_rsa_pub_af_XXXXXX";
-	int fd = mkstemp(tmppath);
-	ASSERT_TRUE(fd >= 0);
-	close(fd);
-
-	for (int n = 0; n < 100; n++) {
-		dssh_test_alloc_fail_after(n);
-		int res = dssh_rsa_sha2_256_save_pub_file(tmppath);
-		dssh_test_alloc_reset();
-		if (res == 0) {
-			unlink(tmppath);
-			dssh_test_reset_global_config();
-			ASSERT_TRUE(n > 0);
-			return TEST_PASS;
-		}
+	bool valid = dssh_register_rsa_sha2_256() == 0 && load_rsa_test_key() == 0;
+	char path[] = "/tmp/dssh_test_rsa_pub_af_XXXXXX";
+	bool created = false;
+	FILE *fp = NULL;
+	char expected[1024], actual[1024];
+	int64_t length = valid ? dssh_rsa_sha2_256_get_pub_str(expected, sizeof(expected)) : -1;
+	valid = length > 0 && length <= 1024 && valid;
+	if (!valid)
+		goto done;
+	size_t count = (size_t)length;
+	int fd = mkstemp(path);
+	if (fd < 0) {
+		valid = false;
+		goto done;
 	}
-	unlink(tmppath);
+	created = true;
+	if (close(fd) != 0) {
+		valid = false;
+		goto done;
+	}
+	dssh_test_alloc_fail_after(0);
+	int ret = dssh_rsa_sha2_256_save_pub_file(path);
+	int allocations = dssh_test_alloc_count();
+	dssh_test_alloc_reset();
+	valid = ret == 0 && allocations == 0;
+	fp = fopen(path, "rb");
+	if (fp == NULL) {
+		valid = false;
+		goto done;
+	}
+	size_t got = fread(actual, 1, sizeof(actual), fp);
+	valid = got == count && ferror(fp) == 0 && memcmp(actual, expected, count - 1) == 0
+	    && actual[count - 1] == '\n' && valid;
+done:
+	if (fp != NULL && fclose(fp) != 0)
+		valid = false;
+	if (created && unlink(path) != 0)
+		valid = false;
+	dssh_test_alloc_reset();
 	dssh_test_reset_global_config();
-	return TEST_FAIL;
+	ASSERT_TRUE(valid);
+	return TEST_PASS;
 }
 #endif /* DSSH_CRYPTO_OPENSSL -- alloc failure tests */
 
@@ -3594,7 +3614,7 @@ static struct dssh_test_entry tests[] = {
 	{ "rsa_generate_calloc_fail",         test_rsa_generate_calloc_fail },
 	{ "ed25519_load_calloc_fail",         test_ed25519_load_calloc_fail },
 	{ "rsa_load_calloc_fail",             test_rsa_load_calloc_fail },
-	{ "rsa_save_pub_alloc_fail",          test_rsa_save_pub_alloc_fail },
+	{ "rsa_save_pub_reuse",          test_rsa_save_pub_reuse },
 #endif
 
 	/* RSA set_rsa_padding ossl failures */

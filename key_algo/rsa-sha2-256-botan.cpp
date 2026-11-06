@@ -27,6 +27,7 @@
 #include "key-context-botan.h"
 #include "key-wire.h"
 #include "key-file-common.h"
+#include "key-text.h"
 
 struct dssh_key_algo_ctx;
 
@@ -422,25 +423,11 @@ DSSH_PUBLIC int64_t
 dssh_rsa_sha2_256_get_pub_str(char *buf, size_t bufsz)
 {
 	const uint8_t *blob;
-	size_t         blob_len;
-	int            res = pubkey_impl(&blob, &blob_len, rsa_ctx);
-	if (res < 0)
-		return res;
-
-	size_t b64_len = 4 * ((blob_len + 2) / 3);
-	size_t needed  = RSA_KEY_TYPE_NAME_LEN + 1 + b64_len + 1;
-
-	if (buf == NULL || bufsz == 0)
-		return static_cast<int64_t>(needed);
-	if (bufsz < needed)
-		return DSSH_ERROR_TOOLONG;
-
-	memcpy(buf, RSA_KEY_TYPE_NAME, RSA_KEY_TYPE_NAME_LEN);
-	buf[RSA_KEY_TYPE_NAME_LEN] = ' ';
-	int encret = dssh_base64_encode(blob, blob_len, &buf[RSA_KEY_TYPE_NAME_LEN + 1], b64_len + 1);
-	if (encret < 0)
-		return encret;
-	return static_cast<int64_t>(needed);
+	size_t length;
+	int ret = pubkey_impl(&blob, &length, rsa_ctx);
+	if (ret < 0)
+		return ret;
+	return dssh_key_text_format(blob, length, RSA_KEY_TYPE_NAME, RSA_KEY_TYPE_NAME_LEN, buf, bufsz);
 }
 
 DSSH_PUBLIC int
@@ -448,29 +435,12 @@ dssh_rsa_sha2_256_save_pub_file(const char *path)
 {
 	if (path == NULL)
 		return DSSH_ERROR_INIT;
-	char   *str = NULL;
-	int64_t len = dssh_rsa_sha2_256_get_pub_str(NULL, 0);
-	if (len < 0)
-		return static_cast<int>(len);
-	str = static_cast<char *>(malloc(static_cast<size_t>(len)));
-	if (str == NULL)
-		return DSSH_ERROR_ALLOC;
-	int64_t sres = dssh_rsa_sha2_256_get_pub_str(str, static_cast<size_t>(len));
-	if (sres < 0) {
-		free(str);
-		return static_cast<int>(sres);
-	}
-
-	FILE *fp = fopen(path, "w");
-	if (fp == NULL) {
-		free(str);
-		return DSSH_ERROR_INIT;
-	}
-	int wok = fprintf(fp, "%s\n", str) >= 0;
-	if (fclose(fp) != 0)
-		wok = 0;
-	free(str);
-	return wok ? 0 : DSSH_ERROR_INIT;
+	const uint8_t *blob;
+	size_t length;
+	int ret = pubkey_impl(&blob, &length, rsa_ctx);
+	if (ret < 0)
+		return ret;
+	return dssh_key_text_write(path, blob, length, RSA_KEY_TYPE_NAME, RSA_KEY_TYPE_NAME_LEN);
 }
 
 DSSH_PUBLIC int

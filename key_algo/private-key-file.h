@@ -14,12 +14,16 @@ FILE *dssh_private_key_open(const char *path);
 int dssh_test_key_file_close(FILE *stream);
 void dssh_test_key_file_cleared(const void *ptr, size_t length);
 size_t dssh_test_key_file_read(void *ptr, size_t size, size_t count, FILE *stream);
+size_t dssh_test_key_file_write(const void *ptr, size_t size, size_t count, FILE *stream);
+int dssh_test_key_file_put(int byte, FILE *stream);
 #ifdef __cplusplus
 void dssh_test_free(void *ptr);
 #define free(ptr) dssh_test_free(ptr)
 #endif
 #define fclose(stream) dssh_test_key_file_close(stream)
 #define fread(ptr, size, count, stream) dssh_test_key_file_read(ptr, size, count, stream)
+#define fwrite(ptr, size, count, stream) dssh_test_key_file_write(ptr, size, count, stream)
+#define fputc(byte, stream) dssh_test_key_file_put(byte, stream)
 #endif
 
 

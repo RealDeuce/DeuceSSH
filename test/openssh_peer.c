@@ -19,6 +19,7 @@
 #define OUTPUT_SIZE 262144
 static const uint8_t digits[] = "0123456789abcdef";
 static const uint8_t error_text[] = "interop-stderr\n";
+static const uint8_t acknowledgement[] = "dssh-ack\n";
 static struct timespec started;
 
 struct authorization {
@@ -163,7 +164,7 @@ write_all(dssh_channel channel, int stream, const uint8_t *data, size_t length)
 }
 
 static int
-server_channel(dssh_session session)
+server_channel(dssh_session session, bool *acknowledged)
 {
 	struct dssh_chan_accept_cbs callbacks = { .exec = accept_command };
 	dssh_channel channel = dssh_chan_accept(session, &callbacks, 10000);
@@ -175,6 +176,36 @@ server_channel(dssh_session session)
 	int ret = 0;
 	for (unsigned i = 0; i < OUTPUT_SIZE / sizeof(block) && ret == 0; i++)
 		ret = write_all(channel, 0, block, sizeof(block));
+	/* OpenSSH sends this application acknowledgement only after its reader has
+	 * checked all stdout. During rekey it queues channel data until NEWKEYS,
+	 * keeping this channel alive through the peer-initiated exchange. */
+	uint8_t reply[sizeof(acknowledgement) - 1];
+	size_t received = 0;
+	while (ret == 0 && received < sizeof(reply)) {
+		ret = remaining();
+		if (ret < 0)
+			break;
+		int ready = dssh_chan_poll(channel, DSSH_POLL_READ, 100);
+		if (ready < 0) {
+			ret = ready;
+			break;
+		}
+		if ((ready & DSSH_POLL_READ) == 0)
+			continue;
+		int64_t amount = dssh_chan_read(channel, 0, reply + received, sizeof(reply) - received);
+		if (amount <= 0 || amount > sizeof(reply) - received) {
+			ret = DSSH_ERROR_INIT;
+			break;
+		}
+		size_t advanced = (size_t)amount; /* actual result <= nine bytes */
+		received += advanced;
+	}
+	if (ret == 0) {
+		if (memcmp(reply, acknowledgement, sizeof(reply)) != 0)
+			ret = DSSH_ERROR_INVALID;
+		else
+			*acknowledged = true;
+	}
 	if (ret == 0)
 		ret = write_all(channel, 1, error_text, sizeof(error_text) - 1);
 	int closed = dssh_chan_close(channel, ret == 0 ? 23 : 1);
@@ -313,6 +344,7 @@ main(int argc, char **argv)
 	if (session == NULL)
 		return 2;
 	const char *stage = "configuration";
+	bool channel_ack = false;
 	ret = dssh_session_set_timeout(session, 75000);
 	if (ret == 0 && client)
 		ret = dssh_session_set_hostkey_verify_cb(session, verify_host, &auth);
@@ -340,12 +372,12 @@ main(int argc, char **argv)
 	}
 	if (ret == 0) {
 		stage = "channel";
-		ret = client ? client_channel(session) : server_channel(session);
+		ret = client ? client_channel(session) : server_channel(session, &channel_ack);
 	}
 	dssh_session_cleanup(session);
 	if (ret == 0 && client && auth.host_checks < 2)
 		ret = DSSH_ERROR_INVALID;
-	fprintf(stderr, "DeuceSSH interop: role=%s kex=%s stage=%s result=%d host-checks=%u signed-auth=%d\n",
-	    argv[1], argv[2], stage, ret, auth.host_checks, auth.signed_auth);
+	fprintf(stderr, "DeuceSSH interop: role=%s kex=%s stage=%s result=%d host-checks=%u signed-auth=%d channel-ack=%u\n",
+	    argv[1], argv[2], stage, ret, auth.host_checks, auth.signed_auth, channel_ack ? 1U : 0U);
 	return ret == 0 ? 0 : 1;
 }

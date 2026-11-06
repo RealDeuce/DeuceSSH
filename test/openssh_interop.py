@@ -11,6 +11,8 @@ import json
 import os
 from pathlib import Path
 import pwd
+import select
+import hashlib
 import shlex
 import signal
 import subprocess
@@ -21,6 +23,7 @@ import time
 
 OUTPUT = b"0123456789abcdef" * 16384
 ERROR = b"interop-stderr\n"
+ACKNOWLEDGEMENT = b"dssh-ack\n"
 
 
 def stop(process):
@@ -83,6 +86,25 @@ def pkcs8(private_key):
     algorithm = bytes.fromhex("300d06092a864886f70d0101010500")
     encoded = base64.b64encode(tlv(0x30, b"\x02\x01\x00" + algorithm + tlv(0x04, rsa))).decode("ascii")
     return "-----BEGIN PRIVATE KEY-----\n" + "\n".join(encoded[i:i + 64] for i in range(0, len(encoded), 64)) + "\n-----END PRIVATE KEY-----\n"
+
+
+def read_server_output(process, until):
+    # Bound each pipe read by both the expected extent and the overall deadline.
+    output = bytearray()
+    while len(output) < len(OUTPUT):
+        left = until - time.monotonic()
+        if left <= 0:
+            raise RuntimeError("server stdout deadline before acknowledgement")
+        ready, _, _ = select.select([process.stdout], [], [], min(0.1, left))
+        if not ready:
+            continue
+        data = os.read(process.stdout.fileno(), min(4096, len(OUTPUT) - len(output)))
+        if not data:
+            raise RuntimeError(f"server stdout ended at {len(output)} bytes before acknowledgement")
+        output.extend(data)
+    if output != OUTPUT:
+        raise RuntimeError("server stdout mismatch before acknowledgement")
+    return bytes(output)
 
 
 def run(args):
@@ -154,10 +176,14 @@ def run(args):
                    "-o", "ProxyCommand=" + proxy_text, "-l", user, "dssh-interop", "dssh-interop"]
             with (evidence / "stderr.log").open("wb") as error:
                 until = time.monotonic() + 140
-                child = subprocess.Popen(ssh, stdin=subprocess.DEVNULL,
+                child = subprocess.Popen(ssh, stdin=subprocess.PIPE,
                                          stdout=subprocess.PIPE, stderr=error, start_new_session=True)
                 processes.append(child)
-                output, _ = child.communicate(timeout=max(0.1, until - time.monotonic()))
+                output = read_server_output(child, until)
+                tail, _ = child.communicate(input=ACKNOWLEDGEMENT,
+                                            timeout=max(0.1, until - time.monotonic()))
+                output += tail
+                result.update(stdout_bytes=len(output), stdout_sha256=hashlib.sha256(output).hexdigest())
             records.append({"command": ssh, "exit": child.returncode})
             # Command exit can precede native retirement during an in-flight
             # rekey. Keep the same overall deadline and the fixture credentials
@@ -174,8 +200,10 @@ def run(args):
                 raise RuntimeError("production server fixture failed")
             error_text = (evidence / "stderr.log").read_bytes()
             peer_text = (evidence / "peer.log").read_text()
-            if error_text != ERROR or "result=0" not in peer_text or "signed-auth=1" not in peer_text:
-                raise RuntimeError("stderr/authentication oracle missing")
+            if error_text != ERROR or "result=0" not in peer_text or "signed-auth=1" not in peer_text \
+                    or "channel-ack=1" not in peer_text:
+                raise RuntimeError("stderr/authentication/acknowledgement oracle missing")
+            result.update(channel_ack_bytes=len(ACKNOWLEDGEMENT))
         else:
             # Quoted OpenSSH configuration paths support spaces. The forced
             # command is fixed test data, independent of the requested text.

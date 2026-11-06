@@ -24,6 +24,7 @@
 #include "key-context-botan.h"
 #include "key-wire.h"
 #include "key-file-common.h"
+#include "key-text.h"
 
 struct dssh_key_algo_ctx;
 
@@ -362,25 +363,11 @@ DSSH_PUBLIC int64_t
 dssh_ed25519_get_pub_str(char *buf, size_t bufsz)
 {
 	const uint8_t *blob;
-	size_t         blob_len;
-	int            res = pubkey_impl(&blob, &blob_len, ed25519_ctx);
-	if (res < 0)
-		return res;
-
-	size_t b64_len = 4 * ((blob_len + 2) / 3);
-	size_t needed  = ED25519_NAME_LEN + 1 + b64_len + 1;
-
-	if (buf == NULL || bufsz == 0)
-		return static_cast<int64_t>(needed);
-	if (bufsz < needed)
-		return DSSH_ERROR_TOOLONG;
-
-	memcpy(buf, ED25519_NAME, ED25519_NAME_LEN);
-	buf[ED25519_NAME_LEN] = ' ';
-	int encret            = dssh_base64_encode(blob, blob_len, &buf[ED25519_NAME_LEN + 1], b64_len + 1);
-	if (encret < 0)
-		return encret;
-	return static_cast<int64_t>(needed);
+	size_t length;
+	int ret = pubkey_impl(&blob, &length, ed25519_ctx);
+	if (ret < 0)
+		return ret;
+	return dssh_key_text_format(blob, length, ED25519_NAME, ED25519_NAME_LEN, buf, bufsz);
 }
 
 DSSH_PUBLIC int
@@ -388,18 +375,12 @@ dssh_ed25519_save_pub_file(const char *path)
 {
 	if (path == NULL)
 		return DSSH_ERROR_INIT;
-	char    str[256];
-	int64_t len = dssh_ed25519_get_pub_str(str, sizeof(str));
-	if (len < 0)
-		return static_cast<int>(len);
-
-	FILE *fp = fopen(path, "w");
-	if (fp == NULL)
-		return DSSH_ERROR_INIT;
-	int wok = fprintf(fp, "%s\n", str) >= 0;
-	if (fclose(fp) != 0)
-		wok = 0;
-	return wok ? 0 : DSSH_ERROR_INIT;
+	const uint8_t *blob;
+	size_t length;
+	int ret = pubkey_impl(&blob, &length, ed25519_ctx);
+	if (ret < 0)
+		return ret;
+	return dssh_key_text_write(path, blob, length, ED25519_NAME, ED25519_NAME_LEN);
 }
 
 DSSH_PUBLIC int

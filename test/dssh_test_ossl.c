@@ -1129,6 +1129,15 @@ dssh_test_cnd_signal(cnd_t *cond)
 static _Thread_local dssh_test_key_clear_observer key_clear_observer;
 static _Thread_local void *key_clear_data;
 static _Thread_local bool key_close_error;
+static _Thread_local bool key_write_armed;
+static _Thread_local bool key_put_armed;
+static _Thread_local unsigned int key_write_after;
+static _Thread_local unsigned int key_put_after;
+static _Thread_local unsigned int key_write_count;
+static _Thread_local unsigned int key_write_short_count;
+static _Thread_local unsigned int key_put_count;
+static _Thread_local unsigned int key_put_injected;
+static _Thread_local unsigned int key_native_write_errors;
 static _Thread_local bool key_watch_read;
 static _Thread_local bool key_read_short;
 static _Thread_local unsigned int key_read_short_count;
@@ -1143,6 +1152,15 @@ dssh_test_key_stdio_reset(void)
 	key_clear_observer = NULL;
 	key_clear_data = NULL;
 	key_close_error = false;
+	key_write_armed = false;
+	key_put_armed = false;
+	key_write_after = 0;
+	key_put_after = 0;
+	key_write_count = 0;
+	key_write_short_count = 0;
+	key_put_count = 0;
+	key_put_injected = 0;
+	key_native_write_errors = 0;
 	key_watch_read = false;
 	key_read_short = false;
 	key_read_short_count = 0;
@@ -1250,4 +1268,91 @@ dssh_test_key_file_cleared(const void *ptr, size_t length)
 {
 	if (key_clear_observer != NULL)
 		key_clear_observer(ptr, length, key_clear_data);
+}
+
+
+void
+dssh_test_key_write_short_after(unsigned int calls)
+{
+	key_write_armed = true;
+	key_write_after = calls;
+}
+
+void
+dssh_test_key_put_error_after(unsigned int calls)
+{
+	key_put_armed = true;
+	key_put_after = calls;
+}
+
+unsigned int
+dssh_test_key_write_calls(void)
+{
+	return key_write_count;
+}
+
+unsigned int
+dssh_test_key_short_write_calls(void)
+{
+	return key_write_short_count;
+}
+
+unsigned int
+dssh_test_key_put_calls(void)
+{
+	return key_put_count;
+}
+
+unsigned int
+dssh_test_key_put_errors(void)
+{
+	return key_put_injected;
+}
+
+unsigned int
+dssh_test_key_native_write_errors(void)
+{
+	return key_native_write_errors;
+}
+
+size_t
+dssh_test_key_file_write(const void *ptr, size_t size, size_t count, FILE *stream)
+{
+	size_t requested = count;
+	if (key_write_armed && count != 0) {
+		if (key_write_after == 0) {
+			key_write_armed = false;
+			requested--;
+			if (key_write_short_count < UINT_MAX)
+				key_write_short_count++;
+		}
+		else
+			key_write_after--;
+	}
+	size_t ret = fwrite(ptr, size, requested, stream);
+	if (ret != requested && key_native_write_errors < UINT_MAX)
+		key_native_write_errors++;
+	if (key_write_count < UINT_MAX)
+		key_write_count++;
+	return ret;
+}
+
+int
+dssh_test_key_file_put(int byte, FILE *stream)
+{
+	int ret = fputc(byte, stream);
+	if (ret == EOF && key_native_write_errors < UINT_MAX)
+		key_native_write_errors++;
+	if (key_put_count < UINT_MAX)
+		key_put_count++;
+	if (key_put_armed) {
+		if (key_put_after == 0) {
+			key_put_armed = false;
+			if (key_put_injected < UINT_MAX)
+				key_put_injected++;
+			return EOF;
+		}
+		key_put_after--;
+	}
+	return ret;
 }

@@ -4,6 +4,9 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include <stdio.h>
+#ifndef _WIN32
+#include <sys/types.h>
+#endif
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -40,6 +43,19 @@ struct dssh_test_key_stream_report dssh_test_key_stream_report(void);
 int dssh_test_key_file_setvbuf(FILE *stream, char *buffer, int mode, size_t capacity);
 int dssh_test_key_file_close(FILE *stream);
 void dssh_test_key_file_cleared(const void *ptr, size_t length);
+
+struct dssh_test_key_open_report {
+	unsigned int stdio_opens, native_opens, associations, rejected_associations;
+	bool descriptor_valid, close_on_exec;
+};
+struct dssh_test_key_open_report dssh_test_key_open_report(void);
+void dssh_test_key_fdopen_error_once(void);
+bool dssh_test_key_failed_fd_closed(void);
+FILE *dssh_test_key_file_fopen(const char *path, const char *mode);
+#ifndef _WIN32
+int dssh_test_key_native_open(const char *path, int flags, mode_t mode);
+FILE *dssh_test_key_native_fdopen(int fd, const char *mode);
+#endif
 
 #ifdef __cplusplus
 }

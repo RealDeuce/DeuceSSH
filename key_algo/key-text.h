@@ -121,7 +121,7 @@ dssh_key_text_write(const char *path, const uint8_t *blob, size_t bytes,
 	int ret = dssh_key_text_size(bytes, name_length, &needed);
 	if (ret < 0)
 		return ret;
-	FILE *fp = fopen(path, "w");
+	FILE *fp = dssh_key_file_open_public(path);
 	if (fp == NULL)
 		return DSSH_ERROR_INIT;
 	if (fwrite(name, 1, name_length, fp) != name_length || fputc(' ', fp) == EOF)

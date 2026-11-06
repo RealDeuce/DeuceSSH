@@ -270,12 +270,12 @@ install_key(std::unique_ptr<Botan::Private_Key> privkey)
 DSSH_PUBLIC int
 dssh_ed25519_load_key_file(const char *path, dssh_pem_password_cb pw_cb, void *pw_cbdata)
 {
-	if (path == NULL)
+	if (path == NULL || path[0] == 0)
 		return DSSH_ERROR_INIT;
 	int config_ret = dssh_key_algo_setup_check(ED25519_NAME);
 	if (config_ret < 0)
 		return config_ret;
-	FILE *fp = fopen(path, "rb");
+	FILE *fp = dssh_key_file_open_read(path);
 	if (fp == NULL)
 		return DSSH_ERROR_INIT;
 	struct dssh_key_file_stream stream;
@@ -333,7 +333,7 @@ write_pem_to_file(FILE *fp, const std::string& pem)
 DSSH_PUBLIC int
 dssh_ed25519_save_key_file(const char *path, dssh_pem_password_cb pw_cb, void *pw_cbdata)
 {
-	if (path == NULL)
+	if (path == NULL || path[0] == 0)
 		return DSSH_ERROR_INIT;
 	if (ed25519_ctx == NULL || ed25519_ctx->keys == nullptr || ed25519_ctx->kind != DSSH_BOTAN_KEY_ED25519)
 		return DSSH_ERROR_INIT;
@@ -387,7 +387,7 @@ dssh_ed25519_get_pub_str(char *buf, size_t bufsz)
 DSSH_PUBLIC int
 dssh_ed25519_save_pub_file(const char *path)
 {
-	if (path == NULL)
+	if (path == NULL || path[0] == 0)
 		return DSSH_ERROR_INIT;
 	const uint8_t *blob;
 	size_t length;

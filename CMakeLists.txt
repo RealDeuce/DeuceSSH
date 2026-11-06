@@ -158,9 +158,6 @@ if(NOT HAVE_THREADS_IN_LIBC)
 else()
 	set(THREADS_LINK_LIB "")
 endif()
-# Backwards-compat alias: older code paths referenced the Win32-only
-# name.  Keep both pointing at whichever shim is active.
-set(DSSH_WIN32_THREADS_SOURCES ${DSSH_THREADS_SHIM_SOURCES})
 
 # Algorithm modules -- backend-specific
 if(WIN32)
@@ -262,7 +259,7 @@ set(DEUCESSH_SOURCES
 	kex/sntrup761.c
 	kex/sntrup761_optblocker.c
 	${DSSH_ALG_SOURCES}
-	${DSSH_WIN32_THREADS_SOURCES}
+	${DSSH_THREADS_SHIM_SOURCES}
 	enc/none.c
 	mac/none.c
 	comp/none.c

@@ -18,6 +18,11 @@
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <errno.h>
+#ifndef _WIN32
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 #ifdef DSSH_CRYPTO_OPENSSL
 #include <openssl/bn.h>
@@ -1213,9 +1218,91 @@ dssh_test_key_file_setvbuf(FILE *stream, char *buffer, int mode, size_t capacity
 	return ret;
 }
 
+static _Thread_local struct dssh_test_key_open_report key_open_report;
+static _Thread_local bool key_fdopen_error;
+static _Thread_local int key_failed_fd = -1;
+
+struct dssh_test_key_open_report
+dssh_test_key_open_report(void)
+{
+	return key_open_report;
+}
+
+void
+dssh_test_key_fdopen_error_once(void)
+{
+	key_fdopen_error = true;
+}
+
+#ifndef _WIN32
+static void
+key_observe_descriptor(int fd)
+{
+	int flags = fcntl(fd, F_GETFD);
+	key_open_report.descriptor_valid = flags >= 0;
+	key_open_report.close_on_exec = flags >= 0 && (flags & FD_CLOEXEC) != 0;
+}
+
+int
+dssh_test_key_native_open(const char *path, int flags, mode_t mode)
+{
+	if (key_open_report.native_opens < UINT_MAX)
+		key_open_report.native_opens++;
+	return open(path, flags, mode);
+}
+
+FILE *
+dssh_test_key_native_fdopen(int fd, const char *mode)
+{
+	if (key_open_report.associations < UINT_MAX)
+		key_open_report.associations++;
+	if (key_fdopen_error) {
+		key_fdopen_error = false;
+		key_failed_fd = fd;
+		if (key_open_report.rejected_associations < UINT_MAX)
+			key_open_report.rejected_associations++;
+		errno = ENOMEM;
+		return NULL;
+	}
+	FILE *fp = fdopen(fd, mode);
+	if (fp != NULL)
+		key_observe_descriptor(fileno(fp));
+	return fp;
+}
+#endif
+
+bool
+dssh_test_key_failed_fd_closed(void)
+{
+#ifndef _WIN32
+	if (key_failed_fd < 0)
+		return false;
+	errno = 0;
+	return fcntl(key_failed_fd, F_GETFD) == -1 && errno == EBADF;
+#else
+	return false;
+#endif
+}
+
+FILE *
+dssh_test_key_file_fopen(const char *path, const char *mode)
+{
+	if (key_open_report.stdio_opens < UINT_MAX)
+		key_open_report.stdio_opens++;
+	FILE *fp = fopen(path, mode);
+#ifndef _WIN32
+	if (fp != NULL)
+		key_observe_descriptor(fileno(fp));
+#endif
+	return fp;
+}
+
 void
 dssh_test_key_stdio_reset(void)
 {
+	key_open_report = (struct dssh_test_key_open_report){0};
+	key_fdopen_error = false;
+	key_failed_fd = -1;
 	key_stream_watch = false;
 	key_setvbuf_error = false;
 	key_stream_closed = false;

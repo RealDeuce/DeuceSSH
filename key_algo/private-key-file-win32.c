@@ -156,3 +156,17 @@ dssh_private_key_open(const char *path)
 		_close(fd);
 	return fp;
 }
+
+/* The CRT N mode sets non-inheritance as part of opening the stream. Paths
+ * have already been checked for NULL/empty values by the public wrappers. */
+DSSH_PRIVATE FILE *
+dssh_key_file_open_read(const char *path)
+{
+	return fopen(path, "rbN");
+}
+
+DSSH_PRIVATE FILE *
+dssh_key_file_open_public(const char *path)
+{
+	return fopen(path, "wN");
+}

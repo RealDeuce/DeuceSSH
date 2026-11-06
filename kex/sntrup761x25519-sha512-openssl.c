@@ -1,4 +1,4 @@
-// draft-ietf-sshm-ntruprime-ssh: sntrup761x25519-sha512 (OpenSSL backend)
+// RFC 9941: sntrup761x25519-sha512 (OpenSSL backend)
 //
 // Provides X25519 and sntrup761 crypto operations for the shared
 // protocol handler in hybrid-pq-kex.c.

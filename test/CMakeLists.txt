@@ -753,6 +753,23 @@ endif()
 # ================================================================
 
 dssh_add_test(transport test_transport.c)
+dssh_add_test(kex_failure test_kex_failure.c)
+target_link_libraries(dssh_test_kex_failure PRIVATE dssh_mock_io)
+add_test(NAME dssh_mock_io_shutdown COMMAND dssh_test_kex_failure --exact kex_failure/io_shutdown)
+set_tests_properties(dssh_mock_io_shutdown PROPERTIES TIMEOUT 60
+	FAIL_REGULAR_EXPRESSION "AddressSanitizer;ThreadSanitizer;UndefinedBehaviorSanitizer;runtime error:"
+	PASS_REGULAR_EXPRESSION "1 tests: 1 passed, 0 failed, 0 skipped")
+foreach(key IN ITEMS ed25519 rsa rsa512)
+	foreach(part IN ITEMS control module inputs send_errors stopped)
+		add_test(NAME dssh_kex_failure_${part}_${key}
+			COMMAND dssh_test_kex_failure --exact kex_failure/${part})
+		set_tests_properties(dssh_kex_failure_${part}_${key} PROPERTIES
+			ENVIRONMENT "DSSH_TEST_KEY=${key};${DSSH_TEST_KEY_ENV}"
+			FIXTURES_REQUIRED dssh_cached_keys TIMEOUT 600
+			FAIL_REGULAR_EXPRESSION "AddressSanitizer;ThreadSanitizer;UndefinedBehaviorSanitizer;runtime error:"
+			PASS_REGULAR_EXPRESSION "1 tests: 1 passed, 0 failed, 0 skipped")
+	endforeach()
+endforeach()
 dssh_add_test(kex_framing test_kex_framing.c)
 add_test(NAME dssh_unit_kex_framing COMMAND dssh_test_kex_framing)
 dssh_add_test(module_contract test_module_contract.c)

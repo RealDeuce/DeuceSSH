@@ -18,6 +18,30 @@
 
 #include "mock_io.h"
 
+static _Thread_local void (*read_retry_hook)(void *);
+static _Thread_local void *read_retry_data;
+
+void
+mock_io_set_read_retry_hook(void (*callback)(void *), void *opaque)
+{
+	read_retry_hook = callback;
+	read_retry_data = callback == NULL ? NULL : opaque;
+}
+
+static void
+read_retry(void)
+{
+	void (*callback)(void *) = read_retry_hook;
+	void *opaque = read_retry_data;
+	read_retry_hook = NULL;
+	read_retry_data = NULL;
+	if (callback != NULL) {
+		int saved_errno = errno;
+		callback(opaque);
+		errno = saved_errno;
+	}
+}
+
 /* ================================================================
  * Pipe operations (socketpair wrapper)
  * ================================================================ */
@@ -117,12 +141,16 @@ pipe_read(struct mock_io_pipe *p, uint8_t *buf, size_t len)
 		return -1;
 	size_t have = 0;
 	while (have < len) {
+		/* A close observed after EAGAIN can follow a completed write.
+		 * Only an already-closed writer makes this read's empty result final. */
+		bool writer_closed = atomic_load(&p->write_closed);
 		ssize_t n = read(fd, buf + have, len - have);
 		if (n < 0 && errno == EINTR)
 			continue;
 		if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+			read_retry();
 			if (atomic_load(&p->read_closed)
-			    || atomic_load(&p->write_closed))
+			    || writer_closed)
 				return -1;
 			continue;
 		}
@@ -146,12 +174,14 @@ pipe_readline(struct mock_io_pipe *p, uint8_t *buf, size_t bufsz,
 	size_t have = 0;
 	for (;;) {
 		uint8_t ch;
+		bool writer_closed = atomic_load(&p->write_closed);
 		ssize_t n = read(fd, &ch, 1);
 		if (n < 0 && errno == EINTR)
 			continue;
 		if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+			read_retry();
 			if (atomic_load(&p->read_closed)
-			    || atomic_load(&p->write_closed))
+			    || writer_closed)
 				return -1;
 			continue;
 		}

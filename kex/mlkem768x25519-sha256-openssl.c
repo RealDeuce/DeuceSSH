@@ -1,4 +1,4 @@
-// mlkem768x25519-sha256: ML-KEM-768 + X25519 hybrid PQ KEX (OpenSSL backend)
+// RFC 10042: mlkem768x25519-sha256 (OpenSSL backend)
 //
 // Provides X25519 and ML-KEM-768 crypto operations for the shared
 // protocol handler in hybrid-pq-kex.c.

@@ -23,6 +23,7 @@ static int send_packet_inner(struct dssh_session_s *sess, const uint8_t *payload
     size_t payload_len, uint32_t *seq_out);
 DSSH_TESTABLE int kexinit(struct dssh_session_s *sess);
 DSSH_TESTABLE int kex(struct dssh_session_s *sess);
+static int kex_exchange(struct dssh_session_s *sess);
 DSSH_TESTABLE int newkeys(struct dssh_session_s *sess);
 static int send_server_ext_info(struct dssh_session_s *sess);
 
@@ -433,7 +434,7 @@ transport_handshake_inner(struct dssh_session_s *sess)
 	res = kexinit(sess);
 	if (res < 0)
 		goto fail;
-	res = kex(sess);
+	res = kex_exchange(sess);
 	if (res < 0)
 		goto fail;
 	res = newkeys(sess);
@@ -567,7 +568,7 @@ rekey(struct dssh_session_s *sess)
 	res = kexinit(sess);
 
 	if (res == 0)
-		res = kex(sess);
+		res = kex_exchange(sess);
 	if (res == 0)
 		res = newkeys(sess);
 
@@ -3228,6 +3229,20 @@ kex(struct dssh_session_s *sess)
 		res = DSSH_ERROR_TERMINATED;
 	if (res < 0)
 		kex_cleanup_state(sess);
+	return res;
+}
+
+/* Method rejection is a wire disconnect in both the initial exchange and
+ * rekey. kex() has already retired the result and method state. A transport
+ * failure, peer disconnect or application cancellation may have terminated
+ * the session first; do not attempt further output in that case. */
+static int
+kex_exchange(struct dssh_session_s *sess)
+{
+	int res = kex(sess);
+	if (res < 0 && !atomic_load_explicit(&sess->terminate, memory_order_acquire))
+		return transport_disconnect_result(sess, SSH_DISCONNECT_KEY_EXCHANGE_FAILED,
+		    "key exchange failed", res);
 	return res;
 }
 

@@ -1,4 +1,4 @@
-// draft-ietf-sshm-ntruprime-ssh: sntrup761x25519-sha512 (Botan3 native C++ backend)
+// RFC 9941: sntrup761x25519-sha512 (Botan3 native C++ backend)
 
 #include <botan/pubkey.h>
 #include <botan/system_rng.h>

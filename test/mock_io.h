@@ -79,6 +79,10 @@ int mock_rxline_server(uint8_t *buf, size_t bufsz,
 size_t mock_io_inject(struct mock_io_pipe *pipe, const uint8_t *data, size_t len);
 size_t mock_io_drain(struct mock_io_pipe *pipe, uint8_t *buf, size_t bufsz);
 
+/* One-shot, thread-local observation after a native read returns EAGAIN or
+ * EWOULDBLOCK, before the mock checks its close flags. NULL disables it. */
+void mock_io_set_read_retry_hook(void (*callback)(void *), void *opaque);
+
 /*
  * Extra-line callback (no-op, returns 0).
  */

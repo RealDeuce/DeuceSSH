@@ -1,4 +1,4 @@
-// mlkem768x25519-sha256: ML-KEM-768 + X25519 hybrid PQ KEX (Botan3 native C++ backend)
+// RFC 10042: mlkem768x25519-sha256 (Botan3 native C++ backend)
 
 #include <botan/ml_kem.h>
 #include <botan/pk_keys.h>

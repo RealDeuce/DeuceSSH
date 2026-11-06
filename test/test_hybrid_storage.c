@@ -16,7 +16,7 @@
 #include "deucessh-crypto.h"
 #include "kex/hybrid-pq-kex-ops.h"
 
-/* Fixed supported-method maxima from the two hybrid draft wire formats. */
+/* Fixed supported-method maxima from RFC 9941 and RFC 10042. */
 struct method_spec {
 	const char *name;
 	const char *hash;
@@ -210,7 +210,7 @@ pair_reset(struct hybrid_pair *pair)
 	    && pair->method->init(false, pair->method->config, &pair->server) == 0;
 }
 
-/* Independent serialization for these exact draft methods. Every input is
+/* Independent serialization for these RFC methods. Every input is
  * bounded by the method constants above; the complete transcript is <4096 bytes. */
 static void
 append_string(uint8_t *bytes, size_t *pos, const void *data, uint16_t length)

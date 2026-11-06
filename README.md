@@ -16,8 +16,8 @@ A from-scratch SSH library in standard C17 implementing the core SSH protocol:
 - RFC 8709 — Ed25519 Host Key Algorithm
 - RFC 8731 — curve25519-sha256 Key Exchange
 - RFC 8268 — Fixed-group SHA-2 Diffie-Hellman Key Exchange
-- draft-ietf-sshm-ntruprime-ssh — sntrup761x25519-sha512 Key Exchange
-- draft-ietf-sshm-mlkem-hybrid-kex — mlkem768x25519-sha256 Key Exchange
+- [RFC 9941](standards/rfc9941.txt) — sntrup761x25519-sha512 Key Exchange
+- [RFC 10042](standards/rfc10042.txt) — mlkem768x25519-sha256 Hybrid Key Exchange
 
 No proprietary extensions (no `@` algorithm names).
 

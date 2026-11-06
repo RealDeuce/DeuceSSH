@@ -298,7 +298,7 @@ dssh_rsa_sha2_256_load_key_file(const char *path, dssh_pem_password_cb pw_cb, vo
 {
 	if (path == NULL)
 		return DSSH_ERROR_INIT;
-	int config_ret = dssh_key_algo_set_ctx(RSA_SHA2_256_NAME, rsa_ctx);
+	int config_ret = dssh_key_algo_setup_check(RSA_SHA2_256_NAME);
 	if (config_ret < 0)
 		return config_ret;
 	FILE *fp = fopen(path, "rb");
@@ -418,7 +418,7 @@ dssh_rsa_sha2_256_save_pub_file(const char *path)
 DSSH_PUBLIC int
 dssh_rsa_sha2_256_generate_key(unsigned int bits)
 {
-	int config_ret = dssh_key_algo_set_ctx(RSA_SHA2_256_NAME, rsa_ctx);
+	int config_ret = dssh_key_algo_setup_check(RSA_SHA2_256_NAME);
 	if (config_ret < 0)
 		return config_ret;
 	char bits_str[16];

@@ -257,6 +257,85 @@ test_encrypted(void)
 {
 	return run(2);
 }
+/* A setup eligibility check must not publish a context on a failed operation.
+ * Detach through the actual public setter, without fabricated native objects. */
+static bool
+preflight_family(const struct publication_ops *ops)
+{
+	char missing[] = "/tmp/dssh-preflight-XXXXXX";
+	bool created = false, valid = false;
+	const char *cache = getenv(ops->cache);
+	struct snapshot before = {0}, after = {0};
+	struct dssh_bytes_result held = {0}, next = {0};
+	uint8_t held_copy[1024];
+	dssh_test_alloc_reset();
+	dssh_test_key_stdio_reset();
+	dssh_test_reset_global_config();
+	if (cache == NULL || ops->reg() != 0 || ops->load(cache, NULL, NULL) != 0
+	    || !temporary(missing, &created) || unlink(missing) != 0)
+		goto done;
+	created = false;
+	dssh_key_algo key = find_key_algo(ops->name);
+	if (!snapshot(ops, key, &before) || sign(key, &held) != 0
+	    || !verify(key, &before, &held) || held.bytes.len > sizeof(held_copy))
+		goto done;
+	memcpy(held_copy, held.bytes.data, held.bytes.len);
+	dssh_key_algo_ctx *prior = key->ctx;
+	valid = true;
+	for (unsigned int action = 0; action < 3; action++) {
+		if (dssh_key_algo_set_ctx(ops->name, NULL) != 0 || key->ctx != NULL
+		    || key->haskey(key->ctx) != 0) {
+			valid = false;
+			break;
+		}
+		if (action != 0)
+			dssh_test_alloc_fail_after(0);
+		int ret = action == 0 ? ops->load(missing, NULL, NULL)
+		    : action == 1 ? ops->generate(2048) : ops->load(cache, NULL, NULL);
+		int calls = dssh_test_alloc_count();
+		dssh_test_alloc_reset();
+		bool detached = key->ctx == NULL;
+		int restored = dssh_key_algo_set_ctx(ops->name, prior);
+		bool one = detached && ret == (action == 0 ? DSSH_ERROR_INIT : DSSH_ERROR_ALLOC)
+		    && calls == (action == 0 ? 0 : 1) && restored == 0 && key->ctx == prior
+		    && snapshot(ops, key, &after) && same_key(&before, &after)
+		    && before.cache == after.cache && verify(key, &before, &held)
+		    && memcmp(held_copy, held.bytes.data, held.bytes.len) == 0;
+		printf("key preflight: algorithm=%s case=%u status=%d calls=%d detached=%u valid=%u\n",
+		    ops->name, action, ret, calls, detached ? 1U : 0U, one ? 1U : 0U);
+		valid = one && valid;
+	}
+	/* A real successful operation still publishes after explicit detachment. */
+	bool replaced = dssh_key_algo_set_ctx(ops->name, NULL) == 0
+	    && ops->load(cache, NULL, NULL) == 0 && key->ctx != NULL && key->ctx != prior
+	    && snapshot(ops, key, &after) && same_key(&before, &after) && before.cache != after.cache
+	    && verify(key, &before, &held) && memcmp(held_copy, held.bytes.data, held.bytes.len) == 0
+	    && sign(key, &next) == 0 && verify(key, &after, &next)
+	    && next.bytes.data != held.bytes.data;
+	printf("key preflight recovery: algorithm=%s valid=%u\n", ops->name, replaced ? 1U : 0U);
+	valid = replaced && valid;
+done:
+	dssh_result_release(&next.lease);
+	dssh_result_release(&held.lease);
+	dssh_test_alloc_reset();
+	dssh_test_key_stdio_reset();
+	dssh_test_reset_global_config();
+	if (created && unlink(missing) != 0)
+		valid = false;
+	return valid;
+}
+static int
+test_preflight(void)
+{
+	unsigned int completed = 0;
+	for (size_t i = 0; i < sizeof(operations) / sizeof(operations[0]); i++) {
+		if (preflight_family(&operations[i]))
+			completed++;
+	}
+	printf("key preflight summary: families=3 rejected=9 recovered=3 completed=%u\n", completed);
+	ASSERT_EQ(completed, 3);
+	return TEST_PASS;
+}
 #ifdef DSSH_CRYPTO_BOTAN
 static void
 cpp_password_cleared(const void *ptr, size_t length, void *opaque)
@@ -589,6 +668,7 @@ cpp_counts_full_password(void)
 #endif
 static struct dssh_test_entry tests[] = {
 	{"generation", test_generation}, {"plain", test_plain}, {"encrypted", test_encrypted},
+	{"preflight", test_preflight},
 #ifdef DSSH_CRYPTO_BOTAN
 		{"cpp_prefix_generation", cpp_prefix_generation},
 	{"cpp_prefix_plain", cpp_prefix_plain},

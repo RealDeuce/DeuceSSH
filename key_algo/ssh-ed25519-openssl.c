@@ -281,7 +281,7 @@ dssh_ed25519_load_key_file(const char *path, dssh_pem_password_cb pw_cb, void *p
 {
 	if (path == NULL)
 		return DSSH_ERROR_INIT;
-	int config_ret = dssh_key_algo_set_ctx(ED25519_NAME, ed25519_ctx);
+	int config_ret = dssh_key_algo_setup_check(ED25519_NAME);
 	if (config_ret < 0)
 		return config_ret;
 	FILE *fp = fopen(path, "rb");
@@ -382,7 +382,7 @@ dssh_ed25519_save_pub_file(const char *path)
 DSSH_PUBLIC int
 dssh_ed25519_generate_key(void)
 {
-	int config_ret = dssh_key_algo_set_ctx(ED25519_NAME, ed25519_ctx);
+	int config_ret = dssh_key_algo_setup_check(ED25519_NAME);
 	if (config_ret < 0)
 		return config_ret;
 	EVP_PKEY     *pkey = NULL;

@@ -9,6 +9,7 @@
 #include "deucessh-crypto.h"
 #include "ssh-internal.h"
 #include "ssh-window.h"
+#include "key_algo/private-key-file.h"
 
 /* DSSH_TESTABLE is defined in ssh-internal.h */
 
@@ -4123,21 +4124,38 @@ dssh_session_cleanup(struct dssh_session_s *sess)
 	free(sess);
 }
 
-DSSH_PUBLIC int
-dssh_key_algo_set_ctx(const char *name, void *ctx)
+/* Called only with a known nonnull name. Eligibility checks do not publish. */
+static int
+key_algo_setup_inner(const char *name, dssh_key_algo *out)
 {
 	if (dssh_result_callback_active())
 		return DSSH_ERROR_INVALID;
-	if (name == NULL)
-		return DSSH_ERROR_INVALID;
-	/* Refuse after first session init -- the global registry is
-	 * read concurrently by active sessions during KEX. */
+	/* Refuse after first accepted session-init attempt, including failure. */
 	if (gconf.used)
 		return DSSH_ERROR_TOOLATE;
 	dssh_key_algo ka = find_key_algo(name);
-
 	if (ka == NULL)
 		return DSSH_ERROR_INIT;
+	*out = ka;
+	return 0;
+}
+
+DSSH_PRIVATE int
+dssh_key_algo_setup_check(const char *name)
+{
+	dssh_key_algo ka;
+	return key_algo_setup_inner(name, &ka);
+}
+
+DSSH_PUBLIC int
+dssh_key_algo_set_ctx(const char *name, void *ctx)
+{
+	if (name == NULL)
+		return DSSH_ERROR_INVALID;
+	dssh_key_algo ka;
+	int ret = key_algo_setup_inner(name, &ka);
+	if (ret < 0)
+		return ret;
 	ka->ctx = (dssh_key_algo_ctx *)ctx;
 	return 0;
 }

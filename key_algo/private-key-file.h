@@ -2,12 +2,17 @@
 #define DSSH_PRIVATE_KEY_FILE_H
 
 #include <stdio.h>
+#include "deucessh-portable.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 FILE *dssh_private_key_open(const char *path);
+
+/* Builtin module setup eligibility only; name is a nonnull module constant.
+ * Publication remains a separate successful-install operation. */
+DSSH_PRIVATE int dssh_key_algo_setup_check(const char *name);
 
 #ifdef DSSH_TESTING
 /* Library-only stdio observations; provider-internal stdio is not redirected. */

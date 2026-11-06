@@ -17,7 +17,9 @@ size_t dssh_test_key_file_read(void *ptr, size_t size, size_t count, FILE *strea
 size_t dssh_test_key_file_write(const void *ptr, size_t size, size_t count, FILE *stream);
 int dssh_test_key_file_put(int byte, FILE *stream);
 #ifdef __cplusplus
+void *dssh_test_malloc(size_t size);
 void dssh_test_free(void *ptr);
+#define malloc(size) dssh_test_malloc(size)
 #define free(ptr) dssh_test_free(ptr)
 #endif
 #define fclose(stream) dssh_test_key_file_close(stream)

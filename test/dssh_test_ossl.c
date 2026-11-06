@@ -1226,6 +1226,94 @@ static _Thread_local int key_failed_fd = -1;
 static _Thread_local bool key_permission_error, key_truncate_error, key_raw_close_error;
 static _Thread_local bool key_target_error, key_status_error, key_different_owner;
 #endif
+#ifdef __FreeBSD__
+static void
+key_acl_count(unsigned int *count)
+{
+	if (*count < UINT_MAX)
+		(*count)++;
+}
+
+static _Thread_local struct dssh_test_key_acl_report key_acl_report;
+static _Thread_local unsigned int key_acl_case;
+static _Thread_local bool key_permission_noop;
+
+void
+dssh_test_key_acl_case(unsigned int kind)
+{
+	key_acl_case = kind;
+}
+
+void
+dssh_test_key_permission_noop_once(void)
+{
+	key_permission_noop = true;
+}
+
+struct dssh_test_key_acl_report
+dssh_test_key_acl_report(void)
+{
+	return key_acl_report;
+}
+
+long
+dssh_test_key_acl_capability(int fd, int name)
+{
+	key_acl_count(&key_acl_report.queries);
+	long actual = fpathconf(fd, name);
+	key_acl_report.capability = actual;
+	if (key_acl_case == 1 || key_acl_case == 5 || key_acl_case == 6 || key_acl_case == 7) {
+		key_acl_count(&key_acl_report.injected);
+		errno = key_acl_case == 7 ? 0 : EIO;
+		return key_acl_case == 5 ? 0 : key_acl_case == 6 ? 2 : -1;
+	}
+	return actual;
+}
+
+acl_t
+dssh_test_key_acl_from_text(const char *text)
+{
+	key_acl_count(&key_acl_report.allocations);
+	if (key_acl_case == 2) {
+		key_acl_count(&key_acl_report.injected);
+		errno = ENOMEM;
+		return NULL;
+	}
+	acl_t acl = acl_from_text(text);
+	if (acl != NULL)
+		key_acl_count(&key_acl_report.produced);
+	return acl;
+}
+
+int
+dssh_test_key_acl_set(int fd, acl_t acl, acl_type_t type)
+{
+	key_acl_count(&key_acl_report.sets);
+	if (key_acl_case == 3) {
+		key_acl_count(&key_acl_report.injected);
+		errno = EIO;
+		return -1;
+	}
+	return acl_set_fd_np(fd, acl, type);
+}
+
+int
+dssh_test_key_acl_free(void *acl)
+{
+	key_acl_count(&key_acl_report.frees);
+	int ret = acl_free(acl);
+	if (ret == 0)
+		key_acl_count(&key_acl_report.retired);
+	else
+		key_acl_count(&key_acl_report.native_free_errors);
+	if (key_acl_case == 4) {
+		key_acl_count(&key_acl_report.injected);
+		errno = EIO;
+		return -1;
+	}
+	return ret;
+}
+#endif
 
 struct dssh_test_key_open_report
 dssh_test_key_open_report(void)
@@ -1320,6 +1408,18 @@ dssh_test_key_native_fchmod(int fd, mode_t mode)
 {
 	if (key_open_report.permissions < UINT_MAX)
 		key_open_report.permissions++;
+#ifdef __FreeBSD__
+	if (key_permission_noop) {
+		key_permission_noop = false;
+		struct stat info;
+		if (fstat(fd, &info) != 0 || (info.st_mode & 0777) != mode) {
+			errno = EINVAL;
+			return -1;
+		}
+		key_acl_count(&key_acl_report.mode_noops);
+		return 0;
+	}
+#endif
 	if (key_permission_error) {
 		key_permission_error = false;
 		key_failed_fd = fd;
@@ -1442,6 +1542,11 @@ dssh_test_key_stdio_reset(void)
 	key_target_error = false;
 	key_status_error = false;
 	key_different_owner = false;
+#endif
+#ifdef __FreeBSD__
+	key_acl_report = (struct dssh_test_key_acl_report){0};
+	key_acl_case = 0;
+	key_permission_noop = false;
 #endif
 	key_stream_watch = false;
 	key_setvbuf_error = false;

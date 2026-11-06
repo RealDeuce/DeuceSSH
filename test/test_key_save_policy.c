@@ -1,3 +1,9 @@
+/* This native-only fixture also uses FreeBSD ACL capability identifiers. */
+#ifdef __FreeBSD__
+#undef _POSIX_C_SOURCE
+#undef _POSIX_SOURCE
+#undef _XOPEN_SOURCE
+#endif
 /* Selected direct-overwrite contract, using only private nonsensitive fixtures. */
 #include <errno.h>
 #include <fcntl.h>
@@ -25,6 +31,49 @@ static const struct policy_ops operations[] = {
 	    "rsa-sha2-512", "DSSH_TEST_RSA_KEY"},
 };
 static const char marker[] = "private output policy fixture";
+static bool policy_workspace;
+
+#ifdef __FreeBSD__
+static bool
+acl_prepare(const char *path)
+{
+	int fd = open(path, O_RDWR | O_CLOEXEC | O_NOFOLLOW);
+	if (fd < 0)
+		return false;
+	bool valid = fchmod(fd, 0600) == 0 && fpathconf(fd, _PC_ACL_NFS4) == 1;
+	acl_t acl = NULL;
+	if (valid) {
+		acl = acl_from_text("user:65534:r::allow,owner@:rw-p--aARWcCos::allow,"
+		    "group@:------a-R-c--s::allow,everyone@:------a-R-c--s::allow");
+		valid = acl != NULL && acl_set_fd_np(fd, acl, ACL_TYPE_NFS4) == 0;
+	}
+	if (acl != NULL && acl_free(acl) != 0)
+		valid = false;
+	if (close(fd) != 0)
+		valid = false;
+	return valid;
+}
+
+/* -1 means inspection failed, 0 nontrivial access, 1 owner-private. */
+static int
+acl_state(const char *path)
+{
+	int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+	if (fd < 0)
+		return -1;
+	int result = -1, trivial = 0;
+	struct stat info;
+	acl_t acl = acl_get_fd_np(fd, ACL_TYPE_NFS4);
+	if (acl != NULL && fstat(fd, &info) == 0 && acl_is_trivial_np(acl, &trivial) == 0)
+		result = trivial == 1 && (info.st_mode & 0777) == 0600 && info.st_uid == geteuid() ? 1 : 0;
+	if (acl != NULL && acl_free(acl) != 0)
+		result = -1;
+	if (close(fd) != 0)
+		result = -1;
+	return result;
+}
+#endif
+
 
 struct password_state {
 	unsigned int calls;
@@ -92,6 +141,12 @@ policy_case(const struct policy_ops *ops, unsigned int kind, bool encrypted)
 	char actual[128] = {0}, alias[128] = {0}, inner[128] = {0}, chosen[128] = {0};
 	bool created = false, alias_created = false, inner_created = false, had_target = false;
 	bool valid = false, retired = false;
+	bool accepted = kind < 4 || kind == 10 || kind == 15;
+	bool acl_case = kind >= 10;
+	int acl_after = -2;
+#ifdef __FreeBSD__
+	struct dssh_test_key_acl_report acl_report = {0};
+#endif
 	int peer = -1, status = DSSH_ERROR_INIT;
 	struct stat before, after, alias_before, alias_after;
 	struct dssh_test_key_open_report report = {0};
@@ -101,6 +156,11 @@ policy_case(const struct policy_ops *ops, unsigned int kind, bool encrypted)
 	size_t public_length = 0;
 	struct password_state pw = {.writing = 1, .valid = true};
 	const char *cache = getenv(ops->cache);
+	if (policy_workspace) {
+		_Static_assert(sizeof("dssh-save-policy-XXXXXX") <= sizeof(root), "relative fixture fits");
+		memcpy(root, "dssh-save-policy-XXXXXX", sizeof("dssh-save-policy-XXXXXX"));
+	}
+
 	dssh_test_key_stdio_reset();
 	dssh_test_alloc_reset();
 	dssh_test_reset_global_config();
@@ -146,6 +206,10 @@ policy_case(const struct policy_ops *ops, unsigned int kind, bool encrypted)
 		alias_created = true;
 		path = alias;
 	}
+#ifdef __FreeBSD__
+	if (acl_case && (!acl_prepare(actual) || acl_state(actual) != 0))
+		goto done;
+#endif
 	if (kind == 2 && chmod(root, 0500) != 0)
 		goto done;
 	had_target = kind != 1 && kind != 8;
@@ -166,25 +230,48 @@ policy_case(const struct policy_ops *ops, unsigned int kind, bool encrypted)
 	memcpy(held_copy, held.bytes.data, held.bytes.len);
 	dssh_test_key_stdio_reset();
 	dssh_test_key_watch_stream();
+#ifdef __FreeBSD__
+	if (acl_case) {
+		dssh_test_key_acl_case(kind - 10);
+		if (kind != 15)
+			dssh_test_key_permission_noop_once();
+	}
+#endif
 	status = ops->save(path, encrypted ? password : NULL, &pw);
 	report = dssh_test_key_open_report();
 	stream = dssh_test_key_stream_report();
-	if (kind >= 4 && report.target_checks != 0)
+	if (!accepted && report.target_checks != 0)
 		retired = dssh_test_key_failed_fd_closed();
-	bool accepted = kind < 4;
-	bool acquired_rejection = kind == 5 || kind == 7;
+	bool acquired_rejection = kind == 5 || kind == 7 || (acl_case && !accepted);
 	valid = status == (accepted ? 0 : DSSH_ERROR_INIT) && pw.valid
 	    && pw.calls == (accepted && encrypted ? 1U : 0U)
 	    && report.native_opens == 1 && report.stdio_opens == 0
 	    && report.target_checks == (accepted || acquired_rejection ? 1U : 0U)
-	    && report.status_updates == (accepted ? 1U : 0U)
-	    && report.permissions == (accepted ? 1U : 0U) && report.truncations == (accepted ? 1U : 0U)
+	    && report.status_updates == (accepted || acl_case ? 1U : 0U)
+	    && report.permissions == (accepted || acl_case ? 1U : 0U) && report.truncations == (accepted ? 1U : 0U)
 	    && report.associations == (accepted ? 1U : 0U)
 	    && report.raw_closes == (acquired_rejection ? 1U : 0U)
 	    && (!acquired_rejection || retired)
 	    && (!accepted || (report.descriptor_valid && report.close_on_exec && report.blocking_io && report.status_arguments_valid))
 	    && stream.valid && !stream.active && stream.configurations == (accepted ? 1U : 0U)
 	    && stream.closes == (accepted ? 1U : 0U) && stream.clears == (accepted ? 1U : 0U);
+#ifdef __FreeBSD__
+	if (acl_case) {
+		acl_report = dssh_test_key_acl_report();
+		acl_after = acl_state(actual);
+		bool allocated = kind == 10 || kind == 12 || kind == 13 || kind == 14;
+		bool produced = kind == 10 || kind == 13 || kind == 14;
+		valid = valid && acl_report.queries == 1 && acl_report.capability == 1
+		    && acl_report.allocations == (allocated ? 1U : 0U)
+		    && acl_report.produced == (produced ? 1U : 0U)
+		    && acl_report.sets == (produced ? 1U : 0U)
+		    && acl_report.frees == (produced ? 1U : 0U) && acl_report.retired == (produced ? 1U : 0U)
+		    && acl_report.injected == (kind == 10 ? 0U : 1U)
+		    && acl_report.mode_noops == (kind == 15 ? 0U : 1U)
+		    && acl_report.native_free_errors == 0
+		    && acl_after == (accepted || kind == 14 ? 1 : 0);
+	}
+#endif
 	dssh_test_key_stdio_reset();
 	const uint8_t *current = NULL;
 	size_t current_length = 0;
@@ -250,10 +337,17 @@ done:
 			valid = false;
 	}
 	printf("key save policy: algorithm=%s kind=%u encrypted=%u status=%d targets=%u flags=%u chmod=%u truncate=%u "
-	    "associations=%u raw-close=%u retired=%u configured=%u closed=%u cleared=%u valid=%u\n",
+	    "associations=%u raw-close=%u retired=%u configured=%u closed=%u cleared=%u valid=%u acl-private=%d\n",
 	    ops->name, kind, encrypted ? 1U : 0U, status, report.target_checks, report.status_updates,
 	    report.permissions, report.truncations, report.associations, report.raw_closes, retired ? 1U : 0U,
-	    stream.configurations, stream.closes, stream.clears, valid ? 1U : 0U);
+	    stream.configurations, stream.closes, stream.clears, valid ? 1U : 0U, acl_after);
+#ifdef __FreeBSD__
+	if (acl_case)
+		printf("key ACL: algorithm=%s kind=%u encrypted=%u queries=%u allocations=%u produced=%u sets=%u "
+		    "frees=%u retired=%u injected=%u noop=%u private=%d valid=%u\n", ops->name, kind, encrypted ? 1U : 0U,
+		    acl_report.queries, acl_report.allocations, acl_report.produced, acl_report.sets,
+		    acl_report.frees, acl_report.retired, acl_report.injected, acl_report.mode_noops, acl_after, valid ? 1U : 0U);
+#endif
 	return valid;
 }
 static int
@@ -262,13 +356,15 @@ cases(unsigned int first, unsigned int last, bool both)
 	unsigned int completed = 0;
 	for (size_t i = 0; i < sizeof(operations) / sizeof(operations[0]); i++) {
 		for (unsigned int kind = first; kind <= last; kind++) {
+			if (first == 11 && kind == 15)
+				continue;
 			for (unsigned int encrypted = both ? 0U : 1U; encrypted < 2; encrypted++) {
 				if (policy_case(&operations[i], kind, encrypted != 0))
 					completed++;
 			}
 		}
 	}
-	unsigned int expected = first == 0 ? 24U : first == 4 ? 15U : 3U;
+	unsigned int expected = first == 0 ? 24U : first == 4 ? 15U : first == 9 ? 3U : first == 11 ? 36U : 6U;
 	printf("key save policy summary: first=%u last=%u expected=%u completed=%u\n", first, last, expected, completed);
 	ASSERT_EQ(completed, expected);
 	return TEST_PASS;
@@ -288,10 +384,58 @@ test_nonblocking(void)
 {
 	return cases(9, 9, false);
 }
+#ifdef __FreeBSD__
+static int
+acl_cases(unsigned int first, unsigned int last, bool workspace)
+{
+	bool prior = policy_workspace;
+	policy_workspace = workspace;
+	int ret = TEST_FAIL;
+	int fd = open(workspace ? "." : "/tmp", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	if (fd >= 0) {
+		long capability = fpathconf(fd, _PC_ACL_NFS4);
+		int closed = close(fd);
+		if (closed == 0 && capability == 1)
+			ret = cases(first, last, true);
+		else if (closed == 0 && capability == 0) {
+			printf("native NFSv4 ACLs unavailable for this fixture directory\n");
+			ret = TEST_SKIP;
+		}
+	}
+	policy_workspace = prior;
+	return ret;
+}
+static int
+test_acl_owner_only(void)
+{
+	return acl_cases(10, 10, false);
+}
+static int
+test_acl_failures(void)
+{
+	return acl_cases(11, 17, false);
+}
+static int
+test_acl_capability_absent(void)
+{
+	return acl_cases(15, 15, false);
+}
+static int
+test_acl_workspace(void)
+{
+	return acl_cases(10, 10, true);
+}
+#endif
 static struct dssh_test_entry tests[] = {
 	{"identity", test_identity},
 	{"rejected", test_rejected},
 	{"nonblocking", test_nonblocking},
+#ifdef __FreeBSD__
+	{"acl_owner_only", test_acl_owner_only},
+	{"acl_failures", test_acl_failures},
+	{"acl_capability_absent", test_acl_capability_absent},
+	{"acl_workspace", test_acl_workspace},
+#endif
 };
 DSSH_TEST_NO_CLEANUP
 DSSH_TEST_MAIN(tests)

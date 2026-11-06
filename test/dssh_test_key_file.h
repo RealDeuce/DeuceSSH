@@ -7,6 +7,9 @@
 #ifndef _WIN32
 #include <sys/types.h>
 #endif
+#ifdef __FreeBSD__
+#include <sys/acl.h>
+#endif
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -72,6 +75,21 @@ void dssh_test_key_status_error_once(void);
 void dssh_test_key_different_owner_once(void);
 int dssh_test_key_native_fstat(int fd, struct stat *info);
 int dssh_test_key_native_fcntl(int fd, int command, int value);
+#endif
+
+#ifdef __FreeBSD__
+struct dssh_test_key_acl_report {
+	unsigned int queries, allocations, sets, frees, produced, retired, injected, mode_noops;
+	unsigned int native_free_errors;
+	long capability;
+};
+void dssh_test_key_acl_case(unsigned int kind);
+void dssh_test_key_permission_noop_once(void);
+struct dssh_test_key_acl_report dssh_test_key_acl_report(void);
+long dssh_test_key_acl_capability(int fd, int name);
+acl_t dssh_test_key_acl_from_text(const char *text);
+int dssh_test_key_acl_set(int fd, acl_t acl, acl_type_t type);
+int dssh_test_key_acl_free(void *acl);
 #endif
 
 #ifdef __cplusplus

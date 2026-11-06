@@ -287,9 +287,13 @@ dssh_ed25519_load_key_file(const char *path, dssh_pem_password_cb pw_cb, void *p
 	FILE *fp = fopen(path, "rb");
 	if (fp == NULL)
 		return DSSH_ERROR_INIT;
+	struct dssh_key_file_stream stream;
+	int stream_ret = dssh_key_file_stream_init(&stream, fp);
+	if (stream_ret < 0)
+		return stream_ret;
 	struct dssh_key_file_password_state password = {pw_cb, pw_cbdata, 0};
 	EVP_PKEY *pkey = PEM_read_PrivateKey(fp, NULL, dssh_key_file_password, &password);
-	int closed = dssh_key_file_close(fp, 0);
+	int closed = dssh_key_file_stream_close(&stream, 0);
 	if (closed < 0 || pkey == NULL || password.status < 0) {
 		EVP_PKEY_free(pkey);
 		return password.status < 0 ? password.status : DSSH_ERROR_INIT;
@@ -332,6 +336,12 @@ dssh_ed25519_save_key_file(const char *path, dssh_pem_password_cb pw_cb, void *p
 		EVP_PKEY_free(pkey);
 		return DSSH_ERROR_INIT;
 	}
+	struct dssh_key_file_stream stream;
+	int stream_ret = dssh_key_file_stream_init(&stream, fp);
+	if (stream_ret < 0) {
+		EVP_PKEY_free(pkey);
+		return stream_ret;
+	}
 
 	EVP_CIPHER *cipher = NULL;
 
@@ -339,7 +349,7 @@ dssh_ed25519_save_key_file(const char *path, dssh_pem_password_cb pw_cb, void *p
 		cipher = EVP_CIPHER_fetch(NULL, "AES-256-CBC", NULL);
 		if (cipher == NULL) {
 			EVP_PKEY_free(pkey);
-			return dssh_key_file_close(fp, DSSH_ERROR_INIT);
+			return dssh_key_file_stream_close(&stream, DSSH_ERROR_INIT);
 		}
 	}
 	struct dssh_key_file_password_state password = {pw_cb, pw_cbdata, 0};
@@ -350,7 +360,7 @@ dssh_ed25519_save_key_file(const char *path, dssh_pem_password_cb pw_cb, void *p
 	int status = ok == 1 ? 0 : DSSH_ERROR_INIT;
 	if (password.status < 0)
 		status = password.status;
-	return dssh_key_file_close(fp, status);
+	return dssh_key_file_stream_close(&stream, status);
 }
 
 DSSH_PUBLIC int64_t

@@ -1,6 +1,11 @@
 /* Key-file import transaction checks using real keys and native stdio. */
 #include <unistd.h>
 #include <limits.h>
+#ifndef _WIN32
+#include <signal.h>
+#include <sys/resource.h>
+#include <sys/stat.h>
+#endif
 #ifdef DSSH_CRYPTO_OPENSSL
 #include <openssl/ui.h>
 #endif
@@ -11,6 +16,9 @@
 #include "deucessh-algorithms.h"
 #include "deucessh-key-algo.h"
 #include "key_algo/key-file-common.h"
+#ifdef setvbuf
+#undef setvbuf
+#endif
 #ifdef fclose
 #undef fclose
 #endif
@@ -812,8 +820,291 @@ test_file_length_models(void)
 	return TEST_PASS;
 }
 
+/* Positive controls forward to real native stdio before reporting a fault. */
+static int
+test_stdio_control(void)
+{
+	unsigned int completed = 0;
+	const char payload[] = "stdio-hook";
+	for (unsigned int kind = 0; kind < 3; kind++) {
+		char buffer[BUFSIZ] = {0}, received[sizeof(payload)] = {0};
+		dssh_test_key_stdio_reset();
+		FILE *fp = tmpfile();
+		if (fp == NULL)
+			continue;
+		dssh_test_key_watch_stream();
+		if (kind == 1)
+			dssh_test_key_setvbuf_error_once();
+		int configured = dssh_test_key_file_setvbuf(fp, buffer, _IOFBF, sizeof(buffer));
+		bool native_data = fwrite(payload, 1, sizeof(payload), fp) == sizeof(payload)
+		    && fseek(fp, 0, SEEK_SET) == 0 && fread(received, 1, sizeof(received), fp) == sizeof(received)
+		    && memcmp(received, payload, sizeof(payload)) == 0;
+		bool valid = configured == (kind == 1 ? EOF : 0) && native_data;
+		if (kind == 2)
+			dssh_test_key_close_error_once();
+		int closed = dssh_test_key_file_close(fp);
+		dssh_key_file_clear(buffer, sizeof(buffer));
+		/* This application test is compiled without DSSH_TESTING; feed the
+		 * real post-cleanse notification to the observer explicitly. */
+		dssh_test_key_file_cleared(buffer, sizeof(buffer));
+		struct dssh_test_key_stream_report report = dssh_test_key_stream_report();
+		valid = valid && closed == (kind == 2 ? EOF : 0) && report.valid && !report.active
+		    && report.configurations == 1 && report.closes == 1 && report.clears == 1 && report.nonzero == 1
+		    && report.injected == (kind == 1 ? 1U : 0U) && report.native_errors == 0
+		    && dssh_test_key_close_calls() == 1 && dssh_test_key_close_errors() == (kind == 2 ? 1U : 0U)
+		    && dssh_test_key_native_close_errors() == 0;
+		printf("key stdio control: kind=%u native-data=%u native-setup-errors=%u closed=%u cleared=%u nonzero=%u injected=%u valid=%u\n",
+		    kind, native_data ? 1U : 0U, report.native_errors, report.closes, report.clears, report.nonzero, report.injected, valid ? 1U : 0U);
+		if (valid)
+			completed++;
+	}
+	dssh_test_key_stdio_reset();
+	ASSERT_EQ(completed, 3);
+	return TEST_PASS;
+}
+
+struct stream_password_state {
+	unsigned int calls;
+	bool valid;
+};
+static int
+stream_password(char *buf, int size, int writing, void *data)
+{
+	struct stream_password_state *state = data;
+	const char phrase[] = {'s', 't', 'r', 0, 'e', 'a', 'm', 's'};
+	if (buf == NULL || size < 8 || (writing != 0 && writing != 1) || state->calls == UINT_MAX) {
+		state->valid = false;
+		return -1;
+	}
+	state->calls++;
+	memcpy(buf, phrase, sizeof(phrase));
+	return 8;
+}
+
+/* kind0 normal, kind1 setup failure, kind2 reported close failure,
+ * kind3 actual short read, kind4 native flush error under a process-local limit.
+ * All storage observations precede destruction of the real local buffer. */
+static bool
+stream_case(const struct key_file_ops *ops, bool save, bool encrypted, unsigned int kind)
+{
+	char candidate_path[] = "/tmp/dssh-stream-candidate-XXXXXX";
+	char output_path[] = "/tmp/dssh-stream-output-XXXXXX";
+	bool candidate_created = false, output_created = false, valid = false;
+	uint8_t candidate_public[512], before_public[512], after_public[512], held_copy[1024];
+	size_t candidate_length = 0, before_length = 0, after_length = 0;
+	char before_text[512], after_text[512];
+	size_t before_text_length = 0, after_text_length = 0;
+	struct dssh_bytes_result held = {0}, next = {0};
+	struct stream_password_state password_state = {.valid = true};
+	struct dssh_test_key_stream_report report = {0};
+	unsigned int callbacks = 0, close_calls = 0, close_errors = 0, native_close_errors = 0, short_reads = 0;
+	int status = DSSH_ERROR_INIT;
+#ifndef _WIN32
+	struct rlimit saved_limit;
+	bool limited = false, signal_changed = false;
+	void (*saved_handler)(int) = SIG_ERR;
+#endif
+	if (!start(ops) || !temporary(candidate_path, &candidate_created)
+	    || !temporary(output_path, &output_created)
+	    || !public_snapshot(ops, candidate_public, &candidate_length)
+	    || ops->save(candidate_path, encrypted ? stream_password : NULL,
+	        encrypted ? &password_state : NULL) != 0
+	    || !password_state.valid || ops->generate() != 0
+	    || !public_snapshot(ops, before_public, &before_length)
+	    || !snapshot(ops, before_text, &before_text_length)
+	    || (candidate_length == before_length && memcmp(candidate_public, before_public, before_length) == 0))
+		goto done;
+	dssh_key_algo key = find_key_algo(ops->name);
+	dssh_key_algo_ctx *prior = key->ctx;
+	const uint8_t *prior_cache = NULL;
+	size_t prior_cache_length = 0;
+	const uint8_t message[] = {'s', 't', 'r', 'e', 'a', 'm'};
+	if (key->pubkey(&prior_cache, &prior_cache_length, prior) != 0
+	    || prior_cache_length != before_length
+	    || key->sign(&held, message, sizeof(message), prior) != 0
+	    || held.bytes.data == NULL || held.bytes.len == 0 || held.bytes.len > sizeof(held_copy)
+	    || held.lease.release == NULL)
+		goto done;
+	memcpy(held_copy, held.bytes.data, held.bytes.len);
+	password_state = (struct stream_password_state){.valid = true};
+	dssh_test_key_stdio_reset();
+	dssh_test_key_watch_stream();
+	if (kind == 1)
+		dssh_test_key_setvbuf_error_once();
+	else if (kind == 2)
+		dssh_test_key_close_error_once();
+	else if (kind == 3)
+		dssh_test_key_read_short_once();
+#ifndef _WIN32
+	if (kind == 4) {
+		struct stat info;
+		if (!save || stat(candidate_path, &info) != 0 || info.st_size < 1 || info.st_size >= BUFSIZ
+		    || getrlimit(RLIMIT_FSIZE, &saved_limit) != 0)
+			goto done;
+		saved_handler = signal(SIGXFSZ, SIG_IGN);
+		if (saved_handler == SIG_ERR)
+			goto done;
+		signal_changed = true;
+		struct rlimit limit = saved_limit;
+		limit.rlim_cur = 0;
+		if (setrlimit(RLIMIT_FSIZE, &limit) != 0)
+			goto done;
+		limited = true;
+	}
+#else
+	if (kind == 4)
+		goto done;
+#endif
+	status = save ? ops->save(output_path, encrypted ? stream_password : NULL,
+	    encrypted ? &password_state : NULL) : ops->load(candidate_path,
+	    encrypted ? stream_password : NULL, encrypted ? &password_state : NULL);
+	report = dssh_test_key_stream_report();
+	callbacks = password_state.calls;
+	close_calls = dssh_test_key_close_calls();
+	close_errors = dssh_test_key_close_errors();
+	native_close_errors = dssh_test_key_native_close_errors();
+	short_reads = dssh_test_key_short_read_calls();
+	valid = true;
+#ifndef _WIN32
+	if (limited) {
+		limited = false;
+		if (setrlimit(RLIMIT_FSIZE, &saved_limit) != 0)
+			valid = false;
+	}
+	if (signal_changed) {
+		signal_changed = false;
+		if (signal(SIGXFSZ, saved_handler) == SIG_ERR)
+			valid = false;
+	}
+#endif
+	dssh_test_key_stdio_reset();
+	unsigned int expected_callbacks = encrypted && kind != 1 && kind != 3 ? 1U : 0U;
+#ifdef DSSH_CRYPTO_BOTAN
+	if (!save && kind == 2)
+		expected_callbacks = 0;
+#endif
+	bool replaced = !save && kind == 0;
+	const uint8_t *expected_public = replaced ? candidate_public : before_public;
+	size_t expected_length = replaced ? candidate_length : before_length;
+	const uint8_t *current_cache = NULL;
+	size_t current_cache_length = 0;
+	valid = valid && report.valid && !report.active && report.configurations == 1
+	    && report.closes == 1 && report.clears == 1 && report.nonzero == (kind == 1 ? 0U : 1U)
+	    && report.injected == (kind == 1 ? 1U : 0U) && report.native_errors == 0
+	    && close_calls == 1 && close_errors == (kind == 2 ? 1U : 0U)
+	    && native_close_errors == (kind == 4 ? 1U : 0U) && short_reads == (kind == 3 ? 1U : 0U)
+	    && status == (kind == 0 ? 0 : DSSH_ERROR_INIT)
+	    && password_state.valid && callbacks == expected_callbacks
+	    && public_snapshot(ops, after_public, &after_length)
+	    && after_length == expected_length && memcmp(after_public, expected_public, expected_length) == 0
+	    && key->pubkey(&current_cache, &current_cache_length, key->ctx) == 0
+	    && current_cache_length == after_length
+	    && (replaced ? key->ctx != prior && current_cache != prior_cache
+	        : key->ctx == prior && current_cache == prior_cache)
+	    && (replaced || (snapshot(ops, after_text, &after_text_length)
+	        && before_text_length == after_text_length && memcmp(before_text, after_text, before_text_length) == 0))
+	    && memcmp(held_copy, held.bytes.data, held.bytes.len) == 0
+	    && key->verify(before_public, before_length, held.bytes.data, held.bytes.len, message, sizeof(message)) == 0;
+	if (valid)
+		valid = key->sign(&next, message, sizeof(message), key->ctx) == 0
+		    && next.bytes.data != NULL && next.bytes.len != 0 && next.lease.release != NULL
+		    && next.bytes.data != held.bytes.data
+		    && key->verify(expected_public, expected_length, next.bytes.data, next.bytes.len, message, sizeof(message)) == 0;
+	if (valid && save && kind == 0) {
+		password_state = (struct stream_password_state){.valid = true};
+		valid = ops->load(output_path, encrypted ? stream_password : NULL,
+		    encrypted ? &password_state : NULL) == 0 && password_state.valid
+		    && public_snapshot(ops, after_public, &after_length) && after_length == before_length
+		    && memcmp(after_public, before_public, before_length) == 0
+		    && signable(ops, before_public, before_length)
+		    && memcmp(held_copy, held.bytes.data, held.bytes.len) == 0
+		    && key->verify(before_public, before_length, held.bytes.data, held.bytes.len, message, sizeof(message)) == 0;
+	}
+done:
+#ifndef _WIN32
+	if (limited && setrlimit(RLIMIT_FSIZE, &saved_limit) != 0)
+		valid = false;
+	if (signal_changed && signal(SIGXFSZ, saved_handler) == SIG_ERR)
+		valid = false;
+#endif
+	dssh_result_release(&next.lease);
+	dssh_result_release(&held.lease);
+	dssh_test_key_stdio_reset();
+	dssh_test_alloc_reset();
+	dssh_test_reset_global_config();
+	if (candidate_created && unlink(candidate_path) != 0)
+		valid = false;
+	if (output_created && unlink(output_path) != 0)
+		valid = false;
+	printf("key stdio: algorithm=%s save=%u encrypted=%u kind=%u status=%d configured=%u closed=%u cleared=%u "
+	    "nonzero=%u injected=%u native-setup-errors=%u close-calls=%u close-errors=%u native-close-errors=%u "
+	    "short-reads=%u callbacks=%u valid=%u\n", ops->name, save ? 1U : 0U, encrypted ? 1U : 0U, kind, status,
+	    report.configurations, report.closes, report.clears, report.nonzero, report.injected, report.native_errors,
+	    close_calls, close_errors, native_close_errors, short_reads, callbacks, valid ? 1U : 0U);
+	return valid;
+}
+
+static int
+stream_cases(unsigned int kind)
+{
+	unsigned int completed = 0, expected = kind == 4 ? 2U : kind == 3 ? 6U : 12U;
+	size_t count = kind == 4 ? 1 : sizeof(algorithms) / sizeof(algorithms[0]);
+	for (size_t i = 0; i < count; i++) {
+		for (unsigned int encrypted = 0; encrypted < 2; encrypted++) {
+			for (unsigned int save = 0; save < 2; save++) {
+				if ((kind == 3 && save != 0) || (kind == 4 && save == 0))
+					continue;
+				if (stream_case(&algorithms[i], save != 0, encrypted != 0, kind))
+					completed++;
+			}
+		}
+	}
+	printf("key stdio summary: kind=%u expected=%u completed=%u\n", kind, expected, completed);
+	ASSERT_EQ(completed, expected);
+	return TEST_PASS;
+}
+static int
+test_stdio_success(void)
+{
+	return stream_cases(0);
+}
+static int
+test_stdio_setup_failure(void)
+{
+	return stream_cases(1);
+}
+static int
+test_stdio_close_failure(void)
+{
+	return stream_cases(2);
+}
+#ifdef DSSH_CRYPTO_BOTAN
+static int
+test_stdio_short_read(void)
+{
+	return stream_cases(3);
+}
+#endif
+#ifndef _WIN32
+static int
+test_stdio_native_flush(void)
+{
+	return stream_cases(4);
+}
+#endif
+
 static struct dssh_test_entry tests[] = {
 	{"file_length_models", test_file_length_models},
+	{"stdio_control", test_stdio_control},
+	{"stdio_success", test_stdio_success},
+	{"stdio_setup_failure", test_stdio_setup_failure},
+	{"stdio_close_failure", test_stdio_close_failure},
+#ifdef DSSH_CRYPTO_BOTAN
+	{"stdio_short_read", test_stdio_short_read},
+#endif
+#ifndef _WIN32
+	{"stdio_native_flush", test_stdio_native_flush},
+#endif
 	{"callback_replacement", test_callback_replacement},
 #ifdef DSSH_CRYPTO_OPENSSL
 	{"reference_failure", test_reference_failure},

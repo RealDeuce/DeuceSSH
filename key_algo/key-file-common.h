@@ -35,6 +35,34 @@ dssh_key_file_close(FILE *stream, int status)
 	return status;
 }
 
+/* One caller-owned I/O block is reused throughout an operation. The stream
+ * borrows it until fclose completes, including a reported close/flush error.
+ * Never copy an initialized stream or let its storage expire before close. */
+struct dssh_key_file_stream {
+	FILE *file;
+	char buffer[BUFSIZ];
+};
+
+static inline int
+dssh_key_file_stream_close(struct dssh_key_file_stream *stream, int status)
+{
+	int ret = dssh_key_file_close(stream->file, status);
+	stream->file = NULL;
+	dssh_key_file_clear(stream->buffer, sizeof(stream->buffer));
+	return ret;
+}
+
+/* fp is open and has performed no stdio I/O. Failure consumes it once. */
+static inline int
+dssh_key_file_stream_init(struct dssh_key_file_stream *stream, FILE *fp)
+{
+	stream->file = fp;
+	memset(stream->buffer, 0, sizeof(stream->buffer));
+	if (setvbuf(fp, stream->buffer, _IOFBF, sizeof(stream->buffer)) != 0)
+		return dssh_key_file_stream_close(stream, DSSH_ERROR_INIT);
+	return 0;
+}
+
 /* Output belongs to this caller and remains unchanged on failure. The
  * explicit bound also permits arithmetic-model checks on the native host. */
 static inline int

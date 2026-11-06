@@ -304,21 +304,25 @@ dssh_rsa_sha2_256_load_key_file(const char *path, dssh_pem_password_cb pw_cb, vo
 	FILE *fp = fopen(path, "rb");
 	if (fp == NULL)
 		return DSSH_ERROR_INIT;
+	struct dssh_key_file_stream stream;
+	int stream_ret = dssh_key_file_stream_init(&stream, fp);
+	if (stream_ret < 0)
+		return stream_ret;
 	if (fseek(fp, 0, SEEK_END) != 0)
-		return dssh_key_file_close(fp, DSSH_ERROR_INIT);
+		return dssh_key_file_stream_close(&stream, DSSH_ERROR_INIT);
 	long fsize = ftell(fp);
 	size_t file_sz;
 	int ret = dssh_key_file_length(fsize, SIZE_MAX, &file_sz);
 	if (ret < 0)
-		return dssh_key_file_close(fp, ret);
+		return dssh_key_file_stream_close(&stream, ret);
 	if (fseek(fp, 0, SEEK_SET) != 0)
-		return dssh_key_file_close(fp, DSSH_ERROR_INIT);
+		return dssh_key_file_stream_close(&stream, DSSH_ERROR_INIT);
 	uint8_t *pem_data = static_cast<uint8_t *>(malloc(file_sz));
 	if (pem_data == NULL)
-		return dssh_key_file_close(fp, DSSH_ERROR_ALLOC);
+		return dssh_key_file_stream_close(&stream, DSSH_ERROR_ALLOC);
 	dssh_key_file_buffer input(pem_data, file_sz);
 	ret = fread(pem_data, 1, file_sz, fp) == file_sz ? 0 : DSSH_ERROR_INIT;
-	ret = dssh_key_file_close(fp, ret);
+	ret = dssh_key_file_stream_close(&stream, ret);
 	if (ret < 0)
 		return ret;
 	char pw_buf[256];
@@ -366,6 +370,10 @@ dssh_rsa_sha2_256_save_key_file(const char *path, dssh_pem_password_cb pw_cb, vo
 	FILE *fp = dssh_private_key_open(path);
 	if (fp == NULL)
 		return DSSH_ERROR_INIT;
+	struct dssh_key_file_stream stream;
+	int stream_ret = dssh_key_file_stream_init(&stream, fp);
+	if (stream_ret < 0)
+		return stream_ret;
 	char pw_buf[256];
 	dssh_key_file_secret_region password_bytes(pw_buf, sizeof(pw_buf));
 	struct dssh_key_file_password_state password = {pw_cb, pw_cbdata, 0};
@@ -374,7 +382,7 @@ dssh_rsa_sha2_256_save_key_file(const char *path, dssh_pem_password_cb pw_cb, vo
 		if (pw_cb != NULL) {
 			int length = dssh_key_file_password(pw_buf, 256, 1, &password);
 			if (length < 0)
-				return dssh_key_file_close(fp, password.status);
+				return dssh_key_file_stream_close(&stream, password.status);
 			size_t count = static_cast<size_t>(length);
 			std::string_view phrase(pw_buf, count);
 			pem.value = Botan::PKCS8::PEM_encode_encrypted_pbkdf_msec(*key.get(),
@@ -384,10 +392,10 @@ dssh_rsa_sha2_256_save_key_file(const char *path, dssh_pem_password_cb pw_cb, vo
 			pem.value = Botan::PKCS8::PEM_encode(*key.get());
 		}
 		bool written = write_pem_to_file(fp, pem.value);
-		return dssh_key_file_close(fp, written ? 0 : DSSH_ERROR_INIT);
+		return dssh_key_file_stream_close(&stream, written ? 0 : DSSH_ERROR_INIT);
 	}
 	catch (...) {
-		return dssh_key_file_close(fp, password.status < 0 ? password.status : DSSH_ERROR_INIT);
+		return dssh_key_file_stream_close(&stream, password.status < 0 ? password.status : DSSH_ERROR_INIT);
 	}
 }
 

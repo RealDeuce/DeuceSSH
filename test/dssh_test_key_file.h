@@ -2,6 +2,8 @@
 #ifndef DSSH_TEST_KEY_FILE_H
 #define DSSH_TEST_KEY_FILE_H
 #include <stddef.h>
+#include <stdbool.h>
+#include <stdio.h>
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -25,6 +27,19 @@ unsigned int dssh_test_key_close_calls(void);
 unsigned int dssh_test_key_close_errors(void);
 unsigned int dssh_test_key_native_close_errors(void);
 unsigned int dssh_test_key_read_calls(void);
+
+/* Observe only explicitly watched, non-nested streams in the focused tests.
+ * Buffer bytes are read only while the supplied storage is still live. */
+struct dssh_test_key_stream_report {
+	unsigned int configurations, closes, clears, nonzero, injected, native_errors;
+	bool valid, active;
+};
+void dssh_test_key_watch_stream(void);
+void dssh_test_key_setvbuf_error_once(void);
+struct dssh_test_key_stream_report dssh_test_key_stream_report(void);
+int dssh_test_key_file_setvbuf(FILE *stream, char *buffer, int mode, size_t capacity);
+int dssh_test_key_file_close(FILE *stream);
+void dssh_test_key_file_cleared(const void *ptr, size_t length);
 
 #ifdef __cplusplus
 }

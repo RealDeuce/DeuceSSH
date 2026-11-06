@@ -1154,9 +1154,75 @@ static _Thread_local unsigned int key_close_injected;
 static _Thread_local unsigned int key_close_native_errors;
 static _Thread_local unsigned int key_read_count;
 
+static _Thread_local bool key_stream_watch, key_setvbuf_error, key_stream_closed;
+static _Thread_local FILE *key_watched_stream;
+static _Thread_local char *key_stream_buffer;
+static _Thread_local size_t key_stream_capacity;
+static _Thread_local struct dssh_test_key_stream_report key_stream_report;
+
+void
+dssh_test_key_watch_stream(void)
+{
+	key_stream_watch = true;
+	key_stream_report.valid = true;
+}
+
+void
+dssh_test_key_setvbuf_error_once(void)
+{
+	key_setvbuf_error = true;
+}
+
+struct dssh_test_key_stream_report
+dssh_test_key_stream_report(void)
+{
+	return key_stream_report;
+}
+
+int
+dssh_test_key_file_setvbuf(FILE *stream, char *buffer, int mode, size_t capacity)
+{
+	int ret = setvbuf(stream, buffer, mode, capacity);
+	if (key_stream_watch) {
+		if (key_stream_report.active || buffer == NULL || mode != _IOFBF || capacity != BUFSIZ
+		    || key_stream_report.configurations == UINT_MAX)
+			key_stream_report.valid = false;
+		else {
+			key_stream_report.configurations++;
+			key_watched_stream = stream;
+			key_stream_buffer = buffer;
+			key_stream_capacity = capacity;
+			key_stream_closed = false;
+			key_stream_report.active = true;
+		}
+		if (ret != 0) {
+			if (key_stream_report.native_errors == UINT_MAX)
+				key_stream_report.valid = false;
+			else
+				key_stream_report.native_errors++;
+		}
+	}
+	if (key_setvbuf_error) {
+		key_setvbuf_error = false;
+		if (key_stream_report.injected == UINT_MAX)
+			key_stream_report.valid = false;
+		else
+			key_stream_report.injected++;
+		return EOF;
+	}
+	return ret;
+}
+
 void
 dssh_test_key_stdio_reset(void)
 {
+	key_stream_watch = false;
+	key_setvbuf_error = false;
+	key_stream_closed = false;
+	key_watched_stream = NULL;
+	key_stream_buffer = NULL;
+	key_stream_capacity = 0;
+	key_stream_report = (struct dssh_test_key_stream_report){0};
 	key_clear_observer = NULL;
 	key_clear_data = NULL;
 	key_close_error = false;
@@ -1229,6 +1295,23 @@ dssh_test_key_read_calls(void)
 int
 dssh_test_key_file_close(FILE *stream)
 {
+	if (key_stream_watch && key_stream_report.active && stream == key_watched_stream) {
+		bool nonzero = false;
+		for (size_t i = 0; i < key_stream_capacity; i++) {
+			if (key_stream_buffer[i] != 0)
+				nonzero = true;
+		}
+		if (key_stream_closed || key_stream_report.closes == UINT_MAX
+		    || (nonzero && key_stream_report.nonzero == UINT_MAX))
+			key_stream_report.valid = false;
+		else {
+			key_stream_report.closes++;
+			if (nonzero)
+				key_stream_report.nonzero++;
+		}
+		key_stream_closed = true;
+		key_watched_stream = NULL;
+	}
 	int ret = fclose(stream);
 	if (key_close_count < UINT_MAX)
 		key_close_count++;
@@ -1274,6 +1357,24 @@ dssh_test_key_observe_clear(dssh_test_key_clear_observer observer, void *data)
 void
 dssh_test_key_file_cleared(const void *ptr, size_t length)
 {
+	if (key_stream_watch && key_stream_report.active && ptr == key_stream_buffer) {
+		bool zero = length == key_stream_capacity;
+		const unsigned char *bytes = ptr;
+		if (zero) {
+			for (size_t i = 0; i < key_stream_capacity; i++) {
+				if (bytes[i] != 0)
+					zero = false;
+			}
+		}
+		if (!key_stream_closed || length != key_stream_capacity || !zero
+		    || key_stream_report.clears == UINT_MAX)
+			key_stream_report.valid = false;
+		else
+			key_stream_report.clears++;
+		key_stream_buffer = NULL;
+		key_stream_capacity = 0;
+		key_stream_report.active = false;
+	}
 	if (key_clear_observer != NULL)
 		key_clear_observer(ptr, length, key_clear_data);
 }

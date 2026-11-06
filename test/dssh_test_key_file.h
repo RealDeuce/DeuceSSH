@@ -17,6 +17,7 @@ extern "C" {
  * A close error is reported only after performing the real fclose once. */
 void dssh_test_key_stdio_reset(void);
 void dssh_test_key_close_error_once(void);
+void dssh_test_key_close_success_once(void);
 void dssh_test_key_watch_read_free(void);
 typedef void (*dssh_test_key_clear_observer)(const void *ptr, size_t length, void *data);
 void dssh_test_key_observe_clear(dssh_test_key_clear_observer observer, void *data);
@@ -38,10 +39,13 @@ unsigned int dssh_test_key_read_calls(void);
  * Buffer bytes are read only while the supplied storage is still live. */
 struct dssh_test_key_stream_report {
 	unsigned int configurations, closes, clears, nonzero, injected, native_errors;
+	unsigned int errors_before_close, close_successes;
+	size_t native_capacity;
 	bool valid, active;
 };
 void dssh_test_key_watch_stream(void);
 void dssh_test_key_setvbuf_error_once(void);
+void dssh_test_key_small_buffer(void);
 struct dssh_test_key_stream_report dssh_test_key_stream_report(void);
 int dssh_test_key_file_setvbuf(FILE *stream, char *buffer, int mode, size_t capacity);
 int dssh_test_key_file_close(FILE *stream);

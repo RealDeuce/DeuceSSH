@@ -1243,6 +1243,15 @@ private-key output using AES-256-CBC and supplies a password when encrypted
 input needs one. NULL permits unencrypted input/output only, ignores cbdata
 and never invokes a provider prompt. Failed imports do not publish a new key.
 
+Private-key saves overwrite the selected file and retain its identity. The
+opened target must be regular, singly linked and owned by the effective caller;
+a final symbolic link or Windows reparse point is rejected before mutation.
+The saved file uses POSIX mode 0600 or a protected caller-SID Windows ACL.
+A save error may leave empty or partial output. The application coordinates
+the destination directory/namespace and manages recovery and key retirement;
+a failed save does not guarantee that the previous file was removed or changed.
+Parent path resolution follows the native platform rules.
+
 This example accepts a C-string password and rejects an oversized password:
 
 ```c

@@ -1224,6 +1224,7 @@ static _Thread_local bool key_fdopen_error;
 static _Thread_local int key_failed_fd = -1;
 #ifndef _WIN32
 static _Thread_local bool key_permission_error, key_truncate_error, key_raw_close_error;
+static _Thread_local bool key_target_error, key_status_error, key_different_owner;
 #endif
 
 struct dssh_test_key_open_report
@@ -1239,6 +1240,63 @@ dssh_test_key_fdopen_error_once(void)
 }
 
 #ifndef _WIN32
+void
+dssh_test_key_target_error_once(void)
+{
+	key_target_error = true;
+}
+
+void
+dssh_test_key_status_error_once(void)
+{
+	key_status_error = true;
+}
+
+void
+dssh_test_key_different_owner_once(void)
+{
+	key_different_owner = true;
+}
+
+int
+dssh_test_key_native_fstat(int fd, struct stat *info)
+{
+	if (key_open_report.target_checks < UINT_MAX)
+		key_open_report.target_checks++;
+	key_failed_fd = fd;
+	if (key_target_error) {
+		key_target_error = false;
+		if (key_open_report.target_errors < UINT_MAX)
+			key_open_report.target_errors++;
+		errno = EIO;
+		return -1;
+	}
+	int ret = fstat(fd, info);
+	if (ret == 0 && key_different_owner) {
+		key_different_owner = false;
+		info->st_uid = info->st_uid == 0 ? 1 : 0;
+		if (key_open_report.reported_owners < UINT_MAX)
+			key_open_report.reported_owners++;
+	}
+	return ret;
+}
+
+int
+dssh_test_key_native_fcntl(int fd, int command, int value)
+{
+	if (key_open_report.status_updates < UINT_MAX)
+		key_open_report.status_updates++;
+	key_open_report.status_arguments_valid = command == F_SETFL && value == 0;
+	if (key_status_error) {
+		key_status_error = false;
+		if (key_open_report.status_errors < UINT_MAX)
+			key_open_report.status_errors++;
+		errno = EIO;
+		return -1;
+	}
+	return fcntl(fd, command, value);
+}
+
 void
 dssh_test_key_permission_error_once(void)
 {
@@ -1311,8 +1369,10 @@ static void
 key_observe_descriptor(int fd)
 {
 	int flags = fcntl(fd, F_GETFD);
-	key_open_report.descriptor_valid = flags >= 0;
+	int status = fcntl(fd, F_GETFL);
+	key_open_report.descriptor_valid = flags >= 0 && status >= 0;
 	key_open_report.close_on_exec = flags >= 0 && (flags & FD_CLOEXEC) != 0;
+	key_open_report.blocking_io = status >= 0 && (status & O_NONBLOCK) == 0;
 }
 
 int
@@ -1379,6 +1439,9 @@ dssh_test_key_stdio_reset(void)
 	key_permission_error = false;
 	key_truncate_error = false;
 	key_raw_close_error = false;
+	key_target_error = false;
+	key_status_error = false;
+	key_different_owner = false;
 #endif
 	key_stream_watch = false;
 	key_setvbuf_error = false;

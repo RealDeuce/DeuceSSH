@@ -41,6 +41,15 @@ DSSH_PUBLIC int dssh_register_dh_gex_sha256(void);
 DSSH_PUBLIC int dssh_register_sntrup761x25519_sha512(void);
 DSSH_PUBLIC int dssh_register_mlkem768x25519_sha256(void);
 
+/* Private-key save contract (all three builtin key families):
+ * Save PEM by opening and overwriting the selected file itself. Validate a
+ * regular, singly linked, effective-caller-owned target before changing it;
+ * reject a final-component symbolic link/reparse point. New/final files are
+ * private to the effective caller (POSIX mode 0600 or protected Windows
+ * caller-SID ACL). An error may leave the destination empty or partial.
+ * Existing file identity is retained; the caller coordinates the destination
+ * directory/namespace throughout the operation and manages recovery copies. */
+
 /* Host key algorithms */
 /* Load or generate keys before the first dssh_session_init(). Subsequent
  * key replacement returns DSSH_ERROR_TOOLATE. Failed replacement preserves

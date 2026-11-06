@@ -12,7 +12,27 @@
 #define fchmod(fd, mode) dssh_test_key_native_fchmod(fd, mode)
 #define ftruncate(fd, length) dssh_test_key_native_ftruncate(fd, length)
 #define close(fd) dssh_test_key_native_close(fd)
+#define fstat(fd, info) dssh_test_key_native_fstat(fd, info)
+#define fcntl(fd, command, value) dssh_test_key_native_fcntl(fd, command, value)
 #endif
+
+/* Validate the acquired object before modifying permissions or contents.
+ * The opening flags reject a final symlink and avoid waiting on a FIFO.
+ * Clear the temporary status flag before handing a regular file to stdio. */
+static bool
+private_descriptor(int fd)
+{
+	struct stat info;
+	if (fstat(fd, &info) != 0)
+		return false;
+	if (!S_ISREG(info.st_mode) || info.st_nlink != 1 || info.st_uid != geteuid()) {
+		errno = EACCES;
+		return false;
+	}
+	if (fcntl(fd, F_SETFL, 0) != 0)
+		return false;
+	return fchmod(fd, S_IRUSR | S_IWUSR) == 0 && ftruncate(fd, 0) == 0;
+}
 
 /* Paths are validated by public wrappers. POSIX.1-2008 supplies O_CLOEXEC;
  * never create an inheritable descriptor and try to fix it afterward. */
@@ -23,7 +43,7 @@ open_stream(const char *path, int flags, mode_t mode, const char *access, bool p
 	if (fd < 0)
 		return NULL;
 	FILE *fp = NULL;
-	if (!private_output || (fchmod(fd, S_IRUSR | S_IWUSR) == 0 && ftruncate(fd, 0) == 0))
+	if (!private_output || private_descriptor(fd))
 		fp = fdopen(fd, access);
 	if (fp == NULL) {
 		int saved_error = errno;
@@ -37,7 +57,8 @@ open_stream(const char *path, int flags, mode_t mode, const char *access, bool p
 FILE *
 dssh_private_key_open(const char *path)
 {
-	return open_stream(path, O_CREAT | O_WRONLY, S_IRUSR | S_IWUSR, "wb", true);
+	return open_stream(path, O_CREAT | O_WRONLY | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY,
+	    S_IRUSR | S_IWUSR, "wb", true);
 }
 
 DSSH_PRIVATE FILE *

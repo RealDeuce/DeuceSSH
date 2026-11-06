@@ -35,7 +35,7 @@ static bool
 stage_file_state(const char *path, unsigned int kind)
 {
 	struct stat info;
-	mode_t expected_mode = kind == 5 || kind == 7 ? 0640 : 0600;
+	mode_t expected_mode = kind == 5 || kind == 7 || kind >= 10 ? 0640 : 0600;
 	bool empty = kind == 3 || kind == 9;
 	if (stat(path, &info) != 0 || (info.st_mode & 0777) != expected_mode
 	    || info.st_size != (empty ? 0 : sizeof(stage_marker)))
@@ -65,6 +65,12 @@ stage_password(char *buffer, int capacity, int writing, void *data)
 	return 1;
 }
 
+static bool
+stage_close_error(unsigned int kind)
+{
+	return (kind >= 7 && kind <= 9) || kind >= 13;
+}
+
 static void
 arm_stage(unsigned int kind)
 {
@@ -74,7 +80,13 @@ arm_stage(unsigned int kind)
 		dssh_test_key_permission_error_once();
 	else if (kind == 6 || kind == 8)
 		dssh_test_key_truncate_error_once();
-	if (kind >= 7)
+	else if (kind == 10 || kind == 13)
+		dssh_test_key_target_error_once();
+	else if (kind == 11 || kind == 14)
+		dssh_test_key_status_error_once();
+	else if (kind == 12 || kind == 15)
+		dssh_test_key_different_owner_once();
+	if (stage_close_error(kind))
 		dssh_test_key_raw_close_error_once();
 }
 
@@ -83,19 +95,31 @@ stage_report_valid(struct dssh_test_key_open_report report, unsigned int kind)
 {
 	bool permission = kind == 5 || kind == 7;
 	bool truncate = kind == 6 || kind == 8;
+	bool metadata = kind >= 10;
+	bool target_error = kind == 10 || kind == 13;
+	bool status_error = kind == 11 || kind == 14;
+	bool owner = kind == 12 || kind == 15;
+	bool associated = !metadata && !permission && !truncate;
 	return report.stdio_opens == 0 && report.native_opens == 1
-	    && report.permissions == 1 && report.permission_errors == (permission ? 1U : 0U)
-	    && report.truncations == (permission ? 0U : 1U)
+	    && report.target_checks == 1 && report.target_errors == (target_error ? 1U : 0U)
+	    && report.status_updates == (!metadata || status_error ? 1U : 0U)
+	    && report.status_errors == (status_error ? 1U : 0U)
+	    && report.reported_owners == (owner ? 1U : 0U)
+	    && (metadata && !status_error ? !report.status_arguments_valid : report.status_arguments_valid)
+	    && report.permissions == (metadata ? 0U : 1U)
+	    && report.permission_errors == (permission ? 1U : 0U)
+	    && report.truncations == (permission || metadata ? 0U : 1U)
 	    && report.truncation_errors == (truncate ? 1U : 0U)
-	    && report.associations == (!permission && !truncate ? 1U : 0U)
-	    && report.rejected_associations == (!permission && !truncate ? 1U : 0U)
-	    && report.raw_closes == 1 && report.raw_close_errors == (kind >= 7 ? 1U : 0U)
+	    && report.associations == (associated ? 1U : 0U)
+	    && report.rejected_associations == (associated ? 1U : 0U)
+	    && report.raw_closes == 1 && report.raw_close_errors == (stage_close_error(kind) ? 1U : 0U)
 	    && report.native_close_errors == 0 && !report.descriptor_valid;
 }
 
 /* kind0 normal property, kind1 NULL, kind2 empty, kind3 rejected fdopen,
  * kind4 actual missing-parent open error, kind5/6 metadata errors,
- * kind7/8/9 metadata/association error with reported post-retirement close error.
+ * kind7/8/9 metadata/association error with reported post-retirement close error;
+ * kind10..15 target/status errors and reported different ownership, plus close.
  * Never inspect a native object layout. */
 static bool
 file_case(const struct descriptor_ops *ops, unsigned int action, unsigned int kind, bool encrypted)
@@ -165,7 +189,7 @@ file_case(const struct descriptor_ops *ops, unsigned int action, unsigned int ki
 	unsigned int calls = report.stdio_opens + report.native_opens;
 	valid = status == (kind == 0 ? 0 : DSSH_ERROR_INIT)
 	    && (kind >= 5 ? stage_report_valid(report, kind) && closed
-	        : kind == 0 ? report.descriptor_valid && report.close_on_exec && calls == 1
+	        : kind == 0 ? report.descriptor_valid && report.close_on_exec && report.blocking_io && calls == 1
 	        : kind == 1 || kind == 2 ? calls == 0 && report.associations == 0
 	        : kind == 3 ? report.rejected_associations == 1 && closed
 	        : calls == 1 && report.associations == 0 && !report.descriptor_valid)
@@ -205,10 +229,12 @@ done:
 		valid = false;
 	printf("key descriptors: algorithm=%s action=%u kind=%u status=%d stdio=%u native=%u associations=%u "
 	    "rejected=%u observed-valid=%u cloexec=%u retired=%u valid=%u "
-	    "encrypted=%u password-calls=%u chmod=%u truncate=%u raw-close=%u close-error=%u\n", ops->name, action, kind, status,
+	    "encrypted=%u password-calls=%u chmod=%u truncate=%u raw-close=%u close-error=%u "
+	    "targets=%u target-errors=%u flags=%u flag-errors=%u reported-owner=%u\n", ops->name, action, kind, status,
 	    report.stdio_opens, report.native_opens, report.associations, report.rejected_associations,
 	    report.descriptor_valid ? 1U : 0U, report.close_on_exec ? 1U : 0U, closed ? 1U : 0U, valid ? 1U : 0U,
-	    encrypted ? 1U : 0U, password_calls, report.permissions, report.truncations, report.raw_closes, report.raw_close_errors);
+	    encrypted ? 1U : 0U, password_calls, report.permissions, report.truncations, report.raw_closes, report.raw_close_errors,
+	    report.target_checks, report.target_errors, report.status_updates, report.status_errors, report.reported_owners);
 	return valid;
 }
 
@@ -294,13 +320,12 @@ test_exec_controls(void)
 	return TEST_PASS;
 }
 static int
-test_private_stages(void)
+private_cases(const unsigned int *kinds, size_t count)
 {
-	const unsigned int kinds[] = {3, 5, 6, 7, 8, 9};
 	unsigned int completed = 0;
 	for (size_t i = 0; i < sizeof(operations) / sizeof(operations[0]); i++) {
 		for (unsigned int encrypted = 0; encrypted < 2; encrypted++) {
-			for (size_t k = 0; k < sizeof(kinds) / sizeof(kinds[0]); k++) {
+			for (size_t k = 0; k < count; k++) {
 				if (file_case(&operations[i], 1, kinds[k], encrypted != 0))
 					completed++;
 			}
@@ -311,14 +336,26 @@ test_private_stages(void)
 	return TEST_PASS;
 }
 
+static int
+test_private_stages(void)
+{
+	const unsigned int kinds[] = {3, 5, 6, 7, 8, 9};
+	return private_cases(kinds, sizeof(kinds) / sizeof(kinds[0]));
+}
+static int
+test_private_metadata(void)
+{
+	const unsigned int kinds[] = {10, 11, 12, 13, 14, 15};
+	return private_cases(kinds, sizeof(kinds) / sizeof(kinds[0]));
+}
+
 /* Direct private-helper errors also distinguish preservation of the initial
  * errno from a later cleanup-close error. Public APIs make no errno promise. */
 static int
-test_helper_errno(void)
+helper_cases(const unsigned int *kinds, size_t count)
 {
-	const unsigned int kinds[] = {3, 5, 6, 7, 8, 9};
 	unsigned int completed = 0;
-	for (size_t k = 0; k < sizeof(kinds) / sizeof(kinds[0]); k++) {
+	for (size_t k = 0; k < count; k++) {
 		unsigned int kind = kinds[k];
 		char path[] = "/tmp/dssh-native-errno-XXXXXX";
 		int fd = mkstemp(path);
@@ -329,7 +366,8 @@ test_helper_errno(void)
 		if (close(fd) != 0)
 			valid = false;
 		int saved = 0;
-		int expected = kind >= 7 ? EIO : kind == 3 ? ENOMEM : kind == 5 ? EACCES : ENOSPC;
+		int expected = stage_close_error(kind) || kind == 10 || kind == 11 ? EIO
+		    : kind == 3 ? ENOMEM : kind == 5 || kind == 12 ? EACCES : ENOSPC;
 		if (valid) {
 			dssh_test_key_stdio_reset();
 			arm_stage(kind);
@@ -351,6 +389,19 @@ test_helper_errno(void)
 	printf("key native errno summary: expected=6 completed=%u\n", completed);
 	ASSERT_EQ(completed, 6);
 	return TEST_PASS;
+}
+
+static int
+test_helper_errno(void)
+{
+	const unsigned int kinds[] = {3, 5, 6, 7, 8, 9};
+	return helper_cases(kinds, sizeof(kinds) / sizeof(kinds[0]));
+}
+static int
+test_helper_metadata_errno(void)
+{
+	const unsigned int kinds[] = {10, 11, 12, 13, 14, 15};
+	return helper_cases(kinds, sizeof(kinds) / sizeof(kinds[0]));
 }
 
 static int
@@ -408,7 +459,9 @@ static struct dssh_test_entry tests[] = {
 	{"native_open_failure", test_native_open_failure},
 	{"exec_controls", test_exec_controls},
 	{"private_stages", test_private_stages},
+	{"private_metadata", test_private_metadata},
 	{"helper_errno", test_helper_errno},
+	{"helper_metadata_errno", test_helper_metadata_errno},
 	{"native_controls", test_native_controls},
 };
 DSSH_TEST_NO_CLEANUP

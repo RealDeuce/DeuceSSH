@@ -48,7 +48,8 @@ struct dssh_test_key_open_report {
 	unsigned int stdio_opens, native_opens, associations, rejected_associations;
 	unsigned int permissions, truncations, raw_closes;
 	unsigned int permission_errors, truncation_errors, raw_close_errors, native_close_errors;
-	bool descriptor_valid, close_on_exec;
+	unsigned int target_checks, target_errors, reported_owners, status_updates, status_errors;
+	bool descriptor_valid, close_on_exec, blocking_io, status_arguments_valid;
 };
 struct dssh_test_key_open_report dssh_test_key_open_report(void);
 void dssh_test_key_fdopen_error_once(void);
@@ -65,6 +66,12 @@ void dssh_test_key_raw_close_error_once(void);
 int dssh_test_key_native_fchmod(int fd, mode_t mode);
 int dssh_test_key_native_ftruncate(int fd, off_t length);
 int dssh_test_key_native_close(int fd);
+struct stat;
+void dssh_test_key_target_error_once(void);
+void dssh_test_key_status_error_once(void);
+void dssh_test_key_different_owner_once(void);
+int dssh_test_key_native_fstat(int fd, struct stat *info);
+int dssh_test_key_native_fcntl(int fd, int command, int value);
 #endif
 
 #ifdef __cplusplus

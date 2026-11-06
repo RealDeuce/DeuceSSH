@@ -127,7 +127,7 @@ policy_case(const struct policy_ops *ops, unsigned int kind, bool encrypted)
 		if (mkfifo(actual, 0640) != 0 || chmod(actual, 0640) != 0)
 			goto done;
 		if (kind == 7) {
-			peer = open(actual, O_RDWR | O_NONBLOCK);
+			peer = open(actual, O_RDONLY | O_NONBLOCK);
 			if (peer < 0)
 				goto done;
 		}
@@ -215,8 +215,7 @@ policy_case(const struct policy_ops *ops, unsigned int kind, bool encrypted)
 		    && (!S_ISREG(before.st_mode) || unchanged_bytes(actual));
 		if (valid && peer >= 0) {
 			char byte;
-			errno = 0;
-			valid = read(peer, &byte, 1) == -1 && (errno == EAGAIN || errno == EWOULDBLOCK);
+			valid = read(peer, &byte, 1) == 0;
 		}
 	}
 	else if (valid) {

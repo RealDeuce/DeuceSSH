@@ -356,6 +356,17 @@ dssh_rsa_sha2_512_load_key_file(const char *path, dssh_pem_password_cb pw_cb, vo
 		EVP_PKEY_free(pkey);
 		return DSSH_ERROR_INVALID;
 	}
+	EVP_PKEY_CTX *validation = EVP_PKEY_CTX_new(pkey, NULL);
+	if (validation == NULL) {
+		EVP_PKEY_free(pkey);
+		return DSSH_ERROR_ALLOC;
+	}
+	int checked = EVP_PKEY_pairwise_check(validation);
+	EVP_PKEY_CTX_free(validation);
+	if (checked != 1) {
+		EVP_PKEY_free(pkey);
+		return checked == 0 ? DSSH_ERROR_INVALID : DSSH_ERROR_INIT;
+	}
 	return install_key(pkey);
 }
 

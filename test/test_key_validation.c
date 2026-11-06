@@ -2,6 +2,9 @@
 #include "dssh_test.h"
 #include "dssh_test_internal.h"
 #include "deucessh-algorithms.h"
+#ifdef DSSH_CRYPTO_OPENSSL
+#include "dssh_test_ossl.h"
+#endif
 
 struct validation_ops {
 	int (*reg)(void);
@@ -105,8 +108,56 @@ done:
 	return TEST_PASS;
 }
 
+#ifdef DSSH_CRYPTO_OPENSSL
+static int
+test_native_errors(void)
+{
+	bool valid = true;
+	unsigned int rejected = 0;
+	for (size_t i = 0; i < sizeof(operations) / sizeof(operations[0]); i++) {
+		const struct validation_ops *ops = &operations[i];
+		const char *cache = getenv(ops->cache);
+		dssh_test_reset_global_config();
+		if (cache == NULL || ops->reg() != 0 || ops->load(cache, NULL, NULL) != 0) {
+			valid = false;
+			continue;
+		}
+		dssh_key_algo key = find_key_algo(ops->name);
+		uint8_t candidate[512], before[512], after[512];
+		size_t candidate_len = 0, before_len = 0, after_len = 0;
+		if (key == NULL || !snapshot(key, candidate, &candidate_len) || ops->generate() != 0
+		    || !snapshot(key, before, &before_len)
+		    || (before_len == candidate_len && memcmp(before, candidate, before_len) == 0)) {
+			valid = false;
+			continue;
+		}
+		dssh_key_algo_ctx *prior = key->ctx;
+		for (int point = 0; point < 2; point++) {
+			dssh_test_ossl_fail_after(point);
+			int ret = ops->load(cache, NULL, NULL);
+			int calls = dssh_test_ossl_count();
+			dssh_test_ossl_reset();
+			int expected = point == 0 ? DSSH_ERROR_ALLOC : DSSH_ERROR_INIT;
+			bool one = ret == expected && calls == point + 1 && key->ctx == prior
+			    && snapshot(key, after, &after_len) && after_len == before_len
+			    && memcmp(after, before, before_len) == 0 && signable(key, before, before_len);
+			rejected += one ? 1U : 0U;
+			valid = one && valid;
+		}
+	}
+	dssh_test_ossl_reset();
+	dssh_test_reset_global_config();
+	printf("key validation native errors: families=3 points=2 rejected=%u valid=%u\n", rejected, valid ? 1U : 0U);
+	ASSERT_TRUE(valid && rejected == 6);
+	return TEST_PASS;
+}
+#endif
+
 static struct dssh_test_entry tests[] = {
 	{"transaction", test_transaction},
+#ifdef DSSH_CRYPTO_OPENSSL
+	{"native_errors", test_native_errors},
+#endif
 };
 DSSH_TEST_NO_CLEANUP
 DSSH_TEST_MAIN(tests)

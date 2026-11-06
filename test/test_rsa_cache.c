@@ -313,13 +313,14 @@ test_publication_errors(void)
 		}
 		dssh_key_algo_ctx *prior = key->ctx;
 		for (int index = 0; index < 4; index++) {
-			dssh_test_ossl_fail_after(index);
+			/* Imported keys now have two native validation calls first. */
+			dssh_test_ossl_fail_after(index + 2);
 			ret = load(cache, NULL, NULL);
 			int calls = dssh_test_ossl_count();
 			dssh_test_ossl_reset();
 			const uint8_t *after = NULL;
 			size_t after_len = 0;
-			bool one = ret == DSSH_ERROR_INIT && calls == index + 1 && key->ctx == prior
+			bool one = ret == DSSH_ERROR_INIT && calls == index + 3 && key->ctx == prior
 			    && key->pubkey(&after, &after_len, key->ctx) == 0 && after != NULL
 			    && after_len == length && memcmp(after, before, length) == 0 && signable(key, before, length);
 			rejected += one ? 1U : 0U;

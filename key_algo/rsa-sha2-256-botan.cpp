@@ -336,6 +336,8 @@ dssh_rsa_sha2_256_load_key_file(const char *path, dssh_pem_password_cb pw_cb, vo
 		    : Botan::PKCS8::load_key(ds, get_password);
 		if (privkey == nullptr || privkey->algo_name() != "RSA")
 			return DSSH_ERROR_INVALID;
+		if (!privkey->check_key(Botan::system_rng(), true))
+			return DSSH_ERROR_INVALID;
 		return install_key(std::move(privkey));
 	}
 	catch (...) {

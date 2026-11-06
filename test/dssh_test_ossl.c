@@ -712,6 +712,14 @@ dssh_test_EVP_PKEY_keygen(EVP_PKEY_CTX *ctx, EVP_PKEY **ppkey)
 }
 
 int
+dssh_test_EVP_PKEY_pairwise_check(EVP_PKEY_CTX *ctx)
+{
+	if (should_fail())
+		return -1;
+	return EVP_PKEY_pairwise_check(ctx);
+}
+
+int
 dssh_test_EVP_PKEY_up_ref(EVP_PKEY *pkey)
 {
 	if (should_fail())

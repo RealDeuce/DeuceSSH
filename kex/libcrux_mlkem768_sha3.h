@@ -149,6 +149,43 @@ Eurydice_slice_to_array3(uint8_t *dst_tag, char *dst_ok, Eurydice_slice src, siz
 
 // CORE STUFF (conversions, endianness, ...)
 
+/* Explicit signed low-word conversion: every narrowing is in range. */
+static inline int16_t
+dssh_mlkem_low_i16(uint32_t value)
+{
+	uint32_t low = value & UINT32_C(0xffff);
+	uint32_t correction = (low >> 15) << 16;
+	int32_t low_signed = (int32_t)low;
+	int32_t correction_signed = (int32_t)correction;
+	int32_t centered = low_signed - correction_signed;
+	/* low is 0..65535, correction is 0/65536; centered is -32768..32767. */
+	int16_t result = (int16_t)centered;
+	return result;
+}
+
+/* Floor division by powers of two without right-shifting a negative value.
+ * Branches depend only on the public shift count; counts >=32 yield 0/-1. */
+static inline int32_t
+dssh_mlkem_sar32(int32_t value, unsigned int shift)
+{
+	uint32_t bits = (uint32_t)value;
+	uint32_t negative = bits >> 31;
+	if (shift == 0)
+		return value;
+	if (shift >= 32) {
+		int32_t sign = (int32_t)negative;
+		return -sign;
+	}
+	uint32_t shifted = bits >> shift;
+	uint64_t bias = (uint64_t)negative << (32U - shift);
+	int64_t shifted_signed = (int64_t)shifted;
+	int64_t bias_signed = (int64_t)bias;
+	int64_t quotient = shifted_signed - bias_signed;
+	/* For 1..31 the quotient is within -1073741824..1073741823. */
+	int32_t result = (int32_t)quotient;
+	return result;
+}
+
 /* Bytewise glue is independent of host byte order and object layout. */
 static inline void
 core_num__u64_9__to_le_bytes(uint64_t v, uint8_t buf[8])
@@ -6641,7 +6678,7 @@ libcrux_ml_kem_vector_portable_cond_subtract_3329_0d(libcrux_ml_kem_vector_porta
 
  #define LIBCRUX_ML_KEM_VECTOR_PORTABLE_ARITHMETIC_BARRETT_MULTIPLIER ((int32_t)20159)
 
- #define LIBCRUX_ML_KEM_VECTOR_PORTABLE_ARITHMETIC_BARRETT_SHIFT ((int32_t)26)
+ #define LIBCRUX_ML_KEM_VECTOR_PORTABLE_ARITHMETIC_BARRETT_SHIFT (26U)
 
  #define LIBCRUX_ML_KEM_VECTOR_PORTABLE_ARITHMETIC_BARRETT_R \
 	 ((int32_t)1 << (uint32_t)LIBCRUX_ML_KEM_VECTOR_PORTABLE_ARITHMETIC_BARRETT_SHIFT)
@@ -6664,8 +6701,12 @@ libcrux_ml_kem_vector_portable_arithmetic_barrett_reduce_element(int16_t value)
 {
 	int32_t t = (int32_t)value * LIBCRUX_ML_KEM_VECTOR_PORTABLE_ARITHMETIC_BARRETT_MULTIPLIER
 	            + (LIBCRUX_ML_KEM_VECTOR_PORTABLE_ARITHMETIC_BARRETT_R >> 1U);
-	int16_t quotient = (int16_t)(t >> (uint32_t)LIBCRUX_ML_KEM_VECTOR_PORTABLE_ARITHMETIC_BARRETT_SHIFT);
-	return (int16_t)(value - quotient * LIBCRUX_ML_KEM_VECTOR_TRAITS_FIELD_MODULUS);
+	int32_t quotient = dssh_mlkem_sar32(t, LIBCRUX_ML_KEM_VECTOR_PORTABLE_ARITHMETIC_BARRETT_SHIFT);
+	/* Keep quotient*3329 wide even when int is 16 bits. Across the full
+	 * int16 input domain the centered result is -1664..1664. */
+	int32_t reduced = value - quotient * LIBCRUX_ML_KEM_VECTOR_TRAITS_FIELD_MODULUS;
+	int16_t result = (int16_t)reduced;
+	return result;
 }
 
 static KRML_MUSTINLINE libcrux_ml_kem_vector_portable_vector_type_PortableVector
@@ -6711,14 +6752,22 @@ libcrux_ml_kem_vector_portable_barrett_reduce_0d(libcrux_ml_kem_vector_portable_
 static inline int16_t
 libcrux_ml_kem_vector_portable_arithmetic_montgomery_reduce_element(int32_t value)
 {
-	int32_t k =
-	    (int32_t)(int16_t)value * (int32_t)LIBCRUX_ML_KEM_VECTOR_TRAITS_INVERSE_OF_MODULUS_MOD_MONTGOMERY_R;
-	int32_t k_times_modulus = (int32_t)(int16_t)k * (int32_t)LIBCRUX_ML_KEM_VECTOR_TRAITS_FIELD_MODULUS;
-	int16_t c =
-	    (int16_t)(k_times_modulus >> (uint32_t)LIBCRUX_ML_KEM_VECTOR_PORTABLE_ARITHMETIC_MONTGOMERY_SHIFT);
-	int16_t value_high =
-	    (int16_t)(value >> (uint32_t)LIBCRUX_ML_KEM_VECTOR_PORTABLE_ARITHMETIC_MONTGOMERY_SHIFT);
-	return value_high - c;
+	uint32_t value_bits = (uint32_t)value;
+	int32_t value_low = dssh_mlkem_low_i16(value_bits);
+	/* -32768*62209..32767*62209 fits int32. */
+	int32_t inverse = LIBCRUX_ML_KEM_VECTOR_TRAITS_INVERSE_OF_MODULUS_MOD_MONTGOMERY_R;
+	int32_t k = value_low * inverse;
+	uint32_t k_bits = (uint32_t)k;
+	int32_t k_low = dssh_mlkem_low_i16(k_bits);
+	int32_t modulus = LIBCRUX_ML_KEM_VECTOR_TRAITS_FIELD_MODULUS;
+	int32_t k_times_modulus = k_low * modulus;
+	int32_t c = dssh_mlkem_sar32(k_times_modulus, LIBCRUX_ML_KEM_VECTOR_PORTABLE_ARITHMETIC_MONTGOMERY_SHIFT);
+	int32_t value_high = dssh_mlkem_sar32(value, LIBCRUX_ML_KEM_VECTOR_PORTABLE_ARITHMETIC_MONTGOMERY_SHIFT);
+	/* This difference fits int32 even for the entire int32 input domain.
+	 * Preserve the generated low-word result with a defined conversion. */
+	int32_t reduced = value_high - c;
+	uint32_t reduced_bits = (uint32_t)reduced;
+	return dssh_mlkem_low_i16(reduced_bits);
 }
 
 /**
@@ -6786,11 +6835,15 @@ libcrux_ml_kem_vector_portable_montgomery_multiply_by_constant_0d(
 static inline uint8_t
 libcrux_ml_kem_vector_portable_compress_compress_message_coefficient(uint16_t fe)
 {
-	int16_t shifted                   = (int16_t)1664 - (int16_t)fe;
-	int16_t mask                      = shifted >> 15U;
-	int16_t shifted_to_positive       = mask ^ shifted;
-	int16_t shifted_positive_in_range = shifted_to_positive - (int16_t)832;
-	return (uint8_t)(shifted_positive_in_range >> 15U & (int16_t)1);
+	int32_t fe_wide = fe;
+	int32_t shifted = INT32_C(1664) - fe_wide;
+	int32_t mask = dssh_mlkem_sar32(shifted, 31);
+	int32_t shifted_to_positive = mask ^ shifted;
+	int32_t shifted_positive_in_range = shifted_to_positive - INT32_C(832);
+	int32_t sign = dssh_mlkem_sar32(shifted_positive_in_range, 31);
+	uint32_t sign_bits = (uint32_t)sign;
+	uint8_t result = (uint8_t)(sign_bits & UINT32_C(1));
+	return result;
 }
 
 static KRML_MUSTINLINE libcrux_ml_kem_vector_portable_vector_type_PortableVector
@@ -6817,7 +6870,9 @@ libcrux_ml_kem_vector_portable_compress_1_0d(libcrux_ml_kem_vector_portable_vect
 static KRML_MUSTINLINE uint32_t
 libcrux_ml_kem_vector_portable_arithmetic_get_n_least_significant_bits(uint8_t n, uint32_t value)
 {
-	return value & ((1U << (uint32_t)n) - 1U);
+	if (n >= 32)
+		return value;
+	return value & ((UINT32_C(1) << n) - UINT32_C(1));
 }
 
 static inline int16_t
@@ -8659,7 +8714,10 @@ libcrux_ml_kem_vector_portable_arithmetic_shift_right_94(
 {
 	for (size_t i = (size_t)0U; i < LIBCRUX_ML_KEM_VECTOR_TRAITS_FIELD_ELEMENTS_IN_VECTOR; i++) {
 		size_t i0      = i;
-		v.elements[i0] = v.elements[i0] >> (uint32_t)(int32_t)15;
+		int32_t shifted = dssh_mlkem_sar32(v.elements[i0], 15);
+		/* An int16 value shifted 15 places yields only -1 or 0. */
+		int16_t mask = (int16_t)shifted;
+		v.elements[i0] = mask;
 	}
 	return v;
 }

@@ -12,12 +12,12 @@ this record does not certify the complete vendor implementation.
 | sntrup761 generic helper symbols | `kex/sntrup761_optblocker.c` defines all three zero-initialized volatile objects, and `CMakeLists.txt` includes it in the library sources. The former missing-definition item is resolved in source. | Exercise the generic helpers and their arithmetic/width assumptions independently of the native assembly paths. Linking the object on x86_64 does not exercise those paths. |
 | sntrup761 unused annotations | `CRYPTOINT_MAYBE_UNUSED` selects the GNU/Clang attribute, the MSVC warning pragma or an empty fallback. | Native Windows and other compiler acceptance retain their own scope; compiler recognition does not establish constant-time behavior. |
 | libcrux population count | The current glue selects MSVC, GNU-compatible or portable C code. The portable branch counts the bits in a `uint8_t` using bounded masks and shifts. The former absent-fallback item is resolved in source. | Exercise compiler branches, including the portable implementation; inspect generated code for the supported compiler/target combinations. |
-| libcrux inclusion | A conventional `LIBCRUX_MLKEM768_SHA3_H` outer guard replaces the former pragma. | Complete the generated header and upstream/local-delta review. |
+| libcrux inclusion | A conventional `LIBCRUX_MLKEM768_SHA3_H` outer guard replaces the former pragma. Implementation reading is complete. | Complete upstream/local-delta and remaining caller-contract review. |
 | ML-KEM byte encoding | `core_num__u64_9__to_le_bytes`, `core_num__u64_9__from_le_bytes` and `core_num__u32_8__from_le_bytes` explicitly assemble or emit octets. `mlkem768.c` no longer selects byte order through compiler macros. | Finish all other arithmetic, object-layout and width assumptions. Current-host vectors alone do not establish other-target execution. |
 
 ## Generated ML-KEM source review
 
-The implementation in all 11,651 lines of `kex/libcrux_mlkem768_sha3.h`
+The implementation throughout `kex/libcrux_mlkem768_sha3.h`
 has now been read. Generated block annotations were omitted from the code view
 with source line numbers preserved; substantive descriptions/preconditions were
 then read separately, and repetitive Rust implementation/type annotations were
@@ -45,8 +45,8 @@ bytes. All rate blocks fit the 5-by-5 state and use explicit little-endian
 conversion. NTT table indices/loop scheduling, arithmetic intermediate bounds
 and all secret cleanup remain separate obligations.
 
-The compiler's macro-expanded AST of the production `mlkem768.c` translation
-unit indexes502 function definitions, with345 reached from the three private
+The compiler's current macro-expanded AST of the production `mlkem768.c` translation
+unit indexes504 function definitions, with347 reached from the three private
 wrappers and no reached indirect calls. External calls are `dssh_random`,
 `dssh_cleanse`, `memcpy`, `memcmp` and `abort`. The reached `memcmp` occurs in
 public-key canonical validation; `abort` occurs in three unwrap helpers whose
@@ -78,8 +78,9 @@ reported glue/model scope, not production provider/module/peer acceptance.
 
 ## Remaining cross-file acceptance
 
-Finish arithmetic and reduction bounds, shift and
-signed-conversion assumptions, 16-bit integer/size behavior, stack use, secret
+The arithmetic continuation below resolves its specified signed conversion,
+reduction and fixed-path bounds cluster. Finish all other caller/width and
+stack assumptions, secret
 intermediate lifetime, generic-path behavior, upstream correspondence and
 independent positive/negative vectors. Check the wrappers and both providers
 against the exact protocol and validation contracts. Preserve the distinction
@@ -89,3 +90,48 @@ Existing historical conversion/parity test results remain recorded in
 `release-1.0-audit.md` with their original source/provider scope.
 Native Windows testing remains the final CI stage after the
 local audit and validation requirements are complete.
+
+## Signed arithmetic continuation on base f2fb657
+
+The glue now constructs signed low words explicitly and computes floor shifts
+through unsigned values and bounded wide subtraction. Barrett quotient/products
+remain32-bit even with16-bit int. Montgomery low words, quotient extraction,
+message compression and vector sign masks use defined conversions/shifts.
+Bit extraction uses a32-bit constant and handles the complete byte-sized count
+domain. The two new helpers are private; no public header, ABI, supported method
+or allocation/ownership behavior changes.
+
+The direct runner checks262144 low-word inputs, all65536 signed16 values for
+Barrett and each production shift,18 int32 boundary values across0..33 and
+UINT_MAX shifts, and589824 Montgomery inputs spanning every low word at nine
+high-word planes. Its independent oracles use remainder/centering,64-bit exact
+division and scalar bit packing, rather than the production shift expressions.
+All65536 sign-mask/representative inputs, all3329 field values for message and
+4/5/10/11-bit compression, and all256 bit counts are checked. Prior polynomial,
+shuffle, constant and range checks remain active.
+
+A conservative range model follows the reviewed fixed K=3 paths: lazy forward
+NTT bounds16552 for public/ciphertext inputs and14371 for eta2 secret inputs;
+even two4095-bound operands yield a rank-three inverse input bound6531. All
+modeled vector sums/differences stay within int16, and products within int32.
+Inverse stages, domain conversions and final decryption subtraction are
+included. The model is source-reconciled mathematical evidence, not formal
+verification or native16-bit execution. Arbitrary caller contracts of unused
+generic generated routines remain separate.
+
+All99 supervised commands exit0: native build/inventory/CTest stages3/4/3 and
+90 exact protocol leaves, ten cases with each host key on each configuration.
+Each exact process selects one passing leaf, with no skips or sanitizer report.
+Retained storage tests pass7/5/7 groups; Botan also passes both independent KEM
+directions. The run uses at most two build/test jobs on CPUs0–7. Nineteen selected
+artifacts are bound:12 change and7 remain identical to their preceding evidence.
+All three shared libraries still export exactly125 public functions.
+
+The actual native Clang19.1.7 x86_64 -O2 output for three primitive probes has no
+conditional jumps, calls or value-indexed loads. This observation is limited to
+those routines/compiler/target, and does not certify other compilers or the
+whole vendor implementation's timing. The
+[validation record](release-1.0-evidence/validation-2026-11-06-vendor-arithmetic.json)
+binds sources, native executables, commands, model, compiler AST and assembly.
+Whole secret/provider/platform/upstream/peer/SDK and release gates remain open;
+the independent native TLS qualification retains its separate recorded scope.

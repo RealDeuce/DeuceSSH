@@ -6,6 +6,9 @@
 #include "dssh_test_alloc.h"
 #include "dssh_test_ossl.h"
 #include "deucessh-algorithms.h"
+#ifdef DSSH_CRYPTO_BOTAN
+#include "key_publication_cpp.h"
+#endif
 
 struct publication_ops {
 	int (*reg)(void);
@@ -36,19 +39,44 @@ struct snapshot {
 	size_t text_len;
 	const uint8_t *cache;
 };
-struct password_state { unsigned int calls; bool valid; };
+struct password_state {
+	unsigned int calls, clears;
+	bool valid, full, observe, watching, zero, arm_after;
+	uintptr_t address;
+};
 static int
 password(char *buf, int capacity, int writing, void *opaque)
 {
 	const char phrase[] = {'p', 'u', 'b', 0, 'l', 'i', 's', 'h'};
 	struct password_state *state = opaque;
-	if (buf == NULL || capacity < 8 || (writing != 0 && writing != 1) || state->calls == UINT_MAX) {
+	int requested = state->full ? 256 : 8;
+	if (buf == NULL || capacity < requested || (writing != 0 && writing != 1) || state->calls == UINT_MAX) {
 		state->valid = false;
 		return -1;
 	}
 	state->calls++;
-	memcpy(buf, phrase, sizeof(phrase));
-	return 8;
+	if (state->observe) {
+		if (state->watching || capacity != 256) {
+			state->valid = false;
+			return -1;
+		}
+		uintptr_t address = (uintptr_t)buf;
+		state->address = address;
+		state->watching = true;
+	}
+	if (state->full) {
+		memset(buf, 'K', 256);
+		buf[128] = 0;
+	}
+	else
+		memcpy(buf, phrase, sizeof(phrase));
+#ifdef DSSH_CRYPTO_BOTAN
+	if (state->arm_after) {
+		state->arm_after = false;
+		dssh_test_cpp_operation_arm(0);
+	}
+#endif
+	return requested;
 }
 static bool
 snapshot(const struct publication_ops *ops, dssh_key_algo key, struct snapshot *out)
@@ -229,8 +257,354 @@ test_encrypted(void)
 {
 	return run(2);
 }
+#ifdef DSSH_CRYPTO_BOTAN
+static void
+cpp_password_cleared(const void *ptr, size_t length, void *opaque)
+{
+	struct password_state *state = opaque;
+	uintptr_t address = (uintptr_t)ptr;
+	if (!state->watching || state->address != address)
+		return;
+	if (length != 256)
+		state->zero = false;
+	else {
+		const uint8_t *bytes = ptr;
+		for (size_t i = 0; i < length; i++) {
+			if (bytes[i] != 0)
+				state->zero = false;
+		}
+	}
+	state->watching = false;
+	state->address = 0;
+	if (state->clears == UINT_MAX)
+		state->valid = false;
+	else
+		state->clears++;
+}
+struct cpp_operation {
+	const struct publication_ops *ops;
+	unsigned int mode;
+	const char *path;
+	struct password_state *password;
+};
+static int
+cpp_operate(void *opaque)
+{
+	struct cpp_operation *operation = opaque;
+	if (operation->mode == 0)
+		return operation->ops->generate(2048);
+	return operation->ops->load(operation->path, operation->mode >= 2 ? password : NULL,
+	    operation->mode >= 2 ? operation->password : NULL);
+}
+static bool
+cpp_profile(const struct publication_ops *ops, unsigned int mode)
+{
+	char path[] = "/tmp/dssh-cpp-profile-XXXXXX";
+	bool created = false, valid = false;
+	struct snapshot candidate = {0}, before = {0}, after = {0};
+	struct dssh_bytes_result held = {0}, next = {0};
+	uint8_t held_copy[1024];
+	struct password_state state = {.valid = true, .full = mode == 3, .zero = true};
+	struct dssh_test_cpp_operation_result result = {0};
+	const char *cache = getenv(ops->cache);
+	dssh_test_alloc_reset();
+	dssh_test_key_stdio_reset();
+	dssh_test_reset_global_config();
+	if (cache == NULL || ops->reg() != 0 || ops->load(cache, NULL, NULL) != 0
+	    || !temporary(path, &created))
+		goto done;
+	dssh_key_algo key = find_key_algo(ops->name);
+	if (!snapshot(ops, key, &candidate)
+	    || ops->save(path, mode >= 2 ? password : NULL, mode >= 2 ? &state : NULL) != 0
+	    || !state.valid || ops->generate(2048) != 0 || !snapshot(ops, key, &before)
+	    || same_key(&candidate, &before) || sign(key, &held) != 0 || !verify(key, &before, &held)
+	    || held.bytes.len > sizeof(held_copy))
+		goto done;
+	memcpy(held_copy, held.bytes.data, held.bytes.len);
+	state = (struct password_state){.valid = true, .full = mode == 3, .zero = true, .observe = true};
+	struct cpp_operation operation = {ops, mode, path, &state};
+	dssh_test_key_observe_clear(cpp_password_cleared, &state);
+	dssh_test_cpp_operation(cpp_operate, &operation, SIZE_MAX, &result);
+	dssh_test_key_observe_clear(NULL, NULL);
+	valid = state.zero && !state.watching && state.calls == state.clears && !result.escaped && !result.injected && result.status == 0 && result.calls > 0
+	    && state.valid && snapshot(ops, key, &after) && !same_key(&before, &after)
+	    && (mode == 0 || same_key(&candidate, &after))
+	    && (mode >= 2 ? state.calls == 1 : state.calls == 0)
+	    && verify(key, &before, &held) && memcmp(held_copy, held.bytes.data, held.bytes.len) == 0;
+	if (valid)
+		valid = sign(key, &next) == 0 && verify(key, &after, &next)
+		    && next.bytes.data != held.bytes.data && verify(key, &before, &held);
+done:
+	dssh_result_release(&next.lease);
+	dssh_result_release(&held.lease);
+	dssh_test_alloc_reset();
+	dssh_test_key_stdio_reset();
+	dssh_test_reset_global_config();
+	if (created && unlink(path) != 0)
+		valid = false;
+	printf("key CPP profile: algorithm=%s mode=%u calls=%zu status=%d injected=%u escaped=%u valid=%u\n",
+	    ops->name, mode, result.calls, result.status, result.injected ? 1U : 0U,
+	    result.escaped ? 1U : 0U, valid ? 1U : 0U);
+	return valid;
+}
+/* Only the public-cache C allocation has this measured odd byte extent;
+ * native owner/signature metadata use pointer-aligned struct sizes. No native
+ * work, allocation or blocking operation runs inside this observer. */
+struct cpp_cache_marker {
+	size_t cache_size, fault;
+	unsigned int seen;
+	bool late, valid;
+};
+static void
+cpp_cache(size_t count, size_t size, void *opaque)
+{
+	struct cpp_cache_marker *marker = opaque;
+	if (count != 1 || size != marker->cache_size)
+		return;
+	if (marker->seen == UINT_MAX) {
+		marker->valid = false;
+		return;
+	}
+	marker->seen++;
+	if (marker->seen != 1) {
+		marker->valid = false;
+		return;
+	}
+	if (marker->late)
+		dssh_test_cpp_operation_arm(marker->fault);
+}
+
+/* scope0: whole ordinary-new prefix; scope1: after public cache allocation;
+ * scope2: actual scalar nothrow allocation of the C++ key context. */
+static bool
+cpp_fault_family(const struct publication_ops *ops, unsigned int mode, unsigned int scope)
+{
+	char candidate_path[] = "/tmp/dssh-cpp-candidate-XXXXXX";
+	char old_path[] = "/tmp/dssh-cpp-old-XXXXXX";
+	bool a = false, b = false, valid = false, finished = false;
+	struct snapshot candidate = {0}, original = {0};
+	struct password_state state = {.valid = true, .full = mode == 3, .zero = true};
+	const char *cache = getenv(ops->cache);
+	size_t rejected = 0, recovered = 0, allocation_errors = 0, invoked = 0, complete_calls = 0;
+	size_t password_size = scope == 3 ? dssh_test_cpp_password_allocation_size() : 0;
+	dssh_test_alloc_reset();
+	dssh_test_key_stdio_reset();
+	dssh_test_reset_global_config();
+	if (cache == NULL || ops->reg() != 0 || ops->load(cache, NULL, NULL) != 0
+	    || !temporary(candidate_path, &a) || !temporary(old_path, &b))
+		goto done;
+	dssh_key_algo key = find_key_algo(ops->name);
+	if (!snapshot(ops, key, &candidate)
+	    || ops->save(candidate_path, mode >= 2 ? password : NULL, mode >= 2 ? &state : NULL) != 0
+	    || !state.valid || ops->generate(2048) != 0 || !snapshot(ops, key, &original)
+	    || same_key(&candidate, &original) || ops->save(old_path, NULL, NULL) != 0)
+		goto done;
+	valid = true;
+	for (size_t point = 0; valid && point < 2048; point++) {
+		struct dssh_bytes_result held = {0}, next = {0};
+		struct snapshot before = {0}, after = {0};
+		struct dssh_test_cpp_operation_result result = {0};
+		uint8_t held_copy[1024];
+		if (ops->load(old_path, NULL, NULL) != 0 || !snapshot(ops, key, &before)
+		    || !same_key(&before, &original) || sign(key, &held) != 0 || !verify(key, &before, &held)
+		    || held.bytes.len > sizeof(held_copy)) {
+			dssh_result_release(&held.lease);
+			valid = false;
+			break;
+		}
+		memcpy(held_copy, held.bytes.data, held.bytes.len);
+		dssh_key_algo_ctx *prior = key->ctx;
+		state = (struct password_state){.valid = true, .full = mode == 3, .zero = true, .observe = true};
+		struct cpp_operation operation = {ops, mode, candidate_path, &state};
+		struct cpp_cache_marker marker = {before.public_len, point, 0, scope == 1, true};
+		dssh_test_alloc_reset();
+		dssh_test_key_stdio_reset();
+		if (mode != 0)
+			dssh_test_key_watch_read_free();
+		dssh_test_alloc_observe_allocations(cpp_cache, &marker);
+		dssh_test_key_observe_clear(cpp_password_cleared, &state);
+		state.arm_after = scope == 3;
+		if (scope == 2)
+			dssh_test_cpp_context_operation(cpp_operate, &operation, &result);
+		else
+			dssh_test_cpp_operation(cpp_operate, &operation, scope == 1 || scope == 3 ? SIZE_MAX : point, &result);
+		dssh_test_alloc_observe_allocations(NULL, NULL);
+		dssh_test_key_observe_clear(NULL, NULL);
+		unsigned int closes = dssh_test_key_close_calls();
+		bool input_retired = true;
+		if (mode != 0) {
+			bool zero = false;
+			input_retired = dssh_test_alloc_watched_free(&zero) && zero;
+		}
+		dssh_test_alloc_reset();
+		valid = state.zero && !state.watching && state.calls == state.clears
+		    && !result.escaped && state.valid && marker.valid && input_retired
+		    && closes == (mode == 0 ? 0U : 1U) && snapshot(ops, key, &after)
+		    && verify(key, &before, &held) && memcmp(held_copy, held.bytes.data, held.bytes.len) == 0;
+		if (scope == 1)
+			valid = valid && marker.seen == 1;
+		if (result.status < 0) {
+			valid = valid && result.injected && result.calls > point && key->ctx == prior
+			    && before.cache == after.cache && same_key(&before, &after);
+			rejected++;
+			if (result.status == DSSH_ERROR_ALLOC)
+				allocation_errors++;
+		}
+		else {
+			valid = valid && result.status == 0 && !same_key(&before, &after)
+			    && (mode == 0 || same_key(&candidate, &after))
+			    && (mode >= 2 ? state.calls == 1 : state.calls == 0);
+			if (result.injected)
+				recovered++;
+			else {
+				valid = valid && result.calls > 0 && result.calls <= point;
+				finished = valid;
+				complete_calls = result.calls;
+			}
+		}
+		if (scope == 2) {
+			valid = valid && point == 0 && result.status == DSSH_ERROR_ALLOC && result.injected
+			    && result.calls == 1 && marker.seen == 0;
+			finished = valid;
+		}
+		if (scope == 3) {
+			valid = valid && mode == 3 && point == 0 && password_size > 0 && result.status == DSSH_ERROR_INIT
+			    && result.injected && result.failed_size == password_size && marker.seen == 0
+			    && state.calls == 1 && state.clears == 1;
+			finished = valid;
+		}
+		if (valid)
+			valid = sign(key, &next) == 0 && verify(key, &after, &next)
+			    && next.bytes.data != held.bytes.data && verify(key, &before, &held);
+		dssh_result_release(&next.lease);
+		dssh_result_release(&held.lease);
+		invoked++;
+		printf("key CPP fault: algorithm=%s mode=%u scope=%u point=%zu calls=%zu status=%d injected=%u escaped=%u "
+		    "bytes=%zu cache=%u pw-calls=%u pw-clears=%u valid=%u\n",
+		    ops->name, mode, scope, point, result.calls, result.status, result.injected ? 1U : 0U,
+		    result.escaped ? 1U : 0U, result.failed_size, marker.seen, state.calls, state.clears, valid ? 1U : 0U);
+		if (finished)
+			break;
+	}
+	valid = valid && finished && rejected > 0 && (scope != 1 || allocation_errors > 0);
+	if (valid && scope >= 2) {
+		struct dssh_bytes_result held = {0}, next = {0};
+		struct snapshot after = {0};
+		struct dssh_test_cpp_operation_result result = {0};
+		uint8_t held_copy[1024];
+		valid = sign(key, &held) == 0 && verify(key, &original, &held)
+		    && held.bytes.len <= sizeof(held_copy);
+		if (valid) {
+			memcpy(held_copy, held.bytes.data, held.bytes.len);
+			state = (struct password_state){.valid = true, .full = mode == 3, .zero = true, .observe = true};
+			struct cpp_operation operation = {ops, mode, candidate_path, &state};
+			dssh_test_key_observe_clear(cpp_password_cleared, &state);
+			dssh_test_cpp_operation(cpp_operate, &operation, SIZE_MAX, &result);
+			dssh_test_key_observe_clear(NULL, NULL);
+			valid = state.zero && !state.watching && state.calls == state.clears
+			    && result.status == 0 && !result.injected && !result.escaped && result.calls > 0
+			    && state.valid && snapshot(ops, key, &after) && !same_key(&original, &after)
+			    && (mode == 0 || same_key(&candidate, &after))
+			    && verify(key, &original, &held) && memcmp(held_copy, held.bytes.data, held.bytes.len) == 0
+			    && sign(key, &next) == 0 && verify(key, &after, &next) && next.bytes.data != held.bytes.data;
+			complete_calls = result.calls;
+		}
+		dssh_result_release(&next.lease);
+		dssh_result_release(&held.lease);
+		printf("key CPP recovery: algorithm=%s mode=%u scope=%u calls=%zu valid=%u\n",
+		    ops->name, mode, scope, complete_calls, valid ? 1U : 0U);
+	}
+done:
+	dssh_test_alloc_reset();
+	dssh_test_key_stdio_reset();
+	dssh_test_reset_global_config();
+	if (a && unlink(candidate_path) != 0)
+		valid = false;
+	if (b && unlink(old_path) != 0)
+		valid = false;
+	printf("key CPP fault summary: algorithm=%s mode=%u scope=%u invoked=%zu rejected=%zu recovered=%zu alloc-errors=%zu complete-calls=%zu valid=%u\n",
+	    ops->name, mode, scope, invoked, rejected, recovered, allocation_errors, complete_calls, valid ? 1U : 0U);
+	return valid;
+}
+static int
+cpp_faults(unsigned int mode, unsigned int scope)
+{
+	unsigned int completed = 0;
+	for (size_t i = 0; i < sizeof(operations) / sizeof(operations[0]); i++) {
+		if (cpp_fault_family(&operations[i], mode, scope))
+			completed++;
+	}
+	printf("key CPP fault group: mode=%u scope=%u families=3 completed=%u\n", mode, scope, completed);
+	ASSERT_EQ(completed, 3);
+	return TEST_PASS;
+}
+#define CPP_FAULT_TEST(name, mode, scope) \
+	static int name(void) \
+	{ \
+		return cpp_faults(mode, scope); \
+	}
+CPP_FAULT_TEST(cpp_prefix_generation, 0, 0)
+CPP_FAULT_TEST(cpp_prefix_plain, 1, 0)
+CPP_FAULT_TEST(cpp_prefix_encrypted, 2, 0)
+CPP_FAULT_TEST(cpp_late_generation, 0, 1)
+CPP_FAULT_TEST(cpp_late_plain, 1, 1)
+CPP_FAULT_TEST(cpp_late_encrypted, 2, 1)
+CPP_FAULT_TEST(cpp_context_generation, 0, 2)
+CPP_FAULT_TEST(cpp_context_plain, 1, 2)
+CPP_FAULT_TEST(cpp_context_encrypted, 2, 2)
+CPP_FAULT_TEST(cpp_password_encrypted, 3, 3)
+#undef CPP_FAULT_TEST
+static int
+cpp_counts(unsigned int mode)
+{
+	unsigned int completed = 0;
+	for (size_t i = 0; i < sizeof(operations) / sizeof(operations[0]); i++) {
+		if (cpp_profile(&operations[i], mode))
+			completed++;
+	}
+	printf("key CPP profile summary: mode=%u families=3 completed=%u\n", mode, completed);
+	ASSERT_EQ(completed, 3);
+	return TEST_PASS;
+}
+static int
+cpp_counts_generation(void)
+{
+	return cpp_counts(0);
+}
+static int
+cpp_counts_plain(void)
+{
+	return cpp_counts(1);
+}
+static int
+cpp_counts_encrypted(void)
+{
+	return cpp_counts(2);
+}
+static int
+cpp_counts_full_password(void)
+{
+	return cpp_counts(3);
+}
+#endif
 static struct dssh_test_entry tests[] = {
 	{"generation", test_generation}, {"plain", test_plain}, {"encrypted", test_encrypted},
+#ifdef DSSH_CRYPTO_BOTAN
+		{"cpp_prefix_generation", cpp_prefix_generation},
+	{"cpp_prefix_plain", cpp_prefix_plain},
+	{"cpp_prefix_encrypted", cpp_prefix_encrypted},
+	{"cpp_late_generation", cpp_late_generation},
+	{"cpp_late_plain", cpp_late_plain},
+	{"cpp_late_encrypted", cpp_late_encrypted},
+	{"cpp_context_generation", cpp_context_generation},
+	{"cpp_context_plain", cpp_context_plain},
+	{"cpp_context_encrypted", cpp_context_encrypted},
+	{"cpp_password_encrypted", cpp_password_encrypted},
+	{"cpp_counts_full_password", cpp_counts_full_password},
+	{"cpp_counts_generation", cpp_counts_generation},
+	{"cpp_counts_plain", cpp_counts_plain},
+	{"cpp_counts_encrypted", cpp_counts_encrypted},
+#endif
 };
 DSSH_TEST_NO_CLEANUP
 DSSH_TEST_MAIN(tests)

@@ -10,14 +10,27 @@ static thread_local bool active;
 static thread_local bool failed;
 static thread_local size_t fail_at;
 static thread_local size_t attempts;
+static thread_local size_t failed_size;
+static thread_local bool nothrow_only, in_nothrow;
+static thread_local size_t nothrow_size;
 
 void
 dssh_test_cpp_new_fail_after(size_t index)
 {
 	active = true;
+	nothrow_only = false;
 	failed = false;
+	failed_size = 0;
 	fail_at = index;
 	attempts = 0;
+}
+
+void
+dssh_test_cpp_new_fail_nothrow_size(size_t size)
+{
+	dssh_test_cpp_new_fail_after(0);
+	nothrow_only = true;
+	nothrow_size = size;
 }
 
 void
@@ -38,15 +51,22 @@ dssh_test_cpp_new_failed(void)
 	return failed;
 }
 
+size_t
+dssh_test_cpp_new_failed_size(void)
+{
+	return failed_size;
+}
+
 void *
 operator new(std::size_t size)
 {
-	if (active) {
+	if (active && (!nothrow_only || (in_nothrow && size == nothrow_size))) {
 		size_t index = attempts;
 		if (attempts < std::numeric_limits<size_t>::max())
 			attempts++;
 		if (!failed && index == fail_at) {
 			failed = true;
+			failed_size = size;
 			throw std::bad_alloc();
 		}
 	}
@@ -61,6 +81,28 @@ operator new(std::size_t size)
 			throw std::bad_alloc();
 		handler();
 	}
+}
+
+void *
+operator new(std::size_t size, const std::nothrow_t &) noexcept
+{
+	bool previous = in_nothrow;
+	in_nothrow = true;
+	try {
+		void *ptr = ::operator new(size);
+		in_nothrow = previous;
+		return ptr;
+	}
+	catch (...) {
+		in_nothrow = previous;
+		return nullptr;
+	}
+}
+
+void
+operator delete(void *ptr, const std::nothrow_t &) noexcept
+{
+	std::free(ptr);
 }
 
 void *

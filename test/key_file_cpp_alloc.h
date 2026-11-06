@@ -6,8 +6,10 @@
 #ifdef __cplusplus
 void dssh_test_cpp_new_fail_after(size_t index);
 void dssh_test_cpp_new_disable(void);
+void dssh_test_cpp_new_fail_nothrow_size(size_t size);
 size_t dssh_test_cpp_new_count(void);
 bool dssh_test_cpp_new_failed(void);
+size_t dssh_test_cpp_new_failed_size(void);
 extern "C" {
 #endif
 bool dssh_test_key_ed_public(uint8_t *out, size_t capacity, size_t *length);

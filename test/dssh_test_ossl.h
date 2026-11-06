@@ -112,4 +112,6 @@ void dssh_test_clock_set(struct timespec value);
 void dssh_test_clock_schedule(struct timespec first, unsigned count, struct timespec second);
 int dssh_test_clock_count(void);
 
+#include "dssh_test_key_file.h"
+
 #endif /* DSSH_TEST_OSSL_H */

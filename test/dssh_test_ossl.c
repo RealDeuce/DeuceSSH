@@ -13,6 +13,7 @@
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <threads.h>
 #include <limits.h>
 #include <stdio.h>
@@ -711,6 +712,14 @@ dssh_test_EVP_PKEY_keygen(EVP_PKEY_CTX *ctx, EVP_PKEY **ppkey)
 }
 
 int
+dssh_test_EVP_PKEY_up_ref(EVP_PKEY *pkey)
+{
+	if (should_fail())
+		return 0;
+	return EVP_PKEY_up_ref(pkey);
+}
+
+int
 dssh_test_EVP_PKEY_derive_init(EVP_PKEY_CTX *ctx)
 {
 	if (should_fail())
@@ -1111,4 +1120,134 @@ dssh_test_cnd_signal(cnd_t *cond)
 	if (should_thrd_fail())
 		return thrd_error;
 	return ret;
+}
+
+
+/* Target library-owned key-file streams, without changing provider stdio. */
+#include "dssh_test_alloc.h"
+
+static _Thread_local dssh_test_key_clear_observer key_clear_observer;
+static _Thread_local void *key_clear_data;
+static _Thread_local bool key_close_error;
+static _Thread_local bool key_watch_read;
+static _Thread_local bool key_read_short;
+static _Thread_local unsigned int key_read_short_count;
+static _Thread_local unsigned int key_close_count;
+static _Thread_local unsigned int key_close_injected;
+static _Thread_local unsigned int key_close_native_errors;
+static _Thread_local unsigned int key_read_count;
+
+void
+dssh_test_key_stdio_reset(void)
+{
+	key_clear_observer = NULL;
+	key_clear_data = NULL;
+	key_close_error = false;
+	key_watch_read = false;
+	key_read_short = false;
+	key_read_short_count = 0;
+	key_close_count = 0;
+	key_close_injected = 0;
+	key_close_native_errors = 0;
+	key_read_count = 0;
+}
+
+void
+dssh_test_key_close_error_once(void)
+{
+	key_close_error = true;
+}
+
+void
+dssh_test_key_watch_read_free(void)
+{
+	key_watch_read = true;
+}
+
+void
+dssh_test_key_read_short_once(void)
+{
+	key_read_short = true;
+}
+
+unsigned int
+dssh_test_key_short_read_calls(void)
+{
+	return key_read_short_count;
+}
+
+unsigned int
+dssh_test_key_close_calls(void)
+{
+	return key_close_count;
+}
+
+unsigned int
+dssh_test_key_close_errors(void)
+{
+	return key_close_injected;
+}
+
+unsigned int
+dssh_test_key_native_close_errors(void)
+{
+	return key_close_native_errors;
+}
+
+unsigned int
+dssh_test_key_read_calls(void)
+{
+	return key_read_count;
+}
+
+int
+dssh_test_key_file_close(FILE *stream)
+{
+	int ret = fclose(stream);
+	if (key_close_count < UINT_MAX)
+		key_close_count++;
+	if (ret != 0 && key_close_native_errors < UINT_MAX)
+		key_close_native_errors++;
+	if (key_close_error) {
+		key_close_error = false;
+		if (key_close_injected < UINT_MAX)
+			key_close_injected++;
+		return EOF;
+	}
+	return ret;
+}
+
+size_t
+dssh_test_key_file_read(void *ptr, size_t size, size_t count, FILE *stream)
+{
+	size_t requested = count;
+	if (key_read_short && count != 0) {
+		key_read_short = false;
+		requested--;
+		if (key_read_short_count < UINT_MAX)
+			key_read_short_count++;
+	}
+	size_t ret = fread(ptr, size, requested, stream);
+	if (key_read_count < UINT_MAX)
+		key_read_count++;
+	if (key_watch_read && size != 0 && count <= SIZE_MAX / size) {
+		key_watch_read = false;
+		dssh_test_alloc_watch_free(ptr, size * count);
+	}
+	return ret;
+}
+
+
+void
+dssh_test_key_observe_clear(dssh_test_key_clear_observer observer, void *data)
+{
+	key_clear_observer = observer;
+	key_clear_data = data;
+}
+
+void
+dssh_test_key_file_cleared(const void *ptr, size_t length)
+{
+	if (key_clear_observer != NULL)
+		key_clear_observer(ptr, length, key_clear_data);
 }

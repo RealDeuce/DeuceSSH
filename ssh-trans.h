@@ -396,6 +396,7 @@ int dssh_test_EVP_MAC_update(EVP_MAC_CTX *ctx, const unsigned char *data, size_t
 int dssh_test_EVP_MAC_final(EVP_MAC_CTX *ctx, unsigned char *out, size_t *outl, size_t outsize);
 int dssh_test_EVP_PKEY_keygen_init(EVP_PKEY_CTX *ctx);
 int dssh_test_EVP_PKEY_keygen(EVP_PKEY_CTX *ctx, EVP_PKEY **ppkey);
+int dssh_test_EVP_PKEY_up_ref(EVP_PKEY *pkey);
 int dssh_test_EVP_PKEY_derive_init(EVP_PKEY_CTX *ctx);
 int dssh_test_EVP_PKEY_derive_set_peer(EVP_PKEY_CTX *ctx, EVP_PKEY *peer);
 int dssh_test_EVP_PKEY_derive(EVP_PKEY_CTX *ctx, unsigned char *key, size_t *keylen);
@@ -430,6 +431,7 @@ int     dssh_test_EVP_PKEY_CTX_set_params(EVP_PKEY_CTX *ctx, const OSSL_PARAM *p
  #define EVP_MAC_final(c, o, ol, os)          dssh_test_EVP_MAC_final(c, o, ol, os)
  #define EVP_PKEY_keygen_init(c)              dssh_test_EVP_PKEY_keygen_init(c)
  #define EVP_PKEY_keygen(c, p)                dssh_test_EVP_PKEY_keygen(c, p)
+ #define EVP_PKEY_up_ref(k)                   dssh_test_EVP_PKEY_up_ref(k)
  #define EVP_PKEY_derive_init(c)              dssh_test_EVP_PKEY_derive_init(c)
  #define EVP_PKEY_derive_set_peer(c, p)       dssh_test_EVP_PKEY_derive_set_peer(c, p)
  #define EVP_PKEY_derive(c, k, kl)            dssh_test_EVP_PKEY_derive(c, k, kl)

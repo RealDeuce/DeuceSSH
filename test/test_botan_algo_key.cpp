@@ -11,6 +11,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <unistd.h>
+#include <new>
+#include <climits>
+#include "key_file_cpp_alloc.h"
 
 #include <botan/rsa.h>
 #include <botan/ed25519.h>
@@ -23,6 +26,8 @@ extern "C" {
 #include "deucessh-algorithms.h"
 #include "deucessh-crypto.h"
 #include "deucessh-result.h"
+#include "dssh_test_alloc.h"
+#include "dssh_test_key_file.h"
 }
 
 struct dssh_key_algo_ctx;
@@ -458,11 +463,212 @@ test_rsa_key_roundtrip(void)
 	return TEST_PASS;
 }
 
+
+struct cpp_password_probe {
+	bool observe = false;
+	bool watching = false;
+	bool valid = true;
+	bool zero = true;
+	uintptr_t address = 0;
+	size_t capacity = 0;
+	size_t callbacks = 0;
+	size_t clears = 0;
+};
+
+static int
+cpp_full_password(char *buf, int size, int rwflag, void *opaque)
+{
+	auto *probe = static_cast<cpp_password_probe *>(opaque);
+	if (buf == nullptr || size < 1 || (rwflag != 0 && rwflag != 1)) {
+		probe->valid = false;
+		return -1;
+	}
+#if INT_MAX > SIZE_MAX
+	if (size > SIZE_MAX) {
+		probe->valid = false;
+		return -1;
+	}
+#endif
+	size_t count = static_cast<size_t>(size);
+	memset(buf, 'F', count);
+	if (probe->observe) {
+		uintptr_t address = reinterpret_cast<uintptr_t>(buf);
+		probe->address = address;
+		probe->capacity = count;
+		probe->watching = true;
+		probe->callbacks++;
+	}
+	return size;
+}
+
+static void
+cpp_password_cleared(const void *ptr, size_t length, void *opaque)
+{
+	auto *probe = static_cast<cpp_password_probe *>(opaque);
+	uintptr_t address = reinterpret_cast<uintptr_t>(ptr);
+	if (!probe->watching || probe->address != address)
+		return;
+	if (length != probe->capacity)
+		probe->zero = false;
+	const uint8_t *bytes = static_cast<const uint8_t *>(ptr);
+	for (size_t i = 0; i < length; i++) {
+		if (bytes[i] != 0)
+			probe->zero = false;
+	}
+	probe->watching = false;
+	probe->clears++;
+}
+
+static bool
+cpp_temporary(char *path, bool *created)
+{
+	int fd = mkstemp(path);
+	if (fd < 0)
+		return false;
+	*created = true;
+	return close(fd) == 0;
+}
+
+static int
+test_key_file_cpp_oom(void)
+{
+	char plain[] = "/tmp/dssh-cpp-plain-XXXXXX";
+	char encrypted[] = "/tmp/dssh-cpp-encrypted-XXXXXX";
+	char current[] = "/tmp/dssh-cpp-current-XXXXXX";
+	char output[] = "/tmp/dssh-cpp-output-XXXXXX";
+	bool a = false, b = false, c = false, d = false;
+	bool valid = true;
+	size_t failures[4] = {}, allocation_errors[4] = {}, recovered[4] = {};
+	size_t calls_at_success[4] = {};
+	uint8_t candidate[512], before[512], after[512];
+	size_t candidate_len = 0, before_len = 0, after_len = 0;
+	cpp_password_probe password;
+	void *allocation = nullptr;
+	bool probe_failed = false;
+	dssh_test_cpp_new_fail_after(0);
+	try {
+		allocation = ::operator new(1);
+	}
+	catch (const std::bad_alloc &) {
+		probe_failed = true;
+	}
+	catch (...) {
+	}
+	dssh_test_cpp_new_disable();
+	if (allocation != nullptr)
+		::operator delete(allocation);
+	valid = probe_failed && dssh_test_cpp_new_failed() && dssh_test_cpp_new_count() == 1;
+	try {
+		dssh_test_key_stdio_reset();
+		dssh_test_alloc_reset();
+		dssh_test_reset_global_config();
+		const char *cache = getenv("DSSH_TEST_ED25519_KEY");
+		valid = valid && cpp_temporary(plain, &a) && cpp_temporary(encrypted, &b)
+		    && cpp_temporary(current, &c) && cpp_temporary(output, &d)
+		    && dssh_register_ssh_ed25519() == 0
+		    && (cache != nullptr ? dssh_ed25519_load_key_file(cache, nullptr, nullptr)
+		        : dssh_ed25519_generate_key()) == 0
+		    && dssh_ed25519_save_key_file(plain, nullptr, nullptr) == 0
+		    && dssh_ed25519_save_key_file(encrypted, cpp_full_password, &password) == 0
+		    && dssh_test_key_ed_public(candidate, sizeof(candidate), &candidate_len);
+		for (unsigned int phase = 0; valid && phase < 4; phase++) {
+			valid = dssh_ed25519_generate_key() == 0
+			    && dssh_ed25519_save_key_file(current, nullptr, nullptr) == 0
+			    && dssh_test_key_ed_public(before, sizeof(before), &before_len)
+			    && (before_len != candidate_len || memcmp(before, candidate, before_len) != 0);
+			bool success = false;
+			for (size_t index = 0; valid && index < 256; index++) {
+				valid = dssh_ed25519_load_key_file(current, nullptr, nullptr) == 0;
+				if (!valid)
+					break;
+				password = cpp_password_probe{};
+				password.observe = true;
+				dssh_test_key_stdio_reset();
+				dssh_test_alloc_reset();
+				if (phase == 1 || phase == 2)
+					dssh_test_key_watch_read_free();
+				dssh_test_key_observe_clear(cpp_password_cleared, &password);
+				dssh_test_cpp_new_fail_after(index);
+				int ret = DSSH_ERROR_INIT;
+				bool escaped = false;
+				try {
+					if (phase == 0)
+						ret = dssh_ed25519_generate_key();
+					else if (phase == 1)
+						ret = dssh_ed25519_load_key_file(plain, nullptr, nullptr);
+					else if (phase == 2)
+						ret = dssh_ed25519_load_key_file(encrypted, cpp_full_password, &password);
+					else
+						ret = dssh_ed25519_save_key_file(output, nullptr, nullptr);
+				}
+				catch (...) {
+					escaped = true;
+				}
+				dssh_test_cpp_new_disable();
+				size_t calls = dssh_test_cpp_new_count();
+				bool injected = dssh_test_cpp_new_failed();
+				dssh_test_key_observe_clear(nullptr, nullptr);
+				bool zero = false;
+				bool input_retired = true;
+				if (phase == 1 || phase == 2)
+					input_retired = dssh_test_alloc_watched_free(&zero) && zero;
+				valid = !escaped && input_retired && password.valid && password.zero
+				    && !password.watching && password.callbacks == password.clears
+				    && dssh_test_key_ed_public(after, sizeof(after), &after_len) && valid;
+				if (ret < 0) {
+					valid = injected && before_len == after_len && memcmp(before, after, before_len) == 0
+					    && dssh_test_key_ed_signable(before, before_len) && valid;
+					failures[phase]++;
+					if (ret == DSSH_ERROR_ALLOC)
+						allocation_errors[phase]++;
+				}
+				else {
+					valid = ret == 0 && dssh_test_key_ed_signable(after, after_len) && valid;
+					if (phase == 1 || phase == 2)
+						valid = after_len == candidate_len && memcmp(after, candidate, candidate_len) == 0 && valid;
+					if (phase == 3)
+						valid = after_len == before_len && memcmp(after, before, before_len) == 0 && valid;
+					if (injected)
+						recovered[phase]++;
+					else {
+						calls_at_success[phase] = calls;
+						success = true;
+						break;
+					}
+				}
+			}
+			valid = success && failures[phase] > 0 && valid;
+			if (phase < 3)
+				valid = allocation_errors[phase] >= 2 && valid;
+			printf("key-file C++ new: phase=%u failed=%zu alloc-errors=%zu recovered=%zu success-calls=%zu valid=%u\n",
+			    phase, failures[phase], allocation_errors[phase], recovered[phase], calls_at_success[phase], valid ? 1U : 0U);
+		}
+	}
+	catch (...) {
+		valid = false;
+	}
+	dssh_test_cpp_new_disable();
+	dssh_test_key_stdio_reset();
+	dssh_test_alloc_reset();
+	dssh_test_reset_global_config();
+	if (a && unlink(plain) != 0)
+		valid = false;
+	if (b && unlink(encrypted) != 0)
+		valid = false;
+	if (c && unlink(current) != 0)
+		valid = false;
+	if (d && unlink(output) != 0)
+		valid = false;
+	ASSERT_TRUE(valid);
+	return TEST_PASS;
+}
+
 /* ================================================================
  * Test table
  * ================================================================ */
 
 static struct dssh_test_entry tests[] = {
+	{ "key_file_cpp_oom", test_key_file_cpp_oom },
 	/* RSA pubkey serialization */
 	{ "rsa_pubkey_e_pad",            test_rsa_pubkey_e_pad },
 	{ "rsa_pubkey_n_no_pad",         test_rsa_pubkey_n_no_pad },

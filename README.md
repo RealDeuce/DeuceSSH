@@ -1235,20 +1235,37 @@ Each key algorithm provides these functions:
 | `_get_pub_str(buf, bufsz)` | Get OpenSSH public key string (0/NULL to query size) |
 | `_generate_key(...)` | Generate a new key in memory |
 
-The `pw_cb` parameter is `dssh_pem_password_cb` — pass NULL for
-unencrypted PEM, or a callback to encrypt (save) / decrypt (load)
-with AES-256-CBC:
+The key-file helpers own their file I/O. `pw_cb` is a
+`dssh_pem_password_cb`: it returns an exact byte count in `[0, size]`, or a
+negative value on failure. Empty passwords, embedded NUL bytes and a full
+buffer are valid; no NUL terminator is required. A callback selects encrypted
+private-key output using AES-256-CBC and supplies a password when encrypted
+input needs one. NULL permits unencrypted input/output only, ignores cbdata
+and never invokes a provider prompt. Failed imports do not publish a new key.
+
+This example accepts a C-string password and rejects an oversized password:
 
 ```c
-/* Passphrase callback: fill buf, return length */
+#include <limits.h>
+#include <stdint.h>
+#include <string.h>
+
 int my_pw_cb(char *buf, int size, int rwflag, void *u)
 {
-    const char *pass = u;
-    int len = strlen(pass);
-    if (len > size)
-        len = size;
-    memcpy(buf, pass, len);
-    return len;
+	const char *pass = u;
+	if (buf == NULL || pass == NULL || size < 1 || (rwflag != 0 && rwflag != 1))
+		return -1;
+#if INT_MAX > SIZE_MAX
+	if (size > SIZE_MAX)
+		return -1;
+#endif
+	size_t capacity = (size_t)size;
+	size_t length = strlen(pass);
+	if (length > capacity)
+		return -1;
+	memcpy(buf, pass, length);
+	int result = (int)length;
+	return result;
 }
 
 /* Generate, save encrypted, export public key */

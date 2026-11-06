@@ -23,6 +23,7 @@
 #include "private-key-file.h"
 #include "key-context-botan.h"
 #include "key-wire.h"
+#include "key-file-common.h"
 
 struct dssh_key_algo_ctx;
 
@@ -231,27 +232,35 @@ dssh_botan_ed25519_cleanup(dssh_key_algo_ctx *ctx)
 static int
 install_key(std::unique_ptr<Botan::Private_Key> privkey)
 {
-	std::unique_ptr<dssh_botan_key_context> replacement(new (std::nothrow) dssh_botan_key_context{});
-	if (replacement == nullptr)
-		return DSSH_ERROR_ALLOC;
-	replacement->privkey = std::move(privkey);
-	const uint8_t *blob;
-	size_t blob_len;
-	int ret = pubkey_impl(&blob, &blob_len, replacement.get());
-	if (ret == 0)
-		ret = dssh_signature_pool_create(&replacement->signatures);
-	if (ret == 0)
-		ret = dssh_key_algo_set_ctx(ED25519_NAME, replacement.get());
-	if (ret < 0) {
-		free(replacement->pub_blob);
-		dssh_signature_pool_destroy(replacement->signatures);
-		return ret;
+	try {
+		std::unique_ptr<dssh_botan_key_context> replacement(new (std::nothrow) dssh_botan_key_context{});
+		if (replacement == nullptr)
+			return DSSH_ERROR_ALLOC;
+		replacement->privkey = std::move(privkey);
+		const uint8_t *blob;
+		size_t blob_len;
+		int ret = pubkey_impl(&blob, &blob_len, replacement.get());
+		if (ret == 0)
+			ret = dssh_signature_pool_create(&replacement->signatures);
+		if (ret == 0)
+			ret = dssh_key_algo_set_ctx(ED25519_NAME, replacement.get());
+		if (ret < 0) {
+			free(replacement->pub_blob);
+			dssh_signature_pool_destroy(replacement->signatures);
+			return ret;
+		}
+		struct dssh_botan_key_context *old = ed25519_ctx;
+		dssh_key_algo_ctx *old_opaque = reinterpret_cast<dssh_key_algo_ctx *>(old);
+		ed25519_ctx = replacement.release();
+		dssh_botan_ed25519_cleanup(old_opaque);
+		return 0;
 	}
-	struct dssh_botan_key_context *old = ed25519_ctx;
-	dssh_key_algo_ctx *old_opaque = reinterpret_cast<dssh_key_algo_ctx *>(old);
-	ed25519_ctx = replacement.release();
-	dssh_botan_ed25519_cleanup(old_opaque);
-	return 0;
+	catch (const std::bad_alloc &) {
+		return DSSH_ERROR_ALLOC;
+	}
+	catch (...) {
+		return DSSH_ERROR_INIT;
+	}
 }
 
 /* --- Public API functions --- */
@@ -264,70 +273,46 @@ dssh_ed25519_load_key_file(const char *path, dssh_pem_password_cb pw_cb, void *p
 	int config_ret = dssh_key_algo_set_ctx(ED25519_NAME, ed25519_ctx);
 	if (config_ret < 0)
 		return config_ret;
-
 	FILE *fp = fopen(path, "rb");
 	if (fp == NULL)
 		return DSSH_ERROR_INIT;
-
-	if (fseek(fp, 0, SEEK_END) != 0) {
-		fclose(fp);
-		return DSSH_ERROR_INIT;
-	}
+	if (fseek(fp, 0, SEEK_END) != 0)
+		return dssh_key_file_close(fp, DSSH_ERROR_INIT);
 	long fsize = ftell(fp);
-	if (fsize <= 0) {
-		fclose(fp);
-		return DSSH_ERROR_INIT;
-	}
-	if (fseek(fp, 0, SEEK_SET) != 0) {
-		fclose(fp);
-		return DSSH_ERROR_INIT;
-	}
-	size_t   file_sz  = static_cast<size_t>(fsize);
+	size_t file_sz;
+	int ret = dssh_key_file_length(fsize, SIZE_MAX, &file_sz);
+	if (ret < 0)
+		return dssh_key_file_close(fp, ret);
+	if (fseek(fp, 0, SEEK_SET) != 0)
+		return dssh_key_file_close(fp, DSSH_ERROR_INIT);
 	uint8_t *pem_data = static_cast<uint8_t *>(malloc(file_sz));
-	if (pem_data == NULL) {
-		fclose(fp);
-		return DSSH_ERROR_ALLOC;
-	}
-	if (fread(pem_data, 1, file_sz, fp) != file_sz) {
-		free(pem_data);
-		fclose(fp);
-		return DSSH_ERROR_INIT;
-	}
-	fclose(fp);
-
-	char        pw_buf[256];
-	const char *password = NULL;
-	if (pw_cb != NULL) {
-		int pw_len = pw_cb(pw_buf, static_cast<int>(sizeof(pw_buf)), 0, pw_cbdata);
-		if (pw_len > 0 && pw_len < static_cast<int>(sizeof(pw_buf))) {
-			pw_buf[pw_len] = '\0';
-			password       = pw_buf;
-		}
-	}
-
-	std::unique_ptr<Botan::Private_Key> privkey;
-
+	if (pem_data == NULL)
+		return dssh_key_file_close(fp, DSSH_ERROR_ALLOC);
+	dssh_key_file_buffer input(pem_data, file_sz);
+	ret = fread(pem_data, 1, file_sz, fp) == file_sz ? 0 : DSSH_ERROR_INIT;
+	ret = dssh_key_file_close(fp, ret);
+	if (ret < 0)
+		return ret;
+	char pw_buf[256];
+	dssh_key_file_secret_region password_bytes(pw_buf, sizeof(pw_buf));
+	struct dssh_key_file_password_state password = {pw_cb, pw_cbdata, 0};
 	try {
 		Botan::DataSource_Memory ds(pem_data, file_sz);
-		std::string              pw_str = password ? password : "";
-
-		privkey = Botan::PKCS8::load_key(ds, pw_str);
-	}
-	catch (...) {
-		free(pem_data);
-		dssh_cleanse(pw_buf, sizeof(pw_buf));
-		return DSSH_ERROR_INIT;
-	}
-	free(pem_data);
-	dssh_cleanse(pw_buf, sizeof(pw_buf));
-
-	try {
+		auto get_password = [&]() -> std::string {
+			int length = dssh_key_file_password(pw_buf, 256, 0, &password);
+			if (length < 0)
+				throw dssh_key_file_password_error{};
+			size_t count = static_cast<size_t>(length);
+			return std::string(pw_buf, count);
+		};
+		auto privkey = pw_cb == NULL ? Botan::PKCS8::load_key(ds)
+		    : Botan::PKCS8::load_key(ds, get_password);
 		if (privkey == nullptr || privkey->algo_name() != "Ed25519")
 			return DSSH_ERROR_INVALID;
 		return install_key(std::move(privkey));
 	}
 	catch (...) {
-		return DSSH_ERROR_INIT;
+		return password.status < 0 ? password.status : DSSH_ERROR_INIT;
 	}
 }
 
@@ -344,40 +329,32 @@ dssh_ed25519_save_key_file(const char *path, dssh_pem_password_cb pw_cb, void *p
 		return DSSH_ERROR_INIT;
 	if (ed25519_ctx == NULL || ed25519_ctx->privkey == NULL)
 		return DSSH_ERROR_INIT;
-
+	std::shared_ptr<Botan::Private_Key> key = ed25519_ctx->privkey;
 	FILE *fp = dssh_private_key_open(path);
 	if (fp == NULL)
 		return DSSH_ERROR_INIT;
-
+	char pw_buf[256];
+	dssh_key_file_secret_region password_bytes(pw_buf, sizeof(pw_buf));
+	struct dssh_key_file_password_state password = {pw_cb, pw_cbdata, 0};
 	try {
-		std::string pem;
-
+		dssh_key_file_secret_string pem;
 		if (pw_cb != NULL) {
-			char pw_buf[256];
-			int  pw_len = pw_cb(pw_buf, static_cast<int>(sizeof(pw_buf)), 1, pw_cbdata);
-			if (pw_len <= 0 || pw_len >= static_cast<int>(sizeof(pw_buf))) {
-				dssh_cleanse(pw_buf, sizeof(pw_buf));
-				fclose(fp);
-				return DSSH_ERROR_INIT;
-			}
-			pw_buf[pw_len] = '\0';
-			pem            = Botan::PKCS8::PEM_encode_encrypted_pbkdf_msec(*ed25519_ctx->privkey,
-				       Botan::system_rng(), pw_buf, std::chrono::milliseconds(300), nullptr, "AES-256/CBC");
-			dssh_cleanse(pw_buf, sizeof(pw_buf));
+			int length = dssh_key_file_password(pw_buf, 256, 1, &password);
+			if (length < 0)
+				return dssh_key_file_close(fp, password.status);
+			size_t count = static_cast<size_t>(length);
+			std::string_view phrase(pw_buf, count);
+			pem.value = Botan::PKCS8::PEM_encode_encrypted_pbkdf_msec(*key,
+			    Botan::system_rng(), phrase, std::chrono::milliseconds(300), nullptr, "AES-256/CBC");
 		}
 		else {
-			pem = Botan::PKCS8::PEM_encode(*ed25519_ctx->privkey);
+			pem.value = Botan::PKCS8::PEM_encode(*key);
 		}
-
-		bool wok = write_pem_to_file(fp, pem);
-
-		if (fclose(fp) != 0)
-			return DSSH_ERROR_INIT;
-		return wok ? 0 : DSSH_ERROR_INIT;
+		bool written = write_pem_to_file(fp, pem.value);
+		return dssh_key_file_close(fp, written ? 0 : DSSH_ERROR_INIT);
 	}
 	catch (...) {
-		fclose(fp);
-		return DSSH_ERROR_INIT;
+		return dssh_key_file_close(fp, password.status < 0 ? password.status : DSSH_ERROR_INIT);
 	}
 }
 

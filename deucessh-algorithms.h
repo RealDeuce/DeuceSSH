@@ -18,7 +18,12 @@ extern "C" {
  * Password callback for PEM key files.  Same signature as OpenSSL's
  * pem_password_cb -- buf receives the passphrase, size is the buffer
  * length, rwflag is 0 for reading / 1 for writing, userdata is the
- * opaque pointer passed alongside.  Return the passphrase length.
+ * opaque pointer passed alongside. Return a byte count in [0, size], including
+ * zero for an empty password; a negative result reports failure. A full buffer
+ * is valid and needs no NUL terminator. Passphrases may contain NUL bytes.
+ * Do not throw C++ exceptions through this callback. NULL callback permits
+ * unencrypted input/output only and never invokes a provider prompt; cbdata
+ * is ignored in that case. File imports preserve the installed key on error.
  */
 typedef int (*dssh_pem_password_cb)(char *buf, int size, int rwflag, void *userdata);
 

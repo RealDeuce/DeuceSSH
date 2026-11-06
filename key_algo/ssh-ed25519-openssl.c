@@ -10,6 +10,7 @@
 #include "private-key-file.h"
 #include "key-context-openssl.h"
 #include "key-wire.h"
+#include "key-file-common.h"
 #ifdef DSSH_TESTING
  #include "ssh-internal.h"
 #endif
@@ -283,21 +284,19 @@ dssh_ed25519_load_key_file(const char *path, dssh_pem_password_cb pw_cb, void *p
 	if (config_ret < 0)
 		return config_ret;
 	FILE *fp = fopen(path, "rb");
-
 	if (fp == NULL)
 		return DSSH_ERROR_INIT;
-
-	EVP_PKEY *pkey = PEM_read_PrivateKey(fp, NULL, pw_cb, pw_cbdata);
-
-	fclose(fp);
-	if (pkey == NULL)
-		return DSSH_ERROR_INIT;
-
+	struct dssh_key_file_password_state password = {pw_cb, pw_cbdata, 0};
+	EVP_PKEY *pkey = PEM_read_PrivateKey(fp, NULL, dssh_key_file_password, &password);
+	int closed = dssh_key_file_close(fp, 0);
+	if (closed < 0 || pkey == NULL || password.status < 0) {
+		EVP_PKEY_free(pkey);
+		return password.status < 0 ? password.status : DSSH_ERROR_INIT;
+	}
 	if (!EVP_PKEY_is_a(pkey, "ED25519")) {
 		EVP_PKEY_free(pkey);
 		return DSSH_ERROR_INVALID;
 	}
-
 	return install_key(pkey);
 }
 
@@ -313,25 +312,33 @@ dssh_ed25519_save_key_file(const char *path, dssh_pem_password_cb pw_cb, void *p
 #endif
 		return DSSH_ERROR_INIT;
 
-	FILE *fp = dssh_private_key_open(path);
-	if (fp == NULL)
+	EVP_PKEY *pkey = ed25519_ctx->pkey;
+	if (EVP_PKEY_up_ref(pkey) != 1)
 		return DSSH_ERROR_INIT;
+	FILE *fp = dssh_private_key_open(path);
+	if (fp == NULL) {
+		EVP_PKEY_free(pkey);
+		return DSSH_ERROR_INIT;
+	}
 
 	EVP_CIPHER *cipher = NULL;
 
 	if (pw_cb != NULL) {
 		cipher = EVP_CIPHER_fetch(NULL, "AES-256-CBC", NULL);
 		if (cipher == NULL) {
-			fclose(fp);
-			return DSSH_ERROR_INIT;
+			EVP_PKEY_free(pkey);
+			return dssh_key_file_close(fp, DSSH_ERROR_INIT);
 		}
 	}
-	int ok = PEM_write_PrivateKey(fp, ed25519_ctx->pkey, cipher, NULL, 0, pw_cb, pw_cbdata);
+	struct dssh_key_file_password_state password = {pw_cb, pw_cbdata, 0};
+	int ok = PEM_write_PrivateKey(fp, pkey, cipher, NULL, 0, dssh_key_file_password, &password);
 
 	EVP_CIPHER_free(cipher);
-	if (fclose(fp) != 0)
-		ok = 0;
-	return ok == 1 ? 0 : DSSH_ERROR_INIT;
+	EVP_PKEY_free(pkey);
+	int status = ok == 1 ? 0 : DSSH_ERROR_INIT;
+	if (password.status < 0)
+		status = password.status;
+	return dssh_key_file_close(fp, status);
 }
 
 DSSH_PUBLIC int64_t

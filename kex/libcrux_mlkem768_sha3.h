@@ -210,7 +210,7 @@ core_num__u8_6__wrapping_sub(uint8_t x, uint8_t y)
 // ITERATORS
 
 #define Eurydice_range_iter_next(iter_ptr, t, ret_t)                              \
-	(((iter_ptr)->start == (iter_ptr)->end) ? (CLITERAL(ret_t) {.tag = None}) \
+	(((iter_ptr)->start >= (iter_ptr)->end) ? (CLITERAL(ret_t) {.tag = None}) \
 						: (CLITERAL(ret_t) {.tag = Some, .f0 = (iter_ptr)->start++}))
 
 #define core_iter_range___core__iter__traits__iterator__Iterator_for_core__ops__range__Range_A___6__next \
@@ -10033,9 +10033,9 @@ with const generics
 */
 static KRML_MUSTINLINE void
 libcrux_ml_kem_serialize_compress_then_serialize_11_e1(libcrux_ml_kem_polynomial_PolynomialRingElement_f0 *re,
-    uint8_t ret[320U])
+    uint8_t ret[352U])
 {
-	uint8_t serialized[320U] = {0U};
+	uint8_t serialized[352U] = {0U};
 	for (size_t i = (size_t)0U; i < LIBCRUX_ML_KEM_POLYNOMIAL_VECTORS_IN_RING_ELEMENT; i++) {
 		size_t                                                    i0 = i;
 		libcrux_ml_kem_vector_portable_vector_type_PortableVector coefficient =
@@ -10047,7 +10047,7 @@ libcrux_ml_kem_serialize_compress_then_serialize_11_e1(libcrux_ml_kem_polynomial
 		    (size_t)22U * i0 + (size_t)22U, uint8_t);
 		Eurydice_slice_copy(uu____0, Eurydice_array_to_slice((size_t)22U, bytes, uint8_t), uint8_t);
 	}
-	memcpy(ret, serialized, (size_t)320U * sizeof(uint8_t));
+	memcpy(ret, serialized, (size_t)352U * sizeof(uint8_t));
 }
 
 /**

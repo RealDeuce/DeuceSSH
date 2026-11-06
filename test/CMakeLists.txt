@@ -219,7 +219,18 @@ if(NOT APPLE)
 		-Wl,--wrap=malloc,--wrap=calloc,--wrap=realloc,--wrap=free)
 endif()
 
-# Helper function for adding test executables
+# This exercises the bundled C glue directly without a provider, registry or
+# library test hooks. The runner uses only standard C library facilities.
+add_executable(dssh_test_vendor_glue test_vendor_glue.c)
+set_property(TARGET dssh_test_vendor_glue PROPERTY C_STANDARD ${DEUCESSH_C_STANDARD})
+set_property(TARGET dssh_test_vendor_glue PROPERTY C_STANDARD_REQUIRED ON)
+target_include_directories(dssh_test_vendor_glue PRIVATE ${PROJECT_SOURCE_DIR})
+target_compile_options(dssh_test_vendor_glue PRIVATE ${DEUCESSH_COMPILE_OPTIONS}
+	$<$<OR:$<C_COMPILER_ID:Clang>,$<C_COMPILER_ID:AppleClang>,$<C_COMPILER_ID:GNU>>:-Wno-unused-function>)
+add_test(NAME dssh_unit_vendor_glue COMMAND dssh_test_vendor_glue)
+set_tests_properties(dssh_unit_vendor_glue PROPERTIES TIMEOUT 60)
+
+# Helper function for adding provider-backed test executables
 function(dssh_add_test test_name source_file)
 	add_executable(dssh_test_${test_name} ${source_file})
 	# Test clocks, mkstemp(), and strdup() need the POSIX namespace in

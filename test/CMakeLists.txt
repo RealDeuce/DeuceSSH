@@ -638,7 +638,8 @@ if(UNIX)
 	target_compile_definitions(dssh_test_key_descriptors PRIVATE _POSIX_C_SOURCE=200809L
 		DSSH_FD_EXEC_PROBE="$<TARGET_FILE:dssh_key_fd_exec_probe>")
 	add_dependencies(dssh_test_key_descriptors dssh_key_fd_exec_probe)
-	foreach(part IN ITEMS modes invalid_paths association_failure native_open_failure exec_controls)
+	foreach(part IN ITEMS modes invalid_paths association_failure native_open_failure exec_controls
+	    private_stages helper_errno native_controls)
 		add_test(NAME dssh_key_descriptors_${part} COMMAND dssh_test_key_descriptors --exact ${part})
 		set_tests_properties(dssh_key_descriptors_${part} PROPERTIES ENVIRONMENT "${DSSH_TEST_KEY_ENV}" TIMEOUT 180)
 	endforeach()

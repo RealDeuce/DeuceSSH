@@ -46,6 +46,8 @@ void dssh_test_key_file_cleared(const void *ptr, size_t length);
 
 struct dssh_test_key_open_report {
 	unsigned int stdio_opens, native_opens, associations, rejected_associations;
+	unsigned int permissions, truncations, raw_closes;
+	unsigned int permission_errors, truncation_errors, raw_close_errors, native_close_errors;
 	bool descriptor_valid, close_on_exec;
 };
 struct dssh_test_key_open_report dssh_test_key_open_report(void);
@@ -55,6 +57,14 @@ FILE *dssh_test_key_file_fopen(const char *path, const char *mode);
 #ifndef _WIN32
 int dssh_test_key_native_open(const char *path, int flags, mode_t mode);
 FILE *dssh_test_key_native_fdopen(int fd, const char *mode);
+/* Metadata errors are reported before the real operation. A reported raw
+ * close error follows the real close; it never simulates an unretired fd. */
+void dssh_test_key_permission_error_once(void);
+void dssh_test_key_truncate_error_once(void);
+void dssh_test_key_raw_close_error_once(void);
+int dssh_test_key_native_fchmod(int fd, mode_t mode);
+int dssh_test_key_native_ftruncate(int fd, off_t length);
+int dssh_test_key_native_close(int fd);
 #endif
 
 #ifdef __cplusplus

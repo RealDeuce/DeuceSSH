@@ -10,6 +10,7 @@
 #include "dssh_test_alloc.h"
 #include "dssh_test_ossl.h"
 #include "deucessh-algorithms.h"
+#include "key_algo/private-key-file.h"
 
 struct descriptor_ops {
 	int (*reg)(void);
@@ -27,10 +28,77 @@ static const struct descriptor_ops operations[] = {
 	    dssh_rsa_sha2_512_save_pub_file, "rsa-sha2-512", "DSSH_TEST_RSA_KEY"},
 };
 
-/* kind0 normal property, kind1 NULL, kind2 empty, kind3 rejected fdopen,
- * kind4 actual missing-parent open error. Never inspect a native object layout. */
+static const char stage_marker[] = "native key-file stage control";
+
+/* Test data is nonsensitive. Inspect the actual file, not an observer's model. */
 static bool
-file_case(const struct descriptor_ops *ops, unsigned int action, unsigned int kind)
+stage_file_state(const char *path, unsigned int kind)
+{
+	struct stat info;
+	mode_t expected_mode = kind == 5 || kind == 7 ? 0640 : 0600;
+	bool empty = kind == 3 || kind == 9;
+	if (stat(path, &info) != 0 || (info.st_mode & 0777) != expected_mode
+	    || info.st_size != (empty ? 0 : sizeof(stage_marker)))
+		return false;
+	FILE *fp = fopen(path, "rb");
+	if (fp == NULL)
+		return false;
+	char observed[sizeof(stage_marker)];
+	size_t count = fread(observed, 1, sizeof(observed), fp);
+	bool valid = count == (empty ? 0 : sizeof(stage_marker))
+	    && (empty || memcmp(observed, stage_marker, sizeof(stage_marker)) == 0)
+	    && fgetc(fp) == EOF && ferror(fp) == 0;
+	if (fclose(fp) != 0)
+		valid = false;
+	return valid;
+}
+
+static int
+stage_password(char *buffer, int capacity, int writing, void *data)
+{
+	unsigned int *calls = data;
+	if (*calls < UINT_MAX)
+		(*calls)++;
+	if (buffer == NULL || capacity < 1 || writing != 1)
+		return -1;
+	buffer[0] = 'p';
+	return 1;
+}
+
+static void
+arm_stage(unsigned int kind)
+{
+	if (kind == 3 || kind == 9)
+		dssh_test_key_fdopen_error_once();
+	else if (kind == 5 || kind == 7)
+		dssh_test_key_permission_error_once();
+	else if (kind == 6 || kind == 8)
+		dssh_test_key_truncate_error_once();
+	if (kind >= 7)
+		dssh_test_key_raw_close_error_once();
+}
+
+static bool
+stage_report_valid(struct dssh_test_key_open_report report, unsigned int kind)
+{
+	bool permission = kind == 5 || kind == 7;
+	bool truncate = kind == 6 || kind == 8;
+	return report.stdio_opens == 0 && report.native_opens == 1
+	    && report.permissions == 1 && report.permission_errors == (permission ? 1U : 0U)
+	    && report.truncations == (permission ? 0U : 1U)
+	    && report.truncation_errors == (truncate ? 1U : 0U)
+	    && report.associations == (!permission && !truncate ? 1U : 0U)
+	    && report.rejected_associations == (!permission && !truncate ? 1U : 0U)
+	    && report.raw_closes == 1 && report.raw_close_errors == (kind >= 7 ? 1U : 0U)
+	    && report.native_close_errors == 0 && !report.descriptor_valid;
+}
+
+/* kind0 normal property, kind1 NULL, kind2 empty, kind3 rejected fdopen,
+ * kind4 actual missing-parent open error, kind5/6 metadata errors,
+ * kind7/8/9 metadata/association error with reported post-retirement close error.
+ * Never inspect a native object layout. */
+static bool
+file_case(const struct descriptor_ops *ops, unsigned int action, unsigned int kind, bool encrypted)
 {
 	char output[] = "/tmp/dssh-fd-output-XXXXXX";
 	char absent[] = "/tmp/dssh-fd-absent-XXXXXX";
@@ -42,6 +110,7 @@ file_case(const struct descriptor_ops *ops, unsigned int action, unsigned int ki
 	struct dssh_test_key_open_report report = {0};
 	bool closed = false;
 	int status = DSSH_ERROR_INIT;
+	unsigned int password_calls = 0;
 	const char *cache = getenv(ops->cache);
 	dssh_test_alloc_reset();
 	dssh_test_key_stdio_reset();
@@ -52,7 +121,11 @@ file_case(const struct descriptor_ops *ops, unsigned int action, unsigned int ki
 	if (fd < 0)
 		goto done;
 	output_created = true;
-	if (close(fd) != 0 || mkdtemp(absent) == NULL)
+	bool seeded = write(fd, stage_marker, sizeof(stage_marker)) == sizeof(stage_marker)
+	    && fchmod(fd, 0640) == 0;
+	if (close(fd) != 0)
+		seeded = false;
+	if (!seeded || mkdtemp(absent) == NULL)
 		goto done;
 	directory_created = true;
 	if (rmdir(absent) != 0)
@@ -81,20 +154,29 @@ file_case(const struct descriptor_ops *ops, unsigned int action, unsigned int ki
 	else if (kind == 4)
 		path = missing;
 	dssh_test_key_stdio_reset();
-	if (kind == 3)
-		dssh_test_key_fdopen_error_once();
+	if (action == 1 && (kind == 3 || kind >= 5))
+		dssh_test_key_watch_stream();
+	arm_stage(kind);
 	status = action == 0 ? ops->load(path, NULL, NULL)
-	    : action == 1 ? ops->save(path, NULL, NULL) : ops->public_save(path);
+	    : action == 1 ? ops->save(path, encrypted ? stage_password : NULL, &password_calls) : ops->public_save(path);
 	report = dssh_test_key_open_report();
-	if (kind == 3)
+	if (kind == 3 || kind >= 5)
 		closed = dssh_test_key_failed_fd_closed();
 	unsigned int calls = report.stdio_opens + report.native_opens;
 	valid = status == (kind == 0 ? 0 : DSSH_ERROR_INIT)
-	    && (kind == 0 ? report.descriptor_valid && report.close_on_exec && calls == 1
+	    && (kind >= 5 ? stage_report_valid(report, kind) && closed
+	        : kind == 0 ? report.descriptor_valid && report.close_on_exec && calls == 1
 	        : kind == 1 || kind == 2 ? calls == 0 && report.associations == 0
 	        : kind == 3 ? report.rejected_associations == 1 && closed
 	        : calls == 1 && report.associations == 0 && !report.descriptor_valid)
-	    && (kind == 3 || report.rejected_associations == 0);
+	    && (kind == 3 || kind == 9 || report.rejected_associations == 0)
+	    && password_calls == 0;
+	if (valid && action == 1 && (kind == 3 || kind >= 5)) {
+		struct dssh_test_key_stream_report stream = dssh_test_key_stream_report();
+		valid = stage_report_valid(report, kind) && closed && stage_file_state(output, kind)
+		    && stream.valid && !stream.active && stream.configurations == 0
+		    && stream.closes == 0 && stream.clears == 0 && dssh_test_key_close_calls() == 0;
+	}
 	const uint8_t *after = NULL;
 	size_t after_length = 0;
 	valid = valid && key->pubkey(&after, &after_length, key->ctx) == 0 && after_length == public_length
@@ -122,9 +204,11 @@ done:
 	if (directory_created && rmdir(absent) != 0)
 		valid = false;
 	printf("key descriptors: algorithm=%s action=%u kind=%u status=%d stdio=%u native=%u associations=%u "
-	    "rejected=%u observed-valid=%u cloexec=%u retired=%u valid=%u\n", ops->name, action, kind, status,
+	    "rejected=%u observed-valid=%u cloexec=%u retired=%u valid=%u "
+	    "encrypted=%u password-calls=%u chmod=%u truncate=%u raw-close=%u close-error=%u\n", ops->name, action, kind, status,
 	    report.stdio_opens, report.native_opens, report.associations, report.rejected_associations,
-	    report.descriptor_valid ? 1U : 0U, report.close_on_exec ? 1U : 0U, closed ? 1U : 0U, valid ? 1U : 0U);
+	    report.descriptor_valid ? 1U : 0U, report.close_on_exec ? 1U : 0U, closed ? 1U : 0U, valid ? 1U : 0U,
+	    encrypted ? 1U : 0U, password_calls, report.permissions, report.truncations, report.raw_closes, report.raw_close_errors);
 	return valid;
 }
 
@@ -135,7 +219,7 @@ cases(unsigned int first, unsigned int last)
 	for (size_t i = 0; i < sizeof(operations) / sizeof(operations[0]); i++) {
 		for (unsigned int action = 0; action < 3; action++) {
 			for (unsigned int kind = first; kind <= last; kind++) {
-				if (file_case(&operations[i], action, kind))
+				if (file_case(&operations[i], action, kind, false))
 					completed++;
 			}
 		}
@@ -209,12 +293,123 @@ test_exec_controls(void)
 	ASSERT_EQ(completed, 2);
 	return TEST_PASS;
 }
+static int
+test_private_stages(void)
+{
+	const unsigned int kinds[] = {3, 5, 6, 7, 8, 9};
+	unsigned int completed = 0;
+	for (size_t i = 0; i < sizeof(operations) / sizeof(operations[0]); i++) {
+		for (unsigned int encrypted = 0; encrypted < 2; encrypted++) {
+			for (size_t k = 0; k < sizeof(kinds) / sizeof(kinds[0]); k++) {
+				if (file_case(&operations[i], 1, kinds[k], encrypted != 0))
+					completed++;
+			}
+		}
+	}
+	printf("key native private stages: expected=36 completed=%u\n", completed);
+	ASSERT_EQ(completed, 36);
+	return TEST_PASS;
+}
+
+/* Direct private-helper errors also distinguish preservation of the initial
+ * errno from a later cleanup-close error. Public APIs make no errno promise. */
+static int
+test_helper_errno(void)
+{
+	const unsigned int kinds[] = {3, 5, 6, 7, 8, 9};
+	unsigned int completed = 0;
+	for (size_t k = 0; k < sizeof(kinds) / sizeof(kinds[0]); k++) {
+		unsigned int kind = kinds[k];
+		char path[] = "/tmp/dssh-native-errno-XXXXXX";
+		int fd = mkstemp(path);
+		if (fd < 0)
+			continue;
+		bool valid = write(fd, stage_marker, sizeof(stage_marker)) == sizeof(stage_marker)
+		    && fchmod(fd, 0640) == 0;
+		if (close(fd) != 0)
+			valid = false;
+		int saved = 0;
+		int expected = kind >= 7 ? EIO : kind == 3 ? ENOMEM : kind == 5 ? EACCES : ENOSPC;
+		if (valid) {
+			dssh_test_key_stdio_reset();
+			arm_stage(kind);
+			FILE *fp = dssh_private_key_open(path);
+			saved = errno;
+			struct dssh_test_key_open_report report = dssh_test_key_open_report();
+			valid = fp == NULL && saved == expected && stage_report_valid(report, kind)
+			    && dssh_test_key_failed_fd_closed() && stage_file_state(path, kind);
+			if (fp != NULL && fclose(fp) != 0)
+				valid = false;
+		}
+		dssh_test_key_stdio_reset();
+		if (unlink(path) != 0)
+			valid = false;
+		if (valid)
+			completed++;
+		printf("key native errno: kind=%u expected=%d observed=%d valid=%u\n", kind, expected, saved, valid ? 1U : 0U);
+	}
+	printf("key native errno summary: expected=6 completed=%u\n", completed);
+	ASSERT_EQ(completed, 6);
+	return TEST_PASS;
+}
+
+static int
+test_native_controls(void)
+{
+	unsigned int completed = 0;
+	for (unsigned int fail = 0; fail < 2; fail++) {
+		char path[] = "/tmp/dssh-native-control-XXXXXX";
+		int fd = mkstemp(path);
+		if (fd < 0)
+			continue;
+		bool valid = write(fd, stage_marker, sizeof(stage_marker)) == sizeof(stage_marker)
+		    && fchmod(fd, 0640) == 0;
+		dssh_test_key_stdio_reset();
+		if (fail != 0) {
+			dssh_test_key_permission_error_once();
+			dssh_test_key_truncate_error_once();
+			dssh_test_key_raw_close_error_once();
+		}
+		int permission = dssh_test_key_native_fchmod(fd, 0400);
+		int permission_errno = errno;
+		int truncate = dssh_test_key_native_ftruncate(fd, 3);
+		int truncate_errno = errno;
+		struct stat info;
+		valid = valid && fstat(fd, &info) == 0
+		    && (info.st_mode & 0777) == (fail != 0 ? 0640 : 0400)
+		    && info.st_size == (fail != 0 ? sizeof(stage_marker) : 3);
+		int closed = dssh_test_key_native_close(fd);
+		int close_errno = errno;
+		errno = 0;
+		valid = valid && fcntl(fd, F_GETFD) == -1 && errno == EBADF;
+		struct dssh_test_key_open_report report = dssh_test_key_open_report();
+		valid = valid && permission == (fail != 0 ? -1 : 0) && truncate == (fail != 0 ? -1 : 0)
+		    && closed == (fail != 0 ? -1 : 0)
+		    && (fail == 0 || (permission_errno == EACCES && truncate_errno == ENOSPC && close_errno == EIO))
+		    && report.permissions == 1 && report.truncations == 1 && report.raw_closes == 1
+		    && report.permission_errors == fail && report.truncation_errors == fail
+		    && report.raw_close_errors == fail && report.native_close_errors == 0;
+		dssh_test_key_stdio_reset();
+		if (unlink(path) != 0)
+			valid = false;
+		if (valid)
+			completed++;
+		printf("key native controls: fault=%u valid=%u\n", fail, valid ? 1U : 0U);
+	}
+	printf("key native controls summary: expected=2 completed=%u\n", completed);
+	ASSERT_EQ(completed, 2);
+	return TEST_PASS;
+}
+
 static struct dssh_test_entry tests[] = {
 	{"modes", test_modes},
 	{"invalid_paths", test_invalid_paths},
 	{"association_failure", test_association_failure},
 	{"native_open_failure", test_native_open_failure},
 	{"exec_controls", test_exec_controls},
+	{"private_stages", test_private_stages},
+	{"helper_errno", test_helper_errno},
+	{"native_controls", test_native_controls},
 };
 DSSH_TEST_NO_CLEANUP
 DSSH_TEST_MAIN(tests)

@@ -21,6 +21,7 @@
 #include <errno.h>
 #ifndef _WIN32
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -1221,6 +1222,9 @@ dssh_test_key_file_setvbuf(FILE *stream, char *buffer, int mode, size_t capacity
 static _Thread_local struct dssh_test_key_open_report key_open_report;
 static _Thread_local bool key_fdopen_error;
 static _Thread_local int key_failed_fd = -1;
+#ifndef _WIN32
+static _Thread_local bool key_permission_error, key_truncate_error, key_raw_close_error;
+#endif
 
 struct dssh_test_key_open_report
 dssh_test_key_open_report(void)
@@ -1235,6 +1239,74 @@ dssh_test_key_fdopen_error_once(void)
 }
 
 #ifndef _WIN32
+void
+dssh_test_key_permission_error_once(void)
+{
+	key_permission_error = true;
+}
+
+void
+dssh_test_key_truncate_error_once(void)
+{
+	key_truncate_error = true;
+}
+
+void
+dssh_test_key_raw_close_error_once(void)
+{
+	key_raw_close_error = true;
+}
+
+int
+dssh_test_key_native_fchmod(int fd, mode_t mode)
+{
+	if (key_open_report.permissions < UINT_MAX)
+		key_open_report.permissions++;
+	if (key_permission_error) {
+		key_permission_error = false;
+		key_failed_fd = fd;
+		if (key_open_report.permission_errors < UINT_MAX)
+			key_open_report.permission_errors++;
+		errno = EACCES;
+		return -1;
+	}
+	return fchmod(fd, mode);
+}
+
+int
+dssh_test_key_native_ftruncate(int fd, off_t length)
+{
+	if (key_open_report.truncations < UINT_MAX)
+		key_open_report.truncations++;
+	if (key_truncate_error) {
+		key_truncate_error = false;
+		key_failed_fd = fd;
+		if (key_open_report.truncation_errors < UINT_MAX)
+			key_open_report.truncation_errors++;
+		errno = ENOSPC;
+		return -1;
+	}
+	return ftruncate(fd, length);
+}
+
+int
+dssh_test_key_native_close(int fd)
+{
+	int ret = close(fd);
+	if (key_open_report.raw_closes < UINT_MAX)
+		key_open_report.raw_closes++;
+	if (ret != 0 && key_open_report.native_close_errors < UINT_MAX)
+		key_open_report.native_close_errors++;
+	if (key_raw_close_error) {
+		key_raw_close_error = false;
+		if (key_open_report.raw_close_errors < UINT_MAX)
+			key_open_report.raw_close_errors++;
+		errno = EIO;
+		return -1;
+	}
+	return ret;
+}
+
 static void
 key_observe_descriptor(int fd)
 {
@@ -1303,6 +1375,11 @@ dssh_test_key_stdio_reset(void)
 	key_open_report = (struct dssh_test_key_open_report){0};
 	key_fdopen_error = false;
 	key_failed_fd = -1;
+#ifndef _WIN32
+	key_permission_error = false;
+	key_truncate_error = false;
+	key_raw_close_error = false;
+#endif
 	key_stream_watch = false;
 	key_setvbuf_error = false;
 	key_stream_closed = false;

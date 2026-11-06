@@ -9,6 +9,9 @@
 #include "dssh_test_key_file.h"
 #define open(path, flags, mode) dssh_test_key_native_open(path, flags, mode)
 #define fdopen(fd, mode) dssh_test_key_native_fdopen(fd, mode)
+#define fchmod(fd, mode) dssh_test_key_native_fchmod(fd, mode)
+#define ftruncate(fd, length) dssh_test_key_native_ftruncate(fd, length)
+#define close(fd) dssh_test_key_native_close(fd)
 #endif
 
 /* Paths are validated by public wrappers. POSIX.1-2008 supplies O_CLOEXEC;

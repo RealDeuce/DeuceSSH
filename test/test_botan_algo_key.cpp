@@ -20,6 +20,7 @@
 #include <botan/bigint.h>
 #include <botan/data_src.h>
 #include <botan/pkcs8.h>
+#include <botan/pubkey.h>
 #include <botan/system_rng.h>
 
 extern "C" {
@@ -832,7 +833,8 @@ test_rsa_cache_native(void)
 				const auto callbacks = {dssh_botan_rsa256_pubkey, dssh_botan_rsa512_pubkey};
 				for (auto callback : callbacks) {
 					dssh_botan_key_context context;
-					context.privkey = key;
+					Botan::DataSource_Stream reloaded(path);
+					context.privkey = Botan::PKCS8::load_key(reloaded);
 					auto *opaque = reinterpret_cast<dssh_key_algo_ctx *>(&context);
 					uint8_t marker = 0;
 					const uint8_t *blob = &marker;
@@ -889,12 +891,129 @@ test_rsa_cache_native(void)
 	return TEST_PASS;
 }
 
+static bool
+native_key_usable(Botan::Private_Key *key, const char *padding)
+{
+	if (key == nullptr)
+		return false;
+	const uint8_t message[] = {'o', 'w', 'n', 'e', 'r'};
+	auto public_key = key->public_key();
+	if (public_key == nullptr)
+		return false;
+	Botan::PK_Signer signer(*key, Botan::system_rng(), padding);
+	auto signature = signer.sign_message(message, sizeof(message), Botan::system_rng());
+	Botan::PK_Verifier verifier(*public_key, padding);
+	return !signature.empty() && verifier.verify_message(message, signature);
+}
+
+static int
+test_native_key_owners(void)
+{
+	bool valid = true;
+	unsigned int failed = 0, recovered = 0, warm = 0, retired = 0, rollbacks = 0;
+	const char *variables[] = {"DSSH_TEST_ED25519_KEY", "DSSH_TEST_RSA_KEY", "DSSH_TEST_RSA_KEY"};
+	const char *padding[] = {"", "PKCS1v15(SHA-256)", "PKCS1v15(SHA-512)"};
+	for (size_t family = 0; family < 3; family++) {
+		struct dssh_native_key_pool *pool = nullptr;
+		try {
+			const char *path = getenv(variables[family]);
+			if (path == nullptr) {
+				valid = false;
+				continue;
+			}
+			Botan::DataSource_Stream input(path);
+			auto original = Botan::PKCS8::load_key(input);
+			Botan::Private_Key *first = original.get();
+			bool ownership = first != nullptr;
+			for (int point = 0; ownership && point < 2; point++) {
+				dssh_test_alloc_fail_after(point);
+				int ret = dssh_botan_key_pool_create(&pool, original);
+				int calls = dssh_test_alloc_count();
+				dssh_test_alloc_reset();
+				ownership = ret == DSSH_ERROR_ALLOC && pool == nullptr
+				    && original.get() == first && calls == point + 1
+				    && native_key_usable(original.get(), padding[family]);
+				rollbacks += ownership ? 1U : 0U;
+			}
+			if (!ownership || dssh_botan_key_pool_create(&pool, original) != 0 || original != nullptr) {
+				valid = false;
+				dssh_native_key_pool_destroy(pool);
+				continue;
+			}
+			Botan::Private_Key *one = nullptr, *two = nullptr;
+			{
+				dssh_botan_key_guard a, b;
+				bool observed = a.acquire(pool) == 0 && a.get() == first;
+				dssh_test_alloc_fail_after(INT_MAX);
+				dssh_test_cpp_new_fail_after(0);
+				int ret = b.acquire(pool);
+				dssh_test_cpp_new_disable();
+				printf("cold clone family=%zu ret=%d object=%u C=%d Cpp=%zu injected=%u\n",
+				    family, ret, b.get() != nullptr ? 1U : 0U, dssh_test_alloc_count(),
+				    dssh_test_cpp_new_count(), dssh_test_cpp_new_failed() ? 1U : 0U);
+				/* Native decoding may wrap bad_alloc in a decoding error.
+				 * Both documented adapter errors must leave the lease empty. */
+				observed = observed && (ret == DSSH_ERROR_ALLOC || ret == DSSH_ERROR_INIT) && b.get() == nullptr
+				    && dssh_test_alloc_count() == 1 && dssh_test_cpp_new_count() > 0 && dssh_test_cpp_new_failed();
+				dssh_test_alloc_reset();
+				failed += observed ? 1U : 0U;
+				valid = observed && valid;
+				observed = b.acquire(pool) == 0 && a.get() != b.get()
+				    && a.get()->public_key_bits() == b.get()->public_key_bits()
+				    && native_key_usable(a.get(), padding[family]) && native_key_usable(b.get(), padding[family]);
+				recovered += observed ? 1U : 0U;
+				valid = observed && valid;
+				one = a.get();
+				two = b.get();
+			}
+			for (unsigned int repeat = 0; repeat < 16; repeat++) {
+				dssh_test_alloc_fail_after(0);
+				dssh_test_cpp_new_fail_after(0);
+				bool observed;
+				{
+					dssh_botan_key_guard a, b;
+					observed = a.acquire(pool) == 0 && b.acquire(pool) == 0 && a.get() != b.get()
+					    && (a.get() == one || a.get() == two) && (b.get() == one || b.get() == two);
+				}
+				dssh_test_cpp_new_disable();
+				observed = observed && dssh_test_alloc_count() == 0 && dssh_test_cpp_new_count() == 0
+				    && !dssh_test_cpp_new_failed();
+				dssh_test_alloc_reset();
+				warm += observed ? 1U : 0U;
+				valid = observed && valid;
+			}
+			{
+				dssh_botan_key_guard a, b, late;
+				bool observed = a.acquire(pool) == 0 && b.acquire(pool) == 0;
+				dssh_native_key_pool_destroy(pool);
+				observed = observed && late.acquire(pool) == DSSH_ERROR_INVALID && late.get() == nullptr;
+				pool = nullptr;
+				observed = observed && native_key_usable(a.get(), padding[family])
+				    && native_key_usable(b.get(), padding[family]);
+				retired += observed ? 1U : 0U;
+				valid = observed && valid;
+			}
+		}
+		catch (...) {
+			valid = false;
+		}
+		dssh_test_cpp_new_disable();
+		dssh_test_alloc_reset();
+		dssh_native_key_pool_destroy(pool);
+	}
+	printf("native Botan owners: families=3 failed=%u recovered=%u warm=%u retired=%u metadata-rollbacks=%u valid=%u\n",
+	    failed, recovered, warm, retired, rollbacks, valid ? 1U : 0U);
+	ASSERT_TRUE(valid && failed == 3 && recovered == 3 && warm == 48 && retired == 3 && rollbacks == 6);
+	return TEST_PASS;
+}
+
 /* ================================================================
  * Test table
  * ================================================================ */
 
 static struct dssh_test_entry tests[] = {
 	{ "key_file_cpp_oom", test_key_file_cpp_oom },
+	{ "native_key_owners", test_native_key_owners },
 	{ "rsa_cache_native", test_rsa_cache_native },
 	{ "key_text_reuse", test_key_text_reuse },
 	/* RSA pubkey serialization */

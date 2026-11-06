@@ -236,6 +236,8 @@ elseif(DEUCESSH_CRYPTO_BACKEND STREQUAL "Botan")
 		key_algo/rsa-sha2-256-botan.cpp
 		key_algo/rsa-sha2-512-botan.c
 		key_algo/rsa-sha2-512-botan.cpp
+		key_algo/native-key-pool.c
+		key_algo/native-key-botan.cpp
 		enc/aes256-ctr-botan.c
 		enc/aes256-ctr-botan.cpp
 		enc/aes128-cbc-botan.c

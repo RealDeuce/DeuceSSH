@@ -5,6 +5,7 @@
 #include <threads.h>
 #include "dssh_test_alloc.h"
 #include "dssh_test_ossl.h"
+#include "key_context_fixture.h"
 
 static bool
 signature_bytes_zero(const uint8_t *bytes, size_t length)
@@ -253,12 +254,19 @@ test_signature_result_concurrent(void)
 		}
 		memcpy(public_copy, public_blob, public_length);
 		bool first = signature_concurrent_round(key, public_copy, public_length, false);
+#ifdef DSSH_CRYPTO_BOTAN
+		/* The first round retains eight result buffers, but scheduling may
+		 * use fewer simultaneous native objects. Warm those independently. */
+		first = test_warm_native_key_context(key->ctx, SIGNATURE_WORKERS) == 0 && first;
+#endif
 		dssh_test_alloc_fail_after(0);
 		bool reused = signature_concurrent_round(key, public_copy, public_length, false);
 		int allocations = dssh_test_alloc_count();
 		dssh_test_alloc_reset();
 		bool retired = signature_concurrent_round(key, public_copy, public_length, true);
 		valid = valid && first && reused && retired && allocations == 0;
+		printf("signature concurrency: family=%u first=%u reused=%u retired=%u allocations=%d\n",
+		    algorithm, first ? 1U : 0U, reused ? 1U : 0U, retired ? 1U : 0U, allocations);
 		free(public_copy);
 	}
 	ASSERT_TRUE(valid);

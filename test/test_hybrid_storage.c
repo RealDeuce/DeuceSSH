@@ -9,6 +9,7 @@
 
 #include "dssh_test.h"
 #include "dssh_test_alloc.h"
+#include "key_context_fixture.h"
 #include "dssh_test_ossl.h"
 #include "dssh_test_internal.h"
 #include "deucessh-algorithms.h"
@@ -436,6 +437,11 @@ test_parallel_sessions(void)
 		valid = gconf.key_algo_head->sign(&signatures[i], digest, sizeof(digest), gconf.key_algo_head->ctx) == 0;
 	for (unsigned i = 0; i < HYBRID_WORKERS; i++)
 		dssh_result_release(&signatures[i].lease);
+#ifdef DSSH_CRYPTO_BOTAN
+	/* Held result buffers do not retain the temporary native operation keys.
+	 * Warm every native owner before the zero-allocation parallel waves. */
+	valid = test_warm_native_key_context(gconf.key_algo_head->ctx, HYBRID_WORKERS) == 0 && valid;
+#endif
 	const uint8_t *secrets[HYBRID_WORKERS][2] = {{0}}, *hashes[HYBRID_WORKERS][2] = {{0}};
 	uint8_t public_values[HYBRID_WORKERS][2][64] = {{{0}}};
 	for (unsigned wave = 0; valid && wave < 3; wave++) {

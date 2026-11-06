@@ -48,11 +48,15 @@ sign_impl(struct dssh_bytes_result *out, const uint8_t *data, size_t data_len, s
 	    || out->bytes.data != NULL || out->bytes.len != 0
 	    || out->lease.release != NULL || out->lease.owner != NULL)
 		return DSSH_ERROR_INVALID;
-	if (cbd == NULL || cbd->privkey == NULL)
+	if (cbd == NULL || cbd->keys == nullptr || cbd->kind != DSSH_BOTAN_KEY_RSA)
 		return DSSH_ERROR_INIT;
 
 	try {
-		Botan::PK_Signer signer(*cbd->privkey, Botan::system_rng(), RSA_SIGN_PADDING);
+		dssh_botan_key_guard key;
+		int acquired_key = key.acquire(cbd->keys);
+		if (acquired_key < 0)
+			return acquired_key;
+		Botan::PK_Signer signer(*key.get(), Botan::system_rng(), RSA_SIGN_PADDING);
 		signer.update(data, data_len);
 		auto raw_sig = signer.signature(Botan::system_rng());
 
@@ -95,7 +99,7 @@ sign_impl(struct dssh_bytes_result *out, const uint8_t *data, size_t data_len, s
 static int
 pubkey_impl(const uint8_t **out, size_t *outlen, struct dssh_botan_key_context *cbd)
 {
-	if (cbd == NULL || cbd->privkey == NULL)
+	if (cbd == NULL || (cbd->privkey == nullptr && cbd->keys == nullptr))
 		return DSSH_ERROR_INIT;
 	if (cbd->pub_blob != NULL) {
 		*out = cbd->pub_blob;
@@ -209,14 +213,7 @@ extern "C" int
 dssh_botan_rsa512_haskey(dssh_key_algo_ctx *ctx)
 {
 	struct dssh_botan_key_context *cbd = reinterpret_cast<struct dssh_botan_key_context *>(ctx);
-	if (cbd == NULL || cbd->privkey == NULL)
-		return 0;
-	try {
-		return (cbd->privkey->algo_name() == "RSA");
-	}
-	catch (...) {
-		return 0;
-	}
+	return cbd != nullptr && cbd->keys != nullptr && cbd->kind == DSSH_BOTAN_KEY_RSA;
 }
 
 extern "C" void
@@ -249,6 +246,10 @@ install_key(std::unique_ptr<Botan::Private_Key> privkey)
 		const uint8_t *blob;
 		size_t blob_len;
 		int ret = pubkey_impl(&blob, &blob_len, replacement.get());
+		if (ret == 0)
+			ret = dssh_botan_key_pool_create(&replacement->keys, replacement->privkey);
+		if (ret == 0)
+			replacement->kind = DSSH_BOTAN_KEY_RSA;
 		if (ret == 0)
 			ret = dssh_signature_pool_create(&replacement->signatures);
 		if (ret == 0)
@@ -338,9 +339,12 @@ dssh_rsa_sha2_512_save_key_file(const char *path, dssh_pem_password_cb pw_cb, vo
 {
 	if (path == NULL)
 		return DSSH_ERROR_INIT;
-	if (rsa_ctx == NULL || rsa_ctx->privkey == NULL)
+	if (rsa_ctx == NULL || rsa_ctx->keys == nullptr || rsa_ctx->kind != DSSH_BOTAN_KEY_RSA)
 		return DSSH_ERROR_INIT;
-	std::shared_ptr<Botan::Private_Key> key = rsa_ctx->privkey;
+	dssh_botan_key_guard key;
+	int acquired_key = key.acquire(rsa_ctx->keys);
+	if (acquired_key < 0)
+		return acquired_key;
 	FILE *fp = dssh_private_key_open(path);
 	if (fp == NULL)
 		return DSSH_ERROR_INIT;
@@ -355,11 +359,11 @@ dssh_rsa_sha2_512_save_key_file(const char *path, dssh_pem_password_cb pw_cb, vo
 				return dssh_key_file_close(fp, password.status);
 			size_t count = static_cast<size_t>(length);
 			std::string_view phrase(pw_buf, count);
-			pem.value = Botan::PKCS8::PEM_encode_encrypted_pbkdf_msec(*key,
+			pem.value = Botan::PKCS8::PEM_encode_encrypted_pbkdf_msec(*key.get(),
 			    Botan::system_rng(), phrase, std::chrono::milliseconds(300), nullptr, "AES-256/CBC");
 		}
 		else {
-			pem.value = Botan::PKCS8::PEM_encode(*key);
+			pem.value = Botan::PKCS8::PEM_encode(*key.get());
 		}
 		bool written = write_pem_to_file(fp, pem.value);
 		return dssh_key_file_close(fp, written ? 0 : DSSH_ERROR_INIT);

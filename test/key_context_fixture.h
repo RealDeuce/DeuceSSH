@@ -16,6 +16,7 @@ test_empty_key_context(void)
 #else
 /* Construct the actual native C++ type, never guess unique_ptr's layout. */
 dssh_key_algo_ctx *test_empty_key_context(void);
+int test_warm_native_key_context(dssh_key_algo_ctx *context, unsigned int slots);
 #endif
 
 #endif

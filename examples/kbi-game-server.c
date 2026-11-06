@@ -966,6 +966,10 @@ main(int argc, char **argv)
 		return 1;
 	if (dssh_register_dh_gex_sha256() != 0)
 		return 1;
+	if (dssh_register_dh_group16_sha512() != 0)
+		return 1;
+	if (dssh_register_dh_group14_sha256() != 0)
+		return 1;
 	if (dssh_register_ssh_ed25519() != 0)
 		return 1;
 	if (dssh_register_rsa_sha2_256() != 0)

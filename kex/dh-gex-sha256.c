@@ -14,10 +14,14 @@ enum dhgex_slot { GEX_GROUP, GEX_PUBLIC, GEX_REPLY, GEX_SLOTS };
 struct dhgex_state {
 	struct dssh_kex_workspace *workspace;
 	dssh_hash_ctx *hash;
+	dssh_hash_ctx *fingerprint_hash;
+	const struct dssh_dh_fixed_group *fixed;
+	size_t hash_len;
 	const struct dhgex_ops *ops;
 	void *native;
 	bool native_active;
 	bool hash_dirty;
+	bool fingerprint_dirty;
 	bool client;
 };
 
@@ -29,16 +33,17 @@ dhgex_cleanup(void *opaque)
 		return;
 	dssh_kex_workspace_destroy(state->workspace);
 	dssh_hash_free(state->hash);
+	dssh_hash_free(state->fingerprint_hash);
 	if (state->native_active)
 		state->ops->cleanup(state->native);
 	dssh_cleanse(state, sizeof(*state));
 	free(state);
 }
 
-DSSH_PRIVATE int
-dhgex_init_impl(bool client, void *config, void **opaque, const struct dhgex_ops *ops)
+static int
+dh_init(bool client, void **opaque, const struct dhgex_ops *ops,
+    const struct dssh_dh_fixed_group *fixed)
 {
-	(void)config;
 	if (opaque == NULL || ops == NULL || ops->init == NULL || ops->reset == NULL
 	    || ops->cleanup == NULL || ops->keygen == NULL || ops->derive == NULL)
 		return DSSH_ERROR_INVALID;
@@ -49,13 +54,14 @@ dhgex_init_impl(bool client, void *config, void **opaque, const struct dhgex_ops
 		state = malloc(sizeof(*state));
 		if (state == NULL)
 			return DSSH_ERROR_ALLOC;
-		*state = (struct dhgex_state){.ops = ops, .client = client};
+		*state = (struct dhgex_state){.ops = ops, .client = client, .fixed = fixed,
+		    .hash_len = fixed != NULL ? fixed->hash_len : SHA256_DIGEST_LEN};
 		ret = dssh_kex_workspace_create(GEX_SLOTS, &state->workspace);
 		if (ret < 0)
 			goto failed;
 	}
 	else {
-		if (state->ops != ops || state->client != client)
+		if (state->ops != ops || state->client != client || state->fixed != fixed)
 			return DSSH_ERROR_INVALID;
 		ret = dssh_kex_workspace_reset(state->workspace);
 		if (ret < 0)
@@ -66,15 +72,32 @@ dhgex_init_impl(bool client, void *config, void **opaque, const struct dhgex_ops
 		dssh_hash_free(state->hash);
 		state->hash = NULL;
 		size_t length = 0;
-		ret = dssh_hash_init(&state->hash, "SHA-256", &length);
+		ret = dssh_hash_init(&state->hash, fixed != NULL ? fixed->hash_name : "SHA-256", &length);
 		if (ret < 0)
 			goto failed;
-		if (length != SHA256_DIGEST_LEN) {
+		if (length != state->hash_len) {
 			state->hash_dirty = true;
 			ret = DSSH_ERROR_INIT;
 			goto failed;
 		}
 		state->hash_dirty = false;
+	}
+	/* Host fingerprints remain SHA-256 even when the exchange uses SHA-512.
+	 * Retain a distinct context rather than allocating it for each rekey. */
+	if (client && state->hash_len != SHA256_DIGEST_LEN
+	    && (state->fingerprint_hash == NULL || state->fingerprint_dirty)) {
+		dssh_hash_free(state->fingerprint_hash);
+		state->fingerprint_hash = NULL;
+		size_t length = 0;
+		ret = dssh_hash_init(&state->fingerprint_hash, "SHA-256", &length);
+		if (ret < 0)
+			goto failed;
+		if (length != SHA256_DIGEST_LEN) {
+			state->fingerprint_dirty = true;
+			ret = DSSH_ERROR_INIT;
+			goto failed;
+		}
+		state->fingerprint_dirty = false;
 	}
 	if (fresh) {
 		ret = ops->init(&state->native);
@@ -90,6 +113,19 @@ failed:
 	if (fresh)
 		dhgex_cleanup(state);
 	return ret;
+}
+
+DSSH_PRIVATE int
+dhgex_init_impl(bool client, void *config, void **opaque, const struct dhgex_ops *ops)
+{
+	(void)config;
+	return dh_init(client, opaque, ops, NULL);
+}
+
+DSSH_PRIVATE int
+dssh_dh_fixed_init(bool client, void **opaque, const struct dssh_dh_fixed_group *group)
+{
+	return dh_init(client, opaque, &dssh_dhgex_backend, group);
 }
 
 DSSH_PRIVATE int
@@ -259,13 +295,15 @@ exchange_hash(struct dhgex_state *state, const struct dssh_kex_context *ctx,
 		if (ret < 0)
 			return ret;
 	}
-	for (size_t i = 0; i < 3; i++) {
-		ret = hash_u32(state->hash, request[i]);
-		if (ret < 0)
-			return ret;
+	if (state->fixed == NULL) {
+		for (size_t i = 0; i < 3; i++) {
+			ret = hash_u32(state->hash, request[i]);
+			if (ret < 0)
+				return ret;
+		}
 	}
 	const struct dssh_bytes mpints[] = {group, e, f};
-	for (size_t i = 0; i < sizeof(mpints) / sizeof(mpints[0]); i++) {
+	for (size_t i = state->fixed != NULL ? 1U : 0U; i < sizeof(mpints) / sizeof(mpints[0]); i++) {
 		ret = dssh_hash_update(state->hash, mpints[i].data, mpints[i].len);
 		if (ret < 0)
 			return ret;
@@ -286,7 +324,7 @@ exchange_hash(struct dhgex_state *state, const struct dssh_kex_context *ctx,
 	ret = dssh_hash_update(state->hash, secret.data, secret.len);
 	if (ret < 0)
 		return ret;
-	ret = dssh_hash_final(state->hash, out, SHA256_DIGEST_LEN);
+	ret = dssh_hash_final(state->hash, out, state->hash_len);
 	if (ret == 0)
 		state->hash_dirty = false;
 	return ret;
@@ -324,7 +362,7 @@ dhgex_handler_impl(const struct dssh_kex_context *ctx, struct dssh_kex_result *o
 	    || out->lease.release != NULL || out->lease.owner != NULL)
 		return DSSH_ERROR_INVALID;
 	struct dhgex_state *state = ctx->state;
-	if (state->ops != ops || state->client != ctx->client || state->hash_dirty)
+	if (state->ops != ops || state->client != ctx->client || state->hash_dirty || state->fingerprint_dirty)
 		return DSSH_ERROR_INVALID;
 	dssh_key_algo key = ctx->key_algo;
 	struct dssh_dh_gex_group_result provider = {0};
@@ -337,7 +375,25 @@ dhgex_handler_impl(const struct dssh_kex_context *ctx, struct dssh_kex_result *o
 	uint8_t type;
 	uint32_t request[3] = {GEX_MIN, GEX_N, GEX_MAX};
 	int ret, drop;
-	if (ctx->client) {
+	if (!ctx->client) {
+		if (key == NULL || key->pubkey == NULL || key->sign == NULL) {
+			ret = DSSH_ERROR_INIT;
+			goto done;
+		}
+		ret = key->pubkey(&host.data, &host.len, key->ctx);
+		if (ret != 0)
+			goto done;
+		if (host.data == NULL || host.len == 0 || host.len > UINT32_MAX) {
+			ret = DSSH_ERROR_INVALID;
+			goto done;
+		}
+	}
+	if (state->fixed != NULL) {
+		static const uint8_t generator = 2;
+		p = (struct dssh_bytes){state->fixed->p, state->fixed->p_len};
+		g = (struct dssh_bytes){&generator, 1};
+	}
+	else if (ctx->client) {
 		uint8_t message[13] = {SSH_MSG_KEX_DH_GEX_REQUEST};
 		for (size_t i = 0; i < 3; i++) {
 			ret = dssh_serialize_uint32(request[i], message, sizeof(message), &pos);
@@ -369,17 +425,6 @@ dhgex_handler_impl(const struct dssh_kex_context *ctx, struct dssh_kex_result *o
 		group = (struct dssh_bytes){&payload[1], payload_len - 1};
 	}
 	else {
-		if (key == NULL || key->pubkey == NULL || key->sign == NULL) {
-			ret = DSSH_ERROR_INIT;
-			goto done;
-		}
-		ret = key->pubkey(&host.data, &host.len, key->ctx);
-		if (ret != 0)
-			goto done;
-		if (host.data == NULL || host.len == 0 || host.len > UINT32_MAX) {
-			ret = DSSH_ERROR_INVALID;
-			goto done;
-		}
 		ret = ctx->recv(&type, &payload, &payload_len, ctx->io_ctx);
 		if (ret != 0)
 			goto done;
@@ -425,24 +470,33 @@ dhgex_handler_impl(const struct dssh_kex_context *ctx, struct dssh_kex_result *o
 	}
 	/* Save p,g across the next receive. On the client the original canonical
 	 * wire form is copied once; on the server raw provider values encode once. */
-	size_t group_capacity = ctx->client ? group.len + 1 : 11 + p.len + g.len;
-	ret = dssh_kex_workspace_get(state->workspace, GEX_GROUP, group_capacity, &group_packet);
-	if (ret < 0)
-		goto done;
-	group_packet[0] = SSH_MSG_KEX_DH_GEX_GROUP;
-	if (ctx->client)
-		memcpy(&group_packet[1], group.data, group.len);
-	else {
-		pos = 1;
-		ret = put_mpint(p, group_packet, group_capacity, &pos);
+	struct dssh_bytes modulus = p, ignored;
+	if (state->fixed == NULL) {
+		size_t group_capacity = ctx->client ? group.len + 1 : 11 + p.len + g.len;
+		ret = dssh_kex_workspace_get(state->workspace, GEX_GROUP, group_capacity, &group_packet);
 		if (ret < 0)
 			goto done;
-		ret = put_mpint(g, group_packet, group_capacity, &pos);
+		group_packet[0] = SSH_MSG_KEX_DH_GEX_GROUP;
+		if (ctx->client)
+			memcpy(&group_packet[1], group.data, group.len);
+		else {
+			pos = 1;
+			ret = put_mpint(p, group_packet, group_capacity, &pos);
+			if (ret < 0)
+				goto done;
+			ret = put_mpint(g, group_packet, group_capacity, &pos);
+			if (ret < 0)
+				goto done;
+			group.len = pos - 1;
+		}
+		group.data = &group_packet[1];
+		/* Keep a canonical modulus borrow independent of producer/payload
+		 * lifetime before the next receive or provider release. */
+		pos = 0;
+		ret = parse_mpint(group.data, group.len, &pos, &modulus, &ignored);
 		if (ret < 0)
 			goto done;
-		group.len = pos - 1;
 	}
-	group.data = &group_packet[1];
 	ret = dssh_kex_workspace_get(state->workspace, GEX_PUBLIC, 6 + p.len, &public_packet);
 	if (ret < 0)
 		goto done;
@@ -457,7 +511,7 @@ dhgex_handler_impl(const struct dssh_kex_context *ctx, struct dssh_kex_result *o
 		goto done;
 	}
 	struct dssh_bytes public_value = trim((struct dssh_bytes){raw_public, public_len});
-	if (public_value.len == 0) {
+	if (!secret_valid(public_value, modulus)) {
 		ret = DSSH_ERROR_INVALID;
 		goto done;
 	}
@@ -466,7 +520,7 @@ dhgex_handler_impl(const struct dssh_kex_context *ctx, struct dssh_kex_result *o
 	 * A leading-zero subspan leaves even more room; no public-value copy. */
 	size_t message_offset = 6 + (public_len - public_value.len) - (pad ? 6U : 5U);
 	uint8_t *public_message = &public_packet[message_offset];
-	public_message[0] = SSH_MSG_KEX_DH_GEX_INIT;
+	public_message[0] = state->fixed != NULL ? UINT8_C(30) : SSH_MSG_KEX_DH_GEX_INIT;
 	pos = 1;
 	size_t encoded_length = public_value.len + (pad ? 1U : 0U);
 	uint32_t wire_length = (uint32_t)encoded_length; /* At most 1025. */
@@ -484,7 +538,7 @@ dhgex_handler_impl(const struct dssh_kex_context *ctx, struct dssh_kex_result *o
 		if (ret != 0)
 			goto done;
 	}
-	else {
+	else if (state->fixed == NULL) {
 		ret = ctx->send(group_packet, 1 + group.len, ctx->io_ctx);
 		if (ret != 0)
 			goto done;
@@ -492,8 +546,9 @@ dhgex_handler_impl(const struct dssh_kex_context *ctx, struct dssh_kex_result *o
 	ret = ctx->recv(&type, &payload, &payload_len, ctx->io_ctx);
 	if (ret != 0)
 		goto done;
-	if (payload == NULL || payload_len < 1
-	    || type != (ctx->client ? SSH_MSG_KEX_DH_GEX_REPLY : SSH_MSG_KEX_DH_GEX_INIT)) {
+	uint8_t expected = state->fixed != NULL ? (ctx->client ? UINT8_C(31) : UINT8_C(30))
+	    : (ctx->client ? SSH_MSG_KEX_DH_GEX_REPLY : SSH_MSG_KEX_DH_GEX_INIT);
+	if (payload == NULL || payload_len < 1 || type != expected) {
 		ret = DSSH_ERROR_PARSE;
 		goto done;
 	}
@@ -515,11 +570,11 @@ dhgex_handler_impl(const struct dssh_kex_context *ctx, struct dssh_kex_result *o
 		ret = DSSH_ERROR_PARSE;
 		goto done;
 	}
-	if (peer.len == 0 || peer.len > DHGEX_RAW_MAX) {
+	if (peer.len > DHGEX_RAW_MAX || !secret_valid(peer, modulus)) {
 		ret = DSSH_ERROR_INVALID;
 		goto done;
 	}
-	ret = dssh_kex_workspace_result(state->workspace, secret_capacity, SHA256_DIGEST_LEN,
+	ret = dssh_kex_workspace_result(state->workspace, secret_capacity, state->hash_len,
 	    &out->lease, &raw_secret, &hash);
 	if (ret < 0)
 		goto done;
@@ -531,12 +586,6 @@ dhgex_handler_impl(const struct dssh_kex_context *ctx, struct dssh_kex_result *o
 		goto done;
 	}
 	secret = trim((struct dssh_bytes){raw_secret, secret_len});
-	/* Reparse only our retained canonical group, never released provider data. */
-	struct dssh_bytes modulus, ignored;
-	pos = 0;
-	ret = parse_mpint(group.data, group.len, &pos, &modulus, &ignored);
-	if (ret < 0)
-		goto done;
 	if (!secret_valid(secret, modulus)) {
 		ret = DSSH_ERROR_INVALID;
 		goto done;
@@ -552,14 +601,17 @@ dhgex_handler_impl(const struct dssh_kex_context *ctx, struct dssh_kex_result *o
 		}
 		if (ctx->hostkey_verify != NULL) {
 			uint8_t fingerprint[SHA256_DIGEST_LEN];
-			state->hash_dirty = true;
-			ret = dssh_hash_update(state->hash, host.data, host.len);
+			dssh_hash_ctx *fingerprint_hash = state->hash_len == SHA256_DIGEST_LEN
+			    ? state->hash : state->fingerprint_hash;
+			bool *dirty = state->hash_len == SHA256_DIGEST_LEN ? &state->hash_dirty : &state->fingerprint_dirty;
+			*dirty = true;
+			ret = dssh_hash_update(fingerprint_hash, host.data, host.len);
 			if (ret < 0)
 				goto done;
-			ret = dssh_hash_final(state->hash, fingerprint, sizeof(fingerprint));
+			ret = dssh_hash_final(fingerprint_hash, fingerprint, sizeof(fingerprint));
 			if (ret < 0)
 				goto done;
-			state->hash_dirty = false;
+			*dirty = false;
 			unsigned int key_bits = key->key_bits != NULL ? key->key_bits(host.data, host.len) : 0;
 			if (ctx->hostkey_verify(key->name, key_bits, fingerprint, host.data, host.len,
 			        ctx->hostkey_verify_cbdata) != DSSH_HOSTKEY_ACCEPT) {
@@ -567,12 +619,12 @@ dhgex_handler_impl(const struct dssh_kex_context *ctx, struct dssh_kex_result *o
 				goto done;
 			}
 		}
-		ret = key->verify(host.data, host.len, peer_signature.data, peer_signature.len, hash, SHA256_DIGEST_LEN);
+		ret = key->verify(host.data, host.len, peer_signature.data, peer_signature.len, hash, state->hash_len);
 		if (ret != 0)
 			goto done;
 	}
 	else {
-		ret = key->sign(&signature, hash, SHA256_DIGEST_LEN, key->ctx);
+		ret = key->sign(&signature, hash, state->hash_len, key->ctx);
 		if (ret != 0)
 			goto done;
 		if (signature.lease.release == NULL || signature.bytes.data == NULL
@@ -596,7 +648,7 @@ dhgex_handler_impl(const struct dssh_kex_context *ctx, struct dssh_kex_result *o
 		ret = dssh_kex_workspace_get(state->workspace, GEX_REPLY, capacity, &reply);
 		if (ret < 0)
 			goto done;
-		reply[0] = SSH_MSG_KEX_DH_GEX_REPLY;
+		reply[0] = state->fixed != NULL ? UINT8_C(31) : SSH_MSG_KEX_DH_GEX_REPLY;
 		pos = 1;
 		ret = put_string(host, reply, capacity, &pos);
 		if (ret < 0)
@@ -627,7 +679,7 @@ done:
 		dssh_result_release(&out->lease);
 	else {
 		out->shared_secret = secret;
-		out->exchange_hash = (struct dssh_bytes){hash, SHA256_DIGEST_LEN};
+		out->exchange_hash = (struct dssh_bytes){hash, state->hash_len};
 	}
 	return ret;
 }

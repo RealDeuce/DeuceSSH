@@ -420,19 +420,14 @@ considered cryptographically weak.
 > Two **REQUIRED** key exchange methods have been defined:
 > `diffie-hellman-group1-sha1`, `diffie-hellman-group14-sha1`.
 
-**NONCONFORMANT** — Neither `diffie-hellman-group1-sha1` nor
-`diffie-hellman-group14-sha1` is implemented.  The library provides
-`curve25519-sha256` (RFC 8731) and
-`diffie-hellman-group-exchange-sha256` (RFC 4419).
-
-`diffie-hellman-group1-sha1` uses a 1024-bit group (insecure by modern
-standards) and SHA-1 (deprecated).
-`diffie-hellman-group14-sha1` uses a 2048-bit group but still uses
-SHA-1.
-
-Both are widely deprecated.  OpenSSH 8.2+ disabled group1 by default,
-and group14-sha1 is being phased out.  All modern implementations
-support `curve25519-sha256` which is preferred.
+**UPDATED REQUIREMENT** — RFC 9142 section3.2.2 replaces the old mandatory
+fixed-group baseline with `diffie-hellman-group14-sha256` and recommends
+`diffie-hellman-group16-sha512`. Both are now implemented through application-
+controlled constructors, alongside the existing Curve25519, DH-GEX and hybrid
+methods. SHA-1 methods remain intentionally excluded under RULES.md. Current
+implementation and precisely scoped acceptance are tracked in
+[the fixed-group release decision](release-1.0-evidence/fixed-group-kex-design.md);
+whole-platform/conformance review is not inferred from registration alone.
 
 ### 6.5-2
 > Additional methods **MAY** be defined as specified in [SSH-NUMBERS].
@@ -762,13 +757,14 @@ receive-direction cipher/MAC contexts.  All subsequent
 > Values of 'e' or 'f' that are not in the range [1, p-1] **MUST NOT**
 > be sent or accepted by either side.
 
-**CONFORMS** — The DH-GEX implementation (`kex/dh-gex-sha256-openssl.c`)
-validates received values using `dh_value_valid()`, which checks that
-the value is not zero, not negative, and less than p.  This is done
-for both `f` (client side, after receiving GEX_REPLY) and `e` (server
-side, after receiving GEX_INIT).
-
-For `curve25519-sha256`, the X25519 function has built-in validation.
+**UPDATED REQUIREMENT** — RFC 8268 section4 corrects the interval to
+`1 < e < p-1` and `1 < f < p-1`. The common DH protocol checks local generated
+and received values before sending/deriving for both DH-GEX and the two fixed
+methods. Canonical positive mpint parsing precedes range checks; a retained
+modulus borrow survives producer release and receive-buffer reuse. The fixed-
+method native fixtures exercise both directions and boundary/malformed values.
+Backend, complete framing and platform acceptance retain their recorded scopes.
+Curve25519 follows its separate RFC 8731 validation, rather than these MODP bounds.
 
 ### 8-2
 > The exchange hash **SHOULD** be kept secret.

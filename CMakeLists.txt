@@ -255,6 +255,7 @@ set(DEUCESSH_SOURCES
 	kex/curve25519-sha256.c
 	kex/hybrid-pq-kex.c
 	kex/dh-gex-sha256.c
+	kex/dh-fixed.c
 	kex/dh-gex-groups.c
 	kex/sntrup761.c
 	kex/sntrup761_optblocker.c

@@ -563,7 +563,9 @@ test_key_material_hash_changes(void)
 		    && dssh_session_set_kex_filter(ctx.server, &method, 1) == 0
 		    && compression_rekey_pair(&ctx);
 		if (valid) {
-			const char *expected_hash = strcmp(method, "sntrup761x25519-sha512") == 0 ? "SHA-512" : "SHA-256";
+			bool sha512 = strcmp(method, "sntrup761x25519-sha512") == 0
+			    || strcmp(method, "diffie-hellman-group16-sha512") == 0;
+			const char *expected_hash = sha512 ? "SHA-512" : "SHA-256";
 			valid = strcmp(ctx.client->trans.kex_selected->name, method) == 0
 			    && strcmp(ctx.server->trans.kex_selected->name, method) == 0
 			    && strcmp(ctx.client->trans.kex_selected->hash_name, expected_hash) == 0

@@ -129,14 +129,7 @@ static int
 register_all_algorithms(void)
 {
 	int res;
-	if (test_using_dhgex())
-		res = dssh_register_dh_gex_sha256();
-	else if (test_using_sntrup())
-		res = dssh_register_sntrup761x25519_sha512();
-	else if (test_using_mlkem())
-		res = dssh_register_mlkem768x25519_sha256();
-	else
-		res = dssh_register_curve25519_sha256();
+	res = test_register_kex();
 	if (res < 0)
 		return res;
 	res = test_register_key_algos();

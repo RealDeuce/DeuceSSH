@@ -38,6 +38,8 @@ typedef int (*dssh_pem_password_cb)(char *buf, int size, int rwflag, void *userd
 /* Key exchange */
 DSSH_PUBLIC int dssh_register_curve25519_sha256(void);
 DSSH_PUBLIC int dssh_register_dh_gex_sha256(void);
+DSSH_PUBLIC int dssh_register_dh_group14_sha256(void);
+DSSH_PUBLIC int dssh_register_dh_group16_sha512(void);
 DSSH_PUBLIC int dssh_register_sntrup761x25519_sha512(void);
 DSSH_PUBLIC int dssh_register_mlkem768x25519_sha256(void);
 

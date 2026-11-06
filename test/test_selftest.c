@@ -194,14 +194,7 @@ static int
 register_all_algorithms(void)
 {
 	int res;
-	if (test_using_dhgex())
-		res = dssh_register_dh_gex_sha256();
-	else if (test_using_sntrup())
-		res = dssh_register_sntrup761x25519_sha512();
-	else if (test_using_mlkem())
-		res = dssh_register_mlkem768x25519_sha256();
-	else
-		res = dssh_register_curve25519_sha256();
+	res = test_register_kex();
 	if (res < 0)
 		return res;
 	res = test_register_key_algos();
@@ -841,30 +834,8 @@ test_self_handshake_curve25519(void)
 	ASSERT_NOT_NULL(dssh_transport_get_enc_name(ctx.client));
 	ASSERT_NOT_NULL(dssh_transport_get_mac_name(ctx.client));
 
-	if (test_using_dhgex()) {
-		ASSERT_STR_EQ(dssh_transport_get_kex_name(ctx.client),
-		    "diffie-hellman-group-exchange-sha256");
-		ASSERT_STR_EQ(dssh_transport_get_kex_name(ctx.server),
-		    "diffie-hellman-group-exchange-sha256");
-	}
-	else if (test_using_sntrup()) {
-		ASSERT_STR_EQ(dssh_transport_get_kex_name(ctx.client),
-		    "sntrup761x25519-sha512");
-		ASSERT_STR_EQ(dssh_transport_get_kex_name(ctx.server),
-		    "sntrup761x25519-sha512");
-	}
-	else if (test_using_mlkem()) {
-		ASSERT_STR_EQ(dssh_transport_get_kex_name(ctx.client),
-		    "mlkem768x25519-sha256");
-		ASSERT_STR_EQ(dssh_transport_get_kex_name(ctx.server),
-		    "mlkem768x25519-sha256");
-	}
-	else {
-		ASSERT_STR_EQ(dssh_transport_get_kex_name(ctx.client),
-		    "curve25519-sha256");
-		ASSERT_STR_EQ(dssh_transport_get_kex_name(ctx.server),
-		    "curve25519-sha256");
-	}
+	ASSERT_STR_EQ(dssh_transport_get_kex_name(ctx.client), test_kex_algo_name());
+	ASSERT_STR_EQ(dssh_transport_get_kex_name(ctx.server), test_kex_algo_name());
 	ASSERT_STR_EQ(dssh_transport_get_hostkey_name(ctx.client),
 	    test_key_algo_name());
 	ASSERT_STR_EQ(dssh_transport_get_enc_name(ctx.client),

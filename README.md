@@ -15,6 +15,7 @@ A from-scratch SSH library in standard C17 implementing the core SSH protocol:
 - RFC 8332 — RSA SHA-256 and SHA-512 Signature Algorithms
 - RFC 8709 — Ed25519 Host Key Algorithm
 - RFC 8731 — curve25519-sha256 Key Exchange
+- RFC 8268 — Fixed-group SHA-2 Diffie-Hellman Key Exchange
 - draft-ietf-sshm-ntruprime-ssh — sntrup761x25519-sha512 Key Exchange
 - draft-ietf-sshm-mlkem-hybrid-kex — mlkem768x25519-sha256 Key Exchange
 
@@ -47,7 +48,7 @@ Use `-S . -B build` to prevent cmake from discovering the parent
 
 | Category | Algorithms |
 |----------|-----------|
-| Key Exchange | `mlkem768x25519-sha256`, `sntrup761x25519-sha512`, `curve25519-sha256`, `diffie-hellman-group-exchange-sha256` |
+| Key Exchange | `mlkem768x25519-sha256`, `sntrup761x25519-sha512`, `curve25519-sha256`, `diffie-hellman-group-exchange-sha256`, `diffie-hellman-group16-sha512`, `diffie-hellman-group14-sha256` |
 | Host Key | `ssh-ed25519`, `rsa-sha2-256`, `rsa-sha2-512` |
 | Encryption | `aes256-ctr`, `aes128-cbc`*, `none` |
 | MAC | `hmac-sha2-256`, `hmac-sha2-512`, `none` |
@@ -89,7 +90,10 @@ int main(void)
 {
     /* 2. Register algorithms (order = preference) */
     dssh_transport_set_callbacks(my_tx, my_rx, NULL, NULL);
-    dssh_register_curve25519_sha256();
+    if (dssh_register_curve25519_sha256() != 0
+        || dssh_register_dh_group16_sha512() != 0
+        || dssh_register_dh_group14_sha256() != 0)
+        return 1;
     dssh_register_ssh_ed25519();
     dssh_register_aes256_ctr();
     dssh_register_none_enc();
@@ -200,7 +204,10 @@ int main(void)
 {
     /* 1. Register algorithms and I/O callbacks (same as client) */
     dssh_transport_set_callbacks(my_tx, my_rx, NULL, NULL);
-    dssh_register_curve25519_sha256();
+    if (dssh_register_curve25519_sha256() != 0
+        || dssh_register_dh_group16_sha512() != 0
+        || dssh_register_dh_group14_sha256() != 0)
+        return 1;
     dssh_register_ssh_ed25519();
     dssh_register_rsa_sha2_256();
     dssh_register_aes256_ctr();
@@ -745,12 +752,28 @@ Registration order determines negotiation preference — first registered
 is most preferred.
 
 ```c
-/* Order = preference: post-quantum hybrid first, then classical */
-dssh_register_mlkem768x25519_sha256();
-dssh_register_sntrup761x25519_sha512();
-dssh_register_curve25519_sha256();
-dssh_register_dh_gex_sha256();
+/* Order = preference: post-quantum hybrid first, then classical.
+ * Propagate any failure from the application's setup function. */
+int ret = dssh_register_mlkem768x25519_sha256();
+if (ret == 0)
+    ret = dssh_register_sntrup761x25519_sha512();
+if (ret == 0)
+    ret = dssh_register_curve25519_sha256();
+if (ret == 0)
+    ret = dssh_register_dh_gex_sha256();
+if (ret == 0)
+    ret = dssh_register_dh_group16_sha512();
+if (ret == 0)
+    ret = dssh_register_dh_group14_sha256();
+if (ret != 0)
+    return ret;
 ```
+
+The fixed methods use RFC 3526 group16 (4096 bits, SHA-512) and group14
+(2048 bits, SHA-256). They use the standard fixed-group DH exchange defined by
+RFC 8268, without a DH-GEX group provider. Host-key fingerprints remain SHA-256
+for both methods. Registration stays application controlled; these functions
+do not enable any algorithm automatically.
 
 You can register your own custom algorithm modules by implementing
 the callback signatures defined in the public module headers and

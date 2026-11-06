@@ -180,14 +180,7 @@ static int
 register_all_algorithms(void)
 {
 	int res;
-	if (test_using_dhgex())
-		res = dssh_register_dh_gex_sha256();
-	else if (test_using_sntrup())
-		res = dssh_register_sntrup761x25519_sha512();
-	else if (test_using_mlkem())
-		res = dssh_register_mlkem768x25519_sha256();
-	else
-		res = dssh_register_curve25519_sha256();
+	res = test_register_kex();
 	if (res < 0)
 		return res;
 	res = test_register_key_algos();
@@ -7643,13 +7636,7 @@ test_debug_short_payload(void)
 static const char *
 current_kex_name(void)
 {
-	if (test_using_dhgex())
-		return "diffie-hellman-group-exchange-sha256";
-	if (test_using_sntrup())
-		return "sntrup761x25519-sha512";
-	if (test_using_mlkem())
-		return "mlkem768x25519-sha256";
-	return "curve25519-sha256";
+	return test_kex_algo_name();
 }
 
 static int
@@ -7966,6 +7953,99 @@ struct boundary_input {
 };
 
 static int
+register_fixed_rekey_methods(void)
+{
+	const char *names[] = {"diffie-hellman-group14-sha256", "diffie-hellman-group16-sha512", "curve25519-sha256"};
+	int (*constructors[])(void) = {dssh_register_dh_group14_sha256, dssh_register_dh_group16_sha512,
+	    dssh_register_curve25519_sha256};
+	for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+		bool found = false;
+		for (dssh_kex entry = gconf.kex_head; entry != NULL; entry = entry->next)
+			found = found || strcmp(entry->name, names[i]) == 0;
+		if (!found) {
+			int ret = constructors[i]();
+			if (ret != 0)
+				return ret;
+		}
+	}
+	return 0;
+}
+
+static int
+fixed_rekey_receive(void *opaque)
+{
+	struct rekey_thread_arg *arg = opaque;
+	uint8_t type, *payload = NULL;
+	size_t length = 0;
+	arg->result = recv_packet(arg->ctx->server, &type, &payload, &length);
+	if (arg->result == 0 && (type != SSH_MSG_SERVICE_REQUEST || length != 2
+	    || payload == NULL || payload[0] != SSH_MSG_SERVICE_REQUEST || payload[1] != 0x42))
+		arg->result = DSSH_ERROR_INVALID;
+	return 0;
+}
+
+static int
+test_fixed_rekey_methods(void)
+{
+	struct handshake_ctx ctx;
+	extra_algorithm_registration = register_fixed_rekey_methods;
+	handshake_kex_filter = "diffie-hellman-group16-sha512";
+	int ret = handshake_setup(&ctx);
+	extra_algorithm_registration = NULL;
+	handshake_kex_filter = NULL;
+	uint8_t session_id[64];
+	bool valid = ret == 0 && ctx.client->trans.session_id_sz == sizeof(session_id)
+	    && ctx.server->trans.session_id_sz == sizeof(session_id);
+	if (valid)
+		memcpy(session_id, ctx.client->trans.session_id, sizeof(session_id));
+	const char *methods[] = {"diffie-hellman-group14-sha256", "curve25519-sha256", "diffie-hellman-group16-sha512"};
+	for (size_t i = 0; valid && i < sizeof(methods) / sizeof(methods[0]); i++) {
+		valid = dssh_session_set_kex_filter(ctx.client, &methods[i], 1) == 0
+		    && dssh_session_set_kex_filter(ctx.server, &methods[i], 1) == 0;
+		if (!valid)
+			break;
+		struct rekey_thread_arg client = {&ctx, DSSH_ERROR_INIT}, server = {&ctx, DSSH_ERROR_INIT};
+		thrd_t ct, st;
+		if (thrd_create(&st, fixed_rekey_receive, &server) != thrd_success) {
+			valid = false;
+			break;
+		}
+		if (thrd_create(&ct, rekey_client_thread, &client) != thrd_success) {
+			mock_io_close_c2s(&ctx.io);
+			mock_io_close_s2c(&ctx.io);
+			if (thrd_join(st, NULL) != thrd_success)
+				abort();
+			valid = false;
+			break;
+		}
+		if (thrd_join(ct, NULL) != thrd_success)
+			abort();
+		ret = client.result;
+		if (ret == 0) {
+			uint8_t message[] = {SSH_MSG_SERVICE_REQUEST, 0x42};
+			ret = send_packet(ctx.client, message, sizeof(message), NULL);
+		}
+		if (ret != 0) {
+			mock_io_close_c2s(&ctx.io);
+			mock_io_close_s2c(&ctx.io);
+		}
+		if (thrd_join(st, NULL) != thrd_success)
+			abort();
+		valid = ret == 0 && server.result == 0
+		    && strcmp(dssh_transport_get_kex_name(ctx.client), methods[i]) == 0
+		    && strcmp(dssh_transport_get_kex_name(ctx.server), methods[i]) == 0
+		    && ctx.client->trans.session_id_sz == sizeof(session_id)
+		    && ctx.server->trans.session_id_sz == sizeof(session_id)
+		    && memcmp(ctx.client->trans.session_id, session_id, sizeof(session_id)) == 0
+		    && memcmp(ctx.server->trans.session_id, session_id, sizeof(session_id)) == 0;
+		printf("fixed DH rekey: method=%s session-id=64 valid=%u\n", methods[i], valid ? 1U : 0U);
+	}
+	handshake_cleanup(&ctx);
+	ASSERT_TRUE(valid);
+	return TEST_PASS;
+}
+
+static int
 test_rekey_changes_algorithms(void)
 {
 	struct handshake_ctx ctx;
@@ -8226,6 +8306,7 @@ test_registration_rejection(void)
 	dssh_test_reset_global_config();
 	int (*constructors[])(void) = {
 		dssh_register_curve25519_sha256, dssh_register_dh_gex_sha256,
+		dssh_register_dh_group14_sha256, dssh_register_dh_group16_sha512,
 		dssh_register_sntrup761x25519_sha512, dssh_register_mlkem768x25519_sha256,
 		dssh_register_ssh_ed25519, dssh_register_rsa_sha2_256, dssh_register_rsa_sha2_512,
 		dssh_register_aes256_ctr, dssh_register_aes128_cbc, dssh_register_none_enc,
@@ -9581,6 +9662,7 @@ static struct dssh_test_entry tests[] = {
 	{ "release/callback_results", test_callback_positive_results },
 	{ "release/packet_framing", test_packet_framing_boundaries },
 	{ "release/rekey_changes_algorithms", test_rekey_changes_algorithms },
+	{ "release/fixed_rekey_methods", test_fixed_rekey_methods },
 	{ "release/version_callback_count", test_version_rx_callback_count },
 	{ "release/initial_kex_out_of_phase", test_initial_kex_rejects_out_of_phase },
 	{ "release/rekey_queue_bounded", test_rekey_queue_bounded },

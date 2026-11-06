@@ -481,8 +481,19 @@ if(DEUCESSH_CRYPTO_BACKEND STREQUAL "Botan")
 		set_target_properties(dssh_test_${storage} PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
 	endforeach()
 endif()
-add_test(NAME dssh_unit_dhgex_storage COMMAND dssh_test_dhgex_storage)
+add_test(NAME dssh_unit_dhgex_storage COMMAND dssh_test_dhgex_storage dh/)
 set_tests_properties(dssh_unit_dhgex_storage PROPERTIES TIMEOUT 180)
+set(fixed_dh_parts native_reuse failures retired_state parallel_sessions allocations bounds)
+if(DEUCESSH_CRYPTO_BACKEND STREQUAL "OpenSSL")
+	list(APPEND fixed_dh_parts provider_failures constructor_failures)
+endif()
+foreach(group IN ITEMS 14 16)
+	foreach(part IN LISTS fixed_dh_parts)
+		add_test(NAME dssh_dh_group${group}_${part} COMMAND dssh_test_dhgex_storage --exact group${group}/${part})
+		set_tests_properties(dssh_dh_group${group}_${part} PROPERTIES TIMEOUT 600)
+	endforeach()
+endforeach()
+
 
 if(DEUCESSH_CRYPTO_BACKEND STREQUAL "OpenSSL")
 	dssh_add_test(hash_provider test_hash_provider.c)
@@ -746,6 +757,13 @@ foreach(part IN ITEMS group_selection group_validation peer_validation mpint_val
 		PASS_REGULAR_EXPRESSION "1 tests: 1 passed, 0 failed, 0 skipped")
 endforeach()
 dssh_add_variant_tests(dssh_transport dssh_test_transport)
+foreach(key IN ITEMS ed25519 rsa rsa512)
+	add_test(NAME dssh_fixed_rekey_${key} COMMAND dssh_test_transport --exact release/fixed_rekey_methods)
+	set_tests_properties(dssh_fixed_rekey_${key} PROPERTIES
+		ENVIRONMENT "DSSH_TEST_KEY=${key};${DSSH_TEST_KEY_ENV}"
+		FIXTURES_REQUIRED dssh_cached_keys TIMEOUT 180)
+endforeach()
+
 foreach(part IN ITEMS codec packet_bound offers advertisement receive_positions receive_rejections send_failure)
 	add_test(NAME dssh_transport_ext_info_${part}
 		COMMAND dssh_test_transport --exact ext_info/${part})
@@ -1320,6 +1338,19 @@ set(SELFTEST_TESTS
 	test_self_io_callback_contract
 )
 dssh_add_individual_tests(dssh_test_selftest dssh_self SELFTEST_TESTS)
+foreach(group IN ITEMS 14 16)
+	foreach(case IN LISTS SELFTEST_TESTS)
+		add_test(NAME dssh_fixed_group${group}_${case} COMMAND dssh_test_selftest --exact ${case})
+		set_tests_properties(dssh_fixed_group${group}_${case} PROPERTIES
+			ENVIRONMENT "DSSH_TEST_KEX=group${group};${DSSH_TEST_KEY_ENV}"
+			FIXTURES_REQUIRED dssh_cached_keys TIMEOUT 300)
+	endforeach()
+	add_test(NAME dssh_fixed_group${group}_transport COMMAND dssh_test_transport)
+	set_tests_properties(dssh_fixed_group${group}_transport PROPERTIES
+		ENVIRONMENT "DSSH_TEST_KEX=group${group};${DSSH_TEST_KEY_ENV}"
+		FIXTURES_REQUIRED dssh_cached_keys TIMEOUT 900)
+endforeach()
+
 
 # ================================================================
 # Tier 3b: Asymmetric MAC negotiation (fork-based, separate registries)
@@ -1351,7 +1382,8 @@ if(DEUCESSH_TEST_OPENSSH)
 			target_compile_options(dssh_openssh_${form} PRIVATE ${DEUCESSH_COMPILE_OPTIONS})
 			target_link_libraries(dssh_openssh_${form} PRIVATE deucessh_${form})
 			foreach(method IN ITEMS curve25519-sha256 diffie-hellman-group-exchange-sha256
-					sntrup761x25519-sha512 mlkem768x25519-sha256)
+					sntrup761x25519-sha512 mlkem768x25519-sha256
+					diffie-hellman-group14-sha256 diffie-hellman-group16-sha512)
 				foreach(role IN ITEMS client server)
 					set(interop_name dssh_openssh_${form}_${role}_${method})
 					add_test(NAME ${interop_name} COMMAND ${Python3_EXECUTABLE}

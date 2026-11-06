@@ -39,9 +39,18 @@ struct dhgex_ops {
 	int (*derive)(void *state, const uint8_t *peer, size_t peerlen,
 	    uint8_t *secret, size_t capacity, size_t *length);
 };
+/* Fixed RFC 3526 group and RFC 8268 hash selected by its constructor.
+ * These immutable module records are never application configuration. */
+struct dssh_dh_fixed_group {
+	const uint8_t *p;
+	size_t p_len;
+	const char *hash_name;
+	size_t hash_len;
+};
 extern DSSH_PRIVATE const struct dhgex_ops dssh_dhgex_backend;
 DSSH_PRIVATE int dhgex_init(bool client, void *config, void **state);
 DSSH_PRIVATE int dhgex_init_impl(bool client, void *config, void **state, const struct dhgex_ops *ops);
+DSSH_PRIVATE int dssh_dh_fixed_init(bool client, void **state, const struct dssh_dh_fixed_group *group);
 DSSH_PRIVATE void dhgex_cleanup(void *state);
 DSSH_PRIVATE int64_t dssh_dhgex_parse_mpint(const uint8_t *buf, size_t bufsz,
     const uint8_t **body, size_t *body_len);

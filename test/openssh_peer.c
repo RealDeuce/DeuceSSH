@@ -331,6 +331,10 @@ main(int argc, char **argv)
 		ret = dssh_register_curve25519_sha256();
 	else if (strcmp(argv[2], "diffie-hellman-group-exchange-sha256") == 0)
 		ret = dssh_register_dh_gex_sha256();
+	else if (strcmp(argv[2], "diffie-hellman-group14-sha256") == 0)
+		ret = dssh_register_dh_group14_sha256();
+	else if (strcmp(argv[2], "diffie-hellman-group16-sha512") == 0)
+		ret = dssh_register_dh_group16_sha512();
 	else if (strcmp(argv[2], "sntrup761x25519-sha512") == 0)
 		ret = dssh_register_sntrup761x25519_sha512();
 	else if (strcmp(argv[2], "mlkem768x25519-sha256") == 0)

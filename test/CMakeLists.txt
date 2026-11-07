@@ -247,6 +247,32 @@ target_compile_options(dssh_test_vendor_glue PRIVATE ${DEUCESSH_COMPILE_OPTIONS}
 add_test(NAME dssh_unit_vendor_glue COMMAND dssh_test_vendor_glue)
 set_tests_properties(dssh_unit_vendor_glue PROPERTIES TIMEOUT 60)
 
+# Pinned official NIST answers, shared by the actual bundled and native roots.
+add_library(dssh_mlkem_acvp_data STATIC mlkem_acvp_data.c)
+set_property(TARGET dssh_mlkem_acvp_data PROPERTY C_STANDARD ${DEUCESSH_C_STANDARD})
+set_property(TARGET dssh_mlkem_acvp_data PROPERTY C_STANDARD_REQUIRED ON)
+target_compile_options(dssh_mlkem_acvp_data PRIVATE ${DEUCESSH_COMPILE_OPTIONS})
+add_executable(dssh_test_mlkem_acvp test_mlkem_acvp.c)
+set_property(TARGET dssh_test_mlkem_acvp PROPERTY C_STANDARD ${DEUCESSH_C_STANDARD})
+set_property(TARGET dssh_test_mlkem_acvp PROPERTY C_STANDARD_REQUIRED ON)
+target_include_directories(dssh_test_mlkem_acvp PRIVATE ${PROJECT_SOURCE_DIR})
+target_compile_options(dssh_test_mlkem_acvp PRIVATE ${DEUCESSH_COMPILE_OPTIONS}
+	$<$<OR:$<C_COMPILER_ID:Clang>,$<C_COMPILER_ID:AppleClang>,$<C_COMPILER_ID:GNU>>:-Wno-unused-function>)
+target_link_libraries(dssh_test_mlkem_acvp PRIVATE dssh_mlkem_acvp_data)
+dssh_add_output_test(dssh_mlkem_acvp_bundled dssh_test_mlkem_acvp
+	"ML-KEM ACVP bundled: 145 passed, 0 failed")
+set_tests_properties(dssh_mlkem_acvp_bundled PROPERTIES TIMEOUT 120)
+if(DEUCESSH_CRYPTO_BACKEND STREQUAL "Botan")
+	add_executable(dssh_test_mlkem_acvp_botan test_mlkem_acvp_botan.cpp)
+	set_property(TARGET dssh_test_mlkem_acvp_botan PROPERTY CXX_STANDARD 20)
+	set_property(TARGET dssh_test_mlkem_acvp_botan PROPERTY CXX_STANDARD_REQUIRED ON)
+	target_compile_options(dssh_test_mlkem_acvp_botan PRIVATE ${DEUCESSH_COMPILE_OPTIONS})
+	target_link_libraries(dssh_test_mlkem_acvp_botan PRIVATE dssh_mlkem_acvp_data PkgConfig::BOTAN3)
+	dssh_add_output_test(dssh_mlkem_acvp_botan dssh_test_mlkem_acvp_botan
+		"ML-KEM ACVP Botan: 145 passed, 0 failed")
+	set_tests_properties(dssh_mlkem_acvp_botan PROPERTIES TIMEOUT 120)
+endif()
+
 # Helper function for adding provider-backed test executables
 function(dssh_add_test test_name source_file)
 	add_executable(dssh_test_${test_name} ${source_file})

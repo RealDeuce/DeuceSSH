@@ -382,7 +382,8 @@ dssh_transport_get_kex_name(struct dssh_session_s *sess)
 {
 	if (sess == NULL || dssh_io_callback_active(sess))
 		return NULL;
-	return sess->trans.kex_selected ? sess->trans.kex_selected->name : NULL;
+	dssh_kex selected = sess->trans.kex_selected;
+	return selected != NULL ? selected->name : NULL;
 }
 
 DSSH_PUBLIC const char *
@@ -390,7 +391,8 @@ dssh_transport_get_hostkey_name(struct dssh_session_s *sess)
 {
 	if (sess == NULL || dssh_io_callback_active(sess))
 		return NULL;
-	return sess->trans.key_algo_selected ? sess->trans.key_algo_selected->name : NULL;
+	dssh_key_algo selected = sess->trans.key_algo_selected;
+	return selected != NULL ? selected->name : NULL;
 }
 
 DSSH_PUBLIC const char *
@@ -398,7 +400,8 @@ dssh_transport_get_enc_name(struct dssh_session_s *sess)
 {
 	if (sess == NULL || dssh_io_callback_active(sess))
 		return NULL;
-	return sess->trans.enc_c2s_selected ? sess->trans.enc_c2s_selected->name : NULL;
+	dssh_enc selected = sess->trans.enc_c2s_selected;
+	return selected != NULL ? selected->name : NULL;
 }
 
 DSSH_PUBLIC const char *
@@ -406,7 +409,8 @@ dssh_transport_get_mac_name(struct dssh_session_s *sess)
 {
 	if (sess == NULL || dssh_io_callback_active(sess))
 		return NULL;
-	return sess->trans.mac_c2s_selected ? sess->trans.mac_c2s_selected->name : NULL;
+	dssh_mac selected = sess->trans.mac_c2s_selected;
+	return selected != NULL ? selected->name : NULL;
 }
 
 DSSH_TESTABLE int

@@ -9316,6 +9316,7 @@ test_auth_replayed_message_state(void)
 
 #include "dh_group_result_cases.h"
 #include "transport_identification_cases.h"
+#include "transport_query_cases.h"
 #include "transport_compression_cases.h"
 #include "transport_module_cases.h"
 
@@ -9632,6 +9633,7 @@ static struct dssh_test_entry tests[] = {
 	{ "identification/grammar", test_identification_grammar },
 	{ "identification/bytes", test_identification_bytes },
 	{ "identification/bounds", test_identification_bounds },
+	{ "release/query_snapshot", test_query_snapshot },
 	{ "release/auth_replayed_message_state", test_auth_replayed_message_state },
 	{ "release/auth_kbi_request_state", test_auth_kbi_request_state },
 	{ "release/auth_server_phase_gate", test_auth_server_phase_gate },

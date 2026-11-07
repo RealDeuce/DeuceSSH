@@ -12469,6 +12469,7 @@ test_auth_request_capacity(void)
 	return TEST_PASS;
 }
 
+#include "auth_helper_cases.h"
 #include "auth_framing_cases.h"
 #include "auth_callback_cases.h"
 #include "password_result_cases.h"
@@ -12476,6 +12477,7 @@ test_auth_request_capacity(void)
 #include "signature_auth_result_cases.h"
 
 static struct dssh_test_entry tests[] = {
+	{ "release/auth_setup_ownership", test_auth_setup_ownership },
 	{ "callbacks/banner_transaction", test_auth_callback_banner_transaction },
 	{ "callbacks/output_pairs", test_auth_callback_output_pairs },
 	{ "callbacks/password_lifetime", test_auth_callback_password_lifetime },

@@ -899,6 +899,10 @@ foreach(part IN ITEMS expansion context_replacement auth_cleanup sensitive_failu
 endforeach()
 
 dssh_add_test(auth test_auth.c)
+dssh_add_output_test(dssh_auth_setup_ownership dssh_test_auth
+	"1 tests: 1 passed, 0 failed, 0 skipped" --exact release/auth_setup_ownership)
+set_tests_properties(dssh_auth_setup_ownership PROPERTIES TIMEOUT 120
+	ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys)
 add_test(NAME dssh_auth_request_capacity
 	COMMAND dssh_test_auth --exact release/request_capacity)
 target_link_libraries(dssh_test_auth PRIVATE dssh_mock_io dssh_mock_comp)

@@ -1105,7 +1105,7 @@ tx_finalize_prepare(struct dssh_session_s *sess, uint8_t *buf, size_t payload_le
 	/* Single trace point for every packet about to hit the wire,
 	 * regardless of which code path led here (send_packet,
 	 * zc_send_inner, drain_one_slot, gather_prepare_one). */
-	DSSH_TRACE_W("tx msg_type=%u len=%zu", buf[9], payload_len);
+	DSSH_TRACE_W(sess, "tx msg_type=%d len=%zu", buf[9], payload_len);
 
 	dssh_comp comp = sess->trans.client ? sess->trans.comp_c2s_active : sess->trans.comp_s2c_active;
 	if (compression_enabled(comp)) {
@@ -2205,7 +2205,7 @@ recv_packet_raw(struct dssh_session_s *sess, uint8_t *msg_type, uint8_t **payloa
 	}
 	*msg_type    = sess->trans.rx_packet[9];
 
-	DSSH_TRACE_W("rx msg_type=%u len=%zu", *msg_type, *payload_len);
+	DSSH_TRACE_W(sess, "rx msg_type=%d len=%zu", *msg_type, *payload_len);
 
 #ifdef DSSH_TESTING
 	struct dssh_session_s *count_sess = sess;

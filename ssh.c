@@ -185,10 +185,10 @@ queue_log_forward(struct dssh_session_s *sess, bool always_display, const uint8_
 	dssh_mtx_unlock(&queue->mtx);
 }
 
-DSSH_PRIVATE void
-dssh_log_emit(struct dssh_session_s *sess, dssh_log_level level, dssh_log_source source, int error_code,
+static void
+log_emit(struct dssh_session_s *sess, dssh_log_level level, dssh_log_source source, int error_code,
     uint32_t ssh_reason_code, bool always_display, bool truncated, const uint8_t *message, size_t message_len,
-    const uint8_t *language, size_t language_len)
+    const uint8_t *language, size_t language_len, bool forward)
 {
 	if (!dssh_log_enabled(sess, level))
 		return;
@@ -230,7 +230,7 @@ dssh_log_emit(struct dssh_session_s *sess, dssh_log_level level, dssh_log_source
 	dssh_log_action action = sess->log_cb(&record, sess->log_cbdata);
 	session_scope_leave(&scope);
 
-	if (source != DSSH_LOG_SOURCE_LIBRARY)
+	if (!forward || source != DSSH_LOG_SOURCE_LIBRARY)
 		return;
 	if (action == DSSH_LOG_SEND_DEBUG)
 		queue_log_forward(sess, false, msg_copy, mlen);
@@ -239,27 +239,36 @@ dssh_log_emit(struct dssh_session_s *sess, dssh_log_level level, dssh_log_source
 }
 
 DSSH_PRIVATE void
-dssh_log_emitf(struct dssh_session_s *sess, dssh_log_level level, int error_code, const char *format, ...)
+dssh_log_emit(struct dssh_session_s *sess, dssh_log_level level, dssh_log_source source, int error_code,
+    uint32_t ssh_reason_code, bool always_display, bool truncated, const uint8_t *message, size_t message_len,
+    const uint8_t *language, size_t language_len)
 {
-	char    message[DSSH_LOG_MESSAGE_MAX + 1];
-	va_list ap;
+	log_emit(sess, level, source, error_code, ssh_reason_code, always_display, truncated,
+	    message, message_len, language, language_len, true);
+}
 
-	va_start(ap, format);
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((format(printf, 5, 0)))
+#endif
+static void
+log_emitv(struct dssh_session_s *sess, dssh_log_level level, int error_code,
+    bool forward, const char *format, va_list ap)
+{
+	char message[DSSH_LOG_MESSAGE_MAX + 1];
 	int result = vsnprintf(message, sizeof(message), format, ap);
-	va_end(ap);
 	if (result < 0) {
 		static const uint8_t failed[] = "Diagnostic formatting failed";
 
-		dssh_log_emit(sess, level, DSSH_LOG_SOURCE_LIBRARY, error_code, 0, false, false, failed,
-		    sizeof(failed) - 1, NULL, 0);
+		log_emit(sess, level, DSSH_LOG_SOURCE_LIBRARY, error_code, 0, false, false, failed,
+		    sizeof(failed) - 1, NULL, 0, forward);
 		return;
 	}
 #if SIZE_MAX < INT_MAX
 	if (result > SIZE_MAX) {
 		static const uint8_t too_long[] = "Diagnostic message length overflow";
 
-		dssh_log_emit(sess, level, DSSH_LOG_SOURCE_LIBRARY, error_code, 0, false, true, too_long,
-		    sizeof(too_long) - 1, NULL, 0);
+		log_emit(sess, level, DSSH_LOG_SOURCE_LIBRARY, error_code, 0, false, true, too_long,
+		    sizeof(too_long) - 1, NULL, 0, forward);
 		return;
 	}
 #endif
@@ -268,8 +277,26 @@ dssh_log_emitf(struct dssh_session_s *sess, dssh_log_level level, int error_code
 
 	if (used > DSSH_LOG_MESSAGE_MAX)
 		used = DSSH_LOG_MESSAGE_MAX;
-	dssh_log_emit(sess, level, DSSH_LOG_SOURCE_LIBRARY, error_code, 0, false,
-	    desired > DSSH_LOG_MESSAGE_MAX, (const uint8_t *)message, used, NULL, 0);
+	log_emit(sess, level, DSSH_LOG_SOURCE_LIBRARY, error_code, 0, false,
+	    desired > DSSH_LOG_MESSAGE_MAX, (const uint8_t *)message, used, NULL, 0, forward);
+}
+
+DSSH_PRIVATE void
+dssh_log_emitf(struct dssh_session_s *sess, dssh_log_level level, int error_code, const char *format, ...)
+{
+	va_list ap;
+	va_start(ap, format);
+	log_emitv(sess, level, error_code, true, format, ap);
+	va_end(ap);
+}
+
+DSSH_PRIVATE void
+dssh_log_emit_localf(struct dssh_session_s *sess, dssh_log_level level, int error_code, const char *format, ...)
+{
+	va_list ap;
+	va_start(ap, format);
+	log_emitv(sess, level, error_code, false, format, ap);
+	va_end(ap);
 }
 
 DSSH_PRIVATE void

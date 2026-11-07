@@ -9322,6 +9322,7 @@ test_auth_replayed_message_state(void)
 #include "dh_group_result_cases.h"
 #include "transport_identification_cases.h"
 #include "transport_query_cases.h"
+#include "transport_wire_trace_cases.h"
 #include "transport_compression_cases.h"
 #include "transport_module_cases.h"
 
@@ -9744,6 +9745,7 @@ static struct dssh_test_entry tests[] = {
 	{ "transport/disconnect_terminates", test_disconnect_sets_terminate },
 	{ "transport/debug_callback",        test_debug_invokes_callback },
 	{ "transport/log_forwards_debug",    test_log_forwards_debug },
+	{ "transport/wire_trace",            test_transport_wire_trace },
 	{ "transport/unimplemented_callback", test_unimplemented_invokes_callback },
 	{ "transport/multiple_ignore",       test_multiple_ignore_before_real },
 

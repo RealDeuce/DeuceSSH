@@ -16,31 +16,22 @@
 
 /* DSSH_TESTABLE is now defined in deucessh-portable.h */
 
-/*
- * Wire-packet telemetry.  Build with -DDSSH_TRACE_WIRE to emit one
- * stderr line per SSH packet sent (after pad/encrypt prep) and per
- * SSH packet received (after decrypt/MAC verify).  Each line is
- * prefixed "[dssh-wire]" so it greps cleanly.  Default builds
- * compile the macro to a no-op.
- */
+/* Optional packet metadata uses the application's local diagnostic callback.
+ * No direct I/O or peer forwarding. Default builds do not evaluate arguments. */
 #ifdef DSSH_TRACE_WIRE
- #include <stdio.h>
- #define DSSH_TRACE_W(...)                                     \
-	 do {                                                  \
-		 fprintf(stderr, "[dssh-wire] " __VA_ARGS__);  \
-		 fputc('\n', stderr);                          \
-		 fflush(stderr);                               \
-	 } while (0)
+ #define DSSH_TRACE_W(sess, ...)                                      \
+	do {                                                          \
+		if (dssh_log_enabled((sess), DSSH_LOG_DEBUG))            \
+			dssh_log_emit_localf((sess), DSSH_LOG_DEBUG,     \
+			    DSSH_ERROR_NONE, "[dssh-wire] " __VA_ARGS__); \
+	} while (0)
 #else
- /* `if (0) fprintf(...)` references the args for type-checking and to
-  * suppress -Wunused-variable on locals only used in trace lines, but
-  * the optimizer drops the dead branch at -O0+. */
- #include <stdio.h>
- #define DSSH_TRACE_W(...)                            \
-	 do {                                         \
-		 if (0)                               \
-			 fprintf(stderr, __VA_ARGS__);  \
-	 } while (0)
+ #define DSSH_TRACE_W(sess, ...)                                      \
+	do {                                                          \
+		if (0)                                                 \
+			dssh_log_emit_localf((sess), DSSH_LOG_DEBUG,     \
+			    DSSH_ERROR_NONE, "[dssh-wire] " __VA_ARGS__); \
+	} while (0)
 #endif
 
 /* ================================================================
@@ -155,6 +146,11 @@ DSSH_PRIVATE void dssh_log_emit(struct dssh_session_s *sess, dssh_log_level leve
 __attribute__((format(printf, 4, 5)))
 #endif
 DSSH_PRIVATE void dssh_log_emitf(struct dssh_session_s *sess, dssh_log_level level, int error_code,
+    const char *format, ...);
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((format(printf, 4, 5)))
+#endif
+DSSH_PRIVATE void dssh_log_emit_localf(struct dssh_session_s *sess, dssh_log_level level, int error_code,
     const char *format, ...);
 DSSH_PRIVATE void dssh_log_cleanup(struct dssh_session_s *sess);
 DSSH_PRIVATE void dssh_log_termination(struct dssh_session_s *sess, int cause);

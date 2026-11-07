@@ -1,3 +1,22 @@
+# Keep exit status authoritative while also requiring the fixture's result text.
+function(dssh_add_output_test name target required_output)
+	set(command "$<TARGET_FILE:${target}>" ${ARGN})
+	get_target_property(emulator ${target} CROSSCOMPILING_EMULATOR)
+	if(emulator)
+		list(PREPEND command ${emulator})
+	endif()
+	get_target_property(launcher ${target} TEST_LAUNCHER)
+	if(launcher)
+		list(PREPEND command ${launcher})
+	endif()
+	add_test(NAME "${name}" COMMAND "${CMAKE_COMMAND}"
+		"-DTEST_COMMAND=${command}" "-DTEST_REQUIRED_OUTPUT=${required_output}"
+		-P "${CMAKE_CURRENT_SOURCE_DIR}/check_output.cmake")
+endfunction()
+
+add_test(NAME dssh_test_output_policy COMMAND "${CMAKE_COMMAND}"
+	-P "${CMAKE_CURRENT_SOURCE_DIR}/check_output_test.cmake")
+
 add_test(NAME dssh_c_standard COMMAND "${CMAKE_COMMAND}"
 	"-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/c-standard-tests"
 	-P "${CMAKE_CURRENT_SOURCE_DIR}/c_standard.cmake")
@@ -26,20 +45,19 @@ foreach(kind IN ITEMS static shared)
 		if(DSSH_THREADS_SHIM_INCLUDE)
 			target_include_directories(${target} BEFORE PRIVATE ${DSSH_THREADS_SHIM_INCLUDE})
 		endif()
-		add_test(NAME dssh_session_init_${kind}_default COMMAND ${target})
-		add_test(NAME dssh_session_init_${kind}_configured COMMAND ${target} configured)
+		dssh_add_output_test(dssh_session_init_${kind}_default ${target} "workers=8 sessions=256 failures=0 frozen=1")
+		dssh_add_output_test(dssh_session_init_${kind}_configured ${target} "workers=8 sessions=256 failures=0 frozen=1"
+			configured)
 		set_tests_properties(dssh_session_init_${kind}_default dssh_session_init_${kind}_configured
-			PROPERTIES TIMEOUT 60
-			PASS_REGULAR_EXPRESSION "workers=8 sessions=256 failures=0 frozen=1")
+			PROPERTIES TIMEOUT 60)
 		set(release_target dssh_test_release_entry_${kind})
 		add_executable(${release_target} test_release_entry.c)
 		set_property(TARGET ${release_target} PROPERTY C_STANDARD ${DEUCESSH_C_STANDARD})
 		set_property(TARGET ${release_target} PROPERTY C_STANDARD_REQUIRED ON)
 		target_compile_options(${release_target} PRIVATE ${DEUCESSH_COMPILE_OPTIONS})
 		target_link_libraries(${release_target} PRIVATE deucessh_${kind})
-		add_test(NAME dssh_release_entry_${kind} COMMAND ${release_target})
-		set_tests_properties(dssh_release_entry_${kind} PROPERTIES TIMEOUT 60
-			PASS_REGULAR_EXPRESSION "release_entries=48 releases=4 before=1 after=1 restored=1")
+		dssh_add_output_test(dssh_release_entry_${kind} ${release_target} "release_entries=48 releases=4 before=1 after=1 restored=1")
+		set_tests_properties(dssh_release_entry_${kind} PROPERTIES TIMEOUT 60)
 		if(UNIX)
 			set(event_target dssh_test_event_peer_${kind})
 			add_executable(${event_target} test_event_peer.c mock_io.c)
@@ -56,9 +74,8 @@ foreach(kind IN ITEMS static shared)
 			if(DSSH_THREADS_SHIM_INCLUDE)
 				target_include_directories(${event_target} BEFORE PRIVATE ${DSSH_THREADS_SHIM_INCLUDE})
 			endif()
-			add_test(NAME dssh_event_peer_${kind} COMMAND ${event_target})
-			set_tests_properties(dssh_event_peer_${kind} PROPERTIES TIMEOUT 60
-				PASS_REGULAR_EXPRESSION "events=130 queue=0 positions=3/2 production=1")
+			dssh_add_output_test(dssh_event_peer_${kind} ${event_target} "events=130 queue=0 positions=3/2 production=1")
+			set_tests_properties(dssh_event_peer_${kind} PROPERTIES TIMEOUT 60)
 			set(callback_target dssh_test_accept_callback_peer_${kind})
 			add_executable(${callback_target} test_accept_callback_peer.c mock_io.c)
 			set_property(TARGET ${callback_target} PROPERTY C_STANDARD ${DEUCESSH_C_STANDARD})
@@ -67,9 +84,9 @@ foreach(kind IN ITEMS static shared)
 			target_compile_definitions(${callback_target} PRIVATE _DEFAULT_SOURCE)
 			target_link_libraries(${callback_target} PRIVATE deucessh_${kind} ${THREADS_LINK_LIB})
 			foreach(mode RANGE 0 5)
-				add_test(NAME dssh_accept_callback_peer_${kind}_${mode} COMMAND ${callback_target} ${mode})
-				set_tests_properties(dssh_accept_callback_peer_${kind}_${mode} PROPERTIES TIMEOUT 60
-					PASS_REGULAR_EXPRESSION "setup_contract=1 kind=${mode}.*production=1")
+				dssh_add_output_test(dssh_accept_callback_peer_${kind}_${mode} ${callback_target} "setup_contract=1 kind=${mode}.*production=1"
+					${mode})
+				set_tests_properties(dssh_accept_callback_peer_${kind}_${mode} PROPERTIES TIMEOUT 60)
 			endforeach()
 
 		endif()
@@ -755,19 +772,18 @@ endif()
 dssh_add_test(transport test_transport.c)
 dssh_add_test(kex_failure test_kex_failure.c)
 target_link_libraries(dssh_test_kex_failure PRIVATE dssh_mock_io)
-add_test(NAME dssh_mock_io_shutdown COMMAND dssh_test_kex_failure --exact kex_failure/io_shutdown)
+dssh_add_output_test(dssh_mock_io_shutdown dssh_test_kex_failure "1 tests: 1 passed, 0 failed, 0 skipped"
+	--exact kex_failure/io_shutdown)
 set_tests_properties(dssh_mock_io_shutdown PROPERTIES TIMEOUT 60
-	FAIL_REGULAR_EXPRESSION "AddressSanitizer;ThreadSanitizer;UndefinedBehaviorSanitizer;runtime error:"
-	PASS_REGULAR_EXPRESSION "1 tests: 1 passed, 0 failed, 0 skipped")
+	FAIL_REGULAR_EXPRESSION "AddressSanitizer;ThreadSanitizer;UndefinedBehaviorSanitizer;runtime error:")
 foreach(key IN ITEMS ed25519 rsa rsa512)
 	foreach(part IN ITEMS control module inputs send_errors stopped)
-		add_test(NAME dssh_kex_failure_${part}_${key}
-			COMMAND dssh_test_kex_failure --exact kex_failure/${part})
+		dssh_add_output_test(dssh_kex_failure_${part}_${key} dssh_test_kex_failure "1 tests: 1 passed, 0 failed, 0 skipped"
+			--exact kex_failure/${part})
 		set_tests_properties(dssh_kex_failure_${part}_${key} PROPERTIES
 			ENVIRONMENT "DSSH_TEST_KEY=${key};${DSSH_TEST_KEY_ENV}"
 			FIXTURES_REQUIRED dssh_cached_keys TIMEOUT 600
-			FAIL_REGULAR_EXPRESSION "AddressSanitizer;ThreadSanitizer;UndefinedBehaviorSanitizer;runtime error:"
-			PASS_REGULAR_EXPRESSION "1 tests: 1 passed, 0 failed, 0 skipped")
+			FAIL_REGULAR_EXPRESSION "AddressSanitizer;ThreadSanitizer;UndefinedBehaviorSanitizer;runtime error:")
 	endforeach()
 endforeach()
 dssh_add_test(kex_framing test_kex_framing.c)
@@ -779,11 +795,10 @@ add_test(NAME dssh_unit_dhgex_contract COMMAND dssh_test_dhgex_contract)
 target_link_libraries(dssh_test_transport PRIVATE dssh_mock_io dssh_mock_comp)
 target_sources(dssh_test_transport PRIVATE dh_group_result_provider.c)
 foreach(part IN ITEMS group_selection group_validation peer_validation mpint_validation provider_contract group_result_handshake group_result_reuse)
-	add_test(NAME dssh_dhgex_${part}
-		COMMAND dssh_test_transport --exact release/dhgex_${part})
+	dssh_add_output_test(dssh_dhgex_${part} dssh_test_transport "1 tests: 1 passed, 0 failed, 0 skipped"
+		--exact release/dhgex_${part})
 	set_tests_properties(dssh_dhgex_${part} PROPERTIES
-		ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys
-		PASS_REGULAR_EXPRESSION "1 tests: 1 passed, 0 failed, 0 skipped")
+		ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys)
 endforeach()
 dssh_add_variant_tests(dssh_transport dssh_test_transport)
 foreach(key IN ITEMS ed25519 rsa rsa512)
@@ -801,52 +816,46 @@ foreach(part IN ITEMS codec packet_bound offers advertisement receive_positions 
 		TIMEOUT 180)
 endforeach()
 foreach(part IN ITEMS notifications auth_callbacks hostkey nested demux joinable)
-	add_test(NAME dssh_transport_receive_entry_${part}
-		COMMAND dssh_test_transport --exact receive_entry/${part})
+	dssh_add_output_test(dssh_transport_receive_entry_${part} dssh_test_transport "1 tests: 1 passed, 0 failed, 0 skipped"
+		--exact receive_entry/${part})
 	set_tests_properties(dssh_transport_receive_entry_${part} PROPERTIES
 		ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys
-		PASS_REGULAR_EXPRESSION "1 tests: 1 passed, 0 failed, 0 skipped"
 		TIMEOUT 180)
 endforeach()
-add_test(NAME dssh_transport_key_material
-	COMMAND dssh_test_transport key_material/)
+dssh_add_output_test(dssh_transport_key_material dssh_test_transport "7 tests: 7 passed, 0 failed, 0 skipped"
+	key_material/)
 set_tests_properties(dssh_transport_key_material PROPERTIES
 	ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys
-	PASS_REGULAR_EXPRESSION "7 tests: 7 passed, 0 failed, 0 skipped"
 	TIMEOUT 180)
 foreach(provider IN ITEMS none test-growth zlib)
 	if(provider STREQUAL "zlib" AND NOT ZLIB_FOUND)
 		continue()
 	endif()
-	add_test(NAME dssh_transport_rekey_control_${provider}
-		COMMAND dssh_test_transport --exact rekey/control_traffic)
+	dssh_add_output_test(dssh_transport_rekey_control_${provider} dssh_test_transport "1 tests: 1 passed, 0 failed, 0 skipped"
+		--exact rekey/control_traffic)
 	set_tests_properties(dssh_transport_rekey_control_${provider} PROPERTIES
 		ENVIRONMENT "${DSSH_TEST_KEY_ENV};DSSH_TEST_REKEY_COMP=${provider}"
 		FIXTURES_REQUIRED dssh_cached_keys
-		PASS_REGULAR_EXPRESSION "1 tests: 1 passed, 0 failed, 0 skipped"
 		TIMEOUT 240)
-	add_test(NAME dssh_transport_rekey_global_pipeline_${provider}
-		COMMAND dssh_test_transport --exact rekey/global_pipeline)
+	dssh_add_output_test(dssh_transport_rekey_global_pipeline_${provider} dssh_test_transport "1 tests: 1 passed, 0 failed, 0 skipped"
+		--exact rekey/global_pipeline)
 	set_tests_properties(dssh_transport_rekey_global_pipeline_${provider} PROPERTIES
 		ENVIRONMENT "${DSSH_TEST_KEY_ENV};DSSH_TEST_REKEY_COMP=${provider}"
 		FIXTURES_REQUIRED dssh_cached_keys
-		PASS_REGULAR_EXPRESSION "1 tests: 1 passed, 0 failed, 0 skipped"
 		TIMEOUT 240)
 endforeach()
 
-add_test(NAME dssh_transport_modules_stateless
-	COMMAND dssh_test_transport --exact modules/stateless)
+dssh_add_output_test(dssh_transport_modules_stateless dssh_test_transport "1 passed, 0 failed, 0 skipped"
+	--exact modules/stateless)
 set_tests_properties(dssh_transport_modules_stateless PROPERTIES
-	ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys
-	PASS_REGULAR_EXPRESSION "1 passed, 0 failed, 0 skipped")
+	ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys)
 foreach(part IN ITEMS grammar bytes bounds setters output)
 	add_test(NAME dssh_transport_identification_${part}
 		COMMAND dssh_test_transport --exact identification/${part})
 endforeach()
-add_test(NAME dssh_transport_query_snapshot
-	COMMAND dssh_test_transport --exact release/query_snapshot)
+dssh_add_output_test(dssh_transport_query_snapshot dssh_test_transport "1 tests: 1 passed, 0 failed, 0 skipped"
+	--exact release/query_snapshot)
 set_tests_properties(dssh_transport_query_snapshot PROPERTIES TIMEOUT 120
-	PASS_REGULAR_EXPRESSION "1 tests: 1 passed, 0 failed, 0 skipped"
 	FAIL_REGULAR_EXPRESSION "AddressSanitizer;UndefinedBehaviorSanitizer;runtime error:;ThreadSanitizer")
 foreach(part IN ITEMS expansion context_replacement auth_cleanup sensitive_failure teardown_cleanup queued_rekey scratch_failures replay_cleanup callbacks newkeys_framing mac_before_decode zlib_bounds gather_slots rekey_reuse transform_failures provider_changes setup_failures registration zlib zlib_allocations)
 	add_test(NAME dssh_transport_compression_${part}
@@ -1028,20 +1037,19 @@ foreach(provider IN ITEMS test-growth zlib)
 		foreach(case IN LISTS compressed_${layer}_cases)
 			string(REPLACE "/" "_" case_name "${case}")
 			set(test_name "dssh_${layer}_compression_${provider}_${case_name}")
-			add_test(NAME "${test_name}" COMMAND dssh_test_${layer} --exact "${case}")
+			dssh_add_output_test("${test_name}" dssh_test_${layer} "1 tests: 1 passed, 0 failed, 0 skipped"
+				--exact "${case}")
 			set_tests_properties("${test_name}" PROPERTIES
 				ENVIRONMENT "${DSSH_TEST_KEY_ENV};DSSH_TEST_COMPRESSION=${provider}"
-				FIXTURES_REQUIRED dssh_cached_keys
-				PASS_REGULAR_EXPRESSION "1 tests: 1 passed, 0 failed, 0 skipped")
+				FIXTURES_REQUIRED dssh_cached_keys)
 		endforeach()
 	endforeach()
 endforeach()
-add_test(NAME dssh_conn_compression_test-growth_window_rekey
-	COMMAND dssh_test_conn --exact compression/window_rekey)
+dssh_add_output_test(dssh_conn_compression_test-growth_window_rekey dssh_test_conn "1 tests: 1 passed, 0 failed, 0 skipped"
+	--exact compression/window_rekey)
 set_tests_properties(dssh_conn_compression_test-growth_window_rekey PROPERTIES
 	ENVIRONMENT "${DSSH_TEST_KEY_ENV};DSSH_TEST_COMPRESSION=test-growth"
 	FIXTURES_REQUIRED dssh_cached_keys
-	PASS_REGULAR_EXPRESSION "1 tests: 1 passed, 0 failed, 0 skipped"
 	TIMEOUT 60)
 set(CONN_TESTS
 	queue_retry/packet_stream_callback queue_retry/gather_stream_callback
@@ -1324,11 +1332,11 @@ foreach(provider IN ITEMS test-growth zlib)
 		test_self_rekey_preserves_channels test_self_rekey_inflight_data
 		test_self_window_adjust_race)
 		set(test_name "dssh_self_compression_${provider}_${case}")
-		add_test(NAME "${test_name}" COMMAND dssh_test_selftest --exact "${case}")
+		dssh_add_output_test("${test_name}" dssh_test_selftest "1 tests: 1 passed, 0 failed, 0 skipped"
+			--exact "${case}")
 		set_tests_properties("${test_name}" PROPERTIES
 			ENVIRONMENT "${DSSH_TEST_KEY_ENV};DSSH_TEST_COMPRESSION=${provider}"
-			FIXTURES_REQUIRED dssh_cached_keys
-			PASS_REGULAR_EXPRESSION "1 tests: 1 passed, 0 failed, 0 skipped")
+			FIXTURES_REQUIRED dssh_cached_keys)
 	endforeach()
 endforeach()
 set(SELFTEST_TESTS

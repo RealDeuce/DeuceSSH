@@ -2581,7 +2581,7 @@ static int
 test_set_version_valid(void)
 {
 	dssh_test_reset_global_config();
-	ASSERT_EQ(dssh_transport_set_version("MySSH-1.0", NULL), 0);
+	ASSERT_EQ(dssh_transport_set_version("MySSH_1.0", NULL), 0);
 	dssh_test_reset_global_config();
 	return TEST_PASS;
 }
@@ -2590,7 +2590,7 @@ static int
 test_set_version_valid_comment(void)
 {
 	dssh_test_reset_global_config();
-	ASSERT_EQ(dssh_transport_set_version("MySSH-1.0", "FreeBSD"), 0);
+	ASSERT_EQ(dssh_transport_set_version("MySSH_1.0", "FreeBSD"), 0);
 	dssh_test_reset_global_config();
 	return TEST_PASS;
 }
@@ -2628,7 +2628,7 @@ static int
 test_set_version_empty_comment(void)
 {
 	dssh_test_reset_global_config();
-	ASSERT_EQ(dssh_transport_set_version("MySSH-1.0", ""),
+	ASSERT_EQ(dssh_transport_set_version("MySSH_1.0", ""),
 	    DSSH_ERROR_PARSE);
 	dssh_test_reset_global_config();
 	return TEST_PASS;
@@ -2739,7 +2739,11 @@ test_version_exchange_with_comment(void)
 
 	dssh_transport_set_callbacks(mock_tx_dispatch, mock_rx_dispatch,
 	    mock_rxline_dispatch, mock_extra_line_cb);
-	dssh_transport_set_version("DeuceSSH-0.0", "test-comment");
+	if (dssh_transport_set_version("DeuceSSH_0.0", "test-comment") != 0) {
+		mock_io_free(&ctx.io);
+		dssh_test_reset_global_config();
+		return TEST_FAIL;
+	}
 
 	ctx.client = dssh_session_init(true, 0);
 	if (ctx.client == NULL) {
@@ -9633,6 +9637,8 @@ static struct dssh_test_entry tests[] = {
 	{ "identification/grammar", test_identification_grammar },
 	{ "identification/bytes", test_identification_bytes },
 	{ "identification/bounds", test_identification_bounds },
+	{ "identification/setters", test_identification_setters },
+	{ "identification/output", test_identification_output },
 	{ "release/query_snapshot", test_query_snapshot },
 	{ "release/auth_replayed_message_state", test_auth_replayed_message_state },
 	{ "release/auth_kbi_request_state", test_auth_kbi_request_state },

@@ -42,7 +42,7 @@ cleanse_free(void *ptr, size_t len)
 #ifndef DSSH_VERSION_STRING
  #define DSSH_VERSION_STRING "0.0"
 #endif
-static const char sw_ver[]             = "DeuceSSH-" DSSH_VERSION_STRING;
+static const char sw_ver[]             = "DeuceSSH_" DSSH_VERSION_STRING;
 static const char ssh_version_prefix[] = "SSH-2.0-";
 
 DSSH_TESTABLE struct dssh_transport_global_config gconf = {
@@ -228,9 +228,8 @@ is_version_line(uint8_t *buf, size_t buflen)
 	return buf[0] == 'S' && buf[1] == 'S' && buf[2] == 'H' && buf[3] == '-';
 }
 
-/* Whole-line character validation is separate from identification grammar.
- * The existing version API accepts printable ASCII, including minus in
- * software identifiers. Spaces delimit the optional comment. */
+/* Whole-line character validation is separate from software-token grammar.
+ * Spaces delimit the optional comment, which may contain minus. */
 DSSH_TESTABLE inline bool
 has_non_ascii(uint8_t *buf, size_t buflen)
 {
@@ -258,6 +257,17 @@ is_20(uint8_t *buf, size_t buflen)
 	return false;
 }
 
+/* RFC 4253 s4.2: printable non-space US-ASCII, excluding minus. */
+static bool
+is_valid_sw_version(const char *s, size_t len)
+{
+	for (size_t i = 0; i < len; i++) {
+		if (s[i] < 0x21 || s[i] > 0x7E || s[i] == '-')
+			return false;
+	}
+	return true;
+}
+
 static bool
 version_identification_valid(uint8_t *buf, size_t length)
 {
@@ -268,7 +278,13 @@ version_identification_valid(uint8_t *buf, size_t length)
 	/* is_20 established one of the complete supported protocol prefixes.
 	 * The first space starts comments; it cannot replace the software token. */
 	size_t software_pos = buf[4] == '1' ? 9 : 8;
-	return length - 2 > software_pos && buf[software_pos] != ' ';
+	if (length - 2 <= software_pos)
+		return false;
+	size_t end = software_pos;
+	while (end < length - 2 && buf[end] != ' ')
+		end++;
+	const char *software = (const char *)&buf[software_pos];
+	return end > software_pos && is_valid_sw_version(software, end - software_pos);
 }
 
 static int
@@ -320,6 +336,8 @@ version_tx(struct dssh_session_s *sess)
 	sz += DSSH_STRLEN(ssh_version_prefix);
 
 	size_t asz = strlen(gconf.software_version);
+	if (asz == 0 || !is_valid_sw_version(gconf.software_version, asz))
+		return DSSH_ERROR_INVALID;
 
 	if (!dssh_buffer_has(DSSH_VERSION_STRING_MAX, sz, asz)
 	    || !dssh_buffer_has(DSSH_VERSION_STRING_MAX, sz + asz, 2))
@@ -4249,21 +4267,6 @@ DEFINE_REGISTER(dssh_transport_register_comp, dssh_comp, comp_head, comp_tail, c
         && item->uncompress != NULL && item->cleanup != NULL)
 DEFINE_REGISTER(dssh_transport_register_lang, dssh_language, lang_head, lang_tail, lang_entries, true)
 #undef DEFINE_REGISTER
-
-/*
- * Validate a softwareversion string per RFC 4253 s4.2:
- * printable US-ASCII (0x21--0x7E), no spaces (space is the
- * delimiter between softwareversion and comments).
- */
-static bool
-is_valid_sw_version(const char *s, size_t len)
-{
-	for (size_t i = 0; i < len; i++) {
-		if ((s[i] < 0x21) || (s[i] > 0x7E))
-			return false;
-	}
-	return true;
-}
 
 /*
  * Validate a comment string per RFC 4253 s4.2:

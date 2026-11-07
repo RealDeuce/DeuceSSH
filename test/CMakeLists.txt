@@ -839,7 +839,7 @@ add_test(NAME dssh_transport_modules_stateless
 set_tests_properties(dssh_transport_modules_stateless PROPERTIES
 	ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys
 	PASS_REGULAR_EXPRESSION "1 passed, 0 failed, 0 skipped")
-foreach(part IN ITEMS grammar bytes bounds)
+foreach(part IN ITEMS grammar bytes bounds setters output)
 	add_test(NAME dssh_transport_identification_${part}
 		COMMAND dssh_test_transport --exact identification/${part})
 endforeach()

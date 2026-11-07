@@ -398,8 +398,9 @@ DSSH_PUBLIC int dssh_session_set_comp_filter(dssh_session sess,
  * Set the SSH version identification strings (RFC 4253 s4.2).
  * Must be called before any session is initialized.
  *
- * software_version: e.g. "MySSH-1.0".  Must be non-empty printable
- *                   US-ASCII (0x21--0x7E, no spaces).  Pass NULL to
+ * software_version: e.g. "MySSH_1.0".  Must be non-empty printable
+ *                   US-ASCII (0x21--0x7E), excluding the minus sign
+ *                   ('-'); spaces are not allowed.  Pass NULL to
  *                   keep the library's built-in default.
  * comment:          optional (pass NULL to omit).  Printable US-ASCII
  *                   (0x20--0x7E); spaces are allowed in comments.
@@ -410,8 +411,8 @@ DSSH_PUBLIC int dssh_session_set_comp_filter(dssh_session sess,
  * If not called, defaults to the library's built-in version string.
  * Returns 0 on success, DSSH_ERROR_TOOLONG if the combined string
  * exceeds 255 bytes, DSSH_ERROR_INVALID if characters are out of
- * range, DSSH_ERROR_PARSE if software_version is empty (or comment
- * is empty when non-NULL), or DSSH_ERROR_TOOLATE if a session has
+ * range or software_version contains '-', DSSH_ERROR_PARSE if
+ * either non-NULL string is empty, or DSSH_ERROR_TOOLATE if a session has
  * already been initialized.
  *
  * The strings are not copied -- caller must ensure they remain

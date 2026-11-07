@@ -366,13 +366,16 @@ verified this way).
 Customize the SSH identification string (RFC 4253 s4.2):
 
 ```c
-dssh_transport_set_version("MyApp-1.0", "FreeBSD");
-/* Produces: SSH-2.0-MyApp-1.0 FreeBSD\r\n */
+dssh_transport_set_version("MyApp_1.0", "FreeBSD");
+/* Produces: SSH-2.0-MyApp_1.0 FreeBSD\r\n */
 ```
 
 Must be called before `dssh_session_init()`.  Pass NULL for
 `software_version` to keep the library default; pass NULL for
 `comment` to omit it.  The resulting line must fit in 255 bytes.
+Software-version tokens must contain printable non-space US-ASCII and exclude
+minus (`-`); peer tokens follow the same rule. The built-in token uses
+`DeuceSSH_<version>`. Comments may contain spaces and minus signs.
 
 ## Session Termination
 

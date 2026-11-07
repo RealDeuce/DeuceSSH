@@ -156,6 +156,7 @@ register_all_algorithms(void)
 
 struct handshake_ctx {
 	struct mock_io_state io;
+	bool io_initialized;
 	dssh_session client;
 	dssh_session server;
 	int client_result;
@@ -186,10 +187,20 @@ handshake_server_thread(void *arg)
 	return 0;
 }
 
+/* Override only in the setup-ownership fixtures, before either worker starts.
+ * The ordinary path always calls the native C11 creator. */
+static int (*auth_fixture_thread_create)(thrd_t *, thrd_start_t, void *) = thrd_create;
+
 static int
 handshake_setup(struct handshake_ctx *ctx)
 {
-	memset(ctx, 0, sizeof(*ctx));
+	/* The caller owns cleanup on every return. The I/O atomics are not
+	 * accessed until mock_io_init has initialized their native handles. */
+	ctx->client = NULL;
+	ctx->server = NULL;
+	ctx->io_initialized = false;
+	ctx->client_result = 0;
+	ctx->server_result = 0;
 
 	dssh_test_reset_global_config();
 
@@ -198,50 +209,51 @@ handshake_setup(struct handshake_ctx *ctx)
 	if (test_generate_host_key() < 0)
 		return -1;
 
+	/* mock_io_init initializes all descriptors even when acquisition fails. */
+	ctx->io_initialized = true;
 	if (mock_io_init(&ctx->io, 0) < 0)
 		return -1;
 
-	dssh_transport_set_callbacks(mock_tx_dispatch, mock_rx_dispatch,
+	int ret = dssh_transport_set_callbacks(mock_tx_dispatch, mock_rx_dispatch,
 	    mock_rxline_dispatch, mock_extra_line_cb);
+	if (ret != 0)
+		return -1;
 
 	ctx->client = dssh_session_init(true, 0);
-	if (ctx->client == NULL) {
-		mock_io_free(&ctx->io);
+	if (ctx->client == NULL)
 		return -1;
-	}
-	dssh_session_set_cbdata(ctx->client, &ctx->io, &ctx->io,
+	ret = dssh_session_set_cbdata(ctx->client, &ctx->io, &ctx->io,
 	    &ctx->io, &ctx->io);
-	dssh_session_set_hostkey_verify_cb(ctx->client, dssh_test_accept_hostkey, NULL);
+	if (ret != 0)
+		return -1;
+	ret = dssh_session_set_hostkey_verify_cb(ctx->client, dssh_test_accept_hostkey, NULL);
+	if (ret != 0)
+		return -1;
 
 	ctx->server = init_server_session();
-	if (ctx->server == NULL) {
-		dssh_session_cleanup(ctx->client);
-		mock_io_free(&ctx->io);
+	if (ctx->server == NULL)
 		return -1;
-	}
-	dssh_session_set_cbdata(ctx->server, &ctx->io, &ctx->io,
+	ret = dssh_session_set_cbdata(ctx->server, &ctx->io, &ctx->io,
 	    &ctx->io, &ctx->io);
+	if (ret != 0)
+		return -1;
 
 	thrd_t ct, st;
-	if (thrd_create(&ct, handshake_client_thread, ctx) != thrd_success) {
-		dssh_session_cleanup(ctx->server);
-		dssh_session_cleanup(ctx->client);
-		mock_io_free(&ctx->io);
+	if (auth_fixture_thread_create(&ct, handshake_client_thread, ctx) != thrd_success)
 		return -1;
-	}
-	if (thrd_create(&st, handshake_server_thread, ctx) != thrd_success) {
+	if (auth_fixture_thread_create(&st, handshake_server_thread, ctx) != thrd_success) {
 		dssh_session_terminate(ctx->client);
 		mock_io_close_c2s(&ctx->io);
 		mock_io_close_s2c(&ctx->io);
-		thrd_join(ct, NULL);
-		dssh_session_cleanup(ctx->server);
-		dssh_session_cleanup(ctx->client);
-		mock_io_free(&ctx->io);
+		if (thrd_join(ct, NULL) != thrd_success)
+			abort();
 		return -1;
 	}
 
-	thrd_join(ct, NULL);
-	thrd_join(st, NULL);
+	if (thrd_join(ct, NULL) != thrd_success)
+		abort();
+	if (thrd_join(st, NULL) != thrd_success)
+		abort();
 
 	if (ctx->client_result != 0 || ctx->server_result != 0
 	    || !compression_fixture_selected(ctx->client, ctx->server))
@@ -253,11 +265,18 @@ handshake_setup(struct handshake_ctx *ctx)
 static void
 handshake_cleanup(struct handshake_ctx *ctx)
 {
-	if (ctx->server)
+	if (ctx->server != NULL) {
 		dssh_session_cleanup(ctx->server);
-	if (ctx->client)
+		ctx->server = NULL;
+	}
+	if (ctx->client != NULL) {
 		dssh_session_cleanup(ctx->client);
-	mock_io_free(&ctx->io);
+		ctx->client = NULL;
+	}
+	if (ctx->io_initialized) {
+		mock_io_free(&ctx->io);
+		ctx->io_initialized = false;
+	}
 	dssh_test_reset_global_config();
 }
 
@@ -3144,16 +3163,15 @@ struct parse_error_ctx {
 	struct auth_server_arg sa;
 	struct test_auth_cbdata cbdata;
 	thrd_t st;
+	bool thread_started;
 };
 
 static int
 parse_error_setup(struct parse_error_ctx *pe)
 {
-	memset(pe, 0, sizeof(*pe));
-	if (handshake_setup(&pe->hctx) < 0) {
-		handshake_cleanup(&pe->hctx);
+	*pe = (struct parse_error_ctx){0};
+	if (handshake_setup(&pe->hctx) < 0)
 		return -1;
-	}
 
 	pe->cbdata.password_result = DSSH_AUTH_SUCCESS;
 	pe->sa.ctx = &pe->hctx;
@@ -3162,40 +3180,45 @@ parse_error_setup(struct parse_error_ctx *pe)
 	pe->sa.cbs.publickey_cb = test_publickey_cb;
 	pe->sa.cbs.cbdata = &pe->cbdata;
 
-	if (thrd_create(&pe->st, auth_server_thread, &pe->sa) != thrd_success)
+	if (auth_fixture_thread_create(&pe->st, auth_server_thread, &pe->sa) != thrd_success)
 		return -1;
+	pe->thread_started = true;
 
 	/* SERVICE_REQUEST */
-	{
-		static const char svc[] = "ssh-userauth";
-		uint8_t msg[64];
-		size_t pos = 0;
-		msg[pos++] = SSH_MSG_SERVICE_REQUEST;
-		dssh_serialize_uint32((uint32_t)(sizeof(svc) - 1), msg, sizeof(msg), &pos);
-		memcpy(&msg[pos], svc, sizeof(svc) - 1);
-		pos += sizeof(svc) - 1;
-		if (send_packet(pe->hctx.client, msg, pos, NULL) < 0)
-			return -1;
-	}
-	{
-		uint8_t msg_type;
-		uint8_t *payload;
-		size_t payload_len;
-		if (recv_packet(pe->hctx.client, &msg_type,
-		    &payload, &payload_len) < 0)
-			return -1;
-		if (msg_type != SSH_MSG_SERVICE_ACCEPT)
-			return -1;
-	}
+	static const char svc[] = "ssh-userauth";
+	uint8_t msg[64];
+	size_t pos = 0;
+	msg[pos++] = SSH_MSG_SERVICE_REQUEST;
+	int ret = dssh_serialize_uint32(DSSH_STRLEN(svc), msg, sizeof(msg), &pos);
+	if (ret != 0)
+		return -1;
+	memcpy(&msg[pos], svc, sizeof(svc) - 1);
+	pos += sizeof(svc) - 1;
+	ret = send_packet(pe->hctx.client, msg, pos, NULL);
+	if (ret != 0)
+		return -1;
+
+	uint8_t msg_type;
+	uint8_t *payload;
+	size_t payload_len;
+	ret = recv_packet(pe->hctx.client, &msg_type, &payload, &payload_len);
+	if (ret != 0 || msg_type != SSH_MSG_SERVICE_ACCEPT)
+		return -1;
 	return 0;
 }
 
 static void
 parse_error_cleanup(struct parse_error_ctx *pe)
 {
-	mock_io_close_c2s(&pe->hctx.io);
-	mock_io_close_s2c(&pe->hctx.io);
-	thrd_join(pe->st, NULL);
+	if (pe->hctx.io_initialized) {
+		mock_io_close_c2s(&pe->hctx.io);
+		mock_io_close_s2c(&pe->hctx.io);
+	}
+	if (pe->thread_started) {
+		if (thrd_join(pe->st, NULL) != thrd_success)
+			abort();
+		pe->thread_started = false;
+	}
 	handshake_cleanup(&pe->hctx);
 }
 
@@ -12478,6 +12501,7 @@ test_auth_request_capacity(void)
 
 static struct dssh_test_entry tests[] = {
 	{ "release/auth_setup_ownership", test_auth_setup_ownership },
+	{ "release/auth_nested_setup_ownership", test_auth_nested_setup_ownership },
 	{ "callbacks/banner_transaction", test_auth_callback_banner_transaction },
 	{ "callbacks/output_pairs", test_auth_callback_output_pairs },
 	{ "callbacks/password_lifetime", test_auth_callback_password_lifetime },

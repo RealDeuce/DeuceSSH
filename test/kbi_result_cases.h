@@ -247,11 +247,12 @@ test_kbi_result_server_contract(void)
 		dssh_test_alloc_reset();
 		mock_io_close_c2s(&ctx.io);
 		mock_io_close_s2c(&ctx.io);
-		int joined = thrd_join(thread, NULL);
+		if (thrd_join(thread, NULL) != thrd_success)
+			abort();
 		auth_test_io_watch = NULL;
 		unsigned calls = mode == 0 || mode == 12 ? 3 : 1;
 		unsigned releases = mode == 5 || mode == 6 ? 0 : calls;
-		valid = valid && joined == thrd_success && ret == expected[mode]
+		valid = valid && ret == expected[mode]
 		    && allocations == expected_allocations && producer.calls == calls && producer.valid
 		    && producer.releases == releases && release.calls == releases && release.valid && peer.valid
 		    && peer.requests == (mode == 0 || mode == 12 ? 2U : mode >= 14 ? 1U : 0U)

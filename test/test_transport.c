@@ -2726,6 +2726,7 @@ static int
 test_version_exchange_with_comment(void)
 {
 	struct handshake_ctx ctx;
+	bool valid = false;
 	memset(&ctx, 0, sizeof(ctx));
 
 	dssh_test_reset_global_config();
@@ -2737,49 +2738,49 @@ test_version_exchange_with_comment(void)
 	if (mock_io_init(&ctx.io, 0) < 0)
 		return TEST_FAIL;
 
-	dssh_transport_set_callbacks(mock_tx_dispatch, mock_rx_dispatch,
-	    mock_rxline_dispatch, mock_extra_line_cb);
-	if (dssh_transport_set_version("DeuceSSH_0.0", "test-comment") != 0) {
-		mock_io_free(&ctx.io);
-		dssh_test_reset_global_config();
-		return TEST_FAIL;
-	}
+	if (dssh_transport_set_callbacks(mock_tx_dispatch, mock_rx_dispatch,
+	    mock_rxline_dispatch, mock_extra_line_cb) != 0
+	    || dssh_transport_set_version("DeuceSSH_0.0", "test-comment") != 0)
+		goto cleanup;
 
 	ctx.client = dssh_session_init(true, 0);
-	if (ctx.client == NULL) {
-		mock_io_free(&ctx.io);
-		dssh_test_reset_global_config();
-		return TEST_FAIL;
-	}
-	dssh_session_set_cbdata(ctx.client, &ctx.io, &ctx.io,
-	    &ctx.io, &ctx.io);
-	dssh_session_set_hostkey_verify_cb(ctx.client, dssh_test_accept_hostkey, NULL);
+	if (ctx.client == NULL)
+		goto cleanup;
+	if (dssh_session_set_cbdata(ctx.client, &ctx.io, &ctx.io,
+	    &ctx.io, &ctx.io) != 0
+	    || dssh_session_set_hostkey_verify_cb(ctx.client, dssh_test_accept_hostkey, NULL) != 0)
+		goto cleanup;
 
 	ctx.server = init_server_session();
-	if (ctx.server == NULL) {
-		dssh_session_cleanup(ctx.client);
-		mock_io_free(&ctx.io);
-		dssh_test_reset_global_config();
-		return TEST_FAIL;
-	}
-	dssh_session_set_cbdata(ctx.server, &ctx.io, &ctx.io,
-	    &ctx.io, &ctx.io);
+	if (ctx.server == NULL)
+		goto cleanup;
+	if (dssh_session_set_cbdata(ctx.server, &ctx.io, &ctx.io,
+	    &ctx.io, &ctx.io) != 0)
+		goto cleanup;
 
 	thrd_t ct, st;
-	ASSERT_THRD_CREATE(&ct, handshake_client_thread, &ctx);
-	ASSERT_THRD_CREATE(&st, handshake_server_thread, &ctx);
-	thrd_join(ct, NULL);
-	thrd_join(st, NULL);
+	if (thrd_create(&ct, handshake_client_thread, &ctx) != thrd_success)
+		goto cleanup;
+	if (thrd_create(&st, handshake_server_thread, &ctx) != thrd_success) {
+		dssh_session_terminate(ctx.client);
+		mock_io_close_c2s(&ctx.io);
+		mock_io_close_s2c(&ctx.io);
+		if (thrd_join(ct, NULL) != thrd_success)
+			abort();
+		goto cleanup;
+	}
+	if (thrd_join(ct, NULL) != thrd_success)
+		abort();
+	if (thrd_join(st, NULL) != thrd_success)
+		abort();
 
-	ASSERT_EQ(ctx.client_result, 0);
-	ASSERT_EQ(ctx.server_result, 0);
-
-	/* The local id string should contain the comment */
+	/* The local id string should contain the comment. */
 	const char *id = ctx.client->trans.id_str;
-	ASSERT_NOT_NULL(id);
-	ASSERT_TRUE(strstr(id, "test-comment") != NULL);
-
+	valid = ctx.client_result == 0 && ctx.server_result == 0
+	    && id != NULL && strstr(id, "test-comment") != NULL;
+cleanup:
 	handshake_cleanup(&ctx);
+	ASSERT_TRUE(valid);
 	return TEST_PASS;
 }
 

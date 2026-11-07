@@ -161,7 +161,8 @@ auth_callback_server(unsigned kind, struct dssh_auth_server_cbs *cbs,
 	    && auth_test_bytes_zero(&ctx.server->trans.rx_packet[4], ctx.server->trans.packet_buf_sz);
 	mock_io_close_c2s(&ctx.io);
 	mock_io_close_s2c(&ctx.io);
-	int joined = thrd_join(thread, NULL);
+	if (thrd_join(thread, NULL) != thrd_success)
+		abort();
 	auth_test_io_watch = NULL;
 	probe->checked = watch.checked;
 	probe->clean = watch.clean;
@@ -170,7 +171,7 @@ auth_callback_server(unsigned kind, struct dssh_auth_server_cbs *cbs,
 	probe->io = NULL;
 	probe->sess = NULL;
 	handshake_cleanup(&ctx);
-	return joined == thrd_success ? ret : -999;
+	return ret;
 }
 
 static int

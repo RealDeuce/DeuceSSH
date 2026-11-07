@@ -95,6 +95,21 @@ kex_io_register(void)
 	return ret;
 }
 
+static bool
+kex_io_exchange(struct handshake_ctx *pair, bool from_client, const uint8_t *packet, size_t length)
+{
+	dssh_session tx = from_client ? pair->client : pair->server;
+	dssh_session rx = from_client ? pair->server : pair->client;
+	uint8_t type = 0;
+	uint8_t *received = NULL;
+	size_t received_len = 0;
+	int ret = send_packet(tx, packet, length, NULL);
+	if (ret == 0)
+		ret = recv_packet(rx, &type, &received, &received_len);
+	return ret == 0 && type == packet[0] && received != NULL
+	    && received_len == length && memcmp(received, packet, length) == 0;
+}
+
 static int
 test_kex_io_arguments(void)
 {
@@ -110,11 +125,11 @@ test_kex_io_arguments(void)
 	uint8_t request[] = {SSH_MSG_SERVICE_REQUEST, 0, 0, 0, 12,
 	    's', 's', 'h', '-', 'u', 's', 'e', 'r', 'a', 'u', 't', 'h'};
 	if (valid)
-		valid = compression_exchange(&pair, true, request, sizeof(request))
+		valid = kex_io_exchange(&pair, true, request, sizeof(request))
 		    && compression_rekey_pair(&pair);
 	request[0] = SSH_MSG_SERVICE_ACCEPT;
 	if (valid)
-		valid = compression_exchange(&pair, false, request, sizeof(request));
+		valid = kex_io_exchange(&pair, false, request, sizeof(request));
 	valid = valid && probe.valid[0] && probe.valid[1]
 	    && probe.calls[0] == 2 && probe.calls[1] == 2
 	    && probe.checks[0] == 16 && probe.checks[1] == 16;

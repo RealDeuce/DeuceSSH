@@ -3145,13 +3145,19 @@ kexinit(struct dssh_session_s *sess)
 static int
 kex_send_wrapper(const uint8_t *payload, size_t len, void *io_ctx)
 {
-	return send_packet((struct dssh_session_s *)io_ctx, payload, len, NULL);
+	if (io_ctx == NULL || payload == NULL || len == 0)
+		return DSSH_ERROR_INVALID;
+	struct dssh_session_s *sess = io_ctx;
+	return send_packet(sess, payload, len, NULL);
 }
 
 static int
 kex_recv_wrapper(uint8_t *msg_type, uint8_t **payload, size_t *payload_len, void *io_ctx)
 {
-	return recv_packet((struct dssh_session_s *)io_ctx, msg_type, payload, payload_len);
+	if (io_ctx == NULL || msg_type == NULL || payload == NULL || payload_len == NULL)
+		return DSSH_ERROR_INVALID;
+	struct dssh_session_s *sess = io_ctx;
+	return recv_packet(sess, msg_type, payload, payload_len);
 }
 
 static void

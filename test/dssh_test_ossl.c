@@ -207,6 +207,27 @@ static _Thread_local bool digest_length_override;
 static _Thread_local unsigned int digest_length_value;
 static _Thread_local bool encoded_length_override;
 static _Thread_local int encoded_length_value;
+static _Thread_local bool encrypt_length_override;
+static _Thread_local int encrypt_length_value;
+static _Thread_local bool encrypt_length_seen;
+static _Thread_local int encrypt_native_length;
+
+void
+dssh_test_ossl_encrypt_length(int value)
+{
+	encrypt_length_override = true;
+	encrypt_length_value = value;
+	encrypt_length_seen = false;
+	encrypt_native_length = 0;
+}
+
+bool
+dssh_test_ossl_encrypt_observed(int *actual_length)
+{
+	if (actual_length != NULL)
+		*actual_length = encrypt_native_length;
+	return encrypt_length_seen;
+}
 
 void
 dssh_test_ossl_encoded_length(int value)
@@ -316,6 +337,9 @@ dssh_test_ossl_reset(void)
 	md_size_override = false;
 	digest_length_override = false;
 	encoded_length_override = false;
+	encrypt_length_override = false;
+	encrypt_length_seen = false;
+	encrypt_native_length = 0;
 #endif
 	dssh_test_clock_reset();
 }
@@ -671,7 +695,13 @@ dssh_test_EVP_EncryptUpdate(EVP_CIPHER_CTX *ctx, unsigned char *out,
 {
 	if (should_fail())
 		return 0;
-	return EVP_EncryptUpdate(ctx, out, outl, in, inl);
+	int ret = EVP_EncryptUpdate(ctx, out, outl, in, inl);
+	if (ret == 1 && encrypt_length_override && outl != NULL) {
+		encrypt_native_length = *outl;
+		encrypt_length_seen = true;
+		*outl = encrypt_length_value;
+	}
+	return ret;
 }
 
 int

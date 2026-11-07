@@ -13,10 +13,12 @@
 #include "test/dssh_test_internal.h"
 
 #ifdef DSSH_CRYPTO_OPENSSL
+#include "dssh_test_ossl.h"
 #include <openssl/evp.h>
 #elif defined(DSSH_CRYPTO_BOTAN)
 #include <botan/ffi.h>
 #endif
+#include <limits.h>
 #include <string.h>
 
 /*
@@ -520,6 +522,53 @@ test_aes256_ctr_module_vectors(void)
 	return TEST_PASS;
 }
 
+#ifdef DSSH_CRYPTO_OPENSSL
+static int
+test_aes256_ctr_module_extents(void)
+{
+	const int reported[] = { INT_MIN, -1, 0, 15, 16, 17, INT_MAX,
+#if INT_MAX > UINT16_MAX
+	    UINT16_MAX + 17,
+#endif
+	};
+	dssh_test_reset_global_config();
+	ASSERT_OK(dssh_register_aes256_ctr());
+	dssh_enc enc = gconf.enc_head;
+	bool valid = enc != NULL;
+	for (unsigned direction = 0; direction < 2 && valid; direction++) {
+		for (size_t i = 0; i < sizeof(reported) / sizeof(reported[0]) && valid; i++) {
+			dssh_test_ossl_reset();
+			dssh_enc_ctx *ctx = NULL;
+			int ret = enc->init(nist_key, nist_iv, direction == 0, &ctx);
+			if (ret != 0 || ctx == NULL) {
+				valid = false;
+				if (ctx != NULL)
+					enc->cleanup(ctx);
+				break;
+			}
+			uint8_t guarded[18];
+			memset(guarded, 0xA5, sizeof(guarded));
+			memcpy(&guarded[1], direction == 0 ? nist_pt : nist_ct, 16);
+			dssh_test_ossl_encrypt_length(reported[i]);
+			ret = direction == 0 ? enc->encrypt(&guarded[1], 16, ctx)
+			    : enc->decrypt(&guarded[1], 16, ctx);
+			int native_length = 0;
+			bool observed = dssh_test_ossl_encrypt_observed(&native_length);
+			dssh_test_ossl_reset();
+			valid = observed && native_length == 16
+			    && ret == (reported[i] == 16 ? 0 : DSSH_ERROR_INIT)
+			    && guarded[0] == 0xA5 && guarded[17] == 0xA5
+			    && memcmp(&guarded[1], direction == 0 ? nist_ct : nist_pt, 16) == 0;
+			enc->cleanup(ctx);
+		}
+	}
+	dssh_test_ossl_reset();
+	dssh_test_reset_global_config();
+	ASSERT_TRUE(valid);
+	return TEST_PASS;
+}
+#endif
+
 /* ================================================================
  * AES-256-CTR: Large buffer (256 bytes, encrypt/decrypt roundtrip)
  * ================================================================ */
@@ -661,6 +710,9 @@ static struct dssh_test_entry tests[] = {
 	{ "enc/aes256_ctr/nist_4block_dec", test_aes256_ctr_nist_4block_decrypt },
 	{ "enc/aes256_ctr/nist_per_block",  test_aes256_ctr_nist_per_block },
 	{ "enc/aes256_ctr/module_vectors",  test_aes256_ctr_module_vectors },
+#ifdef DSSH_CRYPTO_OPENSSL
+	{ "enc/aes256_ctr/module_extents",  test_aes256_ctr_module_extents },
+#endif
 
 	/* AES-256-CTR: behavioral */
 	{ "enc/aes256_ctr/roundtrip",       test_aes256_ctr_roundtrip },

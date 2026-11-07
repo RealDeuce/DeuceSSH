@@ -1,5 +1,6 @@
 #include <openssl/evp.h>
 
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -64,14 +65,12 @@ do_crypt(uint8_t *buf, size_t bufsz, dssh_enc_ctx *ctx)
 	if (bufsz > INT_MAX)
 		return DSSH_ERROR_INVALID;
 
+	int input_length = (int)bufsz;
 	int outlen = 0;
 
-	if (EVP_EncryptUpdate(cbd->ctx, buf, &outlen, buf, (int)bufsz) != 1)
+	if (EVP_EncryptUpdate(cbd->ctx, buf, &outlen, buf, input_length) != 1)
 		return DSSH_ERROR_INIT;
-	if (outlen < 0)
-		return DSSH_ERROR_INIT;
-	size_t written = (size_t)outlen;
-	if (written != bufsz)
+	if (outlen != input_length)
 		return DSSH_ERROR_INIT;
 
 	return 0;

@@ -28,10 +28,12 @@ void dssh_test_ossl_exclude_thread(void);
 int  dssh_test_ossl_count(void);
 
 /* Thread-local reported-metadata overrides for helper boundary tests.
- * Real digest computation still runs; reset disables both overrides. */
+ * Real computation still runs; reset disables the overrides. */
 void dssh_test_ossl_md_size(int value);
 void dssh_test_ossl_digest_length(unsigned int value);
 void dssh_test_ossl_encoded_length(int value);
+void dssh_test_ossl_encrypt_length(int value);
+bool dssh_test_ossl_encrypt_observed(int *actual_length);
 
 /*
  * Separate countdown for lock/condvar wrappers and the legacy join hook.

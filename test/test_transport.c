@@ -9324,6 +9324,7 @@ test_auth_replayed_message_state(void)
 #include "transport_query_cases.h"
 #include "transport_wire_trace_cases.h"
 #include "transport_compression_cases.h"
+#include "kex_io_cases.h"
 #include "transport_module_cases.h"
 
 struct rekey_control_probe {
@@ -9746,6 +9747,7 @@ static struct dssh_test_entry tests[] = {
 	{ "transport/debug_callback",        test_debug_invokes_callback },
 	{ "transport/log_forwards_debug",    test_log_forwards_debug },
 	{ "transport/wire_trace",            test_transport_wire_trace },
+	{ "release/kex_io_arguments",        test_kex_io_arguments },
 	{ "transport/unimplemented_callback", test_unimplemented_invokes_callback },
 	{ "transport/multiple_ignore",       test_multiple_ignore_before_real },
 

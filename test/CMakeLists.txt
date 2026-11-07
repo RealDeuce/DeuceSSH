@@ -861,6 +861,10 @@ dssh_add_output_test(dssh_transport_wire_trace dssh_test_transport
 	"1 tests: 1 passed, 0 failed, 0 skipped" --exact transport/wire_trace)
 set_tests_properties(dssh_transport_wire_trace PROPERTIES TIMEOUT 120
 	ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys)
+dssh_add_output_test(dssh_kex_io_arguments dssh_test_transport
+	"1 tests: 1 passed, 0 failed, 0 skipped" --exact release/kex_io_arguments)
+set_tests_properties(dssh_kex_io_arguments PROPERTIES TIMEOUT 120
+	ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys)
 foreach(part IN ITEMS expansion context_replacement auth_cleanup sensitive_failure teardown_cleanup queued_rekey scratch_failures replay_cleanup callbacks newkeys_framing mac_before_decode zlib_bounds gather_slots rekey_reuse transform_failures provider_changes setup_failures registration zlib zlib_allocations)
 	add_test(NAME dssh_transport_compression_${part}
 		COMMAND dssh_test_transport --exact compression/${part})

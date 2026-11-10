@@ -1140,6 +1140,12 @@ set(AUTH_TESTS
 dssh_add_individual_tests(dssh_test_auth dssh_auth AUTH_TESTS)
 
 dssh_add_test(conn test_conn.c)
+foreach(part IN ITEMS setup no_start)
+	dssh_add_output_test(dssh_conn_${part}_ownership dssh_test_conn
+		"1 tests: 1 passed, 0 failed, 0 skipped" --exact release/conn_${part}_ownership)
+	set_tests_properties(dssh_conn_${part}_ownership PROPERTIES TIMEOUT 120
+		ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys)
+endforeach()
 target_link_libraries(dssh_test_conn PRIVATE dssh_mock_io dssh_mock_comp)
 
 # Exercise actual auth/channel fixtures with external compression. Exact-test

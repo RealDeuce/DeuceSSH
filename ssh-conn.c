@@ -2045,9 +2045,8 @@ maybe_replenish_window(struct dssh_session_s *sess, struct dssh_channel_s *ch)
 		return DSSH_ERROR_TERMINATED;
 
 	if (add > 0)
-		/* Schedule the pre-reserved wa_slot (try-lock + queued slow path)
-		 * so the WINDOW_ADJUST never has to wait for a bulk-data
-		 * sender to release packet-engine ownership — matters under heavy
+		/* Schedule the pre-reserved wa_slot without waiting for the engine,
+		 * so the WINDOW_ADJUST can follow a bulk-data sender — matters under heavy
 		 * bidirectional channel load.  Keeps stream-mode parity
 		 * with ZC mode, which has always used wa_slot. */
 		return schedule_wa_slot(sess);

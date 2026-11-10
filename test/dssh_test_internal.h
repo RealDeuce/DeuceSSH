@@ -261,6 +261,8 @@ int send_packet(dssh_session sess,
     const uint8_t *payload, size_t payload_len, uint32_t *seq_out);
 int recv_packet(dssh_session sess,
     uint8_t *msg_type, uint8_t **payload, size_t *payload_len);
+int resize_tx_slot_live(dssh_session sess, struct dssh_tx_slot *slot, size_t max_payload,
+    size_t block_size, uint16_t mac_digest);
 int send_to_slot(dssh_session sess, struct dssh_tx_slot *slot,
     const uint8_t *payload, size_t payload_len);
 

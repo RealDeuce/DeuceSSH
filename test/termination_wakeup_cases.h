@@ -79,7 +79,7 @@ wake_finish(struct wake_fixture *fixture)
 		mtx_destroy(&fixture->sess->channel_mtx);
 	if (fixture->initialized >= 1)
 		mtx_destroy(&fixture->sess->accept_mtx);
-	free(fixture->slot.buf);
+	free_tx_slot(&fixture->slot);
 	dssh_session_cleanup(fixture->sess);
 	fixture->sess = NULL;
 	return valid;
@@ -92,6 +92,7 @@ wake_init(struct wake_fixture *fixture, unsigned kind)
 	fixture->kind = kind;
 	atomic_init(&fixture->done, false);
 	atomic_init(&fixture->notices, 0);
+	atomic_init(&fixture->slot.ready, false);
 	fixture->sess = dssh_session_init(false, 0);
 	if (fixture->sess == NULL)
 		return false;
@@ -145,10 +146,9 @@ wake_start(struct wake_fixture *fixture, unsigned kind)
 		fixture->condition = &fixture->sess->trans.rekey_cnd;
 	}
 	else if (kind == 1) {
-		fixture->slot.buf = malloc(fixture->sess->trans.packet_buf_sz);
-		if (fixture->slot.buf == NULL)
+		if (alloc_tx_slot(&fixture->slot, 5, 8, 0) != 0)
 			return false;
-		atomic_init(&fixture->slot.ready, true);
+		atomic_store(&fixture->slot.ready, true);
 		if (tx_acquire(fixture->sess, SSH_MSG_IGNORE) != 0)
 			return false;
 		fixture->owner = true;

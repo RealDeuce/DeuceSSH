@@ -1140,10 +1140,12 @@ set(AUTH_TESTS
 dssh_add_individual_tests(dssh_test_auth dssh_auth AUTH_TESTS)
 
 dssh_add_test(conn test_conn.c)
-dssh_add_output_test(dssh_conn_tx_slot_admission dssh_test_conn
-	"1 tests: 1 passed, 0 failed, 0 skipped" --exact release/tx_slot_admission)
-set_tests_properties(dssh_conn_tx_slot_admission PROPERTIES TIMEOUT 120
-	ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys)
+foreach(part IN ITEMS admission resize)
+	dssh_add_output_test(dssh_conn_tx_slot_${part} dssh_test_conn
+		"1 tests: 1 passed, 0 failed, 0 skipped" --exact release/tx_slot_${part})
+	set_tests_properties(dssh_conn_tx_slot_${part} PROPERTIES TIMEOUT 120
+		ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys)
+endforeach()
 foreach(part IN ITEMS lifetime late_reply backpressure)
 	dssh_add_output_test(dssh_conn_channel_id_${part} dssh_test_conn
 		"1 tests: 1 passed, 0 failed, 0 skipped" --exact release/channel_id_${part})

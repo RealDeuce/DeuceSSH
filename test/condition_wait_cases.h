@@ -126,10 +126,9 @@ wait_contract_init(struct wait_contract_fixture *fixture, unsigned path, unsigne
 		wake->condition = &wake->sess->trans.rekey_cnd;
 	}
 	else if (path == 14) {
-		wake->slot.buf = malloc(wake->sess->trans.packet_buf_sz);
-		if (wake->slot.buf == NULL)
+		if (alloc_tx_slot(&wake->slot, 5, 8, 0) != 0)
 			return false;
-		atomic_init(&wake->slot.ready, true);
+		atomic_store(&wake->slot.ready, true);
 		if (tx_acquire(wake->sess, SSH_MSG_IGNORE) != 0)
 			return false;
 		wake->owner = true;

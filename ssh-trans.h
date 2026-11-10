@@ -112,6 +112,7 @@ struct dssh_tx_slot {
 	_Atomic bool ready;       /* preserved until sent or terminal   */
 	uint8_t      payload_len; /* bytes written at buf[9]              */
 	size_t       buf_sz;      /* current allocation (for rekey resize)*/
+	size_t       payload_capacity; /* maximum unframed queued payload */
 	uint8_t     *buf;         /* packet buffer, or NULL before KEX    */
 };
 
@@ -169,7 +170,7 @@ struct dssh_transport_state_s {
 	size_t                 rekey_queue_count;
 	size_t                 rekey_queue_bytes;
 	struct dssh_tx_slot    global_reply_slot; /* REQUEST_SUCCESS/FAILURE (1 B) */
-	struct dssh_tx_slot    open_fail_slot;    /* CHANNEL_OPEN_FAILURE (16 B)   */
+	struct dssh_tx_slot    open_fail_slot;    /* CHANNEL_OPEN_FAILURE (17 B)   */
 	_Atomic dssh_key_algo  key_algo_selected;
 	dssh_enc_ctx          *enc_c2s_ctx;
 	_Atomic dssh_enc       enc_c2s_selected;
@@ -204,7 +205,7 @@ struct dssh_transport_state_s {
 	/* tx_mtx protects only ownership/rekey predicates.  It is never held
 	 * while packet data is built or an I/O/module callback is invoked. */
 	mtx_t tx_mtx;
-	mtx_t tx_queue_mtx; /* protects tx_queue and tx_slot_cnd */
+	mtx_t tx_queue_mtx; /* serializes queue producers and live slot replacement */
 	cnd_t tx_slot_cnd;  /* wakes demux stalled on occupied slot */
 	/* Atomic TX counters -- read lock-free by rekey_needed() (RX
 	 * owner), written by the exclusive packet-engine owner. */

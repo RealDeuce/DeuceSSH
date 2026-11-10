@@ -109,4 +109,74 @@ test_tx_slot_admission(void)
 	return TEST_PASS;
 }
 
+
+struct tx_slot_sender {
+	dssh_session sess;
+	uint8_t reply;
+};
+
+static int
+tx_slot_send_worker(void *opaque)
+{
+	struct tx_slot_sender *sender = opaque;
+	return send_to_slot(sender->sess, &sender->sess->trans.global_reply_slot, &sender->reply, 1);
+}
+
+static bool
+tx_slot_resize_while_waiting(struct conn_ctx *ctx)
+{
+	dssh_session sess = ctx->client;
+	struct dssh_tx_slot *slot = &sess->trans.global_reply_slot;
+	uint8_t first = SSH_MSG_REQUEST_FAILURE;
+	/* An empty slot still supports a direct send with no queue storage. */
+	struct dssh_tx_slot unallocated = {0};
+	if (send_to_slot(sess, &unallocated, &first, 1) != 0
+	    || !tx_slot_receive_reply(ctx->server, first)
+	    || tx_acquire(sess, SSH_MSG_IGNORE) != 0)
+		return false;
+	bool valid = send_to_slot(sess, slot, &first, 1) == 0 && atomic_load(&slot->ready);
+	struct tx_slot_sender sender = {.sess = sess, .reply = SSH_MSG_REQUEST_SUCCESS};
+	atomic_bool *waited = dssh_test_thrd_watch_condition(&sess->trans.tx_slot_cnd);
+	thrd_t worker;
+	bool started = valid && thrd_create(&worker, tx_slot_send_worker, &sender) == thrd_success;
+	valid = started && dssh_test_wait_bool(waited, true);
+	if (valid) {
+		/* The owner replaces storage while a real producer waits on the
+		 * occupied slot. The new allocation also fits the active epoch. */
+		size_t old_size = slot->buf_sz;
+		valid = resize_tx_slot_live(sess, slot, 1, 128, 64) == 0
+		    && slot->buf_sz > old_size && slot->payload_capacity == 1
+		    && atomic_load(&slot->ready) && slot->payload_len == 1 && slot->buf[9] == first;
+	}
+	if (valid) {
+		dssh_test_alloc_fail_after(0);
+		int ret = resize_tx_slot_live(sess, slot, 1, 128, 64);
+		int allocations = dssh_test_alloc_count();
+		dssh_test_alloc_reset();
+		valid = ret == 0 && allocations == 0;
+	}
+	if (!valid)
+		session_set_terminate(sess);
+	tx_unlock_with_slots(sess);
+	int result = DSSH_ERROR_INIT;
+	if (started && thrd_join(worker, &result) != thrd_success)
+		abort();
+	dssh_test_thrd_watch_condition(NULL);
+	return valid && result == 0 && !atomic_load(&slot->ready)
+	    && tx_slot_receive_reply(ctx->server, first)
+	    && tx_slot_receive_reply(ctx->server, sender.reply);
+}
+
+static int
+test_tx_slot_resize(void)
+{
+	struct conn_ctx ctx;
+	if (conn_setup_mode(&ctx, false) != 0)
+		return TEST_FAIL;
+	bool valid = tx_slot_resize_while_waiting(&ctx);
+	conn_cleanup(&ctx);
+	ASSERT_TRUE(valid);
+	return TEST_PASS;
+}
+
 #endif

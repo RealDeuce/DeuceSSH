@@ -783,14 +783,17 @@ alloc_tx_slot(struct dssh_tx_slot *slot, size_t max_payload, size_t block_size, 
 
 	if (need == 0)
 		return DSSH_ERROR_INVALID;
-	if (slot->buf != NULL && slot->buf_sz == need)
+	if (slot->buf != NULL && slot->buf_sz == need) {
+		slot->payload_capacity = max_payload;
 		return 0;
+	}
 	uint8_t *nb = realloc(slot->buf, need);
 
 	if (nb == NULL)
 		return DSSH_ERROR_ALLOC;
 	slot->buf    = nb;
 	slot->buf_sz = need;
+	slot->payload_capacity = max_payload;
 	return 0;
 }
 
@@ -800,14 +803,15 @@ free_tx_slot(struct dssh_tx_slot *slot)
 	free(slot->buf);
 	slot->buf    = NULL;
 	slot->buf_sz = 0;
+	slot->payload_capacity = 0;
 	atomic_store(&slot->ready, false);
 	slot->payload_len = 0;
 }
 
-/* Resize a live slot without allocating under tx_queue_mtx.  A producer may
- * fill the old buffer while the replacement is being allocated; the mutex
- * serializes the final payload copy and pointer swap. */
-static int
+/* The packet engine excludes other resizers and drainers. A producer may
+ * fill the old buffer while the replacement is allocated, so the queue
+ * mutex serializes the final payload copy and storage publication. */
+DSSH_TESTABLE int
 resize_tx_slot_live(struct dssh_session_s *sess, struct dssh_tx_slot *slot, size_t max_payload,
     size_t block_size, uint16_t mac_digest)
 {
@@ -815,7 +819,7 @@ resize_tx_slot_live(struct dssh_session_s *sess, struct dssh_tx_slot *slot, size
 
 	if (need == 0)
 		return DSSH_ERROR_INVALID;
-	if (slot->buf != NULL && slot->buf_sz == need)
+	if (slot->buf != NULL && slot->buf_sz == need && slot->payload_capacity == max_payload)
 		return 0;
 	uint8_t *replacement = malloc(need);
 
@@ -830,15 +834,19 @@ resize_tx_slot_live(struct dssh_session_s *sess, struct dssh_tx_slot *slot, size
 	}
 	uint8_t *old = slot->buf;
 
-	if (old != NULL && atomic_load_explicit(&slot->ready, memory_order_acquire))
+	if (old != NULL && atomic_load_explicit(&slot->ready, memory_order_acquire)) {
+		if (slot->payload_len > max_payload
+		    || !dssh_buffer_has(slot->buf_sz, 9, slot->payload_len)) {
+			dssh_mtx_unlock(&sess->trans.tx_queue_mtx);
+			free(replacement);
+			return DSSH_ERROR_INVALID;
+		}
 		memcpy(&replacement[9], &old[9], slot->payload_len);
+	}
 	slot->buf = replacement;
 	slot->buf_sz = need;
-	ret = dssh_mtx_unlock(&sess->trans.tx_queue_mtx);
-	if (ret != thrd_success) {
-		dssh_thrd_check_unlock(sess, ret);
-		return DSSH_ERROR_TERMINATED;
-	}
+	slot->payload_capacity = max_payload;
+	dssh_mtx_unlock(&sess->trans.tx_queue_mtx);
 	free(old);
 	return 0;
 }
@@ -1609,13 +1617,23 @@ tx_acquire(struct dssh_session_s *sess, uint8_t msg_type)
 	return 0;
 }
 
+static bool
+tx_slot_context_allowed(struct dssh_session_s *sess)
+{
+	return (tx_owned_session == NULL || tx_owned_session == sess)
+	    && !dssh_channel_rx_active() && !dssh_io_callback_active(sess)
+	    && !dssh_setup_callback_active(sess);
+}
+
+/* Try the engine predicate without waiting for ownership. Acquire the short
+ * state mutex normally so transient mutex contention cannot strand a slot
+ * with no engine owner to drain it. Caller holds no physical lock. */
 static int
 tx_try_acquire(struct dssh_session_s *sess, uint8_t msg_type)
 {
-	if (dssh_channel_rx_active() || dssh_io_callback_active(sess) || dssh_setup_callback_active(sess))
-		return thrd_error;
-	int lr = mtx_trylock(&sess->trans.tx_mtx);
-
+	if (tx_owned_session == sess)
+		return thrd_busy;
+	int lr = mtx_lock(&sess->trans.tx_mtx);
 	if (lr != thrd_success)
 		return lr;
 	int ret = thrd_busy;
@@ -1627,16 +1645,7 @@ tx_try_acquire(struct dssh_session_s *sess, uint8_t msg_type)
 		atomic_store_explicit(&sess->trans.tx_owner_active, true, memory_order_release);
 		ret = thrd_success;
 	}
-	int ur = dssh_mtx_unlock(&sess->trans.tx_mtx);
-
-	if (ur != thrd_success) {
-		if (ret == thrd_success)
-			tx_owned_session = NULL;
-		if (ret == thrd_success)
-			atomic_store_explicit(&sess->trans.tx_owner_active, false, memory_order_release);
-		dssh_thrd_check_unlock(sess, ur);
-		return thrd_error;
-	}
+	dssh_mtx_unlock(&sess->trans.tx_mtx);
 	return ret;
 }
 
@@ -1804,27 +1813,11 @@ tx_gather_with_packet(struct dssh_session_s *sess, uint8_t *buf, size_t payload_
 DSSH_PRIVATE int
 send_to_slot(struct dssh_session_s *sess, struct dssh_tx_slot *slot, const uint8_t *payload, size_t payload_len)
 {
-	if (payload_len > UINT8_MAX)
+	if (payload == NULL || payload_len == 0 || payload_len > UINT8_MAX
+	    || !tx_slot_context_allowed(sess))
 		return DSSH_ERROR_INVALID;
-
 	if (sess->terminate)
 		return DSSH_ERROR_TERMINATED;
-
-	/* Pre-KEX: slot buffer not yet allocated.  Fall back to
-	 * send_packet_inner via tx_packet (always available). */
-	if (slot->buf == NULL) {
-		int tr = tx_try_acquire(sess, payload[0]);
-		if (tr == thrd_success) {
-			int ret = send_packet_inner(sess, payload, payload_len, NULL);
-			if ((ret < 0) && (ret != DSSH_ERROR_TOOLONG) && (ret != DSSH_ERROR_REKEY_NEEDED))
-				session_set_terminate(sess);
-			return tx_unlock_with_result(sess, ret);
-		}
-		/* A busy packet engine pre-KEX should not happen — single
-		 * thread at this point.  Terminate as a safeguard. */
-		session_set_terminate(sess);
-		return DSSH_ERROR_TERMINATED;
-	}
 
 	/* Fast path: try to reserve the packet engine immediately */
 	int tr = tx_try_acquire(sess, payload[0]);
@@ -1840,8 +1833,7 @@ send_to_slot(struct dssh_session_s *sess, struct dssh_tx_slot *slot, const uint8
 			tx_unlock_with_slots(sess);
 			return DSSH_ERROR_TERMINATED;
 		}
-		memcpy(&sess->trans.tx_packet[9], payload, payload_len);
-		int ret = tx_finalize(sess, sess->trans.tx_packet, payload_len);
+		int ret = send_packet_inner(sess, payload, payload_len, NULL);
 
 		if ((ret < 0) && (ret != DSSH_ERROR_TOOLONG) && (ret != DSSH_ERROR_REKEY_NEEDED))
 			session_set_terminate(sess);
@@ -1852,29 +1844,37 @@ send_to_slot(struct dssh_session_s *sess, struct dssh_tx_slot *slot, const uint8
 		return DSSH_ERROR_TERMINATED;
 	}
 
-	/* Slow path: stall until slot is free */
+	/* Only the queue lock exposes live slot storage to a producer. Recheck
+	 * the buffer and occupancy after each native condition wait. */
 	if (dssh_thrd_check(sess, mtx_lock(&sess->trans.tx_queue_mtx)) != thrd_success)
 		return DSSH_ERROR_TERMINATED;
-	bool wait_failed = false;
-
-	while (atomic_load(&slot->ready) && !sess->terminate) {
-		if (cnd_wait(&sess->trans.tx_slot_cnd, &sess->trans.tx_queue_mtx) != thrd_success) {
-			wait_failed = true;
-			break;
+	for (;;) {
+		if (sess->terminate) {
+			dssh_mtx_unlock(&sess->trans.tx_queue_mtx);
+			return DSSH_ERROR_TERMINATED;
 		}
-	}
-	if (wait_failed) {
-		int ur = dssh_mtx_unlock(&sess->trans.tx_queue_mtx);
-
-		if (ur == thrd_success)
+		if (slot->buf == NULL) {
+			/* An unallocated slot can only be sent on the direct path. */
+			dssh_mtx_unlock(&sess->trans.tx_queue_mtx);
 			session_set_terminate(sess);
-		else
-			dssh_thrd_check_unlock(sess, ur);
-		return DSSH_ERROR_TERMINATED;
-	}
-	if (sess->terminate) {
-		dssh_thrd_check_unlock(sess, dssh_mtx_unlock(&sess->trans.tx_queue_mtx));
-		return DSSH_ERROR_TERMINATED;
+			return DSSH_ERROR_TERMINATED;
+		}
+		if (payload_len > slot->payload_capacity
+		    || !dssh_buffer_has(slot->buf_sz, 9, payload_len)) {
+			dssh_mtx_unlock(&sess->trans.tx_queue_mtx);
+			return DSSH_ERROR_TOOLONG;
+		}
+		if (!atomic_load(&slot->ready))
+			break;
+		if (tx_owned_session == sess) {
+			dssh_mtx_unlock(&sess->trans.tx_queue_mtx);
+			return DSSH_ERROR_INVALID;
+		}
+		if (cnd_wait(&sess->trans.tx_slot_cnd, &sess->trans.tx_queue_mtx) != thrd_success) {
+			dssh_mtx_unlock(&sess->trans.tx_queue_mtx);
+			session_set_terminate(sess);
+			return DSSH_ERROR_TERMINATED;
+		}
 	}
 
 	memcpy(&slot->buf[9], payload, payload_len);
@@ -1901,6 +1901,8 @@ send_to_slot(struct dssh_session_s *sess, struct dssh_tx_slot *slot, const uint8
 DSSH_PRIVATE int
 schedule_wa_slot(struct dssh_session_s *sess)
 {
+	if (!tx_slot_context_allowed(sess))
+		return DSSH_ERROR_INVALID;
 	if (sess->terminate)
 		return DSSH_ERROR_TERMINATED;
 

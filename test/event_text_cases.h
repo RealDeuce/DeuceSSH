@@ -191,8 +191,9 @@ static void
 event_text_free_check(const void *ptr, void *opaque)
 {
 	struct event_text_free_check *check = opaque;
-	if (ptr != check->metadata)
+	if (ptr == NULL || ptr != check->metadata)
 		return;
+	check->metadata = NULL;
 	check->seen = true;
 	int ret = mtx_trylock(&check->ch->buf_mtx);
 	check->unlocked = ret == thrd_success;

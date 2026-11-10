@@ -1,6 +1,8 @@
 /* GNU --wrap controls for the separate production-linked peer executables.
- * Only the thread that creates the first application worker is controlled.
- * Library-created demux workers continue to use real native operations. */
+ * The first create is on main, before any worker exists. Main joins every
+ * successful application create before cleanup can join library workers.
+ * Child threads have their own false controller flag and use real operations.
+ * No thread identity is retained after a native join. */
 #include <limits.h>
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -16,22 +18,22 @@ int __real_thrd_create(thrd_t *, thrd_start_t, void *);
 int __real_thrd_join(thrd_t, int *);
 int __real_mock_tx_client(uint8_t *, size_t, dssh_session, void *);
 
-static once_flag configured = ONCE_FLAG_INIT;
-static thrd_t controller;
+static bool configured;
+static _Thread_local bool controller;
 static const char *mode;
 static unsigned create_index;
 static unsigned join_index;
-static thrd_t application_workers[4];
-static bool owned[4];
+static unsigned application_workers;
 static atomic_bool tx_failed;
 
 static void
 configure(void)
 {
-	controller = thrd_current();
+	controller = true;
 	mode = getenv("DSSH_PEER_FAILURE");
 	if (mode == NULL)
 		mode = "plain";
+	configured = true;
 }
 
 static bool
@@ -45,8 +47,11 @@ selected(const char *prefix, unsigned index, const char *suffix)
 int
 __wrap_thrd_create(thrd_t *thread, thrd_start_t start, void *arg)
 {
-	call_once(&configured, configure);
-	if (thrd_equal(controller, thrd_current())) {
+	/* This publication precedes the first real native create. Every child
+	 * therefore observes configured/mode after native thread startup. */
+	if (!configured)
+		configure();
+	if (controller) {
 		unsigned index = create_index;
 		if (create_index != UINT_MAX)
 			create_index++;
@@ -55,10 +60,8 @@ __wrap_thrd_create(thrd_t *thread, thrd_start_t start, void *arg)
 			return thrd_error;
 		}
 		int ret = __real_thrd_create(thread, start, arg);
-		if (ret == thrd_success && index < 4) {
-			application_workers[index] = *thread;
-			owned[index] = true;
-		}
+		if (ret == thrd_success && application_workers != UINT_MAX)
+			application_workers++;
 		return ret;
 	}
 	return __real_thrd_create(thread, start, arg);
@@ -67,18 +70,7 @@ __wrap_thrd_create(thrd_t *thread, thrd_start_t start, void *arg)
 int
 __wrap_thrd_join(thrd_t thread, int *result)
 {
-	call_once(&configured, configure);
-	if (!thrd_equal(controller, thrd_current()))
-		return __real_thrd_join(thread, result);
-	bool application = false;
-	for (unsigned i = 0; i < 4; i++) {
-		if (owned[i] && thrd_equal(application_workers[i], thread)) {
-			owned[i] = false;
-			application = true;
-			break;
-		}
-	}
-	if (!application)
+	if (!controller || join_index >= application_workers)
 		return __real_thrd_join(thread, result);
 	unsigned index = join_index;
 	if (join_index != UINT_MAX)
@@ -100,7 +92,6 @@ __wrap_thrd_join(thrd_t thread, int *result)
 int
 __wrap_mock_tx_client(uint8_t *buf, size_t len, dssh_session sess, void *opaque)
 {
-	call_once(&configured, configure);
 	if (strcmp(mode, "tx") == 0 && !atomic_exchange(&tx_failed, true)) {
 		fputs("PEER_TX_FAILURE\n", stderr);
 		return -1;

@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <threads.h>
 
@@ -183,7 +184,7 @@ main(void)
 		if (started[i]) {
 			int result;
 			if (thrd_join(workers[i], &result) != thrd_success)
-				return 3;
+				abort();
 			valid = valid && result == 0;
 		}
 	}

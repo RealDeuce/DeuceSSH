@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <threads.h>
 
@@ -231,7 +232,9 @@ peer_worker(void *opaque)
 			ret = DSSH_ERROR_INIT;
 	}
 	if (ret != 0) {
-		fprintf(stderr, "peer kind=%u client=%u ret=%d callbacks=%u valid=%u ch=%u\n", side->pair->kind, side->client ? 1U : 0U, ret, side->pair->callbacks, side->pair->valid ? 1U : 0U, side->channel != NULL ? 1U : 0U);
+		fprintf(stderr, "peer kind=%u client=%u ret=%d ch=%u\n",
+		    side->pair->kind, side->client ? 1U : 0U, ret,
+		    side->channel != NULL ? 1U : 0U);
 		mock_io_close_c2s(side->io);
 		mock_io_close_s2c(side->io);
 	}
@@ -288,7 +291,7 @@ main(int argc, char **argv)
 		if (started[i]) {
 			int result;
 			if (thrd_join(workers[i], &result) != thrd_success)
-				return 3;
+				abort();
 			valid = valid && result == 0;
 		}
 	}

@@ -341,12 +341,25 @@ dssh_serialize_uint32(uint32_t val, uint8_t *buf, size_t bufsz, size_t *pos)
 {
 	if (pos == NULL || buf == NULL)
 		return DSSH_ERROR_INVALID;
-	if (*pos > bufsz || bufsz - *pos < 4)
+	size_t offset = *pos;
+	if (offset > bufsz || bufsz - offset < 4)
 		return DSSH_ERROR_TOOLONG;
-	buf[(*pos)++] = (uint8_t)((val >> 24) & 0xff);
-	buf[(*pos)++] = (uint8_t)((val >> 16) & 0xff);
-	buf[(*pos)++] = (uint8_t)((val >> 8) & 0xff);
-	buf[(*pos)++] = (uint8_t)(val & 0xff);
+	/* The encoded bytes and the updated position are distinct outputs.
+	 * Compare object-representation addresses without ordering unrelated
+	 * pointers or assuming an integer representation of an address. */
+	const unsigned char *position_bytes = (const unsigned char *)pos;
+	const unsigned char *destination = (const unsigned char *)(buf + offset);
+	for (size_t i = 0; i < 4; i++) {
+		for (size_t j = 0; j < sizeof(*pos); j++) {
+			if (destination + i == position_bytes + j)
+				return DSSH_ERROR_INVALID;
+		}
+	}
+	buf[offset] = (uint8_t)((val >> 24) & 0xff);
+	buf[offset + 1] = (uint8_t)((val >> 16) & 0xff);
+	buf[offset + 2] = (uint8_t)((val >> 8) & 0xff);
+	buf[offset + 3] = (uint8_t)(val & 0xff);
+	*pos = offset + 4; /* The capacity check proves this addition fits. */
 	return 0;
 }
 

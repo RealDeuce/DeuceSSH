@@ -225,8 +225,9 @@ DSSH_PUBLIC const char *dssh_strerror(int error_code);
  * Serialize val as a big-endian uint32 into buf at offset *pos.
  * Advances *pos by 4.  Returns 0 on success, or a negative
  * DSSH_ERROR_* code on failure (DSSH_ERROR_INVALID if buf or
- * pos is NULL, DSSH_ERROR_TOOLONG if the buffer has fewer than
- * 4 bytes remaining at *pos).
+ * pos is NULL or the position object overlaps the four output bytes,
+ * DSSH_ERROR_TOOLONG if the buffer has fewer than 4 bytes remaining
+ * at *pos). The buffer and position are unchanged on failure.
  */
 DSSH_PUBLIC int dssh_serialize_uint32(uint32_t val, uint8_t *buf, size_t bufsz, size_t *pos);
 

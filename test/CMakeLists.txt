@@ -522,7 +522,7 @@ foreach(mode IN ITEMS native generic)
 	if(mode STREQUAL "generic")
 		target_compile_definitions(dssh_test_sntrup_arithmetic_${mode} PRIVATE DSSH_TEST_SNTRUP_GENERIC)
 	endif()
-	foreach(part IN ITEMS masks16 minmax_sort shifts64 field_reduction division_encoding)
+	foreach(part IN ITEMS masks16 minmax_sort shifts64 field_reduction division_encoding kem)
 		dssh_add_output_test(dssh_sntrup_arithmetic_${mode}_${part} dssh_test_sntrup_arithmetic_${mode}
 			"1 tests: 1 passed, 0 failed, 0 skipped" --exact arithmetic/${part})
 	endforeach()

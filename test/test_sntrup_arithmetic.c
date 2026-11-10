@@ -135,6 +135,24 @@ test_minmax_sort(void)
 			valid = memcmp(actual, expected, length * sizeof(actual[0])) == 0 && valid;
 		}
 	}
+	small sampled[761];
+	for (unsigned int mode = 0; mode < 4; mode++) {
+		for (size_t i = 0; i < 761; i++) {
+			actual[i] = mode == 0 ? 0 : mode == 1 ? UINT32_MAX : next_word(&state);
+			expected[i] = i < 286 ? actual[i] - actual[i] % 2
+			    : actual[i] - actual[i] % 4 + 1;
+		}
+		qsort(expected, 761, sizeof(expected[0]), compare_unsigned);
+		Short_fromlist(sampled, actual);
+		unsigned int weight = 0;
+		for (size_t i = 0; i < 761; i++) {
+			int expected_value = (int)(expected[i] % 4);
+			valid = sampled[i] == expected_value - 1 && valid;
+			if (sampled[i] != 0)
+				weight++;
+		}
+		valid = weight == 286 && valid;
+	}
 	ASSERT_TRUE(valid);
 	return TEST_PASS;
 }
@@ -179,6 +197,26 @@ static int
 test_field_reduction(void)
 {
 	bool valid = true;
+	const uint32_t planes[] = {0, UINT32_C(0x00010000), UINT32_C(0x7fff0000),
+	    UINT32_C(0x80000000), UINT32_C(0xfffe0000), UINT32_C(0xffff0000)};
+	for (size_t n = 0; n < sizeof(planes) / sizeof(planes[0]); n++) {
+		for (uint32_t low = 0; low < UINT32_C(65536); low++) {
+			uint32_t bits = planes[n] | low;
+			int64_t expected = bits;
+			if (expected > INT32_MAX)
+				expected -= INT64_C(4294967296);
+			valid = sntrup_signed32(bits) == expected && valid;
+		}
+	}
+	const int32_t edges[] = {INT32_MIN, INT32_MIN + 1, -65536, -32768,
+	    -3, -1, 0, 1, 3, 32767, 65536, INT32_MAX - 1, INT32_MAX};
+	for (size_t i = 0; i < sizeof(edges) / sizeof(edges[0]); i++) {
+		for (unsigned int count = 0; count <= 33; count++) {
+			int64_t expected = floor_oracle(edges[i], count);
+			valid = sntrup_floor32(edges[i], count) == expected && valid;
+		}
+		valid = sntrup_floor32(edges[i], UINT_MAX) == (edges[i] < 0 ? -1 : 0) && valid;
+	}
 	for (int32_t value = INT16_MIN; value <= INT16_MAX; value++) {
 		int16_t input = (int16_t)value;
 		int32_t actual = F3_freeze(input);
@@ -262,6 +300,48 @@ test_division_encoding(void)
 			valid = encoded[i + 1] == expected && valid;
 		}
 	}
+	Fq rounded[761], unrounded[761];
+	uint8_t packed[1009];
+	for (int32_t value = -2295; value <= 2295; value += 3) {
+		for (size_t i = 0; i < 761; i++) {
+			Fq coefficient = (Fq)value;
+			rounded[i] = coefficient;
+		}
+		memset(packed, 0xa5, sizeof(packed));
+		Rounded_encode(packed + 1, rounded);
+		Rounded_decode(unrounded, packed + 1);
+		valid = memcmp(rounded, unrounded, sizeof(rounded)) == 0
+		    && packed[0] == 0xa5 && packed[1008] == 0xa5 && valid;
+	}
+	uint8_t first[crypto_kem_sntrup761_CIPHERTEXTBYTES] = {0};
+	uint8_t second[crypto_kem_sntrup761_CIPHERTEXTBYTES] = {0};
+	for (unsigned int value = 0; value < 256; value++) {
+		uint8_t octet = (uint8_t)value;
+		second[sizeof(second) - 1] = octet;
+		valid = Ciphertexts_diff_mask(first, second) == (value == 0 ? 0 : -1) && valid;
+	}
+	ASSERT_TRUE(valid);
+	return TEST_PASS;
+}
+
+static int
+test_kem(void)
+{
+	uint8_t public_key[crypto_kem_sntrup761_PUBLICKEYBYTES];
+	uint8_t private_key[crypto_kem_sntrup761_SECRETKEYBYTES];
+	uint8_t ciphertext[crypto_kem_sntrup761_CIPHERTEXTBYTES];
+	uint8_t shared[crypto_kem_sntrup761_BYTES], recovered[crypto_kem_sntrup761_BYTES];
+	bool valid = crypto_kem_sntrup761_keypair(public_key, private_key) == 0;
+	if (valid)
+		valid = crypto_kem_sntrup761_enc(ciphertext, shared, public_key) == 0;
+	if (valid)
+		valid = crypto_kem_sntrup761_dec(recovered, ciphertext, private_key) == 0
+		    && memcmp(shared, recovered, sizeof(shared)) == 0;
+	dssh_cleanse(public_key, sizeof(public_key));
+	dssh_cleanse(private_key, sizeof(private_key));
+	dssh_cleanse(ciphertext, sizeof(ciphertext));
+	dssh_cleanse(shared, sizeof(shared));
+	dssh_cleanse(recovered, sizeof(recovered));
 	ASSERT_TRUE(valid);
 	return TEST_PASS;
 }
@@ -272,6 +352,7 @@ static struct dssh_test_entry tests[] = {
 	{"arithmetic/shifts64", test_shifts64},
 	{"arithmetic/field_reduction", test_field_reduction},
 	{"arithmetic/division_encoding", test_division_encoding},
+	{"arithmetic/kem", test_kem},
 };
 
 DSSH_TEST_NO_CLEANUP

@@ -1,6 +1,6 @@
 # Vendor portability review
 
-Status: IN PROGRESS, reconciled with the current source on 2026-11-06.
+Status: IN PROGRESS, continued through the sntrup integer correction on2026-11-10.
 The earlier findings in this document described an older source revision.
 The current implementation and remaining acceptance requirements are below;
 this record does not certify the complete vendor implementation.
@@ -9,7 +9,7 @@ this record does not certify the complete vendor implementation.
 
 | Area | Current implementation | Remaining proof |
 | --- | --- | --- |
-| sntrup761 generic helper symbols | `kex/sntrup761_optblocker.c` defines all three zero-initialized volatile objects, and `CMakeLists.txt` includes it in the library sources. The former missing-definition item is resolved in source. | Exercise the generic helpers and their arithmetic/width assumptions independently of the native assembly paths. Linking the object on x86_64 does not exercise those paths. |
+| sntrup761 generic helper symbols | `kex/sntrup761_optblocker.c` defines all three zero-initialized volatile objects, and `CMakeLists.txt` includes it. R022 now separately compiles/runs native and forced-generic canonical-source arithmetic and raw KEM controls against the real backends. | The exact range/promotion/caller record qualifies the corrected source; actual foreign compiler/width execution and full timing/primitive acceptance remain separate. Linking the object alone is not runtime proof. |
 | sntrup761 unused annotations | `CRYPTOINT_MAYBE_UNUSED` selects the GNU/Clang attribute, the MSVC warning pragma or an empty fallback. | Native Windows and other compiler acceptance retain their own scope; compiler recognition does not establish constant-time behavior. |
 | libcrux population count | The current glue selects MSVC, GNU-compatible or portable C code. The portable branch counts the bits in a `uint8_t` using bounded masks and shifts. The former absent-fallback item is resolved in source. | Exercise compiler branches, including the portable implementation; inspect generated code for the supported compiler/target combinations. |
 | libcrux inclusion | A conventional `LIBCRUX_MLKEM768_SHA3_H` outer guard replaces the former pragma. Implementation reading is complete. | Complete upstream/local-delta and remaining caller-contract review. |
@@ -90,6 +90,25 @@ Existing historical conversion/parity test results remain recorded in
 `release-1.0-audit.md` with their original source/provider scope.
 Native Windows testing remains the final CI stage after the
 local audit and validation requirements are complete.
+
+## Sntrup signed-width continuation
+
+The [complete integer continuation](release-1.0-evidence/sntrup-arithmetic-review.md)
+now binds an actual native generic-build failure, compatible correction and
+106 passing CTests across ASan/UBSan, Botan and full-crypto unsuppressed TSAN.
+Thirty-six strict direct-source cases distinguish native/generic compilation,
+exhaustive reviewed domains and their full KEM roundtrips. Named-array regression,
+2538 controlled KEX scenarios, twelve production OpenSSH exchanges and nine
+handshake-only controls retain their explicit scopes. All306 source inputs stay
+fixed during acceptance, with no internal skips or sanitizer diagnostic.
+
+Defined signed reconstruction/floor shifts, fixed-width field intermediates and
+mask selection, public codec/division bounds, samplers and unsigned packing are
+reconciled with exact primary/source models. The55-definition/two-profile AST
+also retains the52-owner retirement mapping. Twenty-four optimized native Clang
+probe bodies have no conditional jumps/calls or value-indexed loads. This does
+not close other-target timing, all compiler-created copies, complete primitive
+known answers, upstream correspondence or Windows/SDK/release acceptance.
 
 ## Signed arithmetic continuation on base f2fb657
 

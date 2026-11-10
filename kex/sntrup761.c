@@ -88,10 +88,10 @@ extern volatile crypto_int64 crypto_int64_optblocker;
 static inline crypto_int16
 crypto_int16_negative_mask(crypto_int16 crypto_int16_x)
 {
- #if defined(__GNUC__) && defined(__x86_64__)
+ #if !defined(DSSH_TEST_SNTRUP_GENERIC) && defined(__GNUC__) && defined(__x86_64__)
 	__asm__("sarw $15,%0" : "+r"(crypto_int16_x) : : "cc");
 	return crypto_int16_x;
- #elif defined(__GNUC__) && defined(__aarch64__)
+ #elif !defined(DSSH_TEST_SNTRUP_GENERIC) && defined(__GNUC__) && defined(__aarch64__)
 	crypto_int16 crypto_int16_y;
 	__asm__("sbfx %w0,%w1,15,1" : "=r"(crypto_int16_y) : "r"(crypto_int16_x) :);
 	return crypto_int16_y;
@@ -106,14 +106,14 @@ crypto_int16_negative_mask(crypto_int16 crypto_int16_x)
 static inline crypto_int16
 crypto_int16_nonzero_mask(crypto_int16 crypto_int16_x)
 {
- #if defined(__GNUC__) && defined(__x86_64__)
+ #if !defined(DSSH_TEST_SNTRUP_GENERIC) && defined(__GNUC__) && defined(__x86_64__)
 	crypto_int16 crypto_int16_q, crypto_int16_z;
 	__asm__("xorw %0,%0\n movw $-1,%1\n testw %2,%2\n cmovnew %1,%0"
 	    : "=&r"(crypto_int16_z), "=&r"(crypto_int16_q)
 	    : "r"(crypto_int16_x)
 	    : "cc");
 	return crypto_int16_z;
- #elif defined(__GNUC__) && defined(__aarch64__)
+ #elif !defined(DSSH_TEST_SNTRUP_GENERIC) && defined(__GNUC__) && defined(__aarch64__)
 	crypto_int16 crypto_int16_z;
 	__asm__("tst %w1,65535\n csetm %w0,ne" : "=r"(crypto_int16_z) : "r"(crypto_int16_x) : "cc");
 	return crypto_int16_z;
@@ -131,10 +131,10 @@ crypto_int16_nonzero_mask(crypto_int16 crypto_int16_x)
 static inline crypto_int32
 crypto_int32_negative_mask(crypto_int32 crypto_int32_x)
 {
- #if defined(__GNUC__) && defined(__x86_64__)
+ #if !defined(DSSH_TEST_SNTRUP_GENERIC) && defined(__GNUC__) && defined(__x86_64__)
 	__asm__("sarl $31,%0" : "+r"(crypto_int32_x) : : "cc");
 	return crypto_int32_x;
- #elif defined(__GNUC__) && defined(__aarch64__)
+ #elif !defined(DSSH_TEST_SNTRUP_GENERIC) && defined(__GNUC__) && defined(__aarch64__)
 	crypto_int32 crypto_int32_y;
 	__asm__("asr %w0,%w1,31" : "=r"(crypto_int32_y) : "r"(crypto_int32_x) :);
 	return crypto_int32_y;
@@ -151,7 +151,7 @@ crypto_int32_minmax(crypto_int32 *crypto_int32_p, crypto_int32 *crypto_int32_q)
 {
 	crypto_int32 crypto_int32_x = *crypto_int32_p;
 	crypto_int32 crypto_int32_y = *crypto_int32_q;
- #if defined(__GNUC__) && defined(__x86_64__)
+ #if !defined(DSSH_TEST_SNTRUP_GENERIC) && defined(__GNUC__) && defined(__x86_64__)
 	crypto_int32 crypto_int32_z;
 	__asm__("cmpl %2,%1\n movl %1,%0\n cmovgl %2,%1\n cmovgl %0,%2"
 	    : "=&r"(crypto_int32_z), "+&r"(crypto_int32_x), "+r"(crypto_int32_y)
@@ -159,7 +159,7 @@ crypto_int32_minmax(crypto_int32 *crypto_int32_p, crypto_int32 *crypto_int32_q)
 	    : "cc");
 	*crypto_int32_p = crypto_int32_x;
 	*crypto_int32_q = crypto_int32_y;
- #elif defined(__GNUC__) && defined(__aarch64__)
+ #elif !defined(DSSH_TEST_SNTRUP_GENERIC) && defined(__GNUC__) && defined(__aarch64__)
 	crypto_int32 crypto_int32_r, crypto_int32_s;
 	__asm__("cmp %w2,%w3\n csel %w0,%w2,%w3,lt\n csel %w1,%w3,%w2,lt"
 	    : "=&r"(crypto_int32_r), "=r"(crypto_int32_s)
@@ -188,10 +188,10 @@ crypto_int32_minmax(crypto_int32 *crypto_int32_p, crypto_int32 *crypto_int32_q)
 CRYPTOINT_MAYBE_UNUSED static inline crypto_int64
 crypto_int64_bottombit_mask(crypto_int64 crypto_int64_x)
 {
- #if defined(__GNUC__) && defined(__x86_64__)
+ #if !defined(DSSH_TEST_SNTRUP_GENERIC) && defined(__GNUC__) && defined(__x86_64__)
 	__asm__("andq $1,%0" : "+r"(crypto_int64_x) : : "cc");
 	return -crypto_int64_x;
- #elif defined(__GNUC__) && defined(__aarch64__)
+ #elif !defined(DSSH_TEST_SNTRUP_GENERIC) && defined(__GNUC__) && defined(__aarch64__)
 	crypto_int64 crypto_int64_y;
 	__asm__("sbfx %0,%1,0,1" : "=r"(crypto_int64_y) : "r"(crypto_int64_x) :);
 	return crypto_int64_y;
@@ -204,10 +204,10 @@ crypto_int64_bottombit_mask(crypto_int64 crypto_int64_x)
 static inline crypto_int64
 crypto_int64_bottombit_01(crypto_int64 crypto_int64_x)
 {
- #if defined(__GNUC__) && defined(__x86_64__)
+ #if !defined(DSSH_TEST_SNTRUP_GENERIC) && defined(__GNUC__) && defined(__x86_64__)
 	__asm__("andq $1,%0" : "+r"(crypto_int64_x) : : "cc");
 	return crypto_int64_x;
- #elif defined(__GNUC__) && defined(__aarch64__)
+ #elif !defined(DSSH_TEST_SNTRUP_GENERIC) && defined(__GNUC__) && defined(__aarch64__)
 	crypto_int64 crypto_int64_y;
 	__asm__("ubfx %0,%1,0,1" : "=r"(crypto_int64_y) : "r"(crypto_int64_x) :);
 	return crypto_int64_y;
@@ -220,9 +220,9 @@ crypto_int64_bottombit_01(crypto_int64 crypto_int64_x)
 CRYPTOINT_MAYBE_UNUSED static inline crypto_int64
 crypto_int64_bitinrangepublicpos_mask(crypto_int64 crypto_int64_x, crypto_int64 crypto_int64_s)
 {
- #if defined(__GNUC__) && defined(__x86_64__)
+ #if !defined(DSSH_TEST_SNTRUP_GENERIC) && defined(__GNUC__) && defined(__x86_64__)
 	__asm__("sarq %%cl,%0" : "+r"(crypto_int64_x) : "c"(crypto_int64_s) : "cc");
- #elif defined(__GNUC__) && defined(__aarch64__)
+ #elif !defined(DSSH_TEST_SNTRUP_GENERIC) && defined(__GNUC__) && defined(__aarch64__)
 	__asm__("asr %0,%0,%1" : "+r"(crypto_int64_x) : "r"(crypto_int64_s) :);
  #else
 	crypto_int64_x >>= crypto_int64_s ^ crypto_int64_optblocker;
@@ -233,9 +233,9 @@ crypto_int64_bitinrangepublicpos_mask(crypto_int64 crypto_int64_x, crypto_int64 
 static inline crypto_int64
 crypto_int64_shrmod(crypto_int64 crypto_int64_x, crypto_int64 crypto_int64_s)
 {
- #if defined(__GNUC__) && defined(__x86_64__)
+ #if !defined(DSSH_TEST_SNTRUP_GENERIC) && defined(__GNUC__) && defined(__x86_64__)
 	__asm__("sarq %%cl,%0" : "+r"(crypto_int64_x) : "c"(crypto_int64_s) : "cc");
- #elif defined(__GNUC__) && defined(__aarch64__)
+ #elif !defined(DSSH_TEST_SNTRUP_GENERIC) && defined(__GNUC__) && defined(__aarch64__)
 	__asm__("asr %0,%0,%1" : "+r"(crypto_int64_x) : "r"(crypto_int64_s) :);
  #else
 	int crypto_int64_k, crypto_int64_l;

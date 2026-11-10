@@ -214,7 +214,7 @@ setup_terminal_case(unsigned fail)
 	cbs.cbdata = &observer;
 	struct open_exec_ctx open = {.client = ctx.client, .server = ctx.server,
 	    .command = "setup-storage", .cbs = &cbs, .accept_timeout = 30000};
-	int ret = open_exec_channel(&open);
+	int ret = open_exec_channel(&ctx, &open);
 	bool failed = dssh_test_malloc_size_failed();
 	dssh_test_alloc_reset();
 	bool valid = fail == 0 ? ret == 0 && observer.matching == 2

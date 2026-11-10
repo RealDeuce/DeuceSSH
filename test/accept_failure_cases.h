@@ -404,7 +404,7 @@ test_accept_close_deadline(void)
 	fixture.open = (struct open_exec_ctx){.client = fixture.ctx.client,
 	    .server = fixture.ctx.server, .command = "close-deadline",
 	    .cbs = &accept_cbs_all, .accept_timeout = 3000};
-	ASSERT_OK(open_exec_channel(&fixture.open));
+	ASSERT_OK(open_exec_channel(&fixture.ctx, &fixture.open));
 	dssh_channel ch = fixture.open.server_ch;
 	struct timespec first;
 	if (timespec_get(&first, TIME_UTC) != TIME_UTC)

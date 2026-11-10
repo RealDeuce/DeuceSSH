@@ -1318,6 +1318,15 @@ if(UNIX)
 	set_property(TARGET dssh_test_fatal_driver PROPERTY C_STANDARD_REQUIRED ON)
 	target_compile_definitions(dssh_test_fatal_driver PRIVATE _POSIX_C_SOURCE=200809L)
 	target_compile_options(dssh_test_fatal_driver PRIVATE ${DEUCESSH_COMPILE_OPTIONS})
+	foreach(operation IN ITEMS open exec shell subsystem accept)
+		foreach(mode IN ITEMS retained released)
+			set(name dssh_channel_worker_fatal_${operation}_${mode})
+			dssh_add_output_test(${name} dssh_test_fatal_driver "channel_join_fatal=1"
+				$<TARGET_FILE:dssh_test_conn> --channel-fatal ${operation} ${mode})
+			set_tests_properties(${name} PROPERTIES FIXTURES_REQUIRED dssh_cached_keys
+				ENVIRONMENT "${DSSH_TEST_KEY_ENV}" TIMEOUT 120)
+		endforeach()
+	endforeach()
 	foreach(operation IN ITEMS stop cleanup)
 		add_test(NAME dssh_lifecycle_fatal_${operation}
 			COMMAND dssh_test_fatal_driver $<TARGET_FILE:dssh_test_conn> ${operation})

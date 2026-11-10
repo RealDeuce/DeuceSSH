@@ -160,7 +160,7 @@ event_setup(struct event_fixture *fixture, struct event_capture *capture, bool z
 		.client = fixture->ctx.client, .server = fixture->ctx.server,
 		.command = "event-delivery", .cbs = &fixture->cbs, .accept_timeout = 30000,
 	};
-	return open_exec_channel(&fixture->open) == 0;
+	return open_exec_channel(&fixture->ctx, &fixture->open) == 0;
 }
 
 static int

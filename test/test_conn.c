@@ -490,8 +490,9 @@ client_open_exec_thread(void *arg)
 	struct open_exec_ctx *ctx = arg;
 	struct dssh_chan_params p;
 	int ret = dssh_chan_params_init(&p, DSSH_CHAN_EXEC);
-	if (ret == 0)
-		ret = dssh_chan_params_set_command(&p, ctx->command);
+	if (ret != 0)
+		return ret;
+	ret = dssh_chan_params_set_command(&p, ctx->command);
 	if (ret == 0)
 		ret = dssh_chan_params_set_pty(&p, false);
 	if (ret == 0)
@@ -506,34 +507,121 @@ server_accept_exec_thread(void *arg)
 	struct open_exec_ctx *ctx = arg;
 	ctx->server_ch = dssh_chan_accept(ctx->server, ctx->cbs,
 	    ctx->accept_timeout);
-	return wait_stream_writable(ctx->server_ch);
+	return ctx->server_ch == NULL ? DSSH_ERROR_INIT : wait_stream_writable(ctx->server_ch);
 }
 
 /*
  * Open an exec channel concurrently.  Returns 0 on success, -1 on failure.
  * Populates ctx->client_ch and ctx->server_ch.
  */
-static int
-(*channel_fixture_thread_create)(thrd_t *, thrd_start_t, void *) = thrd_create;
-static int
-(*channel_fixture_thread_join)(thrd_t, int *) = thrd_join;
+static int (*channel_fixture_thread_create)(thrd_t *, thrd_start_t, void *) = thrd_create;
+static int (*channel_fixture_thread_join)(thrd_t, int *) = thrd_join;
+static _Thread_local struct conn_ctx *channel_fixture_owner;
+
+struct channel_workers;
+struct channel_worker_call {
+	struct channel_workers *workers;
+	thrd_start_t function;
+	void *data;
+};
+struct channel_workers {
+	struct conn_ctx *owner;
+	thrd_t threads[2];
+	bool created[2];
+	int results[2];
+	struct channel_worker_call calls[2];
+};
+
+static void
+channel_workers_cancel(struct channel_workers *workers)
+{
+	dssh_session_terminate(workers->owner->client);
+	dssh_session_terminate(workers->owner->server);
+	mock_io_close_c2s(&workers->owner->io);
+	mock_io_close_s2c(&workers->owner->io);
+}
 
 static int
-open_exec_channel(struct open_exec_ctx *ctx)
+channel_worker_run(void *data)
 {
-	thrd_t ct, st;
-	int cr, sr;
-	if (channel_fixture_thread_create(&ct, client_open_exec_thread, ctx) != thrd_success)
-		return -1;
-	if (channel_fixture_thread_create(&st, server_accept_exec_thread, ctx) != thrd_success) {
-		channel_fixture_thread_join(ct, NULL);
+	struct channel_worker_call *call = data;
+	int ret = call->function(call->data);
+	if (ret != 0)
+		channel_workers_cancel(call->workers);
+	return ret;
+}
+
+static void
+channel_workers_init(struct channel_workers *workers, struct conn_ctx *owner)
+{
+	workers->owner = owner;
+	for (size_t i = 0; i < 2; i++) {
+		workers->created[i] = false;
+		workers->results[i] = 0;
+	}
+	channel_fixture_owner = owner;
+}
+
+static int
+channel_worker_start(struct channel_workers *workers, unsigned index,
+    thrd_start_t function, void *data)
+{
+	if (index >= 2 || workers->created[index])
+		abort();
+	struct channel_worker_call *call = &workers->calls[index];
+	call->workers = workers;
+	call->function = function;
+	call->data = data;
+	int ret = channel_fixture_thread_create(&workers->threads[index], channel_worker_run, call);
+	if (ret != thrd_success) {
+		channel_workers_cancel(workers);
 		return -1;
 	}
-	channel_fixture_thread_join(ct, &cr);
-	channel_fixture_thread_join(st, &sr);
-	if (cr < 0 || sr < 0)
+	workers->created[index] = true;
+	return 0;
+}
+
+static void
+channel_worker_join(struct channel_workers *workers, unsigned index)
+{
+	if (index >= 2)
+		abort();
+	if (!workers->created[index])
+		return;
+	if (channel_fixture_thread_join(workers->threads[index], &workers->results[index]) != thrd_success)
+		abort();
+	workers->created[index] = false;
+}
+
+static void
+channel_workers_finish(struct channel_workers *workers)
+{
+	channel_worker_join(workers, 0);
+	channel_worker_join(workers, 1);
+	channel_fixture_owner = NULL;
+}
+
+static int
+open_exec_channel(struct conn_ctx *owner, struct open_exec_ctx *ctx)
+{
+	if (owner == NULL || !owner->io_initialized || ctx->client != owner->client
+	    || ctx->server != owner->server)
 		return -1;
-	if (ctx->client_ch == NULL || ctx->server_ch == NULL)
+	ctx->client_ch = NULL;
+	ctx->server_ch = NULL;
+	struct channel_workers workers;
+	channel_workers_init(&workers, owner);
+	if (channel_worker_start(&workers, 0, client_open_exec_thread, ctx) != 0
+	    || channel_worker_start(&workers, 1, server_accept_exec_thread, ctx) != 0) {
+		channel_workers_finish(&workers);
+		return -1;
+	}
+	channel_worker_join(&workers, 0);
+	if (workers.results[0] != 0 || ctx->client_ch == NULL)
+		channel_workers_cancel(&workers);
+	channel_workers_finish(&workers);
+	if (workers.results[0] != 0 || workers.results[1] != 0
+	    || ctx->client_ch == NULL || ctx->server_ch == NULL)
 		return -1;
 	return 0;
 }
@@ -687,7 +775,7 @@ test_session_stop_open_channel(void)
 		.command = "stop-with-owned-parameters", .cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	ASSERT_OK(open_exec_channel(&oc));
+	ASSERT_OK(open_exec_channel(&ctx, &oc));
 	ASSERT_NOT_NULL(oc.client_ch);
 	ASSERT_NOT_NULL(oc.server_ch);
 	ASSERT_STR_EQ(oc.client_ch->params.command, oc.command);
@@ -727,7 +815,7 @@ test_open_exec(void)
 		.accept_timeout = 30000,
 	};
 
-	if (open_exec_channel(&oc) < 0) {
+	if (open_exec_channel(&ctx, &oc) < 0) {
 		conn_cleanup(&ctx);
 		return TEST_FAIL;
 	}
@@ -756,7 +844,7 @@ test_open_exec_command(void)
 		.accept_timeout = 30000,
 	};
 
-	if (open_exec_channel(&oc) < 0) {
+	if (open_exec_channel(&ctx, &oc) < 0) {
 		conn_cleanup(&ctx);
 		return TEST_FAIL;
 	}
@@ -905,7 +993,7 @@ test_session_write_read(void)
 		.cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0) {
+	if (open_exec_channel(&ctx, &oc) < 0) {
 		conn_cleanup(&ctx);
 		return TEST_SKIP;
 	}
@@ -945,7 +1033,7 @@ test_session_read_write_reverse(void)
 		.cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0) {
+	if (open_exec_channel(&ctx, &oc) < 0) {
 		conn_cleanup(&ctx);
 		return TEST_SKIP;
 	}
@@ -985,7 +1073,7 @@ test_session_write_ext(void)
 		.cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0) {
+	if (open_exec_channel(&ctx, &oc) < 0) {
 		conn_cleanup(&ctx);
 		return TEST_SKIP;
 	}
@@ -1025,7 +1113,7 @@ test_session_read_ext(void)
 		.cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0) {
+	if (open_exec_channel(&ctx, &oc) < 0) {
 		conn_cleanup(&ctx);
 		return TEST_SKIP;
 	}
@@ -1064,7 +1152,7 @@ test_session_poll_read(void)
 		.cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0) {
+	if (open_exec_channel(&ctx, &oc) < 0) {
 		conn_cleanup(&ctx);
 		return TEST_SKIP;
 	}
@@ -1095,7 +1183,7 @@ test_session_poll_timeout(void)
 		.cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0) {
+	if (open_exec_channel(&ctx, &oc) < 0) {
 		conn_cleanup(&ctx);
 		return TEST_SKIP;
 	}
@@ -1123,7 +1211,7 @@ test_session_large_write(void)
 		.cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0) {
+	if (open_exec_channel(&ctx, &oc) < 0) {
 		conn_cleanup(&ctx);
 		return TEST_SKIP;
 	}
@@ -1188,7 +1276,7 @@ test_session_multiple_writes(void)
 		.cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0) {
+	if (open_exec_channel(&ctx, &oc) < 0) {
 		conn_cleanup(&ctx);
 		return TEST_SKIP;
 	}
@@ -1448,7 +1536,7 @@ test_send_signal(void)
 		.cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0) {
+	if (open_exec_channel(&ctx, &oc) < 0) {
 		conn_cleanup(&ctx);
 		return TEST_SKIP;
 	}
@@ -1487,7 +1575,7 @@ test_signal_after_data(void)
 		.cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0) {
+	if (open_exec_channel(&ctx, &oc) < 0) {
 		conn_cleanup(&ctx);
 		return TEST_SKIP;
 	}
@@ -1599,7 +1687,7 @@ test_session_close_exit_code(void)
 		.cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0) {
+	if (open_exec_channel(&ctx, &oc) < 0) {
 		conn_cleanup(&ctx);
 		return TEST_SKIP;
 	}
@@ -1677,7 +1765,7 @@ test_eof_detection(void)
 		.cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0) {
+	if (open_exec_channel(&ctx, &oc) < 0) {
 		conn_cleanup(&ctx);
 		return TEST_SKIP;
 	}
@@ -1723,7 +1811,7 @@ test_eof_half_close(void)
 		.cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0) {
+	if (open_exec_channel(&ctx, &oc) < 0) {
 		conn_cleanup(&ctx);
 		return TEST_SKIP;
 	}
@@ -1775,7 +1863,7 @@ test_read_nomore_vs_eof(void)
 		.cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0) {
+	if (open_exec_channel(&ctx, &oc) < 0) {
 		conn_cleanup(&ctx);
 		return TEST_SKIP;
 	}
@@ -1839,7 +1927,7 @@ test_graceful_disconnect(void)
 		.cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0) {
+	if (open_exec_channel(&ctx, &oc) < 0) {
 		conn_cleanup(&ctx);
 		return TEST_SKIP;
 	}
@@ -2172,7 +2260,7 @@ test_concurrent_write_read(void)
 		.cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0) {
+	if (open_exec_channel(&ctx, &oc) < 0) {
 		conn_cleanup(&ctx);
 		return TEST_SKIP;
 	}
@@ -2219,7 +2307,7 @@ test_terminate_during_io(void)
 		.cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0) {
+	if (open_exec_channel(&ctx, &oc) < 0) {
 		conn_cleanup(&ctx);
 		return TEST_SKIP;
 	}
@@ -2265,7 +2353,7 @@ test_connection_drop_during_read(void)
 		.cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0) {
+	if (open_exec_channel(&ctx, &oc) < 0) {
 		conn_cleanup(&ctx);
 		return TEST_SKIP;
 	}
@@ -2309,7 +2397,7 @@ test_connection_drop_during_write(void)
 		.cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0) {
+	if (open_exec_channel(&ctx, &oc) < 0) {
 		conn_cleanup(&ctx);
 		return TEST_SKIP;
 	}
@@ -2350,7 +2438,7 @@ test_cleanup_after_drop(void)
 		.cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0) {
+	if (open_exec_channel(&ctx, &oc) < 0) {
 		conn_cleanup(&ctx);
 		return TEST_SKIP;
 	}
@@ -2431,7 +2519,7 @@ test_session_poll_timeout_zero(void)
 		.cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0) {
+	if (open_exec_channel(&ctx, &oc) < 0) {
 		conn_cleanup(&ctx);
 		return TEST_FAIL;
 	}
@@ -2576,7 +2664,7 @@ test_open_type_and_queue_policy(void)
 		.command = "queue-progress", .cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	ASSERT_OK(open_exec_channel(&oc));
+	ASSERT_OK(open_exec_channel(&ctx, &oc));
 	for (uint32_t i = 0; i < DSSH_ACCEPT_QUEUE_CAP; i++) {
 		len = build_channel_open(msg, sizeof(msg), "session", i + 32, 123, 456);
 		ASSERT_OK(dssh_test_demux_dispatch(ctx.server, SSH_MSG_CHANNEL_OPEN, msg, len));
@@ -2624,7 +2712,7 @@ test_open_response_state(void)
 		.command = "response-state", .cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	ASSERT_OK(open_exec_channel(&oc));
+	ASSERT_OK(open_exec_channel(&ctx, &oc));
 	struct dssh_channel_s *channels[] = { oc.client_ch, oc.server_ch };
 	for (size_t side = 0; side < 2; side++) {
 		struct dssh_channel_s *ch = channels[side];
@@ -2807,7 +2895,7 @@ test_open_sync_failures(void)
 				.accept_timeout = 30000,
 			};
 			if (operation == 3 || operation == 4)
-				ASSERT_OK(open_exec_channel(&oc));
+				ASSERT_OK(open_exec_channel(&ctx, &oc));
 			if (operation == 4) {
 				ASSERT_EQ(mtx_lock(&oc.server_ch->buf_mtx), thrd_success);
 				oc.server_ch->open = false;
@@ -2859,7 +2947,7 @@ test_channel_io_validation(void)
 		.command = "io-validation", .cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	ASSERT_OK(open_exec_channel(&oc));
+	ASSERT_OK(open_exec_channel(&ctx, &oc));
 	uint8_t byte = 1;
 	ASSERT_EQ(dssh_chan_read(oc.client_ch, -1, &byte, 1), DSSH_ERROR_INVALID);
 	ASSERT_EQ(dssh_chan_read(oc.client_ch, 2, NULL, 0), DSSH_ERROR_INVALID);
@@ -2898,7 +2986,7 @@ test_request_response_state(void)
 		.command = "request-state", .cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	ASSERT_OK(open_exec_channel(&oc));
+	ASSERT_OK(open_exec_channel(&ctx, &oc));
 	struct dssh_channel_s *ch = oc.client_ch;
 	ASSERT_EQ(send_channel_request_wait(ctx.client, ch, "unknown-request", NULL, 0), DSSH_ERROR_REJECTED);
 	ASSERT_FALSE(tx_owner_is_current(ctx.client));
@@ -2950,7 +3038,7 @@ test_request_io_sync_failures(void)
 				.command = "io-sync", .cbs = &accept_cbs_all,
 				.accept_timeout = 30000,
 			};
-			ASSERT_OK(open_exec_channel(&oc));
+			ASSERT_OK(open_exec_channel(&ctx, &oc));
 			struct dssh_channel_s *ch = oc.server_ch;
 			if (operation == 5 || operation == 6) {
 				ASSERT_EQ(mtx_lock(&ch->buf_mtx), thrd_success);
@@ -3018,7 +3106,7 @@ test_request_tx_sync_sweep(void)
 				.command = "tx-sync", .cbs = &accept_cbs_all,
 				.accept_timeout = 30000,
 			};
-			ASSERT_OK(open_exec_channel(&oc));
+			ASSERT_OK(open_exec_channel(&ctx, &oc));
 			uint8_t byte = 1;
 			dssh_test_thrd_fail_after(n);
 			int64_t ret = operation == 0 ? dssh_chan_write(oc.client_ch, 0, &byte, 1)
@@ -3061,7 +3149,7 @@ test_channel_registration_failures(void)
 			.command = "registration-sync", .cbs = &accept_cbs_all,
 			.accept_timeout = 30000,
 		};
-		ASSERT_OK(open_exec_channel(&oc));
+		ASSERT_OK(open_exec_channel(&ctx, &oc));
 		struct dssh_channel_s *ch = oc.server_ch;
 		ASSERT_OK(detach_channel(ctx.server, ch));
 		atomic_store(&ch->closing, false);
@@ -3195,7 +3283,7 @@ test_window_adjust_from_peer(void)
 		.cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0 || oc.client_ch == NULL || oc.server_ch == NULL) {
+	if (open_exec_channel(&ctx, &oc) < 0 || oc.client_ch == NULL || oc.server_ch == NULL) {
 		conn_cleanup(&ctx);
 		return TEST_FAIL;
 	}
@@ -3235,7 +3323,7 @@ test_data_after_eof(void)
 		.cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0 || oc.client_ch == NULL || oc.server_ch == NULL) {
+	if (open_exec_channel(&ctx, &oc) < 0 || oc.client_ch == NULL || oc.server_ch == NULL) {
 		conn_cleanup(&ctx);
 		return TEST_FAIL;
 	}
@@ -3293,7 +3381,7 @@ test_truncated_channel_data(void)
 		.cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0 || oc.client_ch == NULL || oc.server_ch == NULL) {
+	if (open_exec_channel(&ctx, &oc) < 0 || oc.client_ch == NULL || oc.server_ch == NULL) {
 		conn_cleanup(&ctx);
 		return TEST_FAIL;
 	}
@@ -3333,7 +3421,7 @@ test_ext_data_after_eof(void)
 		.cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0 || oc.client_ch == NULL || oc.server_ch == NULL) {
+	if (open_exec_channel(&ctx, &oc) < 0 || oc.client_ch == NULL || oc.server_ch == NULL) {
 		conn_cleanup(&ctx);
 		return TEST_FAIL;
 	}
@@ -3380,7 +3468,7 @@ test_truncated_ext_data(void)
 		.cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0 || oc.client_ch == NULL || oc.server_ch == NULL) {
+	if (open_exec_channel(&ctx, &oc) < 0 || oc.client_ch == NULL || oc.server_ch == NULL) {
 		conn_cleanup(&ctx);
 		return TEST_FAIL;
 	}
@@ -3418,7 +3506,7 @@ test_channel_request_want_reply(void)
 		.cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0 || oc.client_ch == NULL || oc.server_ch == NULL) {
+	if (open_exec_channel(&ctx, &oc) < 0 || oc.client_ch == NULL || oc.server_ch == NULL) {
 		conn_cleanup(&ctx);
 		return TEST_FAIL;
 	}
@@ -3462,7 +3550,7 @@ test_data_exceeds_window(void)
 		.cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0 || oc.client_ch == NULL || oc.server_ch == NULL) {
+	if (open_exec_channel(&ctx, &oc) < 0 || oc.client_ch == NULL || oc.server_ch == NULL) {
 		conn_cleanup(&ctx);
 		return TEST_FAIL;
 	}
@@ -3518,7 +3606,7 @@ test_session_poll_write(void)
 		.cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0 || oc.client_ch == NULL || oc.server_ch == NULL) {
+	if (open_exec_channel(&ctx, &oc) < 0 || oc.client_ch == NULL || oc.server_ch == NULL) {
 		conn_cleanup(&ctx);
 		return TEST_FAIL;
 	}
@@ -3553,7 +3641,7 @@ test_session_write_after_eof(void)
 		.cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0 || oc.client_ch == NULL || oc.server_ch == NULL) {
+	if (open_exec_channel(&ctx, &oc) < 0 || oc.client_ch == NULL || oc.server_ch == NULL) {
 		conn_cleanup(&ctx);
 		return TEST_FAIL;
 	}
@@ -3584,7 +3672,7 @@ test_session_write_ext_after_eof(void)
 		.cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0 || oc.client_ch == NULL || oc.server_ch == NULL) {
+	if (open_exec_channel(&ctx, &oc) < 0 || oc.client_ch == NULL || oc.server_ch == NULL) {
 		conn_cleanup(&ctx);
 		return TEST_FAIL;
 	}
@@ -3729,7 +3817,7 @@ test_read_event_empty(void)
 		.cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0 || oc.client_ch == NULL || oc.server_ch == NULL) {
+	if (open_exec_channel(&ctx, &oc) < 0 || oc.client_ch == NULL || oc.server_ch == NULL) {
 		conn_cleanup(&ctx);
 		return TEST_FAIL;
 	}
@@ -3759,7 +3847,7 @@ test_signal_interleave_read(void)
 		.cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0 || oc.client_ch == NULL || oc.server_ch == NULL) {
+	if (open_exec_channel(&ctx, &oc) < 0 || oc.client_ch == NULL || oc.server_ch == NULL) {
 		conn_cleanup(&ctx);
 		return TEST_FAIL;
 	}
@@ -3841,7 +3929,7 @@ test_signal_interleave_read_ext(void)
 		.cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0 || oc.client_ch == NULL || oc.server_ch == NULL) {
+	if (open_exec_channel(&ctx, &oc) < 0 || oc.client_ch == NULL || oc.server_ch == NULL) {
 		conn_cleanup(&ctx);
 		return TEST_FAIL;
 	}
@@ -4003,7 +4091,7 @@ test_truncated_channel_request(void)
 		.cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0 || oc.client_ch == NULL || oc.server_ch == NULL) {
+	if (open_exec_channel(&ctx, &oc) < 0 || oc.client_ch == NULL || oc.server_ch == NULL) {
 		conn_cleanup(&ctx);
 		return TEST_FAIL;
 	}
@@ -4080,7 +4168,7 @@ test_session_poll_read_empty(void)
 		.cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0 || oc.client_ch == NULL || oc.server_ch == NULL) {
+	if (open_exec_channel(&ctx, &oc) < 0 || oc.client_ch == NULL || oc.server_ch == NULL) {
 		conn_cleanup(&ctx);
 		return TEST_FAIL;
 	}
@@ -4118,7 +4206,7 @@ test_session_write_window_zero(void)
 		.cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0 || oc.client_ch == NULL || oc.server_ch == NULL) {
+	if (open_exec_channel(&ctx, &oc) < 0 || oc.client_ch == NULL || oc.server_ch == NULL) {
 		conn_cleanup(&ctx);
 		return TEST_FAIL;
 	}
@@ -4161,7 +4249,7 @@ test_session_write_ext_window_zero(void)
 		.cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0 || oc.client_ch == NULL || oc.server_ch == NULL) {
+	if (open_exec_channel(&ctx, &oc) < 0 || oc.client_ch == NULL || oc.server_ch == NULL) {
 		conn_cleanup(&ctx);
 		return TEST_FAIL;
 	}
@@ -4347,7 +4435,7 @@ test_channel_success_no_request(void)
 		.cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0 || oc.client_ch == NULL || oc.server_ch == NULL) {
+	if (open_exec_channel(&ctx, &oc) < 0 || oc.client_ch == NULL || oc.server_ch == NULL) {
 		conn_cleanup(&ctx);
 		return TEST_FAIL;
 	}
@@ -4395,7 +4483,7 @@ test_double_eof_close(void)
 		.cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0 || oc.client_ch == NULL || oc.server_ch == NULL) {
+	if (open_exec_channel(&ctx, &oc) < 0 || oc.client_ch == NULL || oc.server_ch == NULL) {
 		conn_cleanup(&ctx);
 		return TEST_FAIL;
 	}
@@ -4425,7 +4513,7 @@ test_data_dlen_exceeds_payload(void)
 		.cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0 || oc.client_ch == NULL || oc.server_ch == NULL) {
+	if (open_exec_channel(&ctx, &oc) < 0 || oc.client_ch == NULL || oc.server_ch == NULL) {
 		conn_cleanup(&ctx);
 		return TEST_FAIL;
 	}
@@ -4487,7 +4575,7 @@ test_demux_dispatch_chan_type_zero(void)
 		.cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0 || oc.client_ch == NULL || oc.server_ch == NULL) {
+	if (open_exec_channel(&ctx, &oc) < 0 || oc.client_ch == NULL || oc.server_ch == NULL) {
 		conn_cleanup(&ctx);
 		return TEST_FAIL;
 	}
@@ -4528,7 +4616,7 @@ test_send_eof_already_sent(void)
 		.command = "echo eof2", .cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0 || !oc.client_ch || !oc.server_ch) {
+	if (open_exec_channel(&ctx, &oc) < 0 || !oc.client_ch || !oc.server_ch) {
 		conn_cleanup(&ctx);
 		return TEST_FAIL;
 	}
@@ -4554,7 +4642,7 @@ test_send_close_already_sent(void)
 		.command = "echo close2", .cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0 || !oc.client_ch || !oc.server_ch) {
+	if (open_exec_channel(&ctx, &oc) < 0 || !oc.client_ch || !oc.server_ch) {
 		conn_cleanup(&ctx);
 		return TEST_FAIL;
 	}
@@ -4580,7 +4668,7 @@ test_maybe_replenish_after_eof(void)
 		.command = "echo replenish", .cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0 || !oc.client_ch || !oc.server_ch) {
+	if (open_exec_channel(&ctx, &oc) < 0 || !oc.client_ch || !oc.server_ch) {
 		conn_cleanup(&ctx);
 		return TEST_FAIL;
 	}
@@ -4609,7 +4697,7 @@ test_maybe_replenish_low_window(void)
 		.command = "echo replow", .cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0 || !oc.client_ch || !oc.server_ch) {
+	if (open_exec_channel(&ctx, &oc) < 0 || !oc.client_ch || !oc.server_ch) {
 		conn_cleanup(&ctx);
 		return TEST_FAIL;
 	}
@@ -4661,7 +4749,7 @@ test_replenish_queued_accounting(void)
 		.command = "echo repqueue", .cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0 || !oc.client_ch || !oc.server_ch) {
+	if (open_exec_channel(&ctx, &oc) < 0 || !oc.client_ch || !oc.server_ch) {
 		conn_cleanup(&ctx);
 		return TEST_FAIL;
 	}
@@ -4761,7 +4849,7 @@ test_zc_consumption_clamped(void)
 		.command = "echo zcclamp", .cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0 || !oc.client_ch || !oc.server_ch) {
+	if (open_exec_channel(&ctx, &oc) < 0 || !oc.client_ch || !oc.server_ch) {
 		conn_cleanup(&ctx);
 		return TEST_FAIL;
 	}
@@ -4826,7 +4914,7 @@ test_demux_window_underflow_to_zero(void)
 		.command = "echo wunder", .cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0 || !oc.client_ch || !oc.server_ch) {
+	if (open_exec_channel(&ctx, &oc) < 0 || !oc.client_ch || !oc.server_ch) {
 		conn_cleanup(&ctx);
 		return TEST_FAIL;
 	}
@@ -4876,7 +4964,7 @@ test_window_add_overflow(void)
 		.command = "echo woverflow", .cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0 || !oc.client_ch || !oc.server_ch) {
+	if (open_exec_channel(&ctx, &oc) < 0 || !oc.client_ch || !oc.server_ch) {
 		conn_cleanup(&ctx);
 		return TEST_FAIL;
 	}
@@ -4967,7 +5055,7 @@ test_session_poll_nsec_overflow(void)
 		.cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0 || oc.client_ch == NULL || oc.server_ch == NULL) {
+	if (open_exec_channel(&ctx, &oc) < 0 || oc.client_ch == NULL || oc.server_ch == NULL) {
 		conn_cleanup(&ctx);
 		return TEST_FAIL;
 	}
@@ -5421,7 +5509,7 @@ test_dispatch_sync_failures(void)
 			.cbs = &accept_cbs_all,
 			.accept_timeout = 30000,
 		};
-		if (open_exec_channel(&oc) < 0 || oc.client_ch == NULL || oc.server_ch == NULL) {
+		if (open_exec_channel(&ctx, &oc) < 0 || oc.client_ch == NULL || oc.server_ch == NULL) {
 			conn_cleanup(&ctx);
 			return TEST_FAIL;
 		}
@@ -5460,7 +5548,7 @@ test_detach_sync_failures(void)
 			.cbs = &accept_cbs_all,
 			.accept_timeout = 30000,
 		};
-		if (open_exec_channel(&oc) < 0 || oc.client_ch == NULL || oc.server_ch == NULL) {
+		if (open_exec_channel(&ctx, &oc) < 0 || oc.client_ch == NULL || oc.server_ch == NULL) {
 			conn_cleanup(&ctx);
 			return TEST_FAIL;
 		}
@@ -5501,7 +5589,7 @@ test_demux_data_truncation_window(void)
 		.command = "echo trunc", .cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0 || !oc.client_ch || !oc.server_ch) {
+	if (open_exec_channel(&ctx, &oc) < 0 || !oc.client_ch || !oc.server_ch) {
 		conn_cleanup(&ctx);
 		return TEST_FAIL;
 	}
@@ -5552,7 +5640,7 @@ test_replenish_caps_to_buffer_space(void)
 		.command = "echo repcap", .cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0 || !oc.client_ch || !oc.server_ch) {
+	if (open_exec_channel(&ctx, &oc) < 0 || !oc.client_ch || !oc.server_ch) {
 		conn_cleanup(&ctx);
 		return TEST_FAIL;
 	}
@@ -5598,7 +5686,7 @@ rx_window_setup(struct conn_ctx *ctx, struct open_exec_ctx *oc, uint32_t bufsz)
 	oc->command = "rx-window";
 	oc->cbs = &accept_cbs_all;
 	oc->accept_timeout = 30000;
-	if (open_exec_channel(oc) < 0 || !oc->client_ch || !oc->server_ch)
+	if (open_exec_channel(ctx, oc) < 0 || !oc->client_ch || !oc->server_ch)
 		return -1;
 
 	bytebuf_free(&oc->server_ch->buf.stdout_buf);
@@ -5870,7 +5958,7 @@ test_poll_terminate_surfaces_data_flags(void)
 		.command = "echo poll-terminate",
 		.cbs = &accept_cbs_all, .accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0 || !oc.client_ch || !oc.server_ch) {
+	if (open_exec_channel(&ctx, &oc) < 0 || !oc.client_ch || !oc.server_ch) {
 		conn_cleanup(&ctx);
 		return TEST_FAIL;
 	}
@@ -5913,7 +6001,7 @@ test_poll_terminate_no_event_bit(void)
 		.command = "echo poll-evt",
 		.cbs = &accept_cbs_all, .accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0 || !oc.client_ch || !oc.server_ch) {
+	if (open_exec_channel(&ctx, &oc) < 0 || !oc.client_ch || !oc.server_ch) {
 		conn_cleanup(&ctx);
 		return TEST_FAIL;
 	}
@@ -5975,7 +6063,7 @@ test_data_after_close(void)
 		.cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0 || oc.client_ch == NULL || oc.server_ch == NULL) {
+	if (open_exec_channel(&ctx, &oc) < 0 || oc.client_ch == NULL || oc.server_ch == NULL) {
 		conn_cleanup(&ctx);
 		return TEST_FAIL;
 	}
@@ -6025,7 +6113,7 @@ test_ext_data_after_close(void)
 		.cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0 || oc.client_ch == NULL || oc.server_ch == NULL) {
+	if (open_exec_channel(&ctx, &oc) < 0 || oc.client_ch == NULL || oc.server_ch == NULL) {
 		conn_cleanup(&ctx);
 		return TEST_FAIL;
 	}
@@ -6117,7 +6205,7 @@ test_truncated_window_adjust(void)
 		.cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0 || oc.client_ch == NULL || oc.server_ch == NULL) {
+	if (open_exec_channel(&ctx, &oc) < 0 || oc.client_ch == NULL || oc.server_ch == NULL) {
 		conn_cleanup(&ctx);
 		return TEST_FAIL;
 	}
@@ -6154,22 +6242,18 @@ server_accept_alloc_thread(void *arg)
 	dssh_test_alloc_exclude_thread();
 
 	ctx->server_ch = dssh_chan_accept(ctx->server, ctx->cbs, 1000);
-	return 0;
+	return ctx->server_ch == NULL ? DSSH_ERROR_INIT : 0;
 }
 
 static int
 test_open_exec_alloc_sweep(void)
 {
 	bool fault_seen = false;
-
 	for (int n = 0; n < 50; n++) {
 		struct conn_ctx ctx;
-
 		dssh_test_alloc_exclude_new_threads();
-
-		if (conn_setup(&ctx) < 0)
+		if (conn_setup(&ctx) != 0)
 			return TEST_FAIL;
-
 		struct open_exec_ctx oc = {
 			.client = ctx.client,
 			.server = ctx.server,
@@ -6178,43 +6262,35 @@ test_open_exec_alloc_sweep(void)
 			.command = "echo alloc",
 			.cbs = &accept_cbs_all,
 		};
-
+		struct channel_workers workers;
+		channel_workers_init(&workers, &ctx);
 		dssh_test_alloc_fail_after(n);
-
-		thrd_t ct, st;
-		ASSERT_THRD_CREATE(&ct, client_open_exec_thread, &oc);
-		ASSERT_THRD_CREATE(&st, server_accept_alloc_thread, &oc);
-		thrd_join(ct, NULL);
-
+		int ret = channel_worker_start(&workers, 0, client_open_exec_thread, &oc);
+		if (ret == 0)
+			ret = channel_worker_start(&workers, 1, server_accept_alloc_thread, &oc);
+		if (ret != 0) {
+			channel_workers_finish(&workers);
+			dssh_test_alloc_reset();
+			conn_cleanup(&ctx);
+			return TEST_FAIL;
+		}
+		channel_worker_join(&workers, 0);
 		int count = dssh_test_alloc_count();
 		dssh_test_alloc_reset();
-
-		if (oc.client_ch != NULL) {
-			thrd_join(st, NULL);
-			if (oc.server_ch != NULL)
-				dssh_chan_close(oc.server_ch, 0);
-			dssh_chan_close(oc.client_ch, 0);
-			conn_cleanup(&ctx);
-
-			if (count > n) {
-				fault_seen = true;
-				continue;
-			}
-			ASSERT_TRUE(fault_seen);
+		bool injected = count > n;
+		fault_seen = fault_seen || injected;
+		if (oc.client_ch == NULL)
+			channel_workers_cancel(&workers);
+		channel_workers_finish(&workers);
+		bool complete = oc.client_ch != NULL && oc.server_ch != NULL
+		    && workers.results[0] == 0 && workers.results[1] == 0;
+		/* Session cleanup owns every remaining registered channel. */
+		conn_cleanup(&ctx);
+		if (!injected) {
+			ASSERT_TRUE(complete && fault_seen);
 			return TEST_PASS;
 		}
-
-		fault_seen = fault_seen || count > n;
-		session_set_terminate(ctx.server);
-		thrd_join(st, NULL);
-
-		if (oc.server_ch != NULL)
-			dssh_chan_close(oc.server_ch, 0);
-
-		conn_cleanup(&ctx);
-
 	}
-
 	return TEST_FAIL;
 }
 
@@ -6224,6 +6300,8 @@ client_open_shell_alloc_thread(void *arg)
 	struct open_shell_ctx *ctx = arg;
 	struct dssh_chan_params p;
 	int ret = dssh_chan_params_init(&p, DSSH_CHAN_SHELL);
+	if (ret != 0)
+		return ret;
 	if (ret == 0)
 		ret = dssh_chan_params_set_term(&p, ctx->term);
 	if (ret == 0)
@@ -6242,22 +6320,18 @@ server_accept_shell_alloc_thread(void *arg)
 	dssh_test_alloc_exclude_thread();
 
 	ctx->server_ch = dssh_chan_accept(ctx->server, ctx->cbs, 1000);
-	return 0;
+	return ctx->server_ch == NULL ? DSSH_ERROR_INIT : 0;
 }
 
 static int
 test_open_shell_alloc_sweep(void)
 {
 	bool fault_seen = false;
-
 	for (int n = 0; n < 50; n++) {
 		struct conn_ctx ctx;
-
 		dssh_test_alloc_exclude_new_threads();
-
-		if (conn_setup(&ctx) < 0)
+		if (conn_setup(&ctx) != 0)
 			return TEST_FAIL;
-
 		struct open_shell_ctx oc = {
 			.client = ctx.client,
 			.server = ctx.server,
@@ -6268,40 +6342,35 @@ test_open_shell_alloc_sweep(void)
 			.rows = 24,
 			.cbs = &accept_cbs_all,
 		};
-
+		struct channel_workers workers;
+		channel_workers_init(&workers, &ctx);
 		dssh_test_alloc_fail_after(n);
-
-		thrd_t ct, st;
-		ASSERT_THRD_CREATE(&ct, client_open_shell_alloc_thread, &oc);
-		ASSERT_THRD_CREATE(&st, server_accept_shell_alloc_thread, &oc);
-		thrd_join(ct, NULL);
-
+		int ret = channel_worker_start(&workers, 0, client_open_shell_alloc_thread, &oc);
+		if (ret == 0)
+			ret = channel_worker_start(&workers, 1, server_accept_shell_alloc_thread, &oc);
+		if (ret != 0) {
+			channel_workers_finish(&workers);
+			dssh_test_alloc_reset();
+			conn_cleanup(&ctx);
+			return TEST_FAIL;
+		}
+		channel_worker_join(&workers, 0);
 		int count = dssh_test_alloc_count();
 		dssh_test_alloc_reset();
-
-		if (oc.client_ch != NULL) {
-			thrd_join(st, NULL);
-			if (oc.server_ch != NULL)
-				dssh_chan_close(oc.server_ch, 0);
-			dssh_chan_close(oc.client_ch, 0);
-			conn_cleanup(&ctx);
-			if (count > n) {
-				fault_seen = true;
-				continue;
-			}
-			ASSERT_TRUE(fault_seen);
+		bool injected = count > n;
+		fault_seen = fault_seen || injected;
+		if (oc.client_ch == NULL)
+			channel_workers_cancel(&workers);
+		channel_workers_finish(&workers);
+		bool complete = oc.client_ch != NULL && oc.server_ch != NULL
+		    && workers.results[0] == 0 && workers.results[1] == 0;
+		/* Session cleanup owns every remaining registered channel. */
+		conn_cleanup(&ctx);
+		if (!injected) {
+			ASSERT_TRUE(complete && fault_seen);
 			return TEST_PASS;
 		}
-
-		fault_seen = fault_seen || count > n;
-		session_set_terminate(ctx.server);
-		thrd_join(st, NULL);
-		if (oc.server_ch != NULL)
-			dssh_chan_close(oc.server_ch, 0);
-		conn_cleanup(&ctx);
-
 	}
-
 	return TEST_FAIL;
 }
 
@@ -6315,6 +6384,8 @@ client_open_subsys_alloc_thread(void *arg)
 	struct open_subsys_ctx *ctx = arg;
 	struct dssh_chan_params p;
 	int ret = dssh_chan_params_init(&p, DSSH_CHAN_SUBSYSTEM);
+	if (ret != 0)
+		return ret;
 	if (ret == 0)
 		ret = dssh_chan_params_set_subsystem(&p, ctx->subsystem);
 	if (ret == 0)
@@ -6333,22 +6404,18 @@ server_accept_subsys_alloc_thread(void *arg)
 	dssh_test_alloc_exclude_thread();
 
 	ctx->server_ch = dssh_chan_accept(ctx->server, &accept_cbs_all, 1000);
-	return 0;
+	return ctx->server_ch == NULL ? DSSH_ERROR_INIT : 0;
 }
 
 static int
 test_open_subsystem_alloc_sweep(void)
 {
 	bool fault_seen = false;
-
 	for (int n = 0; n < 50; n++) {
 		struct conn_ctx ctx;
-
 		dssh_test_alloc_exclude_new_threads();
-
-		if (conn_setup(&ctx) < 0)
+		if (conn_setup(&ctx) != 0)
 			return TEST_FAIL;
-
 		struct open_subsys_ctx oc = {
 			.client = ctx.client,
 			.server = ctx.server,
@@ -6356,42 +6423,35 @@ test_open_subsystem_alloc_sweep(void)
 			.server_ch = NULL,
 			.subsystem = "sftp",
 		};
-
+		struct channel_workers workers;
+		channel_workers_init(&workers, &ctx);
 		dssh_test_alloc_fail_after(n);
-
-		thrd_t ct, st;
-		ASSERT_THRD_CREATE(&ct, client_open_subsys_alloc_thread, &oc);
-		ASSERT_THRD_CREATE(&st, server_accept_subsys_alloc_thread, &oc);
-		thrd_join(ct, NULL);
-
+		int ret = channel_worker_start(&workers, 0, client_open_subsys_alloc_thread, &oc);
+		if (ret == 0)
+			ret = channel_worker_start(&workers, 1, server_accept_subsys_alloc_thread, &oc);
+		if (ret != 0) {
+			channel_workers_finish(&workers);
+			dssh_test_alloc_reset();
+			conn_cleanup(&ctx);
+			return TEST_FAIL;
+		}
+		channel_worker_join(&workers, 0);
 		int count = dssh_test_alloc_count();
 		dssh_test_alloc_reset();
-
-		if (oc.client_ch != NULL) {
-			thrd_join(st, NULL);
-			if (oc.server_ch != NULL)
-				dssh_chan_close(oc.server_ch, -1);
-			dssh_chan_close(oc.client_ch, -1);
-			conn_cleanup(&ctx);
-			if (count > n) {
-				fault_seen = true;
-				continue;
-			}
-			ASSERT_TRUE(fault_seen);
+		bool injected = count > n;
+		fault_seen = fault_seen || injected;
+		if (oc.client_ch == NULL)
+			channel_workers_cancel(&workers);
+		channel_workers_finish(&workers);
+		bool complete = oc.client_ch != NULL && oc.server_ch != NULL
+		    && workers.results[0] == 0 && workers.results[1] == 0;
+		/* Session cleanup owns every remaining registered channel. */
+		conn_cleanup(&ctx);
+		if (!injected) {
+			ASSERT_TRUE(complete && fault_seen);
 			return TEST_PASS;
 		}
-
-		fault_seen = fault_seen || count > n;
-		session_set_terminate(ctx.server);
-		thrd_join(st, NULL);
-
-		if (oc.server_ch != NULL)
-			dssh_chan_close(oc.server_ch, -1);
-
-		conn_cleanup(&ctx);
-
 	}
-
 	return TEST_FAIL;
 }
 
@@ -6405,12 +6465,16 @@ client_open_exec_nofail_thread(void *arg)
 	struct open_exec_ctx *ctx = arg;
 	dssh_test_alloc_exclude_thread();
 	struct dssh_chan_params p;
-	dssh_chan_params_init(&p, DSSH_CHAN_EXEC);
-	dssh_chan_params_set_command(&p, ctx->command);
-	dssh_chan_params_set_pty(&p, false);
-	ctx->client_ch = dssh_chan_open(ctx->client, &p);
+	int ret = dssh_chan_params_init(&p, DSSH_CHAN_EXEC);
+	if (ret != 0)
+		return ret;
+	ret = dssh_chan_params_set_command(&p, ctx->command);
+	if (ret == 0)
+		ret = dssh_chan_params_set_pty(&p, false);
+	if (ret == 0)
+		ctx->client_ch = dssh_chan_open(ctx->client, &p);
 	dssh_chan_params_free(&p);
-	return 0;
+	return ret;
 }
 
 static int
@@ -6418,22 +6482,18 @@ server_accept_alloc_inject_thread(void *arg)
 {
 	struct open_exec_ctx *ctx = arg;
 	ctx->server_ch = dssh_chan_accept(ctx->server, ctx->cbs, 1000);
-	return 0;
+	return ctx->server_ch == NULL ? DSSH_ERROR_INIT : 0;
 }
 
 static int
 test_server_accept_alloc_sweep(void)
 {
-	int any_failed = 0;
-
+	bool fault_seen = false;
 	for (int n = 0; n < 50; n++) {
 		struct conn_ctx ctx;
-
 		dssh_test_alloc_exclude_new_threads();
-
-		if (conn_setup(&ctx) < 0)
+		if (conn_setup(&ctx) != 0)
 			return TEST_FAIL;
-
 		struct open_exec_ctx oc = {
 			.client = ctx.client,
 			.server = ctx.server,
@@ -6442,42 +6502,36 @@ test_server_accept_alloc_sweep(void)
 			.command = "echo srvalloc",
 			.cbs = &accept_cbs_all,
 		};
-
-		thrd_t ct, st;
-		ASSERT_THRD_CREATE(&ct, client_open_exec_nofail_thread, &oc);
-
+		struct channel_workers workers;
+		channel_workers_init(&workers, &ctx);
+		int ret = channel_worker_start(&workers, 0, client_open_exec_nofail_thread, &oc);
 		dssh_test_alloc_fail_after(n);
-
-		ASSERT_THRD_CREATE(&st, server_accept_alloc_inject_thread, &oc);
-		thrd_join(st, NULL);
-
+		if (ret == 0)
+			ret = channel_worker_start(&workers, 1, server_accept_alloc_inject_thread, &oc);
+		if (ret != 0) {
+			channel_workers_finish(&workers);
+			dssh_test_alloc_reset();
+			conn_cleanup(&ctx);
+			return TEST_FAIL;
+		}
+		channel_worker_join(&workers, 1);
 		int count = dssh_test_alloc_count();
 		dssh_test_alloc_reset();
-
-		if (oc.server_ch != NULL) {
-			thrd_join(ct, NULL);
-			dssh_chan_close(oc.server_ch, 0);
-			if (oc.client_ch != NULL)
-				dssh_chan_close(oc.client_ch, 0);
-			conn_cleanup(&ctx);
-			ASSERT_TRUE(any_failed);
+		bool injected = count > n;
+		fault_seen = fault_seen || injected;
+		if (oc.server_ch == NULL)
+			channel_workers_cancel(&workers);
+		channel_workers_finish(&workers);
+		bool complete = oc.client_ch != NULL && oc.server_ch != NULL
+		    && workers.results[0] == 0 && workers.results[1] == 0;
+		/* Session cleanup owns every remaining registered channel. */
+		conn_cleanup(&ctx);
+		if (!injected) {
+			ASSERT_TRUE(complete && fault_seen);
 			return TEST_PASS;
 		}
-
-		any_failed = 1;
-		session_set_terminate(ctx.client);
-		thrd_join(ct, NULL);
-
-		if (oc.client_ch != NULL)
-			dssh_chan_close(oc.client_ch, 0);
-
-		conn_cleanup(&ctx);
-
-		if (n >= count)
-			break;
 	}
-
-	return any_failed ? TEST_PASS : TEST_FAIL;
+	return TEST_FAIL;
 }
 
 /* ================================================================
@@ -6563,7 +6617,7 @@ test_poll_deadline_not_reset(void)
 		.cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0) {
+	if (open_exec_channel(&ctx, &oc) < 0) {
 		conn_cleanup(&ctx);
 		return TEST_SKIP;
 	}
@@ -7238,7 +7292,7 @@ test_chan_set_event_cb(void)
 		.cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0) {
+	if (open_exec_channel(&ctx, &oc) < 0) {
 		conn_cleanup(&ctx);
 		return TEST_SKIP;
 	}
@@ -7320,7 +7374,7 @@ test_chan_set_max_events(void)
 		.cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) < 0) {
+	if (open_exec_channel(&ctx, &oc) < 0) {
 		conn_cleanup(&ctx);
 		return TEST_SKIP;
 	}
@@ -7567,7 +7621,7 @@ test_lifecycle_join_once(void)
 		.client = ctx.client, .server = ctx.server,
 		.command = "join-once", .cbs = &accept_cbs_all, .accept_timeout = 30000,
 	};
-	ASSERT_OK(open_exec_channel(&oc));
+	ASSERT_OK(open_exec_channel(&ctx, &oc));
 	dssh_session_terminate(ctx.client);
 	mock_io_close_c2s(&ctx.io);
 	mock_io_close_s2c(&ctx.io);
@@ -7603,8 +7657,10 @@ run_join_fatal_child(const char *operation)
 		.client = ctx.client, .server = ctx.server,
 		.command = "join-fatal", .cbs = &accept_cbs_all, .accept_timeout = 30000,
 	};
-	if (open_exec_channel(&oc) != 0)
+	if (open_exec_channel(&ctx, &oc) != 0) {
+		conn_cleanup(&ctx);
 		return 3;
+	}
 	dssh_session_terminate(ctx.client);
 	mock_io_close_c2s(&ctx.io);
 	mock_io_close_s2c(&ctx.io);
@@ -7808,7 +7864,7 @@ test_clock_poll_accept(void)
 		.command = "clock-poll", .cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	ASSERT_OK(open_exec_channel(&oc));
+	ASSERT_OK(open_exec_channel(&ctx, &oc));
 	dssh_test_clock_fail_after(0);
 	int ret = dssh_chan_poll(oc.client_ch, DSSH_POLL_READ, 5000);
 	dssh_test_clock_reset();
@@ -7845,7 +7901,7 @@ test_clock_pending_waits(void)
 			.command = "clock-pending", .cbs = &accept_cbs_all,
 			.accept_timeout = 30000,
 		};
-		ASSERT_OK(open_exec_channel(&oc));
+		ASSERT_OK(open_exec_channel(&ctx, &oc));
 		if (operation == 3) {
 			ASSERT_EQ(mtx_lock(&oc.client_ch->buf_mtx), thrd_success);
 			oc.client_ch->setup_mode = true;
@@ -7907,7 +7963,7 @@ test_extended_stream_types(void)
 		.client = ctx.client, .server = ctx.server, .command = "extended-stream",
 		.cbs = &accept_cbs_all, .accept_timeout = 30000,
 	};
-	ASSERT_OK(open_exec_channel(&oc));
+	ASSERT_OK(open_exec_channel(&ctx, &oc));
 	ASSERT_EQ(mtx_lock(&oc.server_ch->buf_mtx), thrd_success);
 	oc.server_ch->local_window = 8;
 	oc.server_ch->window_max = 8;
@@ -7993,7 +8049,7 @@ test_extended_zc_types(void)
 		.client = ctx.client, .server = ctx.server, .command = "extended-zc",
 		.cbs = &cbs, .accept_timeout = 30000,
 	};
-	ASSERT_OK(open_exec_channel(&oc));
+	ASSERT_OK(open_exec_channel(&ctx, &oc));
 	uint8_t packet[17];
 	size_t pos = 0;
 	packet[pos++] = SSH_MSG_CHANNEL_EXTENDED_DATA;
@@ -8028,7 +8084,7 @@ test_data_framing(void)
 		.client = ctx.client, .server = ctx.server, .command = "data-framing",
 		.cbs = &accept_cbs_all, .accept_timeout = 30000,
 	};
-	ASSERT_OK(open_exec_channel(&oc));
+	ASSERT_OK(open_exec_channel(&ctx, &oc));
 	for (int extended = 0; extended < 2; extended++) {
 		uint8_t packet[18] = {0};
 		size_t pos = 0;
@@ -8088,7 +8144,7 @@ test_replenish_sync_failures(void)
 			.client = ctx.client, .server = ctx.server, .command = "replenish-sync",
 			.cbs = &accept_cbs_all, .accept_timeout = 30000,
 		};
-		ASSERT_OK(open_exec_channel(&oc));
+		ASSERT_OK(open_exec_channel(&ctx, &oc));
 		ASSERT_EQ(mtx_lock(&oc.server_ch->buf_mtx), thrd_success);
 		oc.server_ch->local_window = 0;
 		oc.server_ch->window_max = 8;
@@ -8195,7 +8251,7 @@ test_compression_window_rekey(void)
 		.client = ctx.client, .server = ctx.server, .command = "window-rekey",
 		.cbs = &cbs, .accept_timeout = 30000,
 	};
-	ASSERT_OK(open_exec_channel(&oc));
+	ASSERT_OK(open_exec_channel(&ctx, &oc));
 	ASSERT_EQ_U(atomic_load(&oc.client_ch->remote_window), 8);
 	unsigned resets_before = compression_fixture_reset_count();
 	struct window_rekey_gate gate = { .server = ctx.server };
@@ -8808,6 +8864,8 @@ DSSH_TEST_MAIN(tests)
 int
 main(int argc, char *argv[])
 {
+	if (argc == 4 && strcmp(argv[1], "--channel-fatal") == 0)
+		return channel_worker_fatal_child(argv[2], argv[3]);
 	if (argc == 3 && strcmp(argv[1], "--join-fatal") == 0)
 		return run_join_fatal_child(argv[2]);
 	return dssh_test_conn_main(argc, argv);

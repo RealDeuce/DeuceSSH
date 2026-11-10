@@ -516,6 +516,15 @@ add_test(NAME dssh_unit_chan COMMAND dssh_test_chan)
 
 dssh_add_test(crypto test_crypto.c)
 add_test(NAME dssh_unit_crypto COMMAND dssh_test_crypto)
+dssh_add_test(sntrup test_sntrup.c)
+dssh_add_output_test(dssh_sntrup_roundtrip dssh_test_sntrup "1 tests: 1 passed, 0 failed, 0 skipped"
+	--exact sntrup/roundtrip)
+if(DEUCESSH_CRYPTO_BACKEND STREQUAL "OpenSSL")
+	dssh_add_output_test(dssh_sntrup_rng_retirement dssh_test_sntrup "1 tests: 1 passed, 0 failed, 0 skipped"
+		--exact sntrup/rng_retirement)
+	dssh_add_output_test(dssh_sntrup_provider_errors dssh_test_sntrup "1 tests: 1 passed, 0 failed, 0 skipped"
+		--exact sntrup/provider_errors)
+endif()
 if(DEUCESSH_CRYPTO_BACKEND STREQUAL "Botan")
 	dssh_add_test(crypto_botan_faults test_crypto_botan_faults.cpp)
 	set_property(TARGET dssh_test_crypto_botan_faults PROPERTY CXX_STANDARD 20)

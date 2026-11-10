@@ -37,6 +37,45 @@
 
 #include "dssh_test_ossl.h"
 
+static _Thread_local bool sntrup_clear_watched;
+static _Thread_local size_t sntrup_clear_size;
+static _Thread_local struct dssh_test_sntrup_clear_stats sntrup_clear_stats;
+
+void
+dssh_test_sntrup_clear_begin(size_t matching_size)
+{
+	sntrup_clear_size = matching_size;
+	sntrup_clear_stats = (struct dssh_test_sntrup_clear_stats){.zero = true};
+	sntrup_clear_watched = true;
+}
+
+struct dssh_test_sntrup_clear_stats
+dssh_test_sntrup_clear_end(void)
+{
+	sntrup_clear_watched = false;
+	return sntrup_clear_stats;
+}
+
+void
+dssh_test_sntrup_cleared(const void *buffer, size_t length)
+{
+	if (!sntrup_clear_watched)
+		return;
+	if (sntrup_clear_stats.calls < SIZE_MAX)
+		sntrup_clear_stats.calls++;
+	if (length == sntrup_clear_size && sntrup_clear_stats.matches < SIZE_MAX)
+		sntrup_clear_stats.matches++;
+	if (buffer == NULL || length == 0) {
+		sntrup_clear_stats.zero = false;
+		return;
+	}
+	const unsigned char *bytes = buffer;
+	for (size_t i = 0; i < length; i++) {
+		if (bytes[i] != 0)
+			sntrup_clear_stats.zero = false;
+	}
+}
+
 static _Thread_local int clock_fail_at = -1;
 static _Thread_local int clock_call_num;
 static _Thread_local bool clock_fixed;

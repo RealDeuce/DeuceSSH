@@ -16,7 +16,18 @@
 #include "sntrup761.h"
 #ifdef DSSH_TESTING
  #include "ssh-internal.h"
+ #include "test/dssh_test_ossl.h"
 #endif
+
+static void
+sntrup_clear(void *buffer, size_t length)
+{
+	dssh_secure_zero(buffer, length);
+#ifdef DSSH_TESTING
+	/* Observe only while the cleared owner is still alive. */
+	dssh_test_sntrup_cleared(buffer, length);
+#endif
+}
 
 #define crypto_declassify(x, y) \
 	do {                    \
@@ -688,7 +699,7 @@ Short_random(small *out)
 	if (randombytes(L, sizeof(L)) < 0)
 		return -1;
 	Short_fromlist(out, L);
-	dssh_secure_zero(L, sizeof(L));
+	sntrup_clear(L, sizeof(L));
 	return 0;
 }
 
@@ -701,7 +712,7 @@ Small_random(small *out)
 		return -1;
 	for (i = 0; i < p; ++i)
 		out[i] = (small)((((L[i] & 0x3fffffff) * 3) >> 30) - 1);
-	dssh_secure_zero(L, sizeof(L));
+	sntrup_clear(L, sizeof(L));
 	return 0;
 }
 

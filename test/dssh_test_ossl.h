@@ -40,6 +40,17 @@ bool dssh_test_ossl_encrypt_observed(int *actual_length);
 void dssh_test_ossl_random_post_failure(bool enabled);
 bool dssh_test_ossl_random_observed(size_t *length, unsigned int *strength, bool *native_completed);
 
+/* Current-thread observations of actual sntrup clears, before owner expiry.
+ * No owner address is retained. Counts saturate; end disables observation. */
+struct dssh_test_sntrup_clear_stats {
+	size_t calls;
+	size_t matches;
+	bool zero;
+};
+void dssh_test_sntrup_clear_begin(size_t matching_size);
+struct dssh_test_sntrup_clear_stats dssh_test_sntrup_clear_end(void);
+void dssh_test_sntrup_cleared(const void *buffer, size_t length);
+
 /*
  * Separate countdown for lock/condvar wrappers and the legacy join hook.
  * Independent of the OpenSSL + init countdown.

@@ -1140,6 +1140,10 @@ set(AUTH_TESTS
 dssh_add_individual_tests(dssh_test_auth dssh_auth AUTH_TESTS)
 
 dssh_add_test(conn test_conn.c)
+dssh_add_output_test(dssh_conn_channel_id_lifetime dssh_test_conn
+	"1 tests: 1 passed, 0 failed, 0 skipped" --exact release/channel_id_lifetime)
+set_tests_properties(dssh_conn_channel_id_lifetime PROPERTIES TIMEOUT 120
+	ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys)
 dssh_add_output_test(dssh_conn_channel_worker_ownership dssh_test_conn
 	"1 tests: 1 passed, 0 failed, 0 skipped" --exact release/channel_worker_ownership)
 set_tests_properties(dssh_conn_channel_worker_ownership PROPERTIES TIMEOUT 120

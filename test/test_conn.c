@@ -8319,6 +8319,7 @@ test_compression_window_rekey(void)
 #include "event_text_cases.h"
 #include "conn_helper_cases.h"
 #include "channel_worker_cases.h"
+#include "channel_id_cases.h"
 #include "setup_mailbox_cases.h"
 #include "accept_failure_cases.h"
 #include "request_framing_cases.h"
@@ -8330,6 +8331,7 @@ test_compression_window_rekey(void)
 #include "event_overflow_cases.h"
 
 static struct dssh_test_entry tests[] = {
+	{ "release/channel_id_lifetime", test_channel_id_lifetime },
 	{ "release/channel_worker_ownership", test_channel_worker_ownership },
 	{ "release/conn_setup_ownership", test_conn_setup_ownership },
 	{ "release/conn_no_start_ownership", test_conn_no_start_ownership },

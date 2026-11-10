@@ -94,6 +94,34 @@ if(DEUCESSH_CRYPTO_BACKEND STREQUAL "Botan")
 endif()
 
 include(CheckCSourceCompiles)
+include(CMakePushCheckState)
+
+# The deadline helpers classify long double values. Some C runtimes
+# implement isfinite for that type in a separate math library.
+function(dssh_find_math_link_library)
+	cmake_push_check_state(RESET)
+	set(CMAKE_TRY_COMPILE_TARGET_TYPE EXECUTABLE)
+	set(probe [[
+		#include <math.h>
+		int main(void) {
+			volatile long double value = 1.0L;
+			return isfinite(value) ? 0 : 1;
+		}
+	]])
+	check_c_source_compiles("${probe}" DSSH_LONG_DOUBLE_ISFINITE_IN_LIBC)
+	if(DSSH_LONG_DOUBLE_ISFINITE_IN_LIBC)
+		set(DSSH_MATH_LINK_LIB "" PARENT_SCOPE)
+	else()
+		set(CMAKE_REQUIRED_LIBRARIES m)
+		check_c_source_compiles("${probe}" DSSH_LONG_DOUBLE_ISFINITE_IN_LIBM)
+		if(NOT DSSH_LONG_DOUBLE_ISFINITE_IN_LIBM)
+			message(FATAL_ERROR "DeuceSSH requires isfinite for long double in <math.h>.")
+		endif()
+		set(DSSH_MATH_LINK_LIB m PARENT_SCOPE)
+	endif()
+	cmake_pop_check_state()
+endfunction()
+dssh_find_math_link_library()
 
 # Compiler language-mode support does not establish that the SDK/libc
 # ships the C11 functions <time.h> promises. Without this probe an
@@ -192,6 +220,9 @@ if(DEUCESSH_CRYPTO_BACKEND STREQUAL "Botan")
 	foreach(lib IN LISTS CMAKE_C_IMPLICIT_LINK_LIBRARIES)
 		list(REMOVE_ITEM DSSH_PC_CXX_RUNTIME_LIBRARIES "${lib}")
 	endforeach()
+	if(DSSH_MATH_LINK_LIB)
+		list(REMOVE_ITEM DSSH_PC_CXX_RUNTIME_LIBRARIES "${DSSH_MATH_LINK_LIB}")
+	endif()
 	foreach(lib IN LISTS DSSH_PC_CXX_RUNTIME_LIBRARIES)
 		if(IS_ABSOLUTE "${lib}" OR "${lib}" MATCHES "^-")
 			string(APPEND DSSH_PC_LIBS_PRIVATE " ${lib}")
@@ -199,6 +230,9 @@ if(DEUCESSH_CRYPTO_BACKEND STREQUAL "Botan")
 			string(APPEND DSSH_PC_LIBS_PRIVATE " -l${lib}")
 		endif()
 	endforeach()
+endif()
+if(DSSH_MATH_LINK_LIB)
+	string(APPEND DSSH_PC_LIBS_PRIVATE " -l${DSSH_MATH_LINK_LIB}")
 endif()
 string(STRIP "${DSSH_PC_LIBS_PRIVATE}" DSSH_PC_LIBS_PRIVATE)
 
@@ -450,7 +484,7 @@ if(DEUCESSH_BUILD_STATIC)
 		PRIVATE ${DSSH_CRYPTO_INCLUDE})
 	target_link_libraries(deucessh_static
 		INTERFACE ${DSSH_CRYPTO_LIB_INTERFACE} ${THREADS_LINK_LIB}
-			${DSSH_PRIVATE_KEY_FILE_LIB} ${DSSH_PC_CXX_RUNTIME_LIBRARIES})
+			${DSSH_PRIVATE_KEY_FILE_LIB} ${DSSH_PC_CXX_RUNTIME_LIBRARIES} ${DSSH_MATH_LINK_LIB})
 	target_compile_definitions(deucessh_static
 		PRIVATE DSSH_VERSION_STRING="${PROJECT_VERSION}"
 		$<$<CONFIG:Release>:NDEBUG>)
@@ -488,7 +522,7 @@ if(DEUCESSH_BUILD_SHARED)
 		PRIVATE ${DSSH_CRYPTO_INCLUDE})
 	target_link_libraries(deucessh_shared
 		PRIVATE ${DSSH_CRYPTO_LIB_PRIVATE} ${THREADS_LINK_LIB}
-			${DSSH_PRIVATE_KEY_FILE_LIB})
+			${DSSH_PRIVATE_KEY_FILE_LIB} ${DSSH_MATH_LINK_LIB})
 	target_compile_definitions(deucessh_shared
 		PRIVATE
 			DSSH_SHARED

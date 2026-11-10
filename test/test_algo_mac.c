@@ -11,6 +11,7 @@
 #include "deucessh-algorithms.h"
 #include "ssh-trans.h"
 #include "test/dssh_test_internal.h"
+#include "test/dssh_test_alloc.h"
 
 #ifdef DSSH_CRYPTO_OPENSSL
 #include <openssl/core_names.h>
@@ -406,7 +407,7 @@ test_hmac_sha256_persistent_ctx(void)
 	    sizeof(rfc4231_tc1_key), params) == 1);
 
 	/* First generate */
-	ASSERT_TRUE(EVP_MAC_init(ctx, NULL, 0, NULL) == 1);
+	ASSERT_TRUE(EVP_MAC_init(ctx, rfc4231_tc1_key, sizeof(rfc4231_tc1_key), NULL) == 1);
 	ASSERT_TRUE(EVP_MAC_update(ctx, rfc4231_tc1_data,
 	    rfc4231_tc1_data_len) == 1);
 	uint8_t d1[32];
@@ -414,8 +415,8 @@ test_hmac_sha256_persistent_ctx(void)
 	ASSERT_TRUE(EVP_MAC_final(ctx, d1, &outlen, 32) == 1);
 	ASSERT_MEM_EQ(d1, rfc4231_tc1_hmac, 32);
 
-	/* Second generate on same context (re-init without key) */
-	ASSERT_TRUE(EVP_MAC_init(ctx, NULL, 0, NULL) == 1);
+	/* Second generate on the same context with the same explicit key */
+	ASSERT_TRUE(EVP_MAC_init(ctx, rfc4231_tc1_key, sizeof(rfc4231_tc1_key), NULL) == 1);
 	ASSERT_TRUE(EVP_MAC_update(ctx, rfc4231_tc2_data,
 	    rfc4231_tc2_data_len) == 1);
 	uint8_t d2[32];
@@ -426,7 +427,7 @@ test_hmac_sha256_persistent_ctx(void)
 	 * rfc4231_tc2_hmac.  But it MUST be a valid HMAC of TC2 data
 	 * under TC1's key.  Verify deterministic by repeating. */
 	uint8_t d3[32];
-	ASSERT_TRUE(EVP_MAC_init(ctx, NULL, 0, NULL) == 1);
+	ASSERT_TRUE(EVP_MAC_init(ctx, rfc4231_tc1_key, sizeof(rfc4231_tc1_key), NULL) == 1);
 	ASSERT_TRUE(EVP_MAC_update(ctx, rfc4231_tc2_data,
 	    rfc4231_tc2_data_len) == 1);
 	outlen = 0;
@@ -763,6 +764,23 @@ test_mac_session_creation(void)
 	return TEST_PASS;
 }
 
+#ifdef DSSH_CRYPTO_OPENSSL
+struct mac_context_allocation {
+	size_t size;
+	unsigned calls;
+};
+
+static void
+observe_mac_context(size_t count, size_t size, void *data)
+{
+	struct mac_context_allocation *allocation = data;
+	if (count != 1 || allocation->calls == UINT_MAX)
+		abort();
+	allocation->calls++;
+	allocation->size = size;
+}
+#endif
+
 /* Exercise the registered module callbacks, rather than only provider helpers.
  * RFC 4231's short keys can be zero-padded to SSH's fixed key lengths without
  * changing HMAC: both lengths are below the hash's key-padding block size. */
@@ -802,14 +820,39 @@ test_mac_module_rfc4231_vectors(void)
 			else
 				memset(key, 0xaa, 20);
 			dssh_mac_ctx *ctx = NULL;
+#ifdef DSSH_CRYPTO_OPENSSL
+			struct mac_context_allocation allocation = {0};
+			dssh_test_alloc_observe_allocations(observe_mac_context, &allocation);
+			int init_result = mac->init(key, &ctx);
+			dssh_test_alloc_observe_allocations(NULL, NULL);
+			ASSERT_OK(init_result);
+#else
 			ASSERT_OK(mac->init(key, &ctx));
+#endif
 			ASSERT_NOT_NULL(ctx);
 			uint8_t output[2][66];
 			memset(output, 0x5a, sizeof(output));
+#ifdef DSSH_CRYPTO_OPENSSL
+			dssh_test_alloc_fail_after(0);
+#endif
 			int first = mac->generate(data[vector], data_len[vector], &output[0][1], ctx);
 			int second = first == 0
 			    ? mac->generate(data[vector], data_len[vector], &output[1][1], ctx) : first;
+#ifdef DSSH_CRYPTO_OPENSSL
+			int generation_allocations = dssh_test_alloc_count();
+			dssh_test_alloc_reset();
+			if (allocation.calls == 1)
+				dssh_test_alloc_watch_free(ctx, allocation.size);
+#endif
 			mac->cleanup(ctx);
+#ifdef DSSH_CRYPTO_OPENSSL
+			bool cleared = false;
+			bool released = dssh_test_alloc_watched_free(&cleared);
+			dssh_test_alloc_watch_free(NULL, 0);
+			ASSERT_EQ(allocation.calls, 1);
+			ASSERT_EQ(generation_allocations, 0);
+			ASSERT_TRUE(released && cleared);
+#endif
 			ASSERT_OK(first);
 			ASSERT_OK(second);
 			for (size_t round = 0; round < 2; round++) {

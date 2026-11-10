@@ -140,7 +140,7 @@ target_include_directories(deucessh_test_lib SYSTEM
 	PRIVATE ${DSSH_CRYPTO_INCLUDE})
 target_link_libraries(deucessh_test_lib
 	INTERFACE ${DSSH_CRYPTO_LIB_INTERFACE} ${THREADS_LINK_LIB}
-		${DSSH_PRIVATE_KEY_FILE_LIB})
+		${DSSH_PRIVATE_KEY_FILE_LIB} ${DSSH_MATH_LINK_LIB})
 target_compile_options(deucessh_test_lib PRIVATE
 	${DEUCESSH_COMPILE_OPTIONS}
 	$<$<OR:$<C_COMPILER_ID:Clang>,$<C_COMPILER_ID:AppleClang>,$<C_COMPILER_ID:GNU>>:

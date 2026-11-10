@@ -251,8 +251,9 @@ wait_contract_case(unsigned path, unsigned mode)
 			abort();
 		if (path == 6 || path == 7)
 			valid = valid && !wake->channel.request_pending && !wake->channel.request_responded;
+		/* A timeout ends this wait. The peer's OPEN reply is still due. */
 		if (mode == 4 && path == 5)
-			valid = valid && !wake->channel.open_pending;
+			valid = valid && wake->channel.open_pending;
 		if (mtx_unlock(&wake->channel.buf_mtx) != thrd_success)
 			abort();
 		/* A completed operation has released the associated mutex. */

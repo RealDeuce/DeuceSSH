@@ -166,28 +166,26 @@ by adding bytes to `remote_window` and waking poll waiters.
 > When a party will no longer send more data to a channel, it **SHOULD**
 > send SSH_MSG_CHANNEL_EOF.
 
-**CONFORMS** — `conn_send_eof()` (internal) sends CHANNEL_EOF.
-Tracks `eof_sent` to prevent double-send.
+**CONFORMS** — `send_eof()` tracks `eof_sent` and sends CHANNEL_EOF.
+`dssh_chan_shutwr()` exposes the half-close operation.
 
 ### 5.3-2
 > Upon receiving [SSH_MSG_CHANNEL_CLOSE], a party **MUST** send back an
 > SSH_MSG_CHANNEL_CLOSE unless it has already sent this message for the
 > channel.
 
-**CONFORMS** — `conn_close()` (internal) tracks `close_sent` and is a
-no-op if already sent (prevents double-close).  The demux thread sets
-`close_received` when the peer sends CLOSE and wakes poll waiters.
-The application cleans up its resources and then calls
-`dssh_session_close()` or `dssh_channel_close()` to send the
-reciprocal CLOSE (which the library skips if it already sent one).
-The channel struct tracks both `close_sent` and `close_received`.
+**APPLICATION** — A live channel's peer CLOSE wakes polling callers or
+reaches the event callback. The application calls `dssh_chan_close()` to
+finish the exchange. The library handles the protocol response during setup
+cancellation and after detachment. A private record retains the channel
+number until both CLOSE directions are complete. See [identifier review](release-1.0-evidence/channel-identifier-review.md).
 
 ### 5.3-3
 > A party **MAY** send SSH_MSG_CHANNEL_CLOSE without having sent or
 > received SSH_MSG_CHANNEL_EOF.
 
-**CONFORMS** — `dssh_session_close()` / `dssh_channel_close()`
-can be called at any time.
+**CONFORMS** — `conn_close()` can send CLOSE independently of EOF, including
+when closing a channel during setup.
 
 ### 5.3-4
 > It is **RECOMMENDED** that all data sent before this message be
@@ -437,12 +435,12 @@ application's responsibility.
   now send the required reply (when constructible) then disconnect with
   PROTOCOL_ERROR.  Prevents reply-ordering corruption from speculative
   replies when `want_reply` is unknowable.
-- **CHANNEL_CLOSE reciprocal** (5.3-2) — `close_sent`/`close_received`
-  tracking, idempotent `conn_close()` (internal); application calls
-  `session_close()` / `channel_close()`.
+- **CHANNEL_CLOSE reciprocal** (5.3-2) — The application calls
+  `dssh_chan_close()` for a live channel. The protocol record keeps the number
+  reserved through the reciprocal exchange.
 - **Window overflow** (5.2-2) — saturating `window_add()`.
-- **CHANNEL_EOF sending** (5.3-1) — `conn_send_eof()` (internal) with
-  tracking; called automatically by `session_close()` / `channel_close()`.
+- **CHANNEL_EOF sending** (5.3-1) — `send_eof()` tracks the send. It is used by
+  `dssh_chan_shutwr()` and `dssh_chan_close()`.
 - **Channel request types** (5.4-1) — pty-req, shell, exec, subsystem,
   window-change all implemented with proper wait-for-response mechanism
   via `send_channel_request_wait()`.

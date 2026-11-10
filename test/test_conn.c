@@ -2756,6 +2756,9 @@ test_open_response_state(void)
 		ch->open = false;
 		ch->open_pending = true;
 		ASSERT_EQ(mtx_unlock(&ch->buf_mtx), thrd_success);
+		ASSERT_EQ(mtx_lock(&ch->sess->channel_mtx), thrd_success);
+		ch->protocol_id->phase = DSSH_CHANNEL_ID_OPENING;
+		ASSERT_EQ(mtx_unlock(&ch->sess->channel_mtx), thrd_success);
 		uint8_t eof[5];
 		size_t eof_pos = 0;
 		eof[eof_pos++] = SSH_MSG_CHANNEL_EOF;
@@ -2791,6 +2794,9 @@ test_open_response_state(void)
 		ch->close_received = false;
 		ch->close_sent = true;
 		ASSERT_EQ(mtx_unlock(&ch->buf_mtx), thrd_success);
+		ASSERT_EQ(mtx_lock(&ch->sess->channel_mtx), thrd_success);
+		ch->protocol_id->phase = DSSH_CHANNEL_ID_OPENING;
+		ASSERT_EQ(mtx_unlock(&ch->sess->channel_mtx), thrd_success);
 		ASSERT_EQ(dssh_test_demux_dispatch(ch->sess, confirmation[0], confirmation, 17), DSSH_ERROR_PARSE);
 		ASSERT_EQ(mtx_lock(&ch->buf_mtx), thrd_success);
 		ch->close_sent = false;
@@ -8332,6 +8338,8 @@ test_compression_window_rekey(void)
 
 static struct dssh_test_entry tests[] = {
 	{ "release/channel_id_lifetime", test_channel_id_lifetime },
+	{ "release/channel_id_late_reply", test_channel_id_late_reply },
+	{ "release/channel_id_backpressure", test_channel_id_backpressure },
 	{ "release/channel_worker_ownership", test_channel_worker_ownership },
 	{ "release/conn_setup_ownership", test_conn_setup_ownership },
 	{ "release/conn_no_start_ownership", test_conn_no_start_ownership },

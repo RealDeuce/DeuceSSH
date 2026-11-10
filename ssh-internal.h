@@ -94,6 +94,8 @@ struct dssh_event_queue {
  * Fixed-capacity ring buffer without allocation.  The demux rejects new
  * opens at capacity and continues dispatching existing channels. */
 #define DSSH_ACCEPT_QUEUE_CAP 8
+/* Stop admitting channels while this many detached IDs await retirement. */
+#define DSSH_RETIRED_CHANNEL_ID_CAP 1024
 
 struct dssh_incoming_open {
 	size_t   channel_type_len;
@@ -325,6 +327,7 @@ enum dssh_channel_dispatch_state {
 struct dssh_channel_s {
 	/* Pointers and size_t (pointer-sized) */
 	struct dssh_session_s *sess; /* back-pointer (new API takes ch only) */
+	struct dssh_channel_id *protocol_id;
 	uint8_t               *setup_payload;
 	size_t                 setup_payload_len;
 	size_t                 setup_payload_capacity;
@@ -411,6 +414,28 @@ struct dssh_channel_s {
 	} buf;
 };
 
+/* Private protocol ownership outlives an application channel when a peer
+ * response is still outstanding. The local number is immutable while
+ * referenced. All other fields are protected by channel_mtx. */
+enum dssh_channel_id_phase {
+	DSSH_CHANNEL_ID_RESERVED,
+	DSSH_CHANNEL_ID_OPENING,
+	DSSH_CHANNEL_ID_CONFIRMED,
+	DSSH_CHANNEL_ID_FAILED
+};
+
+struct dssh_channel_id {
+	struct dssh_channel_id *next;
+	size_t refs;
+	uint32_t local;
+	uint32_t remote;
+	enum dssh_channel_id_phase phase;
+	bool retired;
+	bool close_started;
+	bool close_sent;
+	bool close_received;
+};
+
 struct dssh_session_s {
 	/* Pointers and size_t (pointer-sized) -- callbacks and cbdata */
 	void *tx_cbdata;
@@ -450,6 +475,9 @@ struct dssh_session_s {
 	struct dssh_channel_s **channels;
 	size_t                  channel_count;
 	size_t                  channel_capacity;
+	struct dssh_channel_id *channel_ids;
+	struct dssh_channel_id *free_channel_ids;
+	size_t retired_channel_ids;
 
 	/* Embedded transport state (large, naturally aligned) */
 	struct dssh_transport_state_s trans;

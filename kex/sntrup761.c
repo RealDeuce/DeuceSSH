@@ -436,6 +436,8 @@ Encode(unsigned char *out, const uint16_t *R, const uint16_t *M, long long len)
 			M2[i / 2] = M[i];
 		}
 		Encode(out, R2, M2, (len + 1) / 2);
+		sntrup_clear(R2, sizeof(R2));
+		sntrup_clear(M2, sizeof(M2));
 	}
 }
 
@@ -488,6 +490,10 @@ Decode(uint16_t *out, const unsigned char *S, const uint16_t *M, long long len)
 		}
 		if (i < len)
 			*out++ = R2[i / 2];
+		sntrup_clear(R2, sizeof(R2));
+		sntrup_clear(M2, sizeof(M2));
+		sntrup_clear(bottomr, sizeof(bottomr));
+		sntrup_clear(bottomt, sizeof(bottomt));
 	}
 }
 
@@ -515,6 +521,7 @@ R3_mult(small *h, const small *f, const small *g)
 		fg[i - p + 1] += fg[i];
 	for (i = 0; i < p; ++i)
 		h[i] = F3_freeze(fg[i]);
+	sntrup_clear(fg, sizeof(fg));
 }
 
 static int
@@ -562,7 +569,12 @@ R3_recip(small *out, const small *in)
 	sign = f[0];
 	for (i = 0; i < p; ++i)
 		out[i] = (small)(sign * v[p - 1 - i]);
-	return (int16_t)crypto_int16_nonzero_mask((crypto_int16)delta);
+	int ret = (int16_t)crypto_int16_nonzero_mask((crypto_int16)delta);
+	sntrup_clear(f, sizeof(f));
+	sntrup_clear(g, sizeof(g));
+	sntrup_clear(v, sizeof(v));
+	sntrup_clear(r, sizeof(r));
+	return ret;
 }
 
 static void
@@ -581,6 +593,7 @@ Rq_mult_small(Fq *h, const Fq *f, const small *g)
 		fg[i - p + 1] += fg[i];
 	for (i = 0; i < p; ++i)
 		h[i] = Fq_freeze(fg[i]);
+	sntrup_clear(fg, sizeof(fg));
 }
 
 static void
@@ -650,7 +663,12 @@ Rq_recip3(Fq *out, const small *in)
 	scale = Fq_recip(f[0]);
 	for (i = 0; i < p; ++i)
 		out[i] = Fq_freeze(scale * (int32_t)v[p - 1 - i]);
-	return (int16_t)crypto_int16_nonzero_mask((crypto_int16)delta);
+	int ret = (int16_t)crypto_int16_nonzero_mask((crypto_int16)delta);
+	sntrup_clear(f, sizeof(f));
+	sntrup_clear(g, sizeof(g));
+	sntrup_clear(v, sizeof(v));
+	sntrup_clear(r, sizeof(r));
+	return ret;
 }
 
 static void
@@ -673,6 +691,7 @@ Short_fromlist(small *out, const uint32_t *in)
 	crypto_sort_uint32(L, p);
 	for (i = 0; i < p; ++i)
 		out[i] = (small)((L[i] & 3) - 1);
+	sntrup_clear(L, sizeof(L));
 }
 
 static int
@@ -680,27 +699,32 @@ Hash_prefix(unsigned char *out, int b, const unsigned char *in, int inlen)
 {
 	unsigned char x[crypto_kem_sntrup761_PUBLICKEYBYTES + 1], h[64];
 	int           i;
+	int ret = -1;
 	if (inlen < 0 || (size_t)inlen > sizeof(x) - 1)
-		return -1;
+		goto done;
 	x[0] = (unsigned char)b;
 	for (i = 0; i < inlen; ++i)
 		x[i + 1] = in[i];
 	if (crypto_hash_sha512(h, x, (unsigned long long)(inlen + 1)) < 0)
-		return -1;
+		goto done;
 	for (i = 0; i < 32; ++i)
 		out[i] = h[i];
-	return 0;
+	ret = 0;
+done:
+	sntrup_clear(x, sizeof(x));
+	sntrup_clear(h, sizeof(h));
+	return ret;
 }
 
 static int
 Short_random(small *out)
 {
 	uint32_t L[p];
-	if (randombytes(L, sizeof(L)) < 0)
-		return -1;
-	Short_fromlist(out, L);
+	int ret = randombytes(L, sizeof(L));
+	if (ret == 0)
+		Short_fromlist(out, L);
 	sntrup_clear(L, sizeof(L));
-	return 0;
+	return ret;
 }
 
 static int
@@ -708,12 +732,13 @@ Small_random(small *out)
 {
 	int      i;
 	uint32_t L[p];
-	if (randombytes(L, sizeof(L)) < 0)
-		return -1;
-	for (i = 0; i < p; ++i)
-		out[i] = (small)((((L[i] & 0x3fffffff) * 3) >> 30) - 1);
+	int ret = randombytes(L, sizeof(L));
+	if (ret == 0) {
+		for (i = 0; i < p; ++i)
+			out[i] = (small)((((L[i] & 0x3fffffff) * 3) >> 30) - 1);
+	}
 	sntrup_clear(L, sizeof(L));
-	return 0;
+	return ret;
 }
 
 static int
@@ -721,20 +746,26 @@ KeyGen(Fq *h, small *f, small *ginv)
 {
 	small g[p];
 	Fq    finv[p];
+	int ret = -1;
 	for (;;) {
 		int result;
 		if (Small_random(g) < 0)
-			return -1;
+			goto done;
 		result = R3_recip(ginv, g);
 		crypto_declassify(&result, sizeof result);
 		if (result == 0)
 			break;
 	}
 	if (Short_random(f) < 0)
-		return -1;
-	Rq_recip3(finv, f);
+		goto done;
+	if (Rq_recip3(finv, f) < 0)
+		goto done;
 	Rq_mult_small(h, finv, g);
-	return 0;
+	ret = 0;
+done:
+	sntrup_clear(g, sizeof(g));
+	sntrup_clear(finv, sizeof(finv));
+	return ret;
 }
 
 static void
@@ -743,6 +774,7 @@ Encrypt(Fq *c, const small *r, const Fq *h)
 	Fq hr[p];
 	Rq_mult_small(hr, h, r);
 	Round(c, hr);
+	sntrup_clear(hr, sizeof(hr));
 }
 
 static void
@@ -760,6 +792,11 @@ Decrypt(small *r, const Fq *c, const small *f, const small *ginv)
 		r[i] = (small)(((ev[i] ^ 1) & ~mask) ^ 1);
 	for (i = w; i < p; ++i)
 		r[i] = (small)(ev[i] & ~mask);
+	sntrup_clear(cf, sizeof(cf));
+	sntrup_clear(cf3, sizeof(cf3));
+	sntrup_clear(e, sizeof(e));
+	sntrup_clear(ev, sizeof(ev));
+	sntrup_clear(&mask, sizeof(mask));
 }
 
 static void
@@ -797,6 +834,8 @@ Rq_encode(unsigned char *s, const Fq *r)
 	for (i = 0; i < p; ++i)
 		M[i] = q;
 	Encode(s, R, M, p);
+	sntrup_clear(R, sizeof(R));
+	sntrup_clear(M, sizeof(M));
 }
 
 static void
@@ -809,6 +848,8 @@ Rq_decode(Fq *r, const unsigned char *s)
 	Decode(R, s, M, p);
 	for (i = 0; i < p; ++i)
 		r[i] = ((Fq)R[i]) - q12;
+	sntrup_clear(R, sizeof(R));
+	sntrup_clear(M, sizeof(M));
 }
 
 static void
@@ -821,6 +862,8 @@ Rounded_encode(unsigned char *s, const Fq *r)
 	for (i = 0; i < p; ++i)
 		M[i] = (q + 2) / 3;
 	Encode(s, R, M, p);
+	sntrup_clear(R, sizeof(R));
+	sntrup_clear(M, sizeof(M));
 }
 
 static void
@@ -833,6 +876,8 @@ Rounded_decode(Fq *r, const unsigned char *s)
 	Decode(R, s, M, p);
 	for (i = 0; i < p; ++i)
 		r[i] = (Fq)(R[i] * 3 - q12);
+	sntrup_clear(R, sizeof(R));
+	sntrup_clear(M, sizeof(M));
 }
 
 static int
@@ -840,12 +885,16 @@ ZKeyGen(unsigned char *pk, unsigned char *sk)
 {
 	Fq    h[p];
 	small f[p], v[p];
-	if (KeyGen(h, f, v) < 0)
-		return -1;
-	Rq_encode(pk, h);
-	Small_encode(sk, f);
-	Small_encode(sk + Small_bytes, v);
-	return 0;
+	int ret = KeyGen(h, f, v);
+	if (ret == 0) {
+		Rq_encode(pk, h);
+		Small_encode(sk, f);
+		Small_encode(sk + Small_bytes, v);
+	}
+	sntrup_clear(h, sizeof(h));
+	sntrup_clear(f, sizeof(f));
+	sntrup_clear(v, sizeof(v));
+	return ret;
 }
 
 static void
@@ -855,6 +904,8 @@ ZEncrypt(unsigned char *C, const Inputs r, const unsigned char *pk)
 	Rq_decode(h, pk);
 	Encrypt(c, r, h);
 	Rounded_encode(C, c);
+	sntrup_clear(h, sizeof(h));
+	sntrup_clear(c, sizeof(c));
 }
 
 static void
@@ -866,6 +917,9 @@ ZDecrypt(Inputs r, const unsigned char *C, const unsigned char *sk)
 	Small_decode(v, sk + Small_bytes);
 	Rounded_decode(c, C);
 	Decrypt(r, c, f, v);
+	sntrup_clear(f, sizeof(f));
+	sntrup_clear(v, sizeof(v));
+	sntrup_clear(c, sizeof(c));
 }
 
 static int
@@ -873,11 +927,15 @@ HashConfirm(unsigned char *h, const unsigned char *r, const unsigned char *cache
 {
 	unsigned char x[Hash_bytes * 2];
 	int           i;
-	if (Hash_prefix(x, 3, r, Small_bytes) < 0)
-		return -1;
+	int ret = Hash_prefix(x, 3, r, Small_bytes);
+	if (ret < 0)
+		goto done;
 	for (i = 0; i < Hash_bytes; ++i)
 		x[Hash_bytes + i] = cache[i];
-	return Hash_prefix(h, 2, x, sizeof x);
+	ret = Hash_prefix(h, 2, x, sizeof x);
+done:
+	sntrup_clear(x, sizeof(x));
+	return ret;
 }
 
 static int
@@ -885,11 +943,15 @@ HashSession(unsigned char *k, int b, const unsigned char *y, const unsigned char
 {
 	unsigned char x[Hash_bytes + crypto_kem_sntrup761_CIPHERTEXTBYTES];
 	int           i;
-	if (Hash_prefix(x, 3, y, Small_bytes) < 0)
-		return -1;
+	int ret = Hash_prefix(x, 3, y, Small_bytes);
+	if (ret < 0)
+		goto done;
 	for (i = 0; i < crypto_kem_sntrup761_CIPHERTEXTBYTES; ++i)
 		x[Hash_bytes + i] = z[i];
-	return Hash_prefix(k, b, x, sizeof x);
+	ret = Hash_prefix(k, b, x, sizeof x);
+done:
+	sntrup_clear(x, sizeof(x));
+	return ret;
 }
 
 DSSH_PRIVATE int
@@ -921,13 +983,21 @@ crypto_kem_sntrup761_enc(unsigned char *c, unsigned char *k, const unsigned char
 {
 	Inputs        r;
 	unsigned char r_enc[Small_bytes], cache[Hash_bytes];
-	if (Hash_prefix(cache, 4, pk, crypto_kem_sntrup761_PUBLICKEYBYTES) < 0)
-		return -1;
-	if (Short_random(r) < 0)
-		return -1;
-	if (Hide(c, r_enc, r, pk, cache) < 0)
-		return -1;
-	return HashSession(k, 1, r_enc, c);
+	int ret = Hash_prefix(cache, 4, pk, crypto_kem_sntrup761_PUBLICKEYBYTES);
+	if (ret < 0)
+		goto done;
+	ret = Short_random(r);
+	if (ret < 0)
+		goto done;
+	ret = Hide(c, r_enc, r, pk, cache);
+	if (ret < 0)
+		goto done;
+	ret = HashSession(k, 1, r_enc, c);
+done:
+	sntrup_clear(r, sizeof(r));
+	sntrup_clear(r_enc, sizeof(r_enc));
+	sntrup_clear(cache, sizeof(cache));
+	return ret;
 }
 
 static int
@@ -950,10 +1020,17 @@ crypto_kem_sntrup761_dec(unsigned char *k, const unsigned char *c, const unsigne
 	unsigned char        r_enc[Small_bytes], cnew[crypto_kem_sntrup761_CIPHERTEXTBYTES];
 	int                  mask, i;
 	ZDecrypt(r, c, sk);
-	if (Hide(cnew, r_enc, r, pk, cache) < 0)
-		return -1;
+	int ret = Hide(cnew, r_enc, r, pk, cache);
+	if (ret < 0)
+		goto done;
 	mask = Ciphertexts_diff_mask(c, cnew);
 	for (i = 0; i < Small_bytes; ++i)
 		r_enc[i] = (unsigned char)(r_enc[i] ^ (mask & (r_enc[i] ^ rho[i])));
-	return HashSession(k, 1 + mask, r_enc, c);
+	ret = HashSession(k, 1 + mask, r_enc, c);
+done:
+	sntrup_clear(r, sizeof(r));
+	sntrup_clear(r_enc, sizeof(r_enc));
+	sntrup_clear(cnew, sizeof(cnew));
+	sntrup_clear(&mask, sizeof(mask));
+	return ret;
 }

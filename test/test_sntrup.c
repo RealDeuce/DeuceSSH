@@ -8,6 +8,7 @@
 #include "deucessh-crypto.h"
 #include "kex/sntrup761.h"
 
+#ifdef DSSH_CRYPTO_OPENSSL
 static bool
 filled(const uint8_t *buffer, size_t length, uint8_t value)
 {
@@ -17,6 +18,7 @@ filled(const uint8_t *buffer, size_t length, uint8_t value)
 	}
 	return true;
 }
+#endif
 
 static int
 test_sntrup_roundtrip(void)

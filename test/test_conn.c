@@ -8332,11 +8332,13 @@ test_compression_window_rekey(void)
 #include "control_framing_cases.h"
 #include "window_credit_cases.h"
 #include "queued_control_cases.h"
+#include "tx_slot_cases.h"
 #include "accept_callback_cases.h"
 #include "channel_params_cases.h"
 #include "event_overflow_cases.h"
 
 static struct dssh_test_entry tests[] = {
+	{ "release/tx_slot_admission", test_tx_slot_admission },
 	{ "release/channel_id_lifetime", test_channel_id_lifetime },
 	{ "release/channel_id_late_reply", test_channel_id_late_reply },
 	{ "release/channel_id_backpressure", test_channel_id_backpressure },

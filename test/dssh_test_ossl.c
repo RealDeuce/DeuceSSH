@@ -211,6 +211,29 @@ static _Thread_local bool encrypt_length_override;
 static _Thread_local int encrypt_length_value;
 static _Thread_local bool encrypt_length_seen;
 static _Thread_local int encrypt_native_length;
+static _Thread_local bool random_post_failure;
+static _Thread_local bool random_seen;
+static _Thread_local size_t random_length;
+static _Thread_local unsigned int random_strength;
+static _Thread_local bool random_completed;
+
+void
+dssh_test_ossl_random_post_failure(bool enabled)
+{
+	random_post_failure = enabled;
+}
+
+bool
+dssh_test_ossl_random_observed(size_t *length, unsigned int *strength, bool *native_completed)
+{
+	if (length != NULL)
+		*length = random_length;
+	if (strength != NULL)
+		*strength = random_strength;
+	if (native_completed != NULL)
+		*native_completed = random_completed;
+	return random_seen;
+}
 
 void
 dssh_test_ossl_encrypt_length(int value)
@@ -340,6 +363,11 @@ dssh_test_ossl_reset(void)
 	encrypt_length_override = false;
 	encrypt_length_seen = false;
 	encrypt_native_length = 0;
+	random_post_failure = false;
+	random_seen = false;
+	random_length = 0;
+	random_strength = 0;
+	random_completed = false;
 #endif
 	dssh_test_clock_reset();
 }
@@ -836,11 +864,19 @@ dssh_test_EVP_Digest(const void *data, size_t count, unsigned char *md,
 }
 
 int
-dssh_test_RAND_bytes(unsigned char *buf, int num)
+dssh_test_RAND_priv_bytes_ex(OSSL_LIB_CTX *ctx, unsigned char *buf, size_t num, unsigned int strength)
 {
+	random_seen = true;
+	random_length = num;
+	random_strength = strength;
+	random_completed = false;
 	if (should_fail())
 		return 0;
-	return RAND_bytes(buf, num);
+	int ret = RAND_priv_bytes_ex(ctx, buf, num, strength);
+	random_completed = ret == 1;
+	if (random_post_failure)
+		return 0;
+	return ret;
 }
 
 int

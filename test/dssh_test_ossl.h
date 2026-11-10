@@ -16,6 +16,7 @@
 
 #include <stdatomic.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <threads.h>
 #include <time.h>
 
@@ -34,6 +35,10 @@ void dssh_test_ossl_digest_length(unsigned int value);
 void dssh_test_ossl_encoded_length(int value);
 void dssh_test_ossl_encrypt_length(int value);
 bool dssh_test_ossl_encrypt_observed(int *actual_length);
+/* Observe the actual private RNG request. Post-failure runs native generation
+ * first and reports failure afterward; it does not promise output rollback. */
+void dssh_test_ossl_random_post_failure(bool enabled);
+bool dssh_test_ossl_random_observed(size_t *length, unsigned int *strength, bool *native_completed);
 
 /*
  * Separate countdown for lock/condvar wrappers and the legacy join hook.

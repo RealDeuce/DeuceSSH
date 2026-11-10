@@ -407,7 +407,7 @@ int dssh_test_EVP_PKEY_get_raw_public_key(const EVP_PKEY *pkey, unsigned char *p
 int dssh_test_EVP_PKEY_get_bn_param(const EVP_PKEY *pkey, const char *key_name, BIGNUM **bn);
 int dssh_test_EVP_Digest(const void *data, size_t count, unsigned char *md, unsigned int *size, const EVP_MD *type,
     ENGINE *impl);
-int dssh_test_RAND_bytes(unsigned char *buf, int num);
+int dssh_test_RAND_priv_bytes_ex(OSSL_LIB_CTX *ctx, unsigned char *buf, size_t num, unsigned int strength);
 int dssh_test_BN_mod_exp(BIGNUM *r, const BIGNUM *a, const BIGNUM *p, const BIGNUM *m, BN_CTX *ctx);
 int dssh_test_BN_rand(BIGNUM *rnd, int bits, int top, int bottom);
 BIGNUM *dssh_test_BN_bin2bn(const unsigned char *s, int len, BIGNUM *ret);
@@ -441,7 +441,7 @@ int     dssh_test_EVP_PKEY_CTX_set_params(EVP_PKEY_CTX *ctx, const OSSL_PARAM *p
  #define EVP_PKEY_fromdata(c, p, s, pa)       dssh_test_EVP_PKEY_fromdata(c, p, s, pa)
  #define EVP_PKEY_get_raw_public_key(p, b, l) dssh_test_EVP_PKEY_get_raw_public_key(p, b, l)
  #define EVP_PKEY_get_bn_param(p, k, b)       dssh_test_EVP_PKEY_get_bn_param(p, k, b)
- #define RAND_bytes(b, n)                     dssh_test_RAND_bytes(b, n)
+ #define RAND_priv_bytes_ex(c, b, n, s)       dssh_test_RAND_priv_bytes_ex(c, b, n, s)
  #define BN_mod_exp(r, a, p, m, c)            dssh_test_BN_mod_exp(r, a, p, m, c)
  #define BN_rand(r, b, t, bo)                 dssh_test_BN_rand(r, b, t, bo)
  #define BN_bin2bn(s, l, r)                   dssh_test_BN_bin2bn(s, l, r)

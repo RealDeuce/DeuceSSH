@@ -352,6 +352,47 @@ test_contract_oneshot_rng_errors(void)
 	ASSERT_TRUE(valid);
 	return TEST_PASS;
 }
+
+static int
+test_contract_rng_request(void)
+{
+	uint8_t frame[66];
+	memset(frame, 0xa5, sizeof(frame));
+	dssh_test_ossl_reset();
+	bool valid = dssh_random(NULL, 32) == DSSH_ERROR_INVALID
+	    && dssh_random(frame + 1, 0) == 0;
+#if SIZE_MAX > INT_MAX
+	size_t too_long = INT_MAX;
+	too_long++;
+	valid = valid && dssh_random(frame + 1, too_long) == DSSH_ERROR_INVALID;
+#endif
+	valid = valid && !dssh_test_ossl_random_observed(NULL, NULL, NULL)
+	    && dssh_test_ossl_count() == 0 && crypto_filled(frame, sizeof(frame), 0xa5);
+	for (unsigned int mode = 0; mode < 3; mode++) {
+		dssh_test_ossl_reset();
+		dssh_test_ossl_fail_after(INT_MAX);
+		memset(frame, 0xa5, sizeof(frame));
+		if (mode == 1)
+			dssh_test_ossl_fail_after(0);
+		if (mode == 2)
+			dssh_test_ossl_random_post_failure(true);
+		int ret = dssh_random(frame + 1, 64);
+		size_t length = 0;
+		unsigned int strength = 0;
+		bool completed = false;
+		bool observed = dssh_test_ossl_random_observed(&length, &strength, &completed);
+		int expected = mode == 0 ? 0 : DSSH_ERROR_INIT;
+		valid = valid && ret == expected && observed && length == 64
+		    && strength == 256 && completed == (mode != 1)
+		    && dssh_test_ossl_count() == 1 && frame[0] == 0xa5 && frame[65] == 0xa5;
+		if (mode == 1)
+			valid = valid && crypto_filled(frame + 1, 64, 0xa5);
+	}
+	dssh_test_ossl_reset();
+	valid = valid && !dssh_test_ossl_random_observed(NULL, NULL, NULL);
+	ASSERT_TRUE(valid);
+	return TEST_PASS;
+}
 #endif
 
 #endif

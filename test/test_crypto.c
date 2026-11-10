@@ -515,6 +515,7 @@ static struct dssh_test_entry tests[] = {
 	{ "contract/hash_reported_lengths", test_contract_hash_reported_lengths },
 	{ "contract/hash_publication", test_contract_hash_publication },
 	{ "contract/oneshot_rng_errors", test_contract_oneshot_rng_errors },
+	{ "contract/rng_request", test_contract_rng_request },
 #endif
 	{ "hash/sha256",           test_hash_sha256 },
 	{ "hash/sha256_data",      test_hash_sha256_data },

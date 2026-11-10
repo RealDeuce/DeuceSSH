@@ -220,9 +220,7 @@ dssh_random(uint8_t *buf, size_t len)
 	if (len > INT_MAX)
 		return DSSH_ERROR_INVALID;
 #endif
-	int len_i = (int)len;
-
-	if (RAND_bytes(buf, len_i) != 1)
+	if (RAND_priv_bytes_ex(NULL, buf, len, 256) != 1)
 		return DSSH_ERROR_INIT;
 	return 0;
 }

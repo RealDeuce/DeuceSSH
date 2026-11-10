@@ -1003,6 +1003,100 @@ test_serialize_pos_past_bufsz(void)
 }
 
 static int
+test_serialize_uint32_position_storage(void)
+{
+	size_t storage[4];
+	uint8_t before[sizeof(storage)];
+	uint8_t *bytes = (uint8_t *)storage;
+	size_t *pos = &storage[1];
+	size_t owner_start = sizeof(storage[0]);
+	size_t owner_end = owner_start + sizeof(*pos);
+	const uint32_t values[] = {0, UINT32_C(0x12345678), UINT32_MAX};
+	const uint8_t encodings[][4] = {
+		{0, 0, 0, 0}, {0x12, 0x34, 0x56, 0x78}, {0xff, 0xff, 0xff, 0xff}
+	};
+	size_t rejected = 0;
+	size_t accepted = 0;
+	for (size_t v = 0; v < sizeof(values) / sizeof(values[0]); v++) {
+		for (size_t offset = 0; offset <= sizeof(storage) - 4; offset++) {
+			memset(storage, 0xa5, sizeof(storage));
+			*pos = offset;
+			memcpy(before, storage, sizeof(storage));
+			int ret = dssh_serialize_uint32(values[v], bytes, sizeof(storage), pos);
+			/* Array elements give the oracle exact object offsets, without
+			 * depending on byte order or the production pointer comparisons. */
+			if (offset < owner_end && offset + 4 > owner_start) {
+				ASSERT_EQ(ret, DSSH_ERROR_INVALID);
+				ASSERT_EQ_U(*pos, offset);
+				ASSERT_MEM_EQ(storage, before, sizeof(storage));
+				rejected++;
+				continue;
+			}
+			ASSERT_OK(ret);
+			ASSERT_EQ_U(*pos, offset + 4);
+			ASSERT_MEM_EQ(bytes + offset, encodings[v], 4);
+			for (size_t i = 0; i < sizeof(storage); i++) {
+				if ((i < offset || i >= offset + 4)
+				    && (i < owner_start || i >= owner_end))
+					ASSERT_EQ(bytes[i], before[i]);
+			}
+			accepted++;
+		}
+	}
+	ASSERT_TRUE(rejected > 0);
+	ASSERT_TRUE(accepted > 0);
+	return TEST_PASS;
+}
+
+static int
+test_serialize_uint32_bounds(void)
+{
+	uint8_t bytes[12];
+	uint8_t expected[sizeof(bytes)];
+	const uint8_t encoded[] = {0x12, 0x34, 0x56, 0x78};
+	for (size_t capacity = 0; capacity <= sizeof(bytes); capacity++) {
+		for (size_t offset = 0; offset <= sizeof(bytes) + 4; offset++) {
+			memset(bytes, 0xa5, sizeof(bytes));
+			memcpy(expected, bytes, sizeof(bytes));
+			size_t pos = offset;
+			int ret = dssh_serialize_uint32(UINT32_C(0x12345678), bytes, capacity, &pos);
+			if (offset > capacity || capacity - offset < 4) {
+				ASSERT_EQ(ret, DSSH_ERROR_TOOLONG);
+				ASSERT_EQ_U(pos, offset);
+			}
+			else {
+				ASSERT_OK(ret);
+				ASSERT_EQ_U(pos, offset + 4);
+				memcpy(expected + offset, encoded, sizeof(encoded));
+			}
+			ASSERT_MEM_EQ(bytes, expected, sizeof(bytes));
+		}
+	}
+	size_t pos = SIZE_MAX;
+	memset(bytes, 0xa5, sizeof(bytes));
+	memcpy(expected, bytes, sizeof(bytes));
+	ASSERT_EQ(dssh_serialize_uint32(0, bytes, sizeof(bytes), &pos), DSSH_ERROR_TOOLONG);
+	ASSERT_EQ_U(pos, SIZE_MAX);
+	ASSERT_MEM_EQ(bytes, expected, sizeof(bytes));
+	return TEST_PASS;
+}
+
+static int
+test_parse_uint32_overlapping_output(void)
+{
+	uint32_t storage[4];
+	uint8_t *bytes = (uint8_t *)storage;
+	const uint8_t encoded[] = {0x12, 0x34, 0x56, 0x78};
+	for (size_t offset = 0; offset <= sizeof(storage) - 4; offset++) {
+		memset(storage, 0, sizeof(storage));
+		memcpy(bytes + offset, encoded, sizeof(encoded));
+		ASSERT_EQ(dssh_parse_uint32(bytes + offset, 4, &storage[1]), 4);
+		ASSERT_EQ_U(storage[1], UINT32_C(0x12345678));
+	}
+	return TEST_PASS;
+}
+
+static int
 test_cleanse_basic(void)
 {
 	uint8_t buf[16];
@@ -1755,6 +1849,9 @@ static struct dssh_test_entry tests[] = {
 	{ "serialize_at_nonzero_offset",    test_serialize_at_nonzero_offset },
 	{ "serialize_overflow_at_offset",   test_serialize_overflow_at_offset },
 	{ "serialize_pos_past_bufsz",       test_serialize_pos_past_bufsz },
+	{ "serialize_uint32_position_storage", test_serialize_uint32_position_storage },
+	{ "serialize_uint32_bounds", test_serialize_uint32_bounds },
+	{ "parse_uint32_overlapping_output", test_parse_uint32_overlapping_output },
 
 	/* dssh_cleanse */
 	{ "cleanse_basic",                  test_cleanse_basic },

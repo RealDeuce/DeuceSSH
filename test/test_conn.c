@@ -255,6 +255,7 @@ reset_callbacks(void)
 
 struct conn_ctx {
 	struct mock_io_state io;
+	bool io_initialized;
 	dssh_session client;
 	dssh_session server;
 };
@@ -280,6 +281,10 @@ client_handshake_auth_thread(void *arg)
 	}
 	ctx->result = dssh_auth_password(ctx->sess, "testuser", "testpass",
 	    NULL, NULL);
+	if (ctx->result != 0) {
+		mock_io_close_c2s(ctx->io);
+		mock_io_close_s2c(ctx->io);
+	}
 	return 0;
 }
 
@@ -297,6 +302,10 @@ server_handshake_auth_thread(void *arg)
 	size_t username_len = sizeof(username);
 	ctx->result = dssh_auth_server(ctx->sess, &auth_cbs,
 	    username, &username_len);
+	if (ctx->result != 0) {
+		mock_io_close_c2s(ctx->io);
+		mock_io_close_s2c(ctx->io);
+	}
 	return 0;
 }
 
@@ -304,42 +313,55 @@ server_handshake_auth_thread(void *arg)
  * Set up a full connection: handshake + auth + session_start on both sides.
  * Returns 0 on success, -1 on failure.
  */
-static int
-conn_setup(struct conn_ctx *ctx)
-{
-	memset(ctx, 0, sizeof(*ctx));
-	reset_callbacks();
+static void conn_cleanup(struct conn_ctx *ctx);
 
+/* Overridden only by the controlled setup-ownership cases. */
+static int (*conn_fixture_thread_create)(thrd_t *, thrd_start_t, void *) = thrd_create;
+static int (*conn_fixture_thread_join)(thrd_t, int *) = thrd_join;
+static int (*conn_fixture_session_start)(dssh_session) = dssh_session_start;
+
+static int
+conn_setup_mode(struct conn_ctx *ctx, bool start)
+{
+	ctx->client = NULL;
+	ctx->server = NULL;
+	ctx->io_initialized = false;
+	reset_callbacks();
 	dssh_test_reset_global_config();
 
 	if (register_all_algorithms() < 0)
-		return -1;
+		goto setup_fail;
 	if (test_generate_host_key() < 0)
-		return -1;
+		goto setup_fail;
 
+	/* All four descriptors are initialized even on acquisition failure. */
+	ctx->io_initialized = true;
 	if (mock_io_init(&ctx->io, 0) < 0)
-		return -1;
+		goto setup_fail;
 
-	dssh_transport_set_callbacks(mock_tx_dispatch, mock_rx_dispatch,
+	int ret = dssh_transport_set_callbacks(mock_tx_dispatch, mock_rx_dispatch,
 	    mock_rxline_dispatch, mock_extra_line_cb);
+	if (ret != 0)
+		goto setup_fail;
 
 	ctx->client = dssh_session_init(true, 0);
-	if (ctx->client == NULL) {
-		mock_io_free(&ctx->io);
-		return -1;
-	}
-	dssh_session_set_cbdata(ctx->client, &ctx->io, &ctx->io,
+	if (ctx->client == NULL)
+		goto setup_fail;
+	ret = dssh_session_set_cbdata(ctx->client, &ctx->io, &ctx->io,
 	    &ctx->io, &ctx->io);
-	dssh_session_set_hostkey_verify_cb(ctx->client, dssh_test_accept_hostkey, NULL);
+	if (ret != 0)
+		goto setup_fail;
+	ret = dssh_session_set_hostkey_verify_cb(ctx->client, dssh_test_accept_hostkey, NULL);
+	if (ret != 0)
+		goto setup_fail;
 
 	ctx->server = init_server_session();
-	if (ctx->server == NULL) {
-		dssh_session_cleanup(ctx->client);
-		mock_io_free(&ctx->io);
-		return -1;
-	}
-	dssh_session_set_cbdata(ctx->server, &ctx->io, &ctx->io,
+	if (ctx->server == NULL)
+		goto setup_fail;
+	ret = dssh_session_set_cbdata(ctx->server, &ctx->io, &ctx->io,
 	    &ctx->io, &ctx->io);
+	if (ret != 0)
+		goto setup_fail;
 
 	struct handshake_auth_ctx client_ha = {
 		.io = &ctx->io,
@@ -353,52 +375,39 @@ conn_setup(struct conn_ctx *ctx)
 	};
 
 	thrd_t ct, st;
-	if (thrd_create(&ct, client_handshake_auth_thread, &client_ha) != thrd_success) {
-		dssh_session_cleanup(ctx->server);
-		dssh_session_cleanup(ctx->client);
-		mock_io_free(&ctx->io);
-		return -1;
-	}
-	if (thrd_create(&st, server_handshake_auth_thread, &server_ha) != thrd_success) {
+	if (conn_fixture_thread_create(&ct, client_handshake_auth_thread, &client_ha) != thrd_success)
+		goto setup_fail;
+	if (conn_fixture_thread_create(&st, server_handshake_auth_thread, &server_ha) != thrd_success) {
 		dssh_session_terminate(ctx->client);
 		mock_io_close_c2s(&ctx->io);
 		mock_io_close_s2c(&ctx->io);
-		thrd_join(ct, NULL);
-		dssh_session_cleanup(ctx->server);
-		dssh_session_cleanup(ctx->client);
-		mock_io_free(&ctx->io);
-		return -1;
+		if (conn_fixture_thread_join(ct, NULL) != thrd_success)
+			abort();
+		goto setup_fail;
 	}
-
-	thrd_join(ct, NULL);
-	thrd_join(st, NULL);
+	if (conn_fixture_thread_join(ct, NULL) != thrd_success)
+		abort();
+	if (conn_fixture_thread_join(st, NULL) != thrd_success)
+		abort();
 
 	if (client_ha.result != 0 || server_ha.result != 0
-	    || !compression_fixture_selected(ctx->client, ctx->server)) {
-		dssh_session_cleanup(ctx->server);
-		dssh_session_cleanup(ctx->client);
-		mock_io_free(&ctx->io);
-		return -1;
-	}
-
-	if (dssh_session_start(ctx->client) != 0) {
-		dssh_session_cleanup(ctx->server);
-		dssh_session_cleanup(ctx->client);
-		mock_io_free(&ctx->io);
-		return -1;
-	}
-	if (dssh_session_start(ctx->server) != 0) {
-		mock_io_close_c2s(&ctx->io);
-		mock_io_close_s2c(&ctx->io);
-		dssh_session_stop(ctx->client);
-		dssh_session_cleanup(ctx->server);
-		dssh_session_cleanup(ctx->client);
-		mock_io_free(&ctx->io);
-		return -1;
-	}
+	    || (start && !compression_fixture_selected(ctx->client, ctx->server)))
+		goto setup_fail;
+	if (start && (conn_fixture_session_start(ctx->client) != 0
+	    || conn_fixture_session_start(ctx->server) != 0))
+		goto setup_fail;
 
 	g_active_ctx = ctx;
 	return 0;
+setup_fail:
+	conn_cleanup(ctx);
+	return -1;
+}
+
+static int
+conn_setup(struct conn_ctx *ctx)
+{
+	return conn_setup_mode(ctx, true);
 }
 
 static void
@@ -407,19 +416,24 @@ conn_cleanup(struct conn_ctx *ctx)
 	if (g_active_ctx == ctx)
 		g_active_ctx = NULL;
 
-	/*
-	 * Close the write-ends of both pipes first so that any demux
-	 * thread blocked in read() gets EOF and can exit.  With
-	 * socketpair-based mock I/O, condvar broadcasts alone cannot
-	 * unblock a blocking read() -- only closing the peer fd does.
-	 */
-	mock_io_close_c2s(&ctx->io);
-	mock_io_close_s2c(&ctx->io);
-	dssh_session_stop(ctx->server);
-	dssh_session_stop(ctx->client);
-	dssh_session_cleanup(ctx->server);
-	dssh_session_cleanup(ctx->client);
-	mock_io_free(&ctx->io);
+	/* Shutdown precedes every demux join; free closes the descriptors only
+	 * after all session-owned workers have retired. */
+	if (ctx->io_initialized) {
+		mock_io_close_c2s(&ctx->io);
+		mock_io_close_s2c(&ctx->io);
+	}
+	if (ctx->server != NULL) {
+		dssh_session_cleanup(ctx->server);
+		ctx->server = NULL;
+	}
+	if (ctx->client != NULL) {
+		dssh_session_cleanup(ctx->client);
+		ctx->client = NULL;
+	}
+	if (ctx->io_initialized) {
+		mock_io_free(&ctx->io);
+		ctx->io_initialized = false;
+	}
 	dssh_test_reset_global_config();
 }
 
@@ -433,7 +447,7 @@ fail_with_active_connection(void)
 	struct conn_ctx ctx;
 
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 	ASSERT_TRUE(false);
 	return TEST_PASS;
 }
@@ -597,7 +611,7 @@ test_session_start(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	ASSERT_TRUE(ctx.client->demux_running);
 	ASSERT_TRUE(ctx.server->demux_running);
@@ -611,7 +625,7 @@ test_session_stop(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	/* Close pipes so demux threads' read() returns EOF */
 	mock_io_close_c2s(&ctx.io);
@@ -636,7 +650,7 @@ test_session_start_stop(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	ASSERT_TRUE(ctx.client->demux_running);
 	ASSERT_TRUE(ctx.server->demux_running);
@@ -662,7 +676,7 @@ test_session_stop_open_channel(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 	struct open_exec_ctx oc = {
 		.client = ctx.client, .server = ctx.server,
 		.command = "stop-with-owned-parameters", .cbs = &accept_cbs_all,
@@ -698,7 +712,7 @@ test_open_exec(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_exec_ctx oc = {
 		.client = ctx.client,
@@ -727,7 +741,7 @@ test_open_exec_command(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_exec_ctx oc = {
 		.client = ctx.client,
@@ -776,7 +790,7 @@ test_open_exec_rejected(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_exec_ctx oc = {
 		.client = ctx.client,
@@ -807,7 +821,7 @@ test_open_shell(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_shell_ctx oc = {
 		.client = ctx.client,
@@ -845,7 +859,7 @@ test_open_subsystem(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_subsys_ctx oc = {
 		.client = ctx.client,
@@ -877,7 +891,7 @@ test_session_write_read(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_exec_ctx oc = {
 		.client = ctx.client,
@@ -917,7 +931,7 @@ test_session_read_write_reverse(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_exec_ctx oc = {
 		.client = ctx.client,
@@ -957,7 +971,7 @@ test_session_write_ext(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_exec_ctx oc = {
 		.client = ctx.client,
@@ -997,7 +1011,7 @@ test_session_read_ext(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_exec_ctx oc = {
 		.client = ctx.client,
@@ -1036,7 +1050,7 @@ test_session_poll_read(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_exec_ctx oc = {
 		.client = ctx.client,
@@ -1067,7 +1081,7 @@ test_session_poll_timeout(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_exec_ctx oc = {
 		.client = ctx.client,
@@ -1095,7 +1109,7 @@ test_session_large_write(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_exec_ctx oc = {
 		.client = ctx.client,
@@ -1160,7 +1174,7 @@ test_session_multiple_writes(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_exec_ctx oc = {
 		.client = ctx.client,
@@ -1211,7 +1225,7 @@ test_subsys_write_read(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_subsys_ctx oc = {
 		.client = ctx.client,
@@ -1260,7 +1274,7 @@ test_subsys_multiple_writes(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_subsys_ctx oc = {
 		.client = ctx.client,
@@ -1314,7 +1328,7 @@ test_subsys_poll(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_subsys_ctx oc = {
 		.client = ctx.client,
@@ -1357,7 +1371,7 @@ test_subsys_large_write(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_subsys_ctx oc = {
 		.client = ctx.client,
@@ -1420,7 +1434,7 @@ test_send_signal(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_exec_ctx oc = {
 		.client = ctx.client,
@@ -1459,7 +1473,7 @@ test_signal_after_data(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_exec_ctx oc = {
 		.client = ctx.client,
@@ -1516,7 +1530,7 @@ test_window_change(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_shell_ctx oc = {
 		.client = ctx.client,
@@ -1571,7 +1585,7 @@ test_session_close_exit_code(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_exec_ctx oc = {
 		.client = ctx.client,
@@ -1613,7 +1627,7 @@ test_channel_close_subsys(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_subsys_ctx oc = {
 		.client = ctx.client,
@@ -1649,7 +1663,7 @@ test_eof_detection(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_exec_ctx oc = {
 		.client = ctx.client,
@@ -1695,7 +1709,7 @@ test_eof_half_close(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_exec_ctx oc = {
 		.client = ctx.client,
@@ -1747,7 +1761,7 @@ test_read_nomore_vs_eof(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_exec_ctx oc = {
 		.client = ctx.client,
@@ -1811,7 +1825,7 @@ test_graceful_disconnect(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_exec_ctx oc = {
 		.client = ctx.client,
@@ -1869,7 +1883,7 @@ test_two_channels(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct two_channel_server_ctx sctx = {
 		.server = ctx.server,
@@ -1970,7 +1984,7 @@ test_accept_reject(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct accept_reject_server_ctx sctx = {
 		.server = ctx.server,
@@ -2012,7 +2026,7 @@ test_channel_independence(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct two_channel_server_ctx sctx = {
 		.server = ctx.server,
@@ -2144,7 +2158,7 @@ test_concurrent_write_read(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_exec_ctx oc = {
 		.client = ctx.client,
@@ -2191,7 +2205,7 @@ test_terminate_during_io(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_exec_ctx oc = {
 		.client = ctx.client,
@@ -2237,7 +2251,7 @@ test_connection_drop_during_read(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_exec_ctx oc = {
 		.client = ctx.client,
@@ -2281,7 +2295,7 @@ test_connection_drop_during_write(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_exec_ctx oc = {
 		.client = ctx.client,
@@ -2322,7 +2336,7 @@ test_cleanup_after_drop(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_exec_ctx oc = {
 		.client = ctx.client,
@@ -3490,7 +3504,7 @@ test_session_poll_write(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_exec_ctx oc = {
 		.client = ctx.client,
@@ -3525,7 +3539,7 @@ test_session_write_after_eof(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_exec_ctx oc = {
 		.client = ctx.client,
@@ -3556,7 +3570,7 @@ test_session_write_ext_after_eof(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_exec_ctx oc = {
 		.client = ctx.client,
@@ -3591,7 +3605,7 @@ test_subsys_write_after_close(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_subsys_ctx oc = {
 		.client = ctx.client,
@@ -3630,7 +3644,7 @@ test_subsys_poll_write(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_subsys_ctx oc = {
 		.client = ctx.client,
@@ -3665,7 +3679,7 @@ test_subsys_poll_timeout_zero(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_subsys_ctx oc = {
 		.client = ctx.client,
@@ -3701,7 +3715,7 @@ test_read_event_empty(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_exec_ctx oc = {
 		.client = ctx.client,
@@ -3731,7 +3745,7 @@ test_signal_interleave_read(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_exec_ctx oc = {
 		.client = ctx.client,
@@ -3813,7 +3827,7 @@ test_signal_interleave_read_ext(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_exec_ctx oc = {
 		.client = ctx.client,
@@ -4052,7 +4066,7 @@ test_session_poll_read_empty(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_exec_ctx oc = {
 		.client = ctx.client,
@@ -4090,7 +4104,7 @@ test_session_write_window_zero(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_exec_ctx oc = {
 		.client = ctx.client,
@@ -4133,7 +4147,7 @@ test_session_write_ext_window_zero(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_exec_ctx oc = {
 		.client = ctx.client,
@@ -4194,7 +4208,7 @@ test_accept_timeout_negative(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct accept_blocking_ctx bc = {
 		.ctx = &ctx,
@@ -4226,7 +4240,7 @@ test_setup_exec_rejected_by_callback(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_exec_ctx oc = {
 		.client = ctx.client,
@@ -4367,7 +4381,7 @@ test_double_eof_close(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_exec_ctx oc = {
 		.client = ctx.client,
@@ -4459,7 +4473,7 @@ test_demux_dispatch_chan_type_zero(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_exec_ctx oc = {
 		.client = ctx.client,
@@ -4502,7 +4516,7 @@ test_send_eof_already_sent(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_exec_ctx oc = {
 		.client = ctx.client, .server = ctx.server,
@@ -4528,7 +4542,7 @@ test_send_close_already_sent(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_exec_ctx oc = {
 		.client = ctx.client, .server = ctx.server,
@@ -4554,7 +4568,7 @@ test_maybe_replenish_after_eof(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_exec_ctx oc = {
 		.client = ctx.client, .server = ctx.server,
@@ -4583,7 +4597,7 @@ test_maybe_replenish_low_window(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_exec_ctx oc = {
 		.client = ctx.client, .server = ctx.server,
@@ -4635,7 +4649,7 @@ test_replenish_queued_accounting(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_exec_ctx oc = {
 		.client = ctx.client, .server = ctx.server,
@@ -4735,7 +4749,7 @@ test_zc_consumption_clamped(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_exec_ctx oc = {
 		.client = ctx.client, .server = ctx.server,
@@ -4850,7 +4864,7 @@ test_window_add_overflow(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_exec_ctx oc = {
 		.client = ctx.client, .server = ctx.server,
@@ -4939,7 +4953,7 @@ test_session_poll_nsec_overflow(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_exec_ctx oc = {
 		.client = ctx.client,
@@ -4994,7 +5008,7 @@ test_subsystem_roundtrip(void)
 	struct conn_ctx ctx;
 
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_subsys_ctx oc = {
 		.client = ctx.client,
@@ -5134,7 +5148,7 @@ test_accept_zc(void)
 	struct conn_ctx ctx;
 
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	/* Set up ZC receive state for the server */
 	struct zc_rx_state zc_st;
@@ -5305,7 +5319,7 @@ test_close_during_zc_callback(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct zc_close_race_state zc_st;
 	memset(&zc_st, 0, sizeof(zc_st));
@@ -5475,7 +5489,7 @@ test_demux_data_truncation_window(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_exec_ctx oc = {
 		.client = ctx.client, .server = ctx.server,
@@ -5526,7 +5540,7 @@ test_replenish_caps_to_buffer_space(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_exec_ctx oc = {
 		.client = ctx.client, .server = ctx.server,
@@ -5678,7 +5692,7 @@ test_rx_truncation_default(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_exec_ctx oc = { 0 };
 	if (rx_window_setup(&ctx, &oc, 64) < 0) {
@@ -5714,7 +5728,7 @@ test_rx_truncation_clips_to_window(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_exec_ctx oc = { 0 };
 	if (rx_window_setup(&ctx, &oc, 64) < 0) {
@@ -5749,7 +5763,7 @@ test_rx_bypass_pre_setup(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_exec_ctx oc = { 0 };
 	if (rx_window_setup(&ctx, &oc, 64) < 0) {
@@ -5784,7 +5798,7 @@ test_rx_bypass_disengages_post_setup(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_exec_ctx oc = { 0 };
 	if (rx_window_setup(&ctx, &oc, 64) < 0) {
@@ -5818,7 +5832,7 @@ test_chan_open_type_lock_subsystem(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct dssh_chan_params p;
 	ASSERT_OK(dssh_chan_params_init(&p, DSSH_CHAN_SUBSYSTEM));
@@ -5844,7 +5858,7 @@ test_poll_terminate_surfaces_data_flags(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_exec_ctx oc = {
 		.client = ctx.client, .server = ctx.server,
@@ -5887,7 +5901,7 @@ test_poll_terminate_no_event_bit(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_exec_ctx oc = {
 		.client = ctx.client, .server = ctx.server,
@@ -6470,7 +6484,7 @@ test_subsys_write_zero(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_subsys_ctx oc = {
 		.client = ctx.client,
@@ -6535,7 +6549,7 @@ test_poll_deadline_not_reset(void)
 	struct conn_ctx ctx;
 
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_exec_ctx oc = {
 		.client = ctx.client,
@@ -6819,91 +6833,13 @@ test_chan_send_window_change_null(void)
 static int
 conn_setup_no_start(struct conn_ctx *ctx)
 {
-	memset(ctx, 0, sizeof(*ctx));
-	reset_callbacks();
-
-	dssh_test_reset_global_config();
-
-	if (register_all_algorithms() < 0)
-		return -1;
-	if (test_generate_host_key() < 0)
-		return -1;
-
-	if (mock_io_init(&ctx->io, 0) < 0)
-		return -1;
-
-	dssh_transport_set_callbacks(mock_tx_dispatch, mock_rx_dispatch,
-	    mock_rxline_dispatch, mock_extra_line_cb);
-
-	ctx->client = dssh_session_init(true, 0);
-	if (ctx->client == NULL) {
-		mock_io_free(&ctx->io);
-		return -1;
-	}
-	dssh_session_set_cbdata(ctx->client, &ctx->io, &ctx->io,
-	    &ctx->io, &ctx->io);
-	dssh_session_set_hostkey_verify_cb(ctx->client, dssh_test_accept_hostkey, NULL);
-
-	ctx->server = init_server_session();
-	if (ctx->server == NULL) {
-		dssh_session_cleanup(ctx->client);
-		mock_io_free(&ctx->io);
-		return -1;
-	}
-	dssh_session_set_cbdata(ctx->server, &ctx->io, &ctx->io,
-	    &ctx->io, &ctx->io);
-
-	struct handshake_auth_ctx client_ha = {
-		.io = &ctx->io,
-		.sess = ctx->client,
-		.result = -1,
-	};
-	struct handshake_auth_ctx server_ha = {
-		.io = &ctx->io,
-		.sess = ctx->server,
-		.result = -1,
-	};
-
-	thrd_t ct, st;
-	if (thrd_create(&ct, client_handshake_auth_thread, &client_ha) != thrd_success) {
-		dssh_session_cleanup(ctx->server);
-		dssh_session_cleanup(ctx->client);
-		mock_io_free(&ctx->io);
-		return -1;
-	}
-	if (thrd_create(&st, server_handshake_auth_thread, &server_ha) != thrd_success) {
-		dssh_session_terminate(ctx->client);
-		mock_io_close_c2s(&ctx->io);
-		mock_io_close_s2c(&ctx->io);
-		thrd_join(ct, NULL);
-		dssh_session_cleanup(ctx->server);
-		dssh_session_cleanup(ctx->client);
-		mock_io_free(&ctx->io);
-		return -1;
-	}
-
-	thrd_join(ct, NULL);
-	thrd_join(st, NULL);
-
-	if (client_ha.result != 0 || server_ha.result != 0) {
-		dssh_session_cleanup(ctx->server);
-		dssh_session_cleanup(ctx->client);
-		mock_io_free(&ctx->io);
-		return -1;
-	}
-
-	g_active_ctx = ctx;
-	return 0;
+	return conn_setup_mode(ctx, false);
 }
 
 static void
 conn_cleanup_no_start(struct conn_ctx *ctx)
 {
-	if (g_active_ctx == ctx)
-		g_active_ctx = NULL;
-	dssh_session_cleanup(ctx->server);
-	dssh_session_cleanup(ctx->client);
-	mock_io_free(&ctx->io);
+	conn_cleanup(ctx);
 }
 
 /* ================================================================
@@ -6964,7 +6900,7 @@ test_zc_open_client(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	/* Set up ZC receive state for the client */
 	struct client_zc_rx_state zc_st;
@@ -7081,7 +7017,7 @@ test_zc_cancel(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct client_zc_rx_state zc_st;
 	memset(&zc_st, 0, sizeof(zc_st));
@@ -7240,7 +7176,7 @@ test_session_set_event_cb(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup_no_start(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	/* NULL sess returns error */
 	ASSERT_ERR(dssh_session_set_event_cb(NULL, test_event_cb, NULL),
@@ -7268,7 +7204,7 @@ test_session_set_event_cb_toolate(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	/* After session_start, setting event callback should be refused */
 	ASSERT_ERR(dssh_session_set_event_cb(ctx.client, test_event_cb, NULL),
@@ -7283,7 +7219,7 @@ test_chan_set_event_cb(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	/* NULL guard */
 	ASSERT_ERR(dssh_chan_set_event_cb(NULL, test_event_cb, NULL),
@@ -7331,7 +7267,7 @@ test_session_set_max_events(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup_no_start(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	/* NULL guard */
 	ASSERT_ERR(dssh_session_set_max_events(NULL, 128),
@@ -7352,7 +7288,7 @@ test_session_set_max_events_toolate(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	ASSERT_ERR(dssh_session_set_max_events(ctx.client, 128),
 	    DSSH_ERROR_TOOLATE);
@@ -7366,7 +7302,7 @@ test_chan_set_max_events(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	/* NULL guard */
 	ASSERT_ERR(dssh_chan_set_max_events(NULL, 32),
@@ -7405,7 +7341,7 @@ test_chan_get_pty(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	/* Open shell with PTY */
 	struct open_shell_ctx oc = {
@@ -7530,7 +7466,7 @@ test_env_roundtrip(void)
 {
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	struct open_exec_ctx oc = {
 		.client = ctx.client,

@@ -514,18 +514,23 @@ server_accept_exec_thread(void *arg)
  * Populates ctx->client_ch and ctx->server_ch.
  */
 static int
+(*channel_fixture_thread_create)(thrd_t *, thrd_start_t, void *) = thrd_create;
+static int
+(*channel_fixture_thread_join)(thrd_t, int *) = thrd_join;
+
+static int
 open_exec_channel(struct open_exec_ctx *ctx)
 {
 	thrd_t ct, st;
 	int cr, sr;
-	if (thrd_create(&ct, client_open_exec_thread, ctx) != thrd_success)
+	if (channel_fixture_thread_create(&ct, client_open_exec_thread, ctx) != thrd_success)
 		return -1;
-	if (thrd_create(&st, server_accept_exec_thread, ctx) != thrd_success) {
-		thrd_join(ct, NULL);
+	if (channel_fixture_thread_create(&st, server_accept_exec_thread, ctx) != thrd_success) {
+		channel_fixture_thread_join(ct, NULL);
 		return -1;
 	}
-	thrd_join(ct, &cr);
-	thrd_join(st, &sr);
+	channel_fixture_thread_join(ct, &cr);
+	channel_fixture_thread_join(st, &sr);
 	if (cr < 0 || sr < 0)
 		return -1;
 	if (ctx->client_ch == NULL || ctx->server_ch == NULL)
@@ -8257,6 +8262,7 @@ test_compression_window_rekey(void)
 #include "event_delivery_cases.h"
 #include "event_text_cases.h"
 #include "conn_helper_cases.h"
+#include "channel_worker_cases.h"
 #include "setup_mailbox_cases.h"
 #include "accept_failure_cases.h"
 #include "request_framing_cases.h"
@@ -8268,6 +8274,7 @@ test_compression_window_rekey(void)
 #include "event_overflow_cases.h"
 
 static struct dssh_test_entry tests[] = {
+	{ "release/channel_worker_ownership", test_channel_worker_ownership },
 	{ "release/conn_setup_ownership", test_conn_setup_ownership },
 	{ "release/conn_no_start_ownership", test_conn_no_start_ownership },
 	{ "queue_retry/packet_stream_callback", test_queue_retry_packet_stream_callback },

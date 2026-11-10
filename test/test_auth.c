@@ -8387,67 +8387,109 @@ test_kbi_empty_response(void)
  * ================================================================ */
 
 static int
-direct_server_test(const uint8_t *auth_msg, size_t auth_msg_len,
-    const struct dssh_auth_server_cbs *cbs,
-    uint8_t *username_out, size_t *username_out_len)
+inject_auth_service_request(dssh_session client)
 {
+	static const char service[] = "ssh-userauth";
+	uint8_t packet[1 + 4 + sizeof(service) - 1];
+	size_t pos = 1;
+	packet[0] = SSH_MSG_SERVICE_REQUEST;
+	int ret = dssh_serialize_uint32(DSSH_STRLEN("ssh-userauth"), packet, sizeof(packet), &pos);
+	if (ret < 0)
+		return ret;
+	memcpy(packet + pos, service, sizeof(service) - 1);
+	pos += sizeof(service) - 1;
+	return send_packet(client, packet, pos, NULL);
+}
+
+/* Fixture status is separate from the result of the operation under test.
+ * The optional observer uses the actual encrypted I/O callback after all
+ * handshake workers have joined, and is removed before retiring the session. */
+static int
+direct_server_test_with_io(const uint8_t *auth_msg, size_t auth_msg_len,
+    const struct dssh_auth_server_cbs *cbs,
+    uint8_t *username_out, size_t *username_out_len, int *auth_result,
+    struct auth_test_io_watch *watch)
+{
+	if (auth_result == NULL || cbs == NULL || cbs->methods_str == NULL
+	    || (auth_msg == NULL && auth_msg_len != 0))
+		return DSSH_ERROR_INVALID;
 	struct handshake_ctx ctx;
-	if (handshake_setup(&ctx) < 0) {
+	int ret = handshake_setup(&ctx);
+	if (ret < 0) {
 		handshake_cleanup(&ctx);
-		return -999;
+		return ret;
 	}
-
-	/* Inject SERVICE_REQUEST */
-	{
-		static const char svc[] = "ssh-userauth";
-		uint8_t msg[64];
-		size_t pos = 0;
-		msg[pos++] = SSH_MSG_SERVICE_REQUEST;
-		dssh_serialize_uint32((uint32_t)(sizeof(svc) - 1), msg, sizeof(msg), &pos);
-		memcpy(&msg[pos], svc, sizeof(svc) - 1);
-		pos += sizeof(svc) - 1;
-		send_packet(ctx.client, msg, pos, NULL);
+	struct auth_test_io_watch *previous = auth_test_io_watch;
+	if (watch != NULL) {
+		watch->target = ctx.client;
+		auth_test_io_watch = watch;
 	}
-
-	/* Inject the auth message (if any) */
-	if (auth_msg != NULL && auth_msg_len > 0)
-		send_packet(ctx.client, auth_msg, auth_msg_len, NULL);
-
-	/* Close write end so server gets EOF after reading buffered data */
-	mock_io_close_c2s_write(&ctx.io);
-
-	/* Call server directly from main thread */
-	int res = auth_server_impl(ctx.server, cbs,
-	    username_out, username_out_len);
-
+	ret = inject_auth_service_request(ctx.client);
+	if (ret == 0 && auth_msg_len != 0)
+		ret = send_packet(ctx.client, auth_msg, auth_msg_len, NULL);
+	if (ret == 0) {
+		mock_io_close_c2s_write(&ctx.io);
+		*auth_result = auth_server_impl(ctx.server, cbs, username_out, username_out_len);
+	}
+	if (watch != NULL)
+		watch->target = NULL;
+	auth_test_io_watch = previous;
 	mock_io_close_c2s(&ctx.io);
 	mock_io_close_s2c(&ctx.io);
 	handshake_cleanup(&ctx);
-	return res;
+	return ret;
 }
 
-/* Build a USERAUTH_REQUEST with user="u", service="ssh-connection",
- * and the specified method + extra data appended after the method. */
+static int
+direct_server_test(const uint8_t *auth_msg, size_t auth_msg_len,
+    const struct dssh_auth_server_cbs *cbs,
+    uint8_t *username_out, size_t *username_out_len, int *auth_result)
+{
+	return direct_server_test_with_io(auth_msg, auth_msg_len, cbs,
+	    username_out, username_out_len, auth_result, NULL);
+}
+
+/* Raw fixture builder: method/extra bytes may intentionally be malformed.
+ * Check their complete storage plan before writing the first output byte. */
 static size_t
 build_auth_request(const char *method, size_t method_len,
     const uint8_t *extra, size_t extra_len,
     uint8_t *buf, size_t bufsz)
 {
-	static const char svc[] = "ssh-connection";
+	static const char service[] = "ssh-connection";
+	const size_t fixed = 1 + 4 + 1 + 4 + sizeof(service) - 1 + 4;
+	if (buf == NULL || (method == NULL && method_len != 0)
+	    || (extra == NULL && extra_len != 0))
+		return 0;
+#if SIZE_MAX > UINT32_MAX
+	if (method_len > UINT32_MAX)
+		return 0;
+#endif
+	if (bufsz < fixed || method_len > bufsz - fixed
+	    || extra_len > bufsz - fixed - method_len)
+		return 0;
+	uint32_t wire_method_len = (uint32_t)method_len;
 	size_t pos = 0;
+	int ret;
 	buf[pos++] = SSH_MSG_USERAUTH_REQUEST;
-	dssh_serialize_uint32(1, buf, bufsz, &pos);
+	ret = dssh_serialize_uint32(1, buf, bufsz, &pos);
+	if (ret < 0)
+		return 0;
 	buf[pos++] = 'u';
-	dssh_serialize_uint32((uint32_t)(sizeof(svc) - 1), buf, bufsz, &pos);
-	memcpy(&buf[pos], svc, sizeof(svc) - 1);
-	pos += sizeof(svc) - 1;
-	dssh_serialize_uint32((uint32_t)method_len, buf, bufsz, &pos);
-	memcpy(&buf[pos], method, method_len);
+	ret = dssh_serialize_uint32(DSSH_STRLEN("ssh-connection"), buf, bufsz, &pos);
+	if (ret < 0)
+		return 0;
+	memcpy(buf + pos, service, sizeof(service) - 1);
+	pos += sizeof(service) - 1;
+	ret = dssh_serialize_uint32(wire_method_len, buf, bufsz, &pos);
+	if (ret < 0)
+		return 0;
+	if (method_len != 0)
+		memcpy(buf + pos, method, method_len);
 	pos += method_len;
-	if (extra != NULL && extra_len > 0) {
-		memcpy(&buf[pos], extra, extra_len);
-		pos += extra_len;
-	}
+	if (extra_len != 0)
+		memcpy(buf + pos, extra, extra_len);
+	pos += extra_len;
 	return pos;
 }
 
@@ -8460,6 +8502,99 @@ static struct dssh_auth_server_cbs default_cbs(void)
 	return cbs;
 }
 
+static int
+test_auth_fixture_builder(void)
+{
+	uint8_t frame[66];
+	uint8_t expected_frame[sizeof(frame)];
+	uint8_t *packet = frame + 1;
+	const uint8_t extra[] = {1, 2, 3};
+	const uint8_t expected[] = {
+		SSH_MSG_USERAUTH_REQUEST, 0, 0, 0, 1, 'u',
+		0, 0, 0, 14, 's', 's', 'h', '-', 'c', 'o', 'n', 'n', 'e', 'c', 't', 'i', 'o', 'n',
+		0, 0, 0, 4, 'n', 'o', 'n', 'e', 1, 2, 3
+	};
+	for (size_t capacity = 0; capacity <= sizeof(frame) - 2; capacity++) {
+		memset(frame, 0xa5, sizeof(frame));
+		memcpy(expected_frame, frame, sizeof(frame));
+		size_t length = build_auth_request("none", 4, extra, sizeof(extra), packet, capacity);
+		if (capacity < sizeof(expected))
+			ASSERT_EQ_U(length, 0);
+		else {
+			ASSERT_EQ_U(length, sizeof(expected));
+			memcpy(expected_frame + 1, expected, sizeof(expected));
+		}
+		ASSERT_MEM_EQ(frame, expected_frame, sizeof(frame));
+	}
+	const struct {
+		const char *method;
+		size_t method_len;
+		const uint8_t *extra;
+		size_t extra_len;
+		uint8_t *out;
+		size_t capacity;
+	} invalid[] = {
+		{"none", 4, extra, sizeof(extra), NULL, 64},
+		{NULL, 1, extra, sizeof(extra), packet, 64},
+		{"none", 4, NULL, 1, packet, 64},
+		{"n", SIZE_MAX, NULL, 0, packet, 64},
+		{"none", 4, extra, SIZE_MAX, packet, 64},
+		{"none", 4, extra, sizeof(extra), packet, sizeof(expected) - 1}
+	};
+	for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+		memset(frame, 0xa5, sizeof(frame));
+		memcpy(expected_frame, frame, sizeof(frame));
+		ASSERT_EQ_U(build_auth_request(invalid[i].method, invalid[i].method_len,
+		    invalid[i].extra, invalid[i].extra_len, invalid[i].out, invalid[i].capacity), 0);
+		ASSERT_MEM_EQ(frame, expected_frame, sizeof(frame));
+	}
+	memset(frame, 0xa5, sizeof(frame));
+	ASSERT_EQ_U(build_auth_request(NULL, 0, NULL, 0, packet, 28), 28);
+	ASSERT_MEM_EQ(packet, expected, 24);
+	ASSERT_EQ_U(DSSH_GET_U32(packet + 24), 0);
+	ASSERT_EQ(frame[0], 0xa5);
+	for (size_t i = 29; i < sizeof(frame); i++)
+		ASSERT_EQ(frame[i], 0xa5);
+	return TEST_PASS;
+}
+
+static int
+test_auth_direct_fixture_status(void)
+{
+	uint8_t packet[64];
+	size_t length = build_auth_request("none", 4, NULL, 0, packet, sizeof(packet));
+	ASSERT_TRUE(length > 0);
+	struct test_auth_cbdata cbdata = {.none_result = DSSH_AUTH_SUCCESS};
+	struct dssh_auth_server_cbs cbs = default_cbs();
+	cbs.none_cb = test_none_cb;
+	cbs.cbdata = &cbdata;
+	int auth_result = 123;
+	dssh_test_alloc_fail_after(0);
+	int ret = direct_server_test(packet, length, &cbs, NULL, NULL, &auth_result);
+	int allocation_calls = dssh_test_alloc_count();
+	dssh_test_alloc_reset();
+	ASSERT_TRUE(ret < 0);
+	ASSERT_TRUE(allocation_calls > 0);
+	ASSERT_EQ(auth_result, 123);
+	ASSERT_FALSE(cbdata.none_called);
+	struct auth_test_io_watch *previous = auth_test_io_watch;
+	for (unsigned fail_at = 0; fail_at < 2; fail_at++) {
+		struct auth_test_io_watch watch = {.fail_enabled = true, .fail_at = fail_at};
+		auth_result = 123;
+		ret = direct_server_test_with_io(packet, length, &cbs, NULL, NULL, &auth_result, &watch);
+		ASSERT_EQ(ret, DSSH_ERROR_INIT);
+		ASSERT_EQ(auth_result, 123);
+		ASSERT_FALSE(cbdata.none_called);
+		ASSERT_EQ_U(watch.calls, fail_at + 1);
+		ASSERT_NULL(watch.target);
+		ASSERT_TRUE(auth_test_io_watch == previous);
+	}
+	ASSERT_OK(direct_server_test(packet, length, &cbs, NULL, NULL, &auth_result));
+	ASSERT_EQ(auth_result, 0);
+	ASSERT_TRUE(cbdata.none_called);
+	return TEST_PASS;
+}
+
 /* --- Server parse: password truncation --- */
 
 static int test_direct_pw_no_bool(void)
@@ -8467,8 +8602,11 @@ static int test_direct_pw_no_bool(void)
 	/* method="password" but no boolean byte after */
 	uint8_t msg[128];
 	size_t len = build_auth_request("password", 8, NULL, 0, msg, sizeof(msg));
+	ASSERT_TRUE(len > 0);
 	struct dssh_auth_server_cbs cbs = default_cbs();
-	ASSERT_TRUE(direct_server_test(msg, len, &cbs, NULL, NULL) < 0);
+	int auth_result = 0;
+	ASSERT_OK(direct_server_test(msg, len, &cbs, NULL, NULL, &auth_result));
+	ASSERT_TRUE(auth_result < 0);
 	return TEST_PASS;
 }
 
@@ -8478,8 +8616,11 @@ static int test_direct_pw_no_pw_len(void)
 	uint8_t extra[] = { 0 }; /* boolean false */
 	uint8_t msg[128];
 	size_t len = build_auth_request("password", 8, extra, 1, msg, sizeof(msg));
+	ASSERT_TRUE(len > 0);
 	struct dssh_auth_server_cbs cbs = default_cbs();
-	ASSERT_TRUE(direct_server_test(msg, len, &cbs, NULL, NULL) < 0);
+	int auth_result = 0;
+	ASSERT_OK(direct_server_test(msg, len, &cbs, NULL, NULL, &auth_result));
+	ASSERT_TRUE(auth_result < 0);
 	return TEST_PASS;
 }
 
@@ -8489,13 +8630,16 @@ static int test_direct_pw_overflow(void)
 	uint8_t extra[8];
 	size_t ep = 0;
 	extra[ep++] = 0; /* boolean false */
-	dssh_serialize_uint32(1000, extra, sizeof(extra), &ep);
+	ASSERT_OK(dssh_serialize_uint32(1000, extra, sizeof(extra), &ep));
 	extra[ep++] = 'a';
 	extra[ep++] = 'b';
 	uint8_t msg[128];
 	size_t len = build_auth_request("password", 8, extra, ep, msg, sizeof(msg));
+	ASSERT_TRUE(len > 0);
 	struct dssh_auth_server_cbs cbs = default_cbs();
-	ASSERT_TRUE(direct_server_test(msg, len, &cbs, NULL, NULL) < 0);
+	int auth_result = 0;
+	ASSERT_OK(direct_server_test(msg, len, &cbs, NULL, NULL, &auth_result));
+	ASSERT_TRUE(auth_result < 0);
 	return TEST_PASS;
 }
 
@@ -8505,12 +8649,15 @@ static int test_direct_pw_change_no_new(void)
 	uint8_t extra[16];
 	size_t ep = 0;
 	extra[ep++] = 1; /* boolean true = change */
-	dssh_serialize_uint32(2, extra, sizeof(extra), &ep);
+	ASSERT_OK(dssh_serialize_uint32(2, extra, sizeof(extra), &ep));
 	extra[ep++] = 'o'; extra[ep++] = 'p';
 	uint8_t msg[128];
 	size_t len = build_auth_request("password", 8, extra, ep, msg, sizeof(msg));
+	ASSERT_TRUE(len > 0);
 	struct dssh_auth_server_cbs cbs = default_cbs();
-	ASSERT_TRUE(direct_server_test(msg, len, &cbs, NULL, NULL) < 0);
+	int auth_result = 0;
+	ASSERT_OK(direct_server_test(msg, len, &cbs, NULL, NULL, &auth_result));
+	ASSERT_TRUE(auth_result < 0);
 	return TEST_PASS;
 }
 
@@ -8520,14 +8667,17 @@ static int test_direct_pw_change_overflow(void)
 	uint8_t extra[16];
 	size_t ep = 0;
 	extra[ep++] = 1;
-	dssh_serialize_uint32(2, extra, sizeof(extra), &ep);
+	ASSERT_OK(dssh_serialize_uint32(2, extra, sizeof(extra), &ep));
 	extra[ep++] = 'o'; extra[ep++] = 'p';
-	dssh_serialize_uint32(1000, extra, sizeof(extra), &ep);
+	ASSERT_OK(dssh_serialize_uint32(1000, extra, sizeof(extra), &ep));
 	extra[ep++] = 'n';
 	uint8_t msg[128];
 	size_t len = build_auth_request("password", 8, extra, ep, msg, sizeof(msg));
+	ASSERT_TRUE(len > 0);
 	struct dssh_auth_server_cbs cbs = default_cbs();
-	ASSERT_TRUE(direct_server_test(msg, len, &cbs, NULL, NULL) < 0);
+	int auth_result = 0;
+	ASSERT_OK(direct_server_test(msg, len, &cbs, NULL, NULL, &auth_result));
+	ASSERT_TRUE(auth_result < 0);
 	return TEST_PASS;
 }
 
@@ -8537,8 +8687,11 @@ static int test_direct_pk_no_hassig(void)
 {
 	uint8_t msg[128];
 	size_t len = build_auth_request("publickey", 9, NULL, 0, msg, sizeof(msg));
+	ASSERT_TRUE(len > 0);
 	struct dssh_auth_server_cbs cbs = default_cbs();
-	ASSERT_TRUE(direct_server_test(msg, len, &cbs, NULL, NULL) < 0);
+	int auth_result = 0;
+	ASSERT_OK(direct_server_test(msg, len, &cbs, NULL, NULL, &auth_result));
+	ASSERT_TRUE(auth_result < 0);
 	return TEST_PASS;
 }
 
@@ -8547,8 +8700,11 @@ static int test_direct_pk_no_algo_len(void)
 	uint8_t extra[] = { 0 }; /* has_sig=false, no algo */
 	uint8_t msg[128];
 	size_t len = build_auth_request("publickey", 9, extra, 1, msg, sizeof(msg));
+	ASSERT_TRUE(len > 0);
 	struct dssh_auth_server_cbs cbs = default_cbs();
-	ASSERT_TRUE(direct_server_test(msg, len, &cbs, NULL, NULL) < 0);
+	int auth_result = 0;
+	ASSERT_OK(direct_server_test(msg, len, &cbs, NULL, NULL, &auth_result));
+	ASSERT_TRUE(auth_result < 0);
 	return TEST_PASS;
 }
 
@@ -8557,12 +8713,15 @@ static int test_direct_pk_algo_overflow(void)
 	uint8_t extra[8];
 	size_t ep = 0;
 	extra[ep++] = 0;
-	dssh_serialize_uint32(1000, extra, sizeof(extra), &ep);
+	ASSERT_OK(dssh_serialize_uint32(1000, extra, sizeof(extra), &ep));
 	extra[ep++] = 'r'; extra[ep++] = 's';
 	uint8_t msg[128];
 	size_t len = build_auth_request("publickey", 9, extra, ep, msg, sizeof(msg));
+	ASSERT_TRUE(len > 0);
 	struct dssh_auth_server_cbs cbs = default_cbs();
-	ASSERT_TRUE(direct_server_test(msg, len, &cbs, NULL, NULL) < 0);
+	int auth_result = 0;
+	ASSERT_OK(direct_server_test(msg, len, &cbs, NULL, NULL, &auth_result));
+	ASSERT_TRUE(auth_result < 0);
 	return TEST_PASS;
 }
 
@@ -8571,12 +8730,15 @@ static int test_direct_pk_no_pk_len(void)
 	uint8_t extra[8];
 	size_t ep = 0;
 	extra[ep++] = 0;
-	dssh_serialize_uint32(3, extra, sizeof(extra), &ep);
+	ASSERT_OK(dssh_serialize_uint32(3, extra, sizeof(extra), &ep));
 	extra[ep++] = 'r'; extra[ep++] = 's'; extra[ep++] = 'a';
 	uint8_t msg[128];
 	size_t len = build_auth_request("publickey", 9, extra, ep, msg, sizeof(msg));
+	ASSERT_TRUE(len > 0);
 	struct dssh_auth_server_cbs cbs = default_cbs();
-	ASSERT_TRUE(direct_server_test(msg, len, &cbs, NULL, NULL) < 0);
+	int auth_result = 0;
+	ASSERT_OK(direct_server_test(msg, len, &cbs, NULL, NULL, &auth_result));
+	ASSERT_TRUE(auth_result < 0);
 	return TEST_PASS;
 }
 
@@ -8585,14 +8747,17 @@ static int test_direct_pk_pk_overflow(void)
 	uint8_t extra[16];
 	size_t ep = 0;
 	extra[ep++] = 0;
-	dssh_serialize_uint32(3, extra, sizeof(extra), &ep);
+	ASSERT_OK(dssh_serialize_uint32(3, extra, sizeof(extra), &ep));
 	extra[ep++] = 'r'; extra[ep++] = 's'; extra[ep++] = 'a';
-	dssh_serialize_uint32(1000, extra, sizeof(extra), &ep);
+	ASSERT_OK(dssh_serialize_uint32(1000, extra, sizeof(extra), &ep));
 	extra[ep++] = 'x'; extra[ep++] = 'y';
 	uint8_t msg[128];
 	size_t len = build_auth_request("publickey", 9, extra, ep, msg, sizeof(msg));
+	ASSERT_TRUE(len > 0);
 	struct dssh_auth_server_cbs cbs = default_cbs();
-	ASSERT_TRUE(direct_server_test(msg, len, &cbs, NULL, NULL) < 0);
+	int auth_result = 0;
+	ASSERT_OK(direct_server_test(msg, len, &cbs, NULL, NULL, &auth_result));
+	ASSERT_TRUE(auth_result < 0);
 	return TEST_PASS;
 }
 
@@ -8602,15 +8767,18 @@ static int test_direct_pk_sig_no_sig_len(void)
 	uint8_t extra[32];
 	size_t ep = 0;
 	extra[ep++] = 1; /* has_sig=true */
-	dssh_serialize_uint32(3, extra, sizeof(extra), &ep);
+	ASSERT_OK(dssh_serialize_uint32(3, extra, sizeof(extra), &ep));
 	extra[ep++] = 'r'; extra[ep++] = 's'; extra[ep++] = 'a';
-	dssh_serialize_uint32(2, extra, sizeof(extra), &ep);
+	ASSERT_OK(dssh_serialize_uint32(2, extra, sizeof(extra), &ep));
 	extra[ep++] = 'p'; extra[ep++] = 'k';
 	/* no sig_len */
 	uint8_t msg[128];
 	size_t len = build_auth_request("publickey", 9, extra, ep, msg, sizeof(msg));
+	ASSERT_TRUE(len > 0);
 	struct dssh_auth_server_cbs cbs = default_cbs();
-	ASSERT_TRUE(direct_server_test(msg, len, &cbs, NULL, NULL) < 0);
+	int auth_result = 0;
+	ASSERT_OK(direct_server_test(msg, len, &cbs, NULL, NULL, &auth_result));
+	ASSERT_TRUE(auth_result < 0);
 	return TEST_PASS;
 }
 
@@ -8619,16 +8787,19 @@ static int test_direct_pk_sig_overflow(void)
 	uint8_t extra[32];
 	size_t ep = 0;
 	extra[ep++] = 1;
-	dssh_serialize_uint32(3, extra, sizeof(extra), &ep);
+	ASSERT_OK(dssh_serialize_uint32(3, extra, sizeof(extra), &ep));
 	extra[ep++] = 'r'; extra[ep++] = 's'; extra[ep++] = 'a';
-	dssh_serialize_uint32(2, extra, sizeof(extra), &ep);
+	ASSERT_OK(dssh_serialize_uint32(2, extra, sizeof(extra), &ep));
 	extra[ep++] = 'p'; extra[ep++] = 'k';
-	dssh_serialize_uint32(1000, extra, sizeof(extra), &ep);
+	ASSERT_OK(dssh_serialize_uint32(1000, extra, sizeof(extra), &ep));
 	extra[ep++] = 's';
 	uint8_t msg[128];
 	size_t len = build_auth_request("publickey", 9, extra, ep, msg, sizeof(msg));
+	ASSERT_TRUE(len > 0);
 	struct dssh_auth_server_cbs cbs = default_cbs();
-	ASSERT_TRUE(direct_server_test(msg, len, &cbs, NULL, NULL) < 0);
+	int auth_result = 0;
+	ASSERT_OK(direct_server_test(msg, len, &cbs, NULL, NULL, &auth_result));
+	ASSERT_TRUE(auth_result < 0);
 	return TEST_PASS;
 }
 
@@ -8708,15 +8879,15 @@ static int test_direct_long_username(void)
 	uint8_t msg[512];
 	size_t pos = 0;
 	msg[pos++] = SSH_MSG_USERAUTH_REQUEST;
-	dssh_serialize_uint32(300, msg, sizeof(msg), &pos);
+	ASSERT_OK(dssh_serialize_uint32(300, msg, sizeof(msg), &pos));
 	memset(&msg[pos], 'A', 300);
 	pos += 300;
 	/* service + method "none" so it completes */
 	static const char svc[] = "ssh-connection";
-	dssh_serialize_uint32((uint32_t)(sizeof(svc) - 1), msg, sizeof(msg), &pos);
+	ASSERT_OK(dssh_serialize_uint32((uint32_t)(sizeof(svc) - 1), msg, sizeof(msg), &pos));
 	memcpy(&msg[pos], svc, sizeof(svc) - 1);
 	pos += sizeof(svc) - 1;
-	dssh_serialize_uint32(4, msg, sizeof(msg), &pos);
+	ASSERT_OK(dssh_serialize_uint32(4, msg, sizeof(msg), &pos));
 	memcpy(&msg[pos], "none", 4);
 	pos += 4;
 
@@ -8726,11 +8897,13 @@ static int test_direct_long_username(void)
 	cbdata.none_result = DSSH_AUTH_SUCCESS;
 	cbs.cbdata = &cbdata;
 	uint8_t uout[256];
-	size_t uout_len = 0;
-	/* Server processes the request (auth may fail due to EOF
-	 * after, but the truncation ternary fires during parse).
-	 * We just need the function to not crash. */
-	(void)direct_server_test(msg, pos, &cbs, uout, &uout_len);
+	size_t uout_len = sizeof(uout);
+	int auth_result = 1;
+	ASSERT_OK(direct_server_test(msg, pos, &cbs, uout, &uout_len, &auth_result));
+	ASSERT_EQ(auth_result, 0);
+	ASSERT_TRUE(cbdata.none_called);
+	ASSERT_EQ_U(uout_len, 255);
+	ASSERT_MEM_EQ(uout, msg + 5, uout_len);
 	return TEST_PASS;
 }
 
@@ -8739,15 +8912,20 @@ static int test_direct_null_username_out_len(void)
 	/* Non-NULL username_out but NULL username_out_len */
 	uint8_t msg[128];
 	size_t len = build_auth_request("none", 4, NULL, 0, msg, sizeof(msg));
+	ASSERT_TRUE(len > 0);
 	struct dssh_auth_server_cbs cbs = default_cbs();
 	cbs.none_cb = test_none_cb;
 	struct test_auth_cbdata cbdata = {0};
 	cbdata.none_result = DSSH_AUTH_SUCCESS;
 	cbs.cbdata = &cbdata;
 	uint8_t uout[256];
-	/* Server processes none auth; may return error due to EOF
-	 * after success, but the NULL username_out_len branch fires. */
-	(void)direct_server_test(msg, len, &cbs, uout, NULL);
+	memset(uout, 0xa5, sizeof(uout));
+	int auth_result = 1;
+	ASSERT_OK(direct_server_test(msg, len, &cbs, uout, NULL, &auth_result));
+	ASSERT_EQ(auth_result, 0);
+	ASSERT_TRUE(cbdata.none_called);
+	for (size_t i = 0; i < sizeof(uout); i++)
+		ASSERT_EQ(uout[i], 0xa5);
 	return TEST_PASS;
 }
 
@@ -9324,7 +9502,8 @@ test_direct_bad_prefix_in_loop(void)
 	/* A USERAUTH_REQUEST with only the msg type -- prefix parse fails */
 	uint8_t msg[] = { SSH_MSG_USERAUTH_REQUEST };
 	struct dssh_auth_server_cbs cbs = default_cbs();
-	int res = direct_server_test(msg, 1, &cbs, NULL, NULL);
+	int res = 0;
+	ASSERT_OK(direct_server_test(msg, 1, &cbs, NULL, NULL, &res));
 	ASSERT_EQ(res, DSSH_ERROR_PARSE);
 	return TEST_PASS;
 }
@@ -9337,20 +9516,26 @@ test_direct_pk_sig_unknown_algo(void)
 	uint8_t extra[64];
 	size_t ep = 0;
 	extra[ep++] = 1; /* has_sig=true */
-	dssh_serialize_uint32(7, extra, sizeof(extra), &ep);
+	ASSERT_OK(dssh_serialize_uint32(7, extra, sizeof(extra), &ep));
 	memcpy(&extra[ep], "unknown", 7);
 	ep += 7;
-	dssh_serialize_uint32(2, extra, sizeof(extra), &ep);
+	ASSERT_OK(dssh_serialize_uint32(2, extra, sizeof(extra), &ep));
 	extra[ep++] = 'p'; extra[ep++] = 'k';
-	dssh_serialize_uint32(2, extra, sizeof(extra), &ep);
+	ASSERT_OK(dssh_serialize_uint32(2, extra, sizeof(extra), &ep));
 	extra[ep++] = 's'; extra[ep++] = 'g';
 	uint8_t msg[128];
 	size_t len = build_auth_request("publickey", 9, extra, ep,
 	    msg, sizeof(msg));
+	ASSERT_TRUE(len > 0);
 	struct dssh_auth_server_cbs cbs = default_cbs();
-	/* Server sends FAILURE (unknown algo), then gets EOF -> error.
-	 * We just need it to reach L388. */
-	(void)direct_server_test(msg, len, &cbs, NULL, NULL);
+	struct test_auth_cbdata cbdata = {0};
+	cbs.cbdata = &cbdata;
+	int auth_result = 0;
+	ASSERT_OK(direct_server_test(msg, len, &cbs, NULL, NULL, &auth_result));
+	/* The mock's EOF callback returns -1; the internal operation retains
+	 * that error rather than the public wrapper's termination promotion. */
+	ASSERT_EQ(auth_result, DSSH_ERROR_PARSE);
+	ASSERT_FALSE(cbdata.publickey_called);
 	return TEST_PASS;
 }
 
@@ -11682,27 +11867,7 @@ test_direct_kbi_trunc_lang_hdr(void)
 	uint8_t msg[128];
 	size_t len = build_auth_request("keyboard-interactive", 20,
 	    NULL, 0, msg, sizeof(msg));
-
-	struct handshake_ctx ctx;
-	if (handshake_setup(&ctx) < 0) {
-		handshake_cleanup(&ctx);
-		return TEST_FAIL;
-	}
-
-	/* Inject SERVICE_REQUEST */
-	{
-		static const char svc[] = "ssh-userauth";
-		uint8_t svc_msg[64];
-		size_t pos = 0;
-		svc_msg[pos++] = SSH_MSG_SERVICE_REQUEST;
-		dssh_serialize_uint32((uint32_t)(sizeof(svc) - 1), svc_msg,
-		    sizeof(svc_msg), &pos);
-		memcpy(&svc_msg[pos], svc, sizeof(svc) - 1);
-		pos += sizeof(svc) - 1;
-		send_packet(ctx.client, svc_msg, pos, NULL);
-	}
-	send_packet(ctx.client, msg, len, NULL);
-	mock_io_close_c2s_write(&ctx.io);
+	ASSERT_TRUE(len > 0);
 
 	struct test_server_kbi_data kbi_sdata = {
 		.expect_response = "x",
@@ -11713,12 +11878,9 @@ test_direct_kbi_trunc_lang_hdr(void)
 	cbs.keyboard_interactive_cb = test_server_kbi_cb;
 	cbs.cbdata = &kbi_sdata;
 
-	int res = auth_server_impl(ctx.server, &cbs, NULL, NULL);
-	ASSERT_EQ(res, DSSH_ERROR_PARSE);
-
-	mock_io_close_c2s(&ctx.io);
-	mock_io_close_s2c(&ctx.io);
-	handshake_cleanup(&ctx);
+	int auth_result = 0;
+	ASSERT_OK(direct_server_test(msg, len, &cbs, NULL, NULL, &auth_result));
+	ASSERT_EQ(auth_result, DSSH_ERROR_PARSE);
 	return TEST_PASS;
 }
 
@@ -11728,31 +11890,12 @@ test_direct_kbi_trunc_lang_data(void)
 	/* KBI request: language_len=100 but no data follows */
 	uint8_t extra[4];
 	size_t ep = 0;
-	dssh_serialize_uint32(100, extra, sizeof(extra), &ep);
+	ASSERT_OK(dssh_serialize_uint32(100, extra, sizeof(extra), &ep));
 
 	uint8_t msg[128];
 	size_t len = build_auth_request("keyboard-interactive", 20,
 	    extra, ep, msg, sizeof(msg));
-
-	struct handshake_ctx ctx;
-	if (handshake_setup(&ctx) < 0) {
-		handshake_cleanup(&ctx);
-		return TEST_FAIL;
-	}
-
-	{
-		static const char svc[] = "ssh-userauth";
-		uint8_t svc_msg[64];
-		size_t pos = 0;
-		svc_msg[pos++] = SSH_MSG_SERVICE_REQUEST;
-		dssh_serialize_uint32((uint32_t)(sizeof(svc) - 1), svc_msg,
-		    sizeof(svc_msg), &pos);
-		memcpy(&svc_msg[pos], svc, sizeof(svc) - 1);
-		pos += sizeof(svc) - 1;
-		send_packet(ctx.client, svc_msg, pos, NULL);
-	}
-	send_packet(ctx.client, msg, len, NULL);
-	mock_io_close_c2s_write(&ctx.io);
+	ASSERT_TRUE(len > 0);
 
 	struct test_server_kbi_data kbi_sdata = {
 		.expect_response = "x",
@@ -11763,12 +11906,9 @@ test_direct_kbi_trunc_lang_data(void)
 	cbs.keyboard_interactive_cb = test_server_kbi_cb;
 	cbs.cbdata = &kbi_sdata;
 
-	int res = auth_server_impl(ctx.server, &cbs, NULL, NULL);
-	ASSERT_EQ(res, DSSH_ERROR_PARSE);
-
-	mock_io_close_c2s(&ctx.io);
-	mock_io_close_s2c(&ctx.io);
-	handshake_cleanup(&ctx);
+	int auth_result = 0;
+	ASSERT_OK(direct_server_test(msg, len, &cbs, NULL, NULL, &auth_result));
+	ASSERT_EQ(auth_result, DSSH_ERROR_PARSE);
 	return TEST_PASS;
 }
 
@@ -11778,31 +11918,12 @@ test_direct_kbi_trunc_submethods(void)
 	/* KBI request: valid language (empty), but no submethods */
 	uint8_t extra[4];
 	size_t ep = 0;
-	dssh_serialize_uint32(0, extra, sizeof(extra), &ep); /* language = empty */
+	ASSERT_OK(dssh_serialize_uint32(0, extra, sizeof(extra), &ep)); /* language = empty */
 
 	uint8_t msg[128];
 	size_t len = build_auth_request("keyboard-interactive", 20,
 	    extra, ep, msg, sizeof(msg));
-
-	struct handshake_ctx ctx;
-	if (handshake_setup(&ctx) < 0) {
-		handshake_cleanup(&ctx);
-		return TEST_FAIL;
-	}
-
-	{
-		static const char svc[] = "ssh-userauth";
-		uint8_t svc_msg[64];
-		size_t pos = 0;
-		svc_msg[pos++] = SSH_MSG_SERVICE_REQUEST;
-		dssh_serialize_uint32((uint32_t)(sizeof(svc) - 1), svc_msg,
-		    sizeof(svc_msg), &pos);
-		memcpy(&svc_msg[pos], svc, sizeof(svc) - 1);
-		pos += sizeof(svc) - 1;
-		send_packet(ctx.client, svc_msg, pos, NULL);
-	}
-	send_packet(ctx.client, msg, len, NULL);
-	mock_io_close_c2s_write(&ctx.io);
+	ASSERT_TRUE(len > 0);
 
 	struct test_server_kbi_data kbi_sdata = {
 		.expect_response = "x",
@@ -11813,12 +11934,9 @@ test_direct_kbi_trunc_submethods(void)
 	cbs.keyboard_interactive_cb = test_server_kbi_cb;
 	cbs.cbdata = &kbi_sdata;
 
-	int res = auth_server_impl(ctx.server, &cbs, NULL, NULL);
-	ASSERT_EQ(res, DSSH_ERROR_PARSE);
-
-	mock_io_close_c2s(&ctx.io);
-	mock_io_close_s2c(&ctx.io);
-	handshake_cleanup(&ctx);
+	int auth_result = 0;
+	ASSERT_OK(direct_server_test(msg, len, &cbs, NULL, NULL, &auth_result));
+	ASSERT_EQ(auth_result, DSSH_ERROR_PARSE);
 	return TEST_PASS;
 }
 
@@ -11828,32 +11946,13 @@ test_direct_kbi_trunc_submethods_data(void)
 	/* KBI request: valid language (empty), submethods_len=50 but no data */
 	uint8_t extra[8];
 	size_t ep = 0;
-	dssh_serialize_uint32(0, extra, sizeof(extra), &ep); /* language = empty */
-	dssh_serialize_uint32(50, extra, sizeof(extra), &ep); /* submethods_len=50 */
+	ASSERT_OK(dssh_serialize_uint32(0, extra, sizeof(extra), &ep)); /* language = empty */
+	ASSERT_OK(dssh_serialize_uint32(50, extra, sizeof(extra), &ep)); /* submethods_len=50 */
 
 	uint8_t msg[128];
 	size_t len = build_auth_request("keyboard-interactive", 20,
 	    extra, ep, msg, sizeof(msg));
-
-	struct handshake_ctx ctx;
-	if (handshake_setup(&ctx) < 0) {
-		handshake_cleanup(&ctx);
-		return TEST_FAIL;
-	}
-
-	{
-		static const char svc[] = "ssh-userauth";
-		uint8_t svc_msg[64];
-		size_t pos = 0;
-		svc_msg[pos++] = SSH_MSG_SERVICE_REQUEST;
-		dssh_serialize_uint32((uint32_t)(sizeof(svc) - 1), svc_msg,
-		    sizeof(svc_msg), &pos);
-		memcpy(&svc_msg[pos], svc, sizeof(svc) - 1);
-		pos += sizeof(svc) - 1;
-		send_packet(ctx.client, svc_msg, pos, NULL);
-	}
-	send_packet(ctx.client, msg, len, NULL);
-	mock_io_close_c2s_write(&ctx.io);
+	ASSERT_TRUE(len > 0);
 
 	struct test_server_kbi_data kbi_sdata = {
 		.expect_response = "x",
@@ -11864,12 +11963,9 @@ test_direct_kbi_trunc_submethods_data(void)
 	cbs.keyboard_interactive_cb = test_server_kbi_cb;
 	cbs.cbdata = &kbi_sdata;
 
-	int res = auth_server_impl(ctx.server, &cbs, NULL, NULL);
-	ASSERT_EQ(res, DSSH_ERROR_PARSE);
-
-	mock_io_close_c2s(&ctx.io);
-	mock_io_close_s2c(&ctx.io);
-	handshake_cleanup(&ctx);
+	int auth_result = 0;
+	ASSERT_OK(direct_server_test(msg, len, &cbs, NULL, NULL, &auth_result));
+	ASSERT_EQ(auth_result, DSSH_ERROR_PARSE);
 	return TEST_PASS;
 }
 
@@ -12502,6 +12598,8 @@ test_auth_request_capacity(void)
 static struct dssh_test_entry tests[] = {
 	{ "release/auth_setup_ownership", test_auth_setup_ownership },
 	{ "release/auth_nested_setup_ownership", test_auth_nested_setup_ownership },
+	{ "release/auth_fixture_builder", test_auth_fixture_builder },
+	{ "release/auth_direct_fixture_status", test_auth_direct_fixture_status },
 	{ "callbacks/banner_transaction", test_auth_callback_banner_transaction },
 	{ "callbacks/output_pairs", test_auth_callback_output_pairs },
 	{ "callbacks/password_lifetime", test_auth_callback_password_lifetime },

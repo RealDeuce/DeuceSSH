@@ -363,6 +363,7 @@ test_auth_frame_server(void)
 		extra[pos++] = 0;
 		uint8_t packet[512];
 		size_t size = build_auth_request(methods[variant], strlen(methods[variant]), extra, pos, packet, sizeof(packet));
+		ASSERT_TRUE(size > 0);
 		struct test_auth_cbdata callbacks = { .none_result = DSSH_AUTH_SUCCESS, .password_result = DSSH_AUTH_SUCCESS,
 		    .publickey_result = DSSH_AUTH_SUCCESS };
 		struct dssh_auth_server_cbs cbs = { .methods_str = "password,publickey", .none_cb = test_none_cb,
@@ -372,7 +373,9 @@ test_auth_frame_server(void)
 			cbs.keyboard_interactive_cb = auth_frame_server_kbi;
 			cbs.cbdata = &probe;
 		}
-		ASSERT_EQ(direct_server_test(packet, size, &cbs, NULL, NULL), DSSH_ERROR_PARSE);
+		int auth_result = 0;
+		ASSERT_OK(direct_server_test(packet, size, &cbs, NULL, NULL, &auth_result));
+		ASSERT_EQ(auth_result, DSSH_ERROR_PARSE);
 		ASSERT_FALSE(callbacks.none_called);
 		ASSERT_FALSE(callbacks.password_called);
 		ASSERT_FALSE(callbacks.publickey_called);
@@ -383,10 +386,13 @@ test_auth_frame_server(void)
 		uint8_t packet[128];
 		const char method[] = "keyboard-interactive";
 		size_t size = build_auth_request(method, sizeof(method) - 1, extra, sizeof(extra), packet, sizeof(packet));
+		ASSERT_TRUE(size > 0);
 		struct auth_frame_probe probe = { .shape = shape };
 		struct dssh_auth_server_cbs cbs = { .methods_str = method, .keyboard_interactive_cb = auth_frame_server_kbi,
 		    .cbdata = &probe };
-		ASSERT_EQ(direct_server_test(packet, size, &cbs, NULL, NULL), DSSH_ERROR_INVALID);
+		int auth_result = 0;
+		ASSERT_OK(direct_server_test(packet, size, &cbs, NULL, NULL, &auth_result));
+		ASSERT_EQ(auth_result, DSSH_ERROR_INVALID);
 		ASSERT_EQ_U(probe.calls, 1);
 	}
 	const char *invalid[] = { "none", "password,none", ",password", "password,", "p,,q", "p q", "p\177", "p\200" };
@@ -446,6 +452,7 @@ test_auth_frame_config_update(void)
 		ASSERT_TRUE(auth_frame_string(packet, sizeof(packet), &length, "ssh-userauth", 12));
 		ASSERT_OK(send_packet(ctx.client, packet, length, NULL));
 		length = build_auth_request("none", 4, NULL, 0, packet, sizeof(packet));
+		ASSERT_TRUE(length > 0);
 		ASSERT_OK(send_packet(ctx.client, packet, length, NULL));
 		mock_io_close_c2s_write(&ctx.io);
 		uint32_t sequence = ctx.server->trans.tx_seq;

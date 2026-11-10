@@ -7481,9 +7481,19 @@ test_chan_get_pty(void)
 static int
 accept_env_cb(dssh_channel ch, const struct dssh_chan_params *p, void *cbdata)
 {
-	(void)ch;
 	(void)p;
 	(void)cbdata;
+	const uint8_t *rtype;
+	uint32_t rtype_len;
+	bool want_reply;
+	const uint8_t *data;
+	size_t data_len;
+	/* The occupied setup mailbox retains the actual peer request throughout
+	 * this callback. Both accepted and rejected env requests must be silent. */
+	int ret = parse_channel_request(ch->setup_payload, ch->setup_payload_len,
+	    &rtype, &rtype_len, &want_reply, &data, &data_len);
+	if (ret < 0 || want_reply || rtype_len != 3 || memcmp(rtype, "env", 3) != 0)
+		return DSSH_ERROR_PARSE;
 	return 0;
 }
 
@@ -7561,8 +7571,9 @@ test_env_roundtrip(void)
 static int
 accept_selected_env_cb(dssh_channel ch, const struct dssh_chan_params *p, void *cbdata)
 {
-	(void)ch;
-	(void)cbdata;
+	int ret = accept_env_cb(ch, p, cbdata);
+	if (ret < 0)
+		return ret;
 	if (p->env_count == 0)
 		return DSSH_ERROR_INVALID;
 	const char *name = p->env[p->env_count - 1].name;

@@ -1364,6 +1364,10 @@ for shell (disabled for exec/subsystem), no modes, no env.  Zero
 terminal mode opcodes by default — the library cannot know the app's
 terminal state.
 
+Environment requests use `want_reply=false`. Channel opening does not wait for
+environment acknowledgments or report whether the peer accepted a variable;
+local allocation and send errors still fail the open.
+
 `set_mode()` accumulates opcode/value pairs.  Encoding at open time
 emits opcodes 1–159 first, then 160+, then TTY_OP_END (RFC 4254 s8).
 

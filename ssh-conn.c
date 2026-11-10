@@ -3056,10 +3056,10 @@ wait_channel_request_response(struct dssh_session_s *sess, struct dssh_channel_s
 	return result;
 }
 
-/* Send one setup request and wait for its SUCCESS/FAILURE response. */
-DSSH_TESTABLE int
-send_channel_request_wait(struct dssh_session_s *sess, struct dssh_channel_s *ch, const char *req_type,
-    const uint8_t *extra, size_t extra_len)
+/* Send one setup request, optionally waiting for SUCCESS/FAILURE. */
+static int
+send_channel_request(struct dssh_session_s *sess, struct dssh_channel_s *ch, const char *req_type,
+    const uint8_t *extra, size_t extra_len, bool want_reply)
 {
 	size_t rtlen = strlen(req_type);
 	if (rtlen > UINT32_MAX || rtlen > SIZE_MAX - CHAN_REQUEST_FIXED
@@ -3089,9 +3089,11 @@ send_channel_request_wait(struct dssh_session_s *sess, struct dssh_channel_s *ch
 		send_cancel(sess);
 		return result;
 	}
-	ch->request_pending = true;
-	ch->request_responded = false;
-	ch->request_success = false;
+	if (want_reply) {
+		ch->request_pending = true;
+		ch->request_responded = false;
+		ch->request_success = false;
+	}
 	if (channel_unlock_lifecycle(sess, ch) < 0) {
 		send_cancel(sess);
 		return DSSH_ERROR_TERMINATED;
@@ -3104,10 +3106,12 @@ send_channel_request_wait(struct dssh_session_s *sess, struct dssh_channel_s *ch
 	DSSH_PUT_U32(wire_rtlen, msg, &pos);
 	memcpy(&msg[pos], req_type, rtlen);
 	pos += rtlen;
-	msg[pos++] = 1;
+	msg[pos++] = want_reply ? 1 : 0;
 	if (extra_len > 0)
 		memcpy(&msg[pos], extra, extra_len);
 	ret = send_commit(sess, total, NULL);
+	if (!want_reply)
+		return ret;
 	if (ret < 0) {
 		int lock_ret = mtx_lock(&ch->buf_mtx);
 		if (lock_ret != thrd_success) {
@@ -3121,6 +3125,14 @@ send_channel_request_wait(struct dssh_session_s *sess, struct dssh_channel_s *ch
 		return ret;
 	}
 	return wait_channel_request_response(sess, ch);
+}
+
+/* Send one setup request and wait for its SUCCESS/FAILURE response. */
+DSSH_TESTABLE int
+send_channel_request_wait(struct dssh_session_s *sess, struct dssh_channel_s *ch, const char *req_type,
+    const uint8_t *extra, size_t extra_len)
+{
+	return send_channel_request(sess, ch, req_type, extra, extra_len, true);
 }
 
 /*
@@ -3717,10 +3729,10 @@ chan_send_env(struct dssh_session_s *sess, struct dssh_channel_s *ch, const stru
 		memcpy(&extra[ep], p->env[i].value, vlen);
 		ep += vlen;
 
-		int ret = send_channel_request_wait(sess, ch, "env", extra, ep);
+		int ret = send_channel_request(sess, ch, "env", extra, ep, false);
 
 		free(extra);
-		if (ret < 0 && ret != DSSH_ERROR_REJECTED)
+		if (ret < 0)
 			return ret;
 	}
 	return 0;

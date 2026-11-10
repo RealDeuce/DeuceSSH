@@ -205,8 +205,8 @@ final destination is the application's responsibility.
 **CONFORMS** — Library functions send CHANNEL_REQUEST with
 `want_reply=TRUE` for: pty-req (`session_open_shell`), shell
 (`session_open_shell`), exec (`session_open_exec`), subsystem
-(`channel_open_subsystem`), env (declared in header).  Window-change
-uses `want_reply=FALSE` per RFC.  All requests that use `want_reply=TRUE`
+(`channel_open_subsystem`). Environment requests and window-change
+use `want_reply=FALSE`. All requests that use `want_reply=TRUE`
 wait for SUCCESS/FAILURE via the `send_channel_request_wait()` mechanism.
 
 ### 5.4-2 (CHANNEL_SUCCESS/FAILURE handling)
@@ -278,10 +278,11 @@ pty requests.
 
 ## Section 6.4: Environment Variable Passing
 
-**CONFORMS** — Server-side env callback in
-`dssh_server_session_cbs` receives environment variables during
-`dssh_session_accept_channel()`.  Client-side env sending is
-available via `conn_request_env()` (internal).
+**CONFORMS** — The `env` callback in `dssh_chan_accept_cbs` receives
+environment variables during `dssh_chan_accept()`. Client-side builder
+entries are sent by `chan_send_env()` with `want_reply=FALSE`, without
+waiting for or reporting peer acceptance. Servers continue to honor the
+reply flag supplied by peers, including requests that ask for a response.
 
 ---
 

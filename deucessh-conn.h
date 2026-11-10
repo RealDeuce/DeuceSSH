@@ -127,6 +127,7 @@ DSSH_PUBLIC int  dssh_chan_params_set_size(struct dssh_chan_params *p, uint32_t 
 DSSH_PUBLIC int  dssh_chan_params_set_mode(struct dssh_chan_params *p, uint8_t opcode, uint32_t value);
 DSSH_PUBLIC int  dssh_chan_params_set_command(struct dssh_chan_params *p, const char *command);
 DSSH_PUBLIC int  dssh_chan_params_set_subsystem(struct dssh_chan_params *p, const char *name);
+/* Env requests are sent with want_reply=false; peer acceptance is not reported. */
 DSSH_PUBLIC int  dssh_chan_params_add_env(struct dssh_chan_params *p, const char *name, const char *value);
 
 /* Event poll flag (in addition to DSSH_POLL_READ etc.) */

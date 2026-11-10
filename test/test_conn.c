@@ -8604,6 +8604,7 @@ static struct dssh_test_entry tests[] = {
 	{ "setup/terminal_first_failure", test_setup_terminal_first_failure },
 	{ "setup/terminal_second_failure", test_setup_terminal_second_failure },
 	{ "event/text_poll_reuse", test_event_text_poll_reuse },
+	{ "event/text_free_observer", test_event_text_free_observer },
 	{ "event/text_growth_unlocked", test_event_text_growth_unlocked },
 	{ "event/text_poll_race", test_event_text_poll_race },
 	{ "event/text_binary_callback", test_event_text_binary_callback },

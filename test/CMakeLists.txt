@@ -677,6 +677,54 @@ foreach(part IN LISTS key_generation_parts)
 	set_tests_properties(dssh_key_generation_${part} PROPERTIES ENVIRONMENT "${DSSH_TEST_KEY_ENV}" TIMEOUT 180)
 endforeach()
 find_package(Python3 3.9 QUIET COMPONENTS Interpreter)
+if(Python3_Interpreter_FOUND AND UNIX AND NOT APPLE)
+	# Compile the canonical application sources with GNU linker controls;
+	# both variants continue to link the actual production libraries.
+	foreach(kind IN ITEMS static shared)
+		foreach(peer IN ITEMS event accept_callback)
+			set(consumer dssh_test_${peer}_peer_${kind})
+			if(NOT TARGET ${consumer})
+				continue()
+			endif()
+			set(control ${consumer}_failures)
+			get_target_property(consumer_sources ${consumer} SOURCES)
+			add_executable(${control} ${consumer_sources} peer_thread_failures.c)
+			set_property(TARGET ${control} PROPERTY C_STANDARD ${DEUCESSH_C_STANDARD})
+			set_property(TARGET ${control} PROPERTY C_STANDARD_REQUIRED ON)
+			target_compile_options(${control} PRIVATE ${DEUCESSH_COMPILE_OPTIONS})
+			target_compile_definitions(${control} PRIVATE _DEFAULT_SOURCE)
+			target_link_libraries(${control} PRIVATE deucessh_${kind} ${THREADS_LINK_LIB})
+			if(DSSH_THREADS_SHIM_INCLUDE)
+				target_include_directories(${control} BEFORE PRIVATE ${DSSH_THREADS_SHIM_INCLUDE})
+			endif()
+			target_link_options(${control} PRIVATE
+				-Wl,--wrap=thrd_create,--wrap=thrd_join,--wrap=mock_tx_client)
+			if(peer STREQUAL "event")
+				set(profiles event)
+			else()
+				set(profiles accept nested)
+			endif()
+			foreach(profile IN LISTS profiles)
+				set(modes plain tx)
+				if(profile STREQUAL "nested")
+					set(last_worker 3)
+				else()
+					set(last_worker 1)
+				endif()
+				foreach(index RANGE 0 ${last_worker})
+					list(APPEND modes create-${index} join-${index}-retained join-${index}-released)
+				endforeach()
+				foreach(mode IN LISTS modes)
+					set(name dssh_peer_ownership_${kind}_${profile}_${mode})
+					add_test(NAME ${name} COMMAND ${Python3_EXECUTABLE}
+						${CMAKE_CURRENT_SOURCE_DIR}/peer_thread_failures.py
+						$<TARGET_FILE:${control}> ${profile} ${mode})
+					set_tests_properties(${name} PROPERTIES TIMEOUT 60)
+				endforeach()
+			endforeach()
+		endforeach()
+	endforeach()
+endif()
 if(Python3_Interpreter_FOUND)
 	dssh_add_test(key_validation test_key_validation.c)
 	if(DEUCESSH_CRYPTO_BACKEND STREQUAL "OpenSSL")
@@ -1227,7 +1275,7 @@ set(CONN_TESTS
 	setup/mailbox_reuse setup/mailbox_growth setup/mailbox_rollback setup/mailbox_bound
 	setup/terminal_storage setup/terminal_first_failure setup/terminal_second_failure
 	event/text_poll_reuse
-	event/text_growth_unlocked event/text_poll_race
+	event/text_free_observer event/text_growth_unlocked event/text_poll_race
 	event/text_binary_callback event/text_binary_poll event/text_empty_callback event/text_empty_poll event/text_packet_boundary
 	event/delivery_atomic_state
 	event/delivery_self_disable

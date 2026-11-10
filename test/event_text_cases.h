@@ -201,6 +201,27 @@ event_text_free_check(const void *ptr, void *opaque)
 }
 
 static int
+test_event_text_free_observer(void)
+{
+	struct dssh_channel_s ch = {0};
+	if (mtx_init(&ch.buf_mtx, mtx_plain) != thrd_success)
+		return TEST_FAIL;
+	unsigned char metadata = 0;
+	struct event_text_free_check check = {.ch = &ch, .metadata = &metadata};
+	event_text_free_check(NULL, &check);
+	bool valid = !check.seen;
+	event_text_free_check(&metadata, &check);
+	valid = valid && check.metadata == NULL && check.seen && check.unlocked;
+	check.seen = false;
+	check.unlocked = false;
+	event_text_free_check(NULL, &check);
+	valid = valid && !check.seen && !check.unlocked;
+	mtx_destroy(&ch.buf_mtx);
+	ASSERT_TRUE(valid);
+	return TEST_PASS;
+}
+
+static int
 test_event_text_growth_unlocked(void)
 {
 	struct event_fixture fixture = {0};

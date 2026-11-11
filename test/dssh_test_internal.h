@@ -50,11 +50,12 @@ int reserve_mac_buffers(dssh_session sess, uint16_t needed);
  * from client_list (preference order) that also appears in server_list
  * and is registered in the linked list starting at head.
  * name_offset is the byte offset of the name[] flex member in the struct.
+ * next reads the declared linkage type and returns its converted value.
  * filter is an optional CSV whitelist (NULL = no filter).
  * Returns node pointer or NULL.
  */
 void *negotiate_algo(struct dssh_name_list client_list,
-    struct dssh_name_list server_list, void *head, size_t name_offset, const char *filter);
+    struct dssh_name_list server_list, void *head, size_t name_offset, dssh_registry_next next, const char *filter);
 
 /*
  * Build a comma-separated name-list from a linked list of algorithm
@@ -63,8 +64,14 @@ void *negotiate_algo(struct dssh_name_list client_list,
  * (NULL = registration-order, all entries).  Returns the length
  * written.
  */
-int64_t build_namelist(void *head, size_t name_offset,
+int64_t build_namelist(void *head, size_t name_offset, dssh_registry_next next,
     char *buf, size_t bufsz, const char *filter);
+
+void *registry_next_kex(void *node);
+void *registry_next_key_algo(void *node);
+void *registry_next_enc(void *node);
+void *registry_next_mac(void *node);
+void *registry_next_comp(void *node);
 
 /*
  * Membership test: is `name` (length nlen) in the comma-separated

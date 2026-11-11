@@ -60,12 +60,14 @@ static _Atomic(dssh_session) receive_entry_watched_rx;
 static atomic_bool receive_entry_rx_entered;
 
 
+static void *test_algo_next(void *node);
+
 static void *
 negotiate_text(const char *client, const char *server, void *head, size_t offset, const char *filter)
 {
 	struct dssh_name_list client_names = { (const uint8_t *)client, strlen(client) };
 	struct dssh_name_list server_names = { (const uint8_t *)server, strlen(server) };
-	return negotiate_algo(client_names, server_names, head, offset, filter);
+	return negotiate_algo(client_names, server_names, head, offset, test_algo_next, filter);
 }
 
 static size_t
@@ -533,8 +535,13 @@ struct test_algo_node {
 	struct test_algo_node *next;
 	char name[64];
 };
-_Static_assert(!offsetof(struct test_algo_node, next),
-    "next must be at offset 0 for generic list traversal");
+
+static void *
+test_algo_next(void *node)
+{
+	struct test_algo_node *entry = node;
+	return entry->next;
+}
 
 static int
 test_negotiate_first_client_match(void)
@@ -619,7 +626,7 @@ test_build_namelist_single(void)
 	char buf[256];
 
 	size_t noff = offsetof(struct test_algo_node, name);
-	int64_t len = build_namelist(&a, noff, buf, sizeof(buf), NULL);
+	int64_t len = build_namelist(&a, noff, test_algo_next, buf, sizeof(buf), NULL);
 	ASSERT_STR_EQ(buf, "aes256-ctr");
 	ASSERT_EQ_U(len, strlen("aes256-ctr"));
 	return TEST_PASS;
@@ -634,7 +641,7 @@ test_build_namelist_multiple(void)
 	char buf[256];
 
 	size_t noff = offsetof(struct test_algo_node, name);
-	int64_t len = build_namelist(&a, noff, buf, sizeof(buf), NULL);
+	int64_t len = build_namelist(&a, noff, test_algo_next, buf, sizeof(buf), NULL);
 	ASSERT_STR_EQ(buf, "aes256-ctr,hmac-sha2-256,none");
 	ASSERT_EQ_U(len, strlen("aes256-ctr,hmac-sha2-256,none"));
 	return TEST_PASS;
@@ -645,7 +652,7 @@ test_build_namelist_empty(void)
 {
 	char buf[256];
 	buf[0] = 'X';
-	int64_t len = build_namelist(NULL, 0, buf, sizeof(buf), NULL);
+	int64_t len = build_namelist(NULL, 0, test_algo_next, buf, sizeof(buf), NULL);
 	ASSERT_EQ_U(len, 0);
 	ASSERT_EQ(buf[0], '\0');
 	return TEST_PASS;
@@ -664,7 +671,7 @@ test_filter_drops_algo(void)
 	char   buf[64];
 
 	size_t noff = offsetof(struct test_algo_node, name);
-	int64_t len  = build_namelist(&a, noff, buf, sizeof(buf), "aes256-ctr");
+	int64_t len  = build_namelist(&a, noff, test_algo_next, buf, sizeof(buf), "aes256-ctr");
 	ASSERT_STR_EQ(buf, "aes256-ctr");
 	ASSERT_EQ_U(len, strlen("aes256-ctr"));
 	return TEST_PASS;
@@ -679,7 +686,7 @@ test_filter_reorders(void)
 	char   buf[64];
 
 	size_t noff = offsetof(struct test_algo_node, name);
-	int64_t len  = build_namelist(&a, noff, buf, sizeof(buf), "B,A");
+	int64_t len  = build_namelist(&a, noff, test_algo_next, buf, sizeof(buf), "B,A");
 	ASSERT_STR_EQ(buf, "B,A");
 	ASSERT_EQ_U(len, 3);
 	return TEST_PASS;
@@ -693,7 +700,7 @@ test_filter_skips_unknown(void)
 	char   buf[64];
 
 	size_t noff = offsetof(struct test_algo_node, name);
-	int64_t len  = build_namelist(&a, noff, buf, sizeof(buf),
+	int64_t len  = build_namelist(&a, noff, test_algo_next, buf, sizeof(buf),
 	    "aes256-ctr,nonexistent");
 	ASSERT_STR_EQ(buf, "aes256-ctr");
 	ASSERT_EQ_U(len, strlen("aes256-ctr"));
@@ -709,7 +716,7 @@ test_filter_null_uses_all(void)
 	char   buf[64];
 
 	size_t noff = offsetof(struct test_algo_node, name);
-	int64_t len  = build_namelist(&a, noff, buf, sizeof(buf), NULL);
+	int64_t len  = build_namelist(&a, noff, test_algo_next, buf, sizeof(buf), NULL);
 	ASSERT_STR_EQ(buf, "A,B");
 	ASSERT_EQ_U(len, 3);
 	return TEST_PASS;
@@ -3933,120 +3940,85 @@ test_init_large_packet_size(void)
 static int
 test_build_namelist_overflow(void)
 {
-	/* Build namelist into a tiny buffer using a mock linked list.
-	 * This tests the comma-overflow and name-overflow branches. */
 	dssh_test_reset_global_config();
+	struct dssh_kex_s *first = malloc(sizeof(*first) + sizeof("alpha"));
+	struct dssh_kex_s *second = malloc(sizeof(*second) + sizeof("bravo"));
+	if (first == NULL || second == NULL) {
+		free(first);
+		free(second);
+		return TEST_FAIL;
+	}
+	*first = (struct dssh_kex_s){ .next = second };
+	*second = (struct dssh_kex_s){0};
+	memcpy(first->name, "alpha", sizeof("alpha"));
+	memcpy(second->name, "bravo", sizeof("bravo"));
 
-	/* Create two fake kex entries with known names */
-	uint8_t e1buf[sizeof(struct dssh_kex_s) + 16];
-	uint8_t e2buf[sizeof(struct dssh_kex_s) + 16];
-	memset(e1buf, 0, sizeof(e1buf));
-	memset(e2buf, 0, sizeof(e2buf));
-	struct dssh_kex_s *e1 = (struct dssh_kex_s *)e1buf;
-	struct dssh_kex_s *e2 = (struct dssh_kex_s *)e2buf;
-	strcpy(e1->name, "alpha");
-	strcpy(e2->name, "bravo");
-	e1->next = e2;
-	e2->next = NULL;
-
-	/* Buffer fits "alpha," but not "alpha,bravo".
-	 * Comma+name checked together, so only "alpha" is emitted. */
+	/* A comma and complete next name must fit together. All three
+	 * capacities fail, preserving the previously completed prefix. */
 	char buf[8];
-	int64_t len = build_namelist(e1,
-	    offsetof(struct dssh_kex_s, name), buf, sizeof(buf), NULL);
-	ASSERT_STR_EQ(buf, "alpha");
-	ASSERT_EQ(len, DSSH_ERROR_TOOLONG);
-
-	/* Buffer too small for comma after "alpha" -- covers pos+1>=bufsz */
-	char exact[6];  /* pos=5 after "alpha", 5+1>=6 so comma not written */
-	len = build_namelist(e1,
-	    offsetof(struct dssh_kex_s, name), exact, sizeof(exact), NULL);
-	ASSERT_STR_EQ(exact, "alpha");
-	ASSERT_EQ(len, DSSH_ERROR_TOOLONG);
-
-	/* Buffer too small even for "alpha" */
+	int64_t len = build_namelist(first, offsetof(struct dssh_kex_s, name),
+	    registry_next_kex, buf, sizeof(buf), NULL);
+	bool valid = len == DSSH_ERROR_TOOLONG && strcmp(buf, "alpha") == 0;
+	char exact[6];
+	len = build_namelist(first, offsetof(struct dssh_kex_s, name),
+	    registry_next_kex, exact, sizeof(exact), NULL);
+	valid = valid && len == DSSH_ERROR_TOOLONG && strcmp(exact, "alpha") == 0;
 	char tiny[4];
-	len = build_namelist(e1,
-	    offsetof(struct dssh_kex_s, name), tiny, sizeof(tiny), NULL);
-	ASSERT_EQ(len, DSSH_ERROR_TOOLONG);
-
+	len = build_namelist(first, offsetof(struct dssh_kex_s, name),
+	    registry_next_kex, tiny, sizeof(tiny), NULL);
+	valid = valid && len == DSSH_ERROR_TOOLONG && tiny[0] == 0;
+	free(second);
+	free(first);
 	dssh_test_reset_global_config();
+	ASSERT_TRUE(valid);
 	return TEST_PASS;
 }
 
-/* ================================================================
- * build_namelist truncation -- verify no trailing comma or partial
- * name when buffer is too small for the next entry.
- * ================================================================ */
-
+/* Complete names are published; insufficient capacity leaves no trailing
+ * comma. Allocated descriptors provide the declared type and alignment. */
 static int
 test_build_namelist_truncation_no_trailing_comma(void)
 {
-	/* Two entries: "alpha" (5) and "bravo" (5).
-	 * "alpha,bravo" = 11 chars + NUL = 12 bytes.
-	 * Buffer of 11 fits "alpha," + comma but not "bravo" --
-	 * must NOT produce a trailing comma. */
 	dssh_test_reset_global_config();
+	struct dssh_kex_s *entries[3] = {NULL, NULL, NULL};
+	for (size_t i = 0; i < 3; i++) {
+		entries[i] = malloc(sizeof(*entries[i]) + sizeof("alpha"));
+		if (entries[i] == NULL) {
+			for (size_t j = 0; j < i; j++)
+				free(entries[j]);
+			return TEST_FAIL;
+		}
+		*entries[i] = (struct dssh_kex_s){0};
+	}
+	entries[0]->next = entries[1];
+	memcpy(entries[0]->name, "alpha", sizeof("alpha"));
+	memcpy(entries[1]->name, "bravo", sizeof("bravo"));
+	char exact[12];
+	int64_t len = build_namelist(entries[0], offsetof(struct dssh_kex_s, name),
+	    registry_next_kex, exact, sizeof(exact), NULL);
+	bool valid = len == 11 && strcmp(exact, "alpha,bravo") == 0;
+	char short_buf[11];
+	len = build_namelist(entries[0], offsetof(struct dssh_kex_s, name),
+	    registry_next_kex, short_buf, sizeof(short_buf), NULL);
+	valid = valid && len == DSSH_ERROR_TOOLONG && strcmp(short_buf, "alpha") == 0;
 
-	uint8_t e1buf[sizeof(struct dssh_kex_s) + 16];
-	uint8_t e2buf[sizeof(struct dssh_kex_s) + 16];
-	memset(e1buf, 0, sizeof(e1buf));
-	memset(e2buf, 0, sizeof(e2buf));
-	struct dssh_kex_s *e1 = (struct dssh_kex_s *)e1buf;
-	struct dssh_kex_s *e2 = (struct dssh_kex_s *)e2buf;
-	strcpy(e1->name, "alpha");
-	strcpy(e2->name, "bravo");
-	e1->next = e2;
-	e2->next = NULL;
-
-	/* Exact fit: buf[12] holds "alpha,bravo\0" */
-	char exact_fit[12];
-	int64_t len = build_namelist(e1,
-	    offsetof(struct dssh_kex_s, name), exact_fit, sizeof(exact_fit), NULL);
-	ASSERT_STR_EQ(exact_fit, "alpha,bravo");
-	ASSERT_EQ_U(len, 11);
-
-	/* One byte short: can't fit "bravo" after comma.
-	 * Must roll back to "alpha" with no trailing comma. */
-	char one_short[11];
-	len = build_namelist(e1,
-	    offsetof(struct dssh_kex_s, name), one_short, sizeof(one_short), NULL);
-	ASSERT_STR_EQ(one_short, "alpha");
-	ASSERT_EQ(len, DSSH_ERROR_TOOLONG);
-
-	/* Three entries: "aa", "bb", "cc".  "aa,bb,cc" = 8 + NUL = 9.
-	 * Buffer of 7 fits "aa,bb," but not "cc" -- must be "aa,bb". */
-	uint8_t e3buf[sizeof(struct dssh_kex_s) + 16];
-	uint8_t e4buf[sizeof(struct dssh_kex_s) + 16];
-	uint8_t e5buf[sizeof(struct dssh_kex_s) + 16];
-	memset(e3buf, 0, sizeof(e3buf));
-	memset(e4buf, 0, sizeof(e4buf));
-	memset(e5buf, 0, sizeof(e5buf));
-	struct dssh_kex_s *e3 = (struct dssh_kex_s *)e3buf;
-	struct dssh_kex_s *e4 = (struct dssh_kex_s *)e4buf;
-	struct dssh_kex_s *e5 = (struct dssh_kex_s *)e5buf;
-	strcpy(e3->name, "aa");
-	strcpy(e4->name, "bb");
-	strcpy(e5->name, "cc");
-	e3->next = e4;
-	e4->next = e5;
-	e5->next = NULL;
-
+	/* Reuse the same objects for the three-entry boundary. */
+	entries[1]->next = entries[2];
+	memcpy(entries[0]->name, "aa", sizeof("aa"));
+	memcpy(entries[1]->name, "bb", sizeof("bb"));
+	memcpy(entries[2]->name, "cc", sizeof("cc"));
 	char three[7];
-	len = build_namelist(e3,
-	    offsetof(struct dssh_kex_s, name), three, sizeof(three), NULL);
-	ASSERT_STR_EQ(three, "aa,bb");
-	ASSERT_EQ(len, DSSH_ERROR_TOOLONG);
-
-	/* Buffer fits comma but nothing after: "aa,bb" in buf[6].
-	 * pos=5 after "aa,bb", comma check: 5+1>=6 -> break. */
+	len = build_namelist(entries[0], offsetof(struct dssh_kex_s, name),
+	    registry_next_kex, three, sizeof(three), NULL);
+	valid = valid && len == DSSH_ERROR_TOOLONG && strcmp(three, "aa,bb") == 0;
 	char tight[6];
-	len = build_namelist(e3,
-	    offsetof(struct dssh_kex_s, name), tight, sizeof(tight), NULL);
-	ASSERT_STR_EQ(tight, "aa,bb");
-	ASSERT_EQ(len, DSSH_ERROR_TOOLONG);
-
+	len = build_namelist(entries[0], offsetof(struct dssh_kex_s, name),
+	    registry_next_kex, tight, sizeof(tight), NULL);
+	valid = valid && len == DSSH_ERROR_TOOLONG && strcmp(tight, "aa,bb") == 0;
+	for (size_t i = 0; i < 3; i++)
+		free(entries[i]);
 	dssh_test_reset_global_config();
+	ASSERT_TRUE(valid);
 	return TEST_PASS;
 }
 
@@ -7057,13 +7029,13 @@ test_negotiate_no_common_comp_s2c(void)
 	/* Determine our algorithm names for the matching lists */
 	char kex_name[64], ka_name[64], enc_name[64], mac_name[64];
 	build_namelist(gconf.kex_head,
-	    offsetof(struct dssh_kex_s, name), kex_name, sizeof(kex_name), NULL);
+	    offsetof(struct dssh_kex_s, name), registry_next_kex, kex_name, sizeof(kex_name), NULL);
 	build_namelist(gconf.key_algo_head,
-	    offsetof(struct dssh_key_algo_s, name), ka_name, sizeof(ka_name), NULL);
+	    offsetof(struct dssh_key_algo_s, name), registry_next_key_algo, ka_name, sizeof(ka_name), NULL);
 	build_namelist(gconf.enc_head,
-	    offsetof(struct dssh_enc_s, name), enc_name, sizeof(enc_name), NULL);
+	    offsetof(struct dssh_enc_s, name), registry_next_enc, enc_name, sizeof(enc_name), NULL);
 	build_namelist(gconf.mac_head,
-	    offsetof(struct dssh_mac_s, name), mac_name, sizeof(mac_name), NULL);
+	    offsetof(struct dssh_mac_s, name), registry_next_mac, mac_name, sizeof(mac_name), NULL);
 
 	size_t pos = 17;  /* skip msg_type + cookie */
 	pos = write_namelist(crafted, pos, kex_name);     /* [0] kex */

@@ -47,7 +47,7 @@ typedef unsigned int (*dssh_key_algo_keybits)(const uint8_t *key_blob, size_t ke
 #define DSSH_KEY_ALGO_FLAG_SIGNATURE_CAPABLE  UINT32_C(1 << 1)
 
 typedef struct dssh_key_algo_s {
-	struct dssh_key_algo_s *next; /* must be first -- generic traversal assumes offsetof(next) == 0 */
+	struct dssh_key_algo_s *next; /* Registry link; must be NULL at registration. */
 	dssh_key_algo_sign      sign;
 	dssh_key_algo_verify    verify;
 	dssh_key_algo_pubkey    pubkey;

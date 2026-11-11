@@ -54,7 +54,7 @@ typedef dssh_comp_transform dssh_comp_uncompress;
 typedef void (*dssh_comp_cleanup)(dssh_comp_ctx *ctx);
 
 typedef struct dssh_comp_s {
-	struct dssh_comp_s  *next; /* must be first -- generic traversal assumes offsetof(next) == 0 */
+	struct dssh_comp_s  *next; /* Registry link; must be NULL at registration. */
 	dssh_comp_init       init;
 	dssh_comp_bound      bound;
 	dssh_comp_compress   compress;

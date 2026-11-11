@@ -2819,20 +2819,36 @@ name_in_filter(const char *name, size_t nlen, const char *filter)
 	return false;
 }
 
+/* Read each link with its declared pointer type, then convert its value.
+ * Generic name operations must not copy pointer representations between types. */
+#define DEFINE_REGISTRY_NEXT(suffix, type) \
+	DSSH_TESTABLE void *registry_next_##suffix(void *node) \
+	{ \
+		type entry = node; \
+		return entry->next; \
+	}
+DEFINE_REGISTRY_NEXT(kex, dssh_kex)
+DEFINE_REGISTRY_NEXT(key_algo, dssh_key_algo)
+DEFINE_REGISTRY_NEXT(enc, dssh_enc)
+DEFINE_REGISTRY_NEXT(mac, dssh_mac)
+DEFINE_REGISTRY_NEXT(comp, dssh_comp)
+#undef DEFINE_REGISTRY_NEXT
+
 /*
  * Look up a node in `head` by exact-length name match.  Returns
  * the node pointer or NULL.  Used by build_namelist when iterating
  * the filter (filter order, not registration order).
  */
 static void *
-find_node_by_name(void *head, size_t name_offset, const char *name, size_t nlen)
+find_node_by_name(void *head, size_t name_offset, dssh_registry_next next,
+    const char *name, size_t nlen)
 {
-	for (uint8_t *node = head; node != NULL;) {
-		const char *nm = (const char *)(node + name_offset);
+	for (void *node = head; node != NULL; node = next(node)) {
+		const unsigned char *entry = node;
+		const char *nm = (const char *)(entry + name_offset);
 
 		if ((strlen(nm) == nlen) && (memcmp(nm, name, nlen) == 0))
 			return node;
-		memcpy(&node, node, sizeof(void *));
 	}
 	return NULL;
 }
@@ -2885,7 +2901,7 @@ append_registered_name(void *node, size_t name_offset, char *buf, size_t bufsz,
 		if (available == 0)
 			return 0;
 	}
-	const uint8_t *entry = node;
+	const unsigned char *entry = node;
 	const char *name = (const char *)&entry[name_offset];
 	size_t len = strlen(name);
 	if (len == 0 || len > DSSH_ALGO_NAME_MAX)
@@ -2902,7 +2918,8 @@ append_registered_name(void *node, size_t name_offset, char *buf, size_t bufsz,
 }
 
 static int64_t
-build_namelist_inner(void *head, size_t name_offset, char *buf, size_t bufsz,
+build_namelist_inner(void *head, size_t name_offset, dssh_registry_next next,
+    char *buf, size_t bufsz,
     const char *filter, bool hostkeys)
 {
 	if (bufsz == 0)
@@ -2911,11 +2928,10 @@ build_namelist_inner(void *head, size_t name_offset, char *buf, size_t bufsz,
 	size_t pos = 0;
 	int ret;
 	if (filter == NULL) {
-		for (uint8_t *node = head; node != NULL;) {
+		for (void *node = head; node != NULL; node = next(node)) {
 			ret = append_registered_name(node, name_offset, buf, bufsz, &pos, hostkeys);
 			if (ret < 0)
 				return ret;
-			memcpy(&node, node, sizeof(void *));
 		}
 	}
 	else {
@@ -2924,7 +2940,7 @@ build_namelist_inner(void *head, size_t name_offset, char *buf, size_t bufsz,
 		size_t offset = 0;
 		while (next_name(names, &offset, &name)) {
 			const char *text = (const char *)name.data;
-			void *node = find_node_by_name(head, name_offset, text, name.len);
+			void *node = find_node_by_name(head, name_offset, next, text, name.len);
 			if (node == NULL)
 				continue;
 			ret = append_registered_name(node, name_offset, buf, bufsz, &pos, hostkeys);
@@ -2941,9 +2957,10 @@ build_namelist_inner(void *head, size_t name_offset, char *buf, size_t bufsz,
 }
 
 DSSH_TESTABLE int64_t
-build_namelist(void *head, size_t name_offset, char *buf, size_t bufsz, const char *filter)
+build_namelist(void *head, size_t name_offset, dssh_registry_next next,
+    char *buf, size_t bufsz, const char *filter)
 {
-	return build_namelist_inner(head, name_offset, buf, bufsz, filter, false);
+	return build_namelist_inner(head, name_offset, next, buf, bufsz, filter, false);
 }
 
 DSSH_TESTABLE size_t
@@ -2963,7 +2980,7 @@ first_name(struct dssh_name_list list, char *buf, size_t bufsz)
 
 DSSH_TESTABLE void *
 negotiate_algo(struct dssh_name_list client, struct dssh_name_list server,
-    void *head, size_t name_offset, const char *filter)
+    void *head, size_t name_offset, dssh_registry_next next, const char *filter)
 {
 	size_t pos = 0;
 	struct dssh_name_list name;
@@ -2971,7 +2988,7 @@ negotiate_algo(struct dssh_name_list client, struct dssh_name_list server,
 		const char *text = (const char *)name.data;
 		if (filter != NULL && !name_in_filter(text, name.len, filter))
 			continue;
-		void *node = find_node_by_name(head, name_offset, text, name.len);
+		void *node = find_node_by_name(head, name_offset, next, text, name.len);
 		if (node != NULL && list_has_name(server, name))
 			return node;
 	}
@@ -2980,7 +2997,8 @@ negotiate_algo(struct dssh_name_list client, struct dssh_name_list server,
 
 static int
 append_registry_namelist(uint8_t *buf, size_t bufsz,
-    size_t *pos, void *head, size_t name_offset, const char *filter, bool hostkeys)
+    size_t *pos, void *head, size_t name_offset, dssh_registry_next next,
+    const char *filter, bool hostkeys)
 {
 	if (!dssh_buffer_has(bufsz, *pos, 4))
 		return DSSH_ERROR_TOOLONG;
@@ -2988,8 +3006,8 @@ append_registry_namelist(uint8_t *buf, size_t bufsz,
 	*pos += 4;
 	char *names = (char *)&buf[*pos];
 	int64_t length = hostkeys
-	    ? build_namelist_inner(head, name_offset, names, bufsz - *pos, filter, true)
-	    : build_namelist(head, name_offset, names, bufsz - *pos, filter);
+	    ? build_namelist_inner(head, name_offset, next, names, bufsz - *pos, filter, true)
+	    : build_namelist(head, name_offset, next, names, bufsz - *pos, filter);
 	if (length < 0) {
 		int ret = (int)length;
 		return ret;
@@ -3118,15 +3136,15 @@ build_kexinit_packet(struct dssh_session_s *sess, uint8_t **buf_out, size_t *pos
 		return ret;
 	}
 	pos += DSSH_KEXINIT_COOKIE_SIZE;
-#define OFFER(head, type, filter, hostkeys) \
+#define OFFER(head, type, suffix, filter, hostkeys) \
 	do { \
-		ret = append_registry_namelist(buf, bufsz, &pos, (head), offsetof(type, name), (filter), (hostkeys)); \
+		ret = append_registry_namelist(buf, bufsz, &pos, (head), offsetof(type, name), registry_next_##suffix, (filter), (hostkeys)); \
 		if (ret < 0) { \
 			free(buf); \
 			return ret; \
 		} \
 	} while (0)
-	OFFER(gconf.kex_head, struct dssh_kex_s, sess->kex_filter, false);
+	OFFER(gconf.kex_head, struct dssh_kex_s, kex, sess->kex_filter, false);
 	if (sess->trans.session_id == NULL) {
 		const char *indicator = sess->trans.client ? "ext-info-c" : "ext-info-s";
 		size_t length = strlen(indicator);
@@ -3148,13 +3166,13 @@ build_kexinit_packet(struct dssh_session_s *sess, uint8_t **buf_out, size_t *pos
 		uint32_t wire_length = (uint32_t)list_length;
 		DSSH_PUT_U32(wire_length, buf, &prefix);
 	}
-	OFFER(gconf.key_algo_head, struct dssh_key_algo_s, sess->key_algo_filter, !sess->trans.client);
-	OFFER(gconf.enc_head, struct dssh_enc_s, sess->enc_filter, false);
-	OFFER(gconf.enc_head, struct dssh_enc_s, sess->enc_filter, false);
-	OFFER(gconf.mac_head, struct dssh_mac_s, sess->mac_filter, false);
-	OFFER(gconf.mac_head, struct dssh_mac_s, sess->mac_filter, false);
-	OFFER(gconf.comp_head, struct dssh_comp_s, sess->comp_filter, false);
-	OFFER(gconf.comp_head, struct dssh_comp_s, sess->comp_filter, false);
+	OFFER(gconf.key_algo_head, struct dssh_key_algo_s, key_algo, sess->key_algo_filter, !sess->trans.client);
+	OFFER(gconf.enc_head, struct dssh_enc_s, enc, sess->enc_filter, false);
+	OFFER(gconf.enc_head, struct dssh_enc_s, enc, sess->enc_filter, false);
+	OFFER(gconf.mac_head, struct dssh_mac_s, mac, sess->mac_filter, false);
+	OFFER(gconf.mac_head, struct dssh_mac_s, mac, sess->mac_filter, false);
+	OFFER(gconf.comp_head, struct dssh_comp_s, comp, sess->comp_filter, false);
+	OFFER(gconf.comp_head, struct dssh_comp_s, comp, sess->comp_filter, false);
 #undef OFFER
 	ret = append_language_fields(sess, buf, bufsz, &pos);
 	if (ret < 0) {
@@ -3260,7 +3278,7 @@ negotiate_key(struct dssh_name_list client, struct dssh_name_list server,
 		if (filter != NULL && !name_in_filter(text, name.len, filter))
 			continue;
 		dssh_key_algo key = find_node_by_name(gconf.key_algo_head,
-		    offsetof(struct dssh_key_algo_s, name), text, name.len);
+		    offsetof(struct dssh_key_algo_s, name), registry_next_key_algo, text, name.len);
 		if (key != NULL && (key->flags & required) == required && list_has_name(server, name))
 			return key;
 	}
@@ -3309,7 +3327,7 @@ negotiate_algorithms(struct dssh_session_s *sess,
 		}
 		if (sess->kex_filter != NULL && !name_in_filter(text, name.len, sess->kex_filter))
 			continue;
-		dssh_kex kex = find_node_by_name(gconf.kex_head, offsetof(struct dssh_kex_s, name), text, name.len);
+		dssh_kex kex = find_node_by_name(gconf.kex_head, offsetof(struct dssh_kex_s, name), registry_next_kex, text, name.len);
 		if (kex == NULL || !list_has_name(server[0], name))
 			continue;
 		uint32_t required = 0;
@@ -3324,14 +3342,14 @@ negotiate_algorithms(struct dssh_session_s *sess,
 			break;
 		}
 	}
-#define SELECT(field, index, head, type, filter) \
-	sess->trans.field = negotiate_algo(client[index], server[index], (head), offsetof(type, name), (filter))
-	SELECT(enc_c2s_selected, 2, gconf.enc_head, struct dssh_enc_s, sess->enc_filter);
-	SELECT(enc_s2c_selected, 3, gconf.enc_head, struct dssh_enc_s, sess->enc_filter);
-	SELECT(mac_c2s_selected, 4, gconf.mac_head, struct dssh_mac_s, sess->mac_filter);
-	SELECT(mac_s2c_selected, 5, gconf.mac_head, struct dssh_mac_s, sess->mac_filter);
-	SELECT(comp_c2s_selected, 6, gconf.comp_head, struct dssh_comp_s, sess->comp_filter);
-	SELECT(comp_s2c_selected, 7, gconf.comp_head, struct dssh_comp_s, sess->comp_filter);
+#define SELECT(field, index, head, type, suffix, filter) \
+	sess->trans.field = negotiate_algo(client[index], server[index], (head), offsetof(type, name), registry_next_##suffix, (filter))
+	SELECT(enc_c2s_selected, 2, gconf.enc_head, struct dssh_enc_s, enc, sess->enc_filter);
+	SELECT(enc_s2c_selected, 3, gconf.enc_head, struct dssh_enc_s, enc, sess->enc_filter);
+	SELECT(mac_c2s_selected, 4, gconf.mac_head, struct dssh_mac_s, mac, sess->mac_filter);
+	SELECT(mac_s2c_selected, 5, gconf.mac_head, struct dssh_mac_s, mac, sess->mac_filter);
+	SELECT(comp_c2s_selected, 6, gconf.comp_head, struct dssh_comp_s, comp, sess->comp_filter);
+	SELECT(comp_s2c_selected, 7, gconf.comp_head, struct dssh_comp_s, comp, sess->comp_filter);
 #undef SELECT
 	if (sess->trans.kex_selected == NULL || sess->trans.key_algo_selected == NULL
 	    || sess->trans.enc_c2s_selected == NULL || sess->trans.enc_s2c_selected == NULL

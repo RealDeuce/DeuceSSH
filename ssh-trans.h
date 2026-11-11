@@ -73,6 +73,9 @@ struct dssh_name_list {
 	size_t len;
 };
 
+/* Private typed linkage access for generic registry name operations. */
+typedef void *(*dssh_registry_next)(void *node);
+
 /* Module type definitions are now in the public headers above. */
 
 /*

@@ -145,7 +145,7 @@ typedef void (*dssh_kex_cleanup)(void *state);
 #define DSSH_KEX_FLAG_K_ENCODING_STRING        UINT32_C(1 << 2)
 
 typedef struct dssh_kex_s {
-	struct dssh_kex_s *next; /* must be first -- generic traversal assumes offsetof(next) == 0 */
+	struct dssh_kex_s *next; /* Registry link; must be NULL at registration. */
 	dssh_kex_init      init;
 	dssh_kex_handler   handler;
 	dssh_kex_cleanup   cleanup;

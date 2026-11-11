@@ -22,7 +22,7 @@ typedef int  (*dssh_enc_crypt)(uint8_t *buf, size_t bufsz, dssh_enc_ctx *ctx);
 typedef void (*dssh_enc_cleanup)(dssh_enc_ctx *ctx);
 
 typedef struct dssh_enc_s {
-	struct dssh_enc_s *next; /* must be first -- generic traversal assumes offsetof(next) == 0 */
+	struct dssh_enc_s *next; /* Registry link; must be NULL at registration. */
 	dssh_enc_init      init;
 	dssh_enc_crypt     encrypt;
 	dssh_enc_crypt     decrypt;

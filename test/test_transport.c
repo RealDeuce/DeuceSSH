@@ -40,6 +40,7 @@
 
 static int (*extra_algorithm_registration)(void);
 static const char *handshake_kex_filter;
+static int (*handshake_language_setup)(dssh_session client, dssh_session server);
 static void (*dh_group_tx_observer)(dssh_session sess);
 static _Thread_local dssh_session compression_callback_session;
 static void (*compression_tx_observer)(dssh_session sess);
@@ -309,6 +310,9 @@ handshake_setup_configured(struct handshake_ctx *ctx, bool alternate_cipher, con
 	if (handshake_kex_filter != NULL
 	    && (dssh_session_set_kex_filter(ctx->client, &handshake_kex_filter, 1) < 0
 	        || dssh_session_set_kex_filter(ctx->server, &handshake_kex_filter, 1) < 0))
+		goto setup_fail;
+	if (handshake_language_setup != NULL
+	    && handshake_language_setup(ctx->client, ctx->server) < 0)
 		goto setup_fail;
 	thrd_t ct, st;
 	if (thrd_create(&ct, handshake_client_thread, ctx) != thrd_success)
@@ -3081,7 +3085,7 @@ test_version_exchange_extra_line_error(void)
 
 /* ================================================================
  * Registration validation -- covers TOOLATE, TOOLONG, MUST_BE_NULL
- * branches in register_kex/key_algo/enc/mac/comp/lang.
+ * branches in register_kex/key_algo/enc/mac/comp.
  * ================================================================ */
 
 static int
@@ -3197,60 +3201,11 @@ test_register_comp_empty_name(void)
 	return TEST_PASS;
 }
 
-static int
-test_register_lang_basic(void)
-{
-	/* Covers the entire register_lang function which was never called.
-	 * Must heap-allocate since reset_global_config frees entries. */
-	dssh_test_reset_global_config();
 
-	size_t sz = sizeof(struct dssh_language_s) + 8;
-	struct dssh_language_s *lang = calloc(1, sz);
-	if (lang == NULL)
-		return TEST_FAIL;
-	strcpy(lang->name, "en");
-	ASSERT_EQ(dssh_transport_register_lang(lang), 0);
 
-	dssh_test_reset_global_config();
-	return TEST_PASS;
-}
 
-static int
-test_register_lang_empty_name(void)
-{
-	dssh_test_reset_global_config();
 
-	uint8_t lbuf[sizeof(struct dssh_language_s) + 4];
-	memset(lbuf, 0, sizeof(lbuf));
-	struct dssh_language_s *bad = (struct dssh_language_s *)lbuf;
-	bad->name[0] = '\0';
-	ASSERT_EQ(dssh_transport_register_lang(bad), DSSH_ERROR_INVALID);
 
-	dssh_test_reset_global_config();
-	return TEST_PASS;
-}
-
-static int
-test_register_lang_toolate(void)
-{
-	dssh_test_reset_global_config();
-	ASSERT_EQ(register_all_algorithms(), 0);
-	dssh_transport_set_callbacks(mock_tx_dispatch, mock_rx_dispatch,
-	    mock_rxline_dispatch, mock_extra_line_cb);
-
-	dssh_session sess = dssh_session_init(true, 0);
-	ASSERT_NOT_NULL(sess);
-
-	uint8_t lbuf[sizeof(struct dssh_language_s) + 8];
-	memset(lbuf, 0, sizeof(lbuf));
-	struct dssh_language_s *lang = (struct dssh_language_s *)lbuf;
-	strcpy(lang->name, "en");
-	ASSERT_EQ(dssh_transport_register_lang(lang), DSSH_ERROR_TOOLATE);
-
-	dssh_session_cleanup(sess);
-	dssh_test_reset_global_config();
-	return TEST_PASS;
-}
 
 /* ================================================================
  * Additional registration validation: TOOLONG, MUST_BE_NULL, TOOLATE
@@ -3446,21 +3401,7 @@ test_register_comp_next_not_null(void)
 	return TEST_PASS;
 }
 
-static int
-test_register_lang_next_not_null(void)
-{
-	dssh_test_reset_global_config();
 
-	uint8_t buf[sizeof(struct dssh_language_s) + 16];
-	memset(buf, 0, sizeof(buf));
-	struct dssh_language_s *lang = (struct dssh_language_s *)buf;
-	strcpy(lang->name, "en");
-	lang->next = (void *)1;
-	ASSERT_EQ(dssh_transport_register_lang(lang), DSSH_ERROR_MUST_BE_NULL);
-
-	dssh_test_reset_global_config();
-	return TEST_PASS;
-}
 
 /* ================================================================
  * Getter-before-handshake -- covers NULL ternary branches in
@@ -6149,34 +6090,7 @@ test_rsa_haskey_wrong_type(void)
 	return TEST_PASS;
 }
 
-static int
-test_remote_languages_cleanup(void)
-{
-	/* Populate remote_languages, then verify cleanup frees them */
-	dssh_test_reset_global_config();
-	ASSERT_EQ(register_all_algorithms(), 0);
-	dssh_transport_set_callbacks(mock_tx_dispatch, mock_rx_dispatch,
-	    mock_rxline_dispatch, mock_extra_line_cb);
 
-	struct mock_io_state io;
-	ASSERT_OK(mock_io_init(&io, 0));
-	dssh_session sess = dssh_session_init(true, 0);
-	ASSERT_NOT_NULL(sess);
-	dssh_session_set_cbdata(sess, &io, &io, &io, &io);
-
-	/* Manually populate remote_languages (NULL-terminated array) */
-	sess->trans.remote_languages = calloc(3, sizeof(char *));
-	ASSERT_NOT_NULL(sess->trans.remote_languages);
-	sess->trans.remote_languages[0] = strdup("en");
-	sess->trans.remote_languages[1] = strdup("fr");
-	sess->trans.remote_languages[2] = NULL;
-
-	/* Cleanup should free them without crashing */
-	dssh_session_cleanup(sess);
-	mock_io_free(&io);
-	dssh_test_reset_global_config();
-	return TEST_PASS;
-}
 
 /* ================================================================
  * Coverage: first_name helper, register tail->next, cleanup NULL
@@ -6254,25 +6168,7 @@ test_register_two_comp(void)
 	return TEST_PASS;
 }
 
-static int
-test_register_two_lang(void)
-{
-	/* Covers lang_tail->next assignment (line 1702) */
-	dssh_test_reset_global_config();
 
-	size_t sz = sizeof(struct dssh_language_s) + 4;
-	struct dssh_language_s *l1 = calloc(1, sz);
-	struct dssh_language_s *l2 = calloc(1, sz);
-	ASSERT_NOT_NULL(l1);
-	ASSERT_NOT_NULL(l2);
-	strcpy(l1->name, "en");
-	strcpy(l2->name, "fr");
-	ASSERT_EQ(dssh_transport_register_lang(l1), 0);
-	ASSERT_EQ(dssh_transport_register_lang(l2), 0);
-
-	dssh_test_reset_global_config();
-	return TEST_PASS;
-}
 
 /* ================================================================
  * KEXINIT parsing -- direct unit tests via parse_peer_kexinit
@@ -6710,7 +6606,7 @@ test_hmac_sha2_256_generate_failure(void)
 #endif /* DSSH_CRYPTO_OPENSSL -- encrypt/MAC injection tests */
 
 /* ================================================================
- * Registration toolong guards (kex, comp, lang)
+ * Registration toolong guards (kex, comp)
  * ================================================================ */
 
 static int
@@ -6745,21 +6641,7 @@ test_register_comp_toolong(void)
 	return TEST_PASS;
 }
 
-static int
-test_register_lang_toolong(void)
-{
-	dssh_test_reset_global_config();
 
-	uint8_t buf[sizeof(struct dssh_language_s) + 128];
-	memset(buf, 0, sizeof(buf));
-	struct dssh_language_s *lang = (struct dssh_language_s *)buf;
-	memset(lang->name, 'x', 65);
-	lang->name[65] = '\0';
-	ASSERT_EQ(dssh_transport_register_lang(lang), DSSH_ERROR_TOOLONG);
-
-	dssh_test_reset_global_config();
-	return TEST_PASS;
-}
 
 /* ================================================================
  * Registration toomany guards (all 6 register functions)
@@ -6887,29 +6769,7 @@ test_register_comp_toomany(void)
 	return TEST_PASS;
 }
 
-static int
-test_register_lang_toomany(void)
-{
-	dssh_test_reset_global_config();
 
-	size_t sz = sizeof(struct dssh_language_s) + 8;
-	struct dssh_language_s *l1 = calloc(1, sz);
-	ASSERT_NOT_NULL(l1);
-	strcpy(l1->name, "lang-1");
-	ASSERT_EQ(dssh_transport_register_lang(l1), 0);
-
-	gconf.lang_entries = SIZE_MAX - 1;
-
-	uint8_t buf[sizeof(struct dssh_language_s) + 8];
-	memset(buf, 0, sizeof(buf));
-	struct dssh_language_s *l2 = (struct dssh_language_s *)buf;
-	strcpy(l2->name, "lang-2");
-	ASSERT_EQ(dssh_transport_register_lang(l2), DSSH_ERROR_TOOMANY);
-
-	gconf.lang_entries = 1;
-	dssh_test_reset_global_config();
-	return TEST_PASS;
-}
 
 /* ================================================================
  * Blocksize clamping -- direct tx/rx_block_size tests
@@ -8328,22 +8188,6 @@ test_registration_rejection(void)
 		ASSERT_EQ(constructors[i](), DSSH_ERROR_TOOLATE);
 	dssh_session_cleanup(sess);
 	dssh_test_reset_global_config();
-	static const char *bad[] = { "a,b", " a", "a b", "a\001", "a\177" };
-	for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
-		struct dssh_language_s *entry = calloc(1, sizeof(*entry) + 16);
-		ASSERT_NOT_NULL(entry);
-		strcpy(entry->name, bad[i]);
-		int ret = dssh_transport_register_lang(entry);
-		free(entry);
-		ASSERT_EQ(ret, DSSH_ERROR_INVALID);
-	}
-	struct dssh_language_s *entry = calloc(1, sizeof(*entry) + 4);
-	ASSERT_NOT_NULL(entry);
-	strcpy(entry->name, "en");
-	ASSERT_OK(dssh_transport_register_lang(entry));
-	ASSERT_EQ(dssh_transport_register_lang(entry), DSSH_ERROR_INVALID);
-	ASSERT_NULL(entry->next);
-	dssh_test_reset_global_config();
 	return TEST_PASS;
 }
 
@@ -9589,8 +9433,16 @@ test_rekey_global_pipeline(void)
 #include "key_material_cases.h"
 #include "receive_entry_cases.h"
 #include "transport_ext_info_cases.h"
+#include "language_cases.h"
 
 static struct dssh_test_entry tests[] = {
+	{ "language/local", test_language_local },
+	{ "language/bounds", test_language_bounds },
+	{ "language/concurrent", test_language_concurrent },
+	{ "language/entry_failures", test_language_entry_failures },
+	{ "language/storage", test_language_storage },
+	{ "language/wire", test_language_wire },
+	{ "language/handshake_rekey", test_language_handshake_rekey },
 	{ "ext_info/codec", test_ext_info_codec },
 	{ "ext_info/packet_bound", test_ext_info_packet_bound },
 	{ "ext_info/offers", test_ext_info_offers },
@@ -9822,19 +9674,13 @@ static struct dssh_test_entry tests[] = {
 	{ "register/mac_next_not_null",      test_register_mac_next_not_null },
 	{ "register/comp_toolate",           test_register_comp_toolate },
 	{ "register/comp_next_not_null",     test_register_comp_next_not_null },
-	{ "register/lang_basic",             test_register_lang_basic },
-	{ "register/lang_empty_name",        test_register_lang_empty_name },
-	{ "register/lang_toolate",           test_register_lang_toolate },
-	{ "register/lang_next_not_null",     test_register_lang_next_not_null },
 	{ "register/kex_toolong",            test_register_kex_toolong },
 	{ "register/comp_toolong",           test_register_comp_toolong },
-	{ "register/lang_toolong",           test_register_lang_toolong },
 	{ "register/kex_toomany",            test_register_kex_toomany },
 	{ "register/key_algo_toomany",       test_register_key_algo_toomany },
 	{ "register/enc_toomany",            test_register_enc_toomany },
 	{ "register/mac_toomany",            test_register_mac_toomany },
 	{ "register/comp_toomany",           test_register_comp_toomany },
-	{ "register/lang_toomany",           test_register_lang_toomany },
 
 	/* Algorithm edge cases */
 	{ "aes256_ctr/null_ctx",             test_aes256_ctr_null_ctx },
@@ -9865,13 +9711,11 @@ static struct dssh_test_entry tests[] = {
 	{ "guard/rsa_pubkey_basic",          test_rsa_pubkey_basic },
 	{ "guard/ed25519_haskey_wrong_type", test_ed25519_haskey_wrong_type },
 	{ "guard/rsa_haskey_wrong_type",     test_rsa_haskey_wrong_type },
-	{ "guard/remote_languages_cleanup",  test_remote_languages_cleanup },
 	{ "guard/first_name_basic",          test_first_name_basic },
 	{ "guard/first_name_single",         test_first_name_single },
 	{ "guard/first_name_small_buf",      test_first_name_small_buf },
 	{ "register/two_kex",               test_register_two_kex },
 	{ "register/two_comp",              test_register_two_comp },
-	{ "register/two_lang",              test_register_two_lang },
 	{ "kexinit/parse_valid",            test_kexinit_parse_valid },
 	{ "kexinit/parse_control_char",     test_kexinit_parse_control_char },
 	{ "kexinit/parse_name_too_long",    test_kexinit_parse_name_too_long },

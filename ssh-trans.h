@@ -160,7 +160,6 @@ struct dssh_transport_state_s {
 	size_t                 rx_mac_capacity; /* retained capacity of each MAC buffer */
 	size_t                 id_str_sz;
 	size_t                 remote_id_str_sz;
-	char                 **remote_languages;
 	_Atomic dssh_kex       kex_selected;
 	/* Sole receive/packet-engine owner serializes the active KEX state and
 	 * result. Negotiation may replace kex_selected without changing creator. */
@@ -340,9 +339,6 @@ struct dssh_transport_global_config {
 	size_t        comp_entries;
 	dssh_comp     comp_head;
 	dssh_comp     comp_tail;
-	size_t        lang_entries;
-	dssh_language lang_head;
-	dssh_language lang_tail;
 	atomic_bool   used;
 };
 

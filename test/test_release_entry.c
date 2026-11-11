@@ -9,7 +9,6 @@
 #include "deucessh.h"
 #include "deucessh-algorithms.h"
 #include "deucessh-crypto.h"
-#include "deucessh-lang.h"
 #include "deucessh-result.h"
 
 struct entry_probe {
@@ -18,7 +17,6 @@ struct entry_probe {
 	unsigned releases;
 	unsigned unexpected_count;
 	dssh_session unexpected[4];
-	dssh_language language;
 	struct dssh_result_lease outer;
 	struct dssh_result_lease inner;
 };
@@ -56,7 +54,7 @@ check_entries(struct entry_probe *probe)
 	check_status(probe, dssh_register_none_enc());
 	check_status(probe, dssh_register_none_mac());
 	check_status(probe, dssh_register_none_comp());
-	check_status(probe, dssh_transport_register_lang(probe->language));
+	check_status(probe, dssh_register_aes128_cbc());
 	dssh_session sess = dssh_session_init(true, 0);
 	probe->checks++;
 	if (sess != NULL) {
@@ -116,21 +114,13 @@ run_release(struct entry_probe *probe)
 int
 main(void)
 {
-	static const char name[] = "en-US";
 	struct entry_probe probe = {
 		.valid = true,
 		.unexpected = {NULL, NULL, NULL, NULL},
-		.language = NULL,
 		.outer = {.release = NULL, .owner = NULL},
 		.inner = {.release = NULL, .owner = NULL},
 	};
-	probe.language = malloc(sizeof(*probe.language) + sizeof(name));
-	if (probe.language == NULL)
-		return 1;
-	probe.language->next = NULL;
-	memcpy(probe.language->name, name, sizeof(name));
 	if (dssh_register_rsa_sha2_256() != 0 || dssh_register_dh_gex_sha256() != 0) {
-		free(probe.language);
 		return 1;
 	}
 	run_release(&probe);
@@ -148,7 +138,7 @@ main(void)
 		dssh_register_none_enc(),
 		dssh_register_none_mac(),
 		dssh_register_none_comp(),
-		dssh_transport_register_lang(probe.language),
+		dssh_register_aes128_cbc(),
 	};
 	for (size_t i = 0; i < sizeof(accepted) / sizeof(accepted[0]); i++) {
 		if (accepted[i] != 0)
@@ -164,8 +154,6 @@ main(void)
 	dssh_session_cleanup(sess);
 	for (unsigned i = 0; i < probe.unexpected_count; i++)
 		dssh_session_cleanup(probe.unexpected[i]);
-	/* Successful registrations have process lifetime. Do not free the linked
-	 * language record or invent a shutdown hook for this test. */
 	printf("release_entries=%u releases=%u before=%d after=%d restored=%d\n",
 	    probe.checks, probe.releases, before, after, restored);
 	return before && after && restored ? 0 : 1;

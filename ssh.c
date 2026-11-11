@@ -629,19 +629,18 @@ dssh_session_set_rekey_seconds(struct dssh_session_s *sess, uint32_t seconds)
 }
 
 /*
- * Build a comma-separated CSV from names[count] into a fresh
- * malloc'd string.  count == 0 or names == NULL produces *out = NULL.
+ * Measure the storage for a comma-separated list including its NUL.
+ * count == 0 or names == NULL produces *out = 0.
  * Rejects NULL elements, empty names, and names containing commas
  * (would corrupt CSV parsing).
  */
 static int
-build_filter_csv(const char * const *names, size_t count, char **out)
+filter_csv_size(const char * const *names, size_t count, size_t *out)
 {
-	*out = NULL;
+	*out = 0;
 	if (names == NULL || count == 0)
 		return 0;
 
-	/* Two passes: validate + measure, then allocate + copy. */
 	size_t total = 0;
 
 	for (size_t i = 0; i < count; i++) {
@@ -655,16 +654,18 @@ build_filter_csv(const char * const *names, size_t count, char **out)
 			return DSSH_ERROR_INVALID;
 		/* Reserve nlen + 1 per name for either the comma
 		 * separator (i > 0) or the trailing NUL (last). */
-		if (nlen > SIZE_MAX - 1 - total)
+		if (total == SIZE_MAX || nlen > SIZE_MAX - total - 1)
 			return DSSH_ERROR_INVALID;
 		total += nlen + 1;
 	}
 
-	char *buf = malloc(total);
+	*out = total;
+	return 0;
+}
 
-	if (buf == NULL)
-		return DSSH_ERROR_ALLOC;
-
+static void
+write_filter_csv(const char * const *names, size_t count, char *buf)
+{
 	size_t pos = 0;
 
 	for (size_t i = 0; i < count; i++) {
@@ -676,9 +677,188 @@ build_filter_csv(const char * const *names, size_t count, char **out)
 		pos += nlen;
 	}
 	buf[pos] = 0;
+}
 
+static int
+build_filter_csv(const char * const *names, size_t count, char **out)
+{
+	*out = NULL;
+	size_t total;
+	int ret = filter_csv_size(names, count, &total);
+	if (ret < 0 || total == 0)
+		return ret;
+	char *buf = malloc(total);
+	if (buf == NULL)
+		return DSSH_ERROR_ALLOC;
+	write_filter_csv(names, count, buf);
 	*out = buf;
 	return 0;
+}
+
+/* These parts use the RFC 3066 syntax referenced by SSH. Preserve case. */
+static bool
+language_tag_valid(const char *name)
+{
+	bool primary = true;
+	unsigned length = 0;
+	for (const char *at = name; *at != 0; at++) {
+		unsigned char ch = (unsigned char)*at;
+		if (ch == '-') {
+			if (length == 0)
+				return false;
+			primary = false;
+			length = 0;
+			continue;
+		}
+		bool alpha = (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z');
+		if (!alpha && (primary || ch < '0' || ch > '9'))
+			return false;
+		length++;
+		if (length > 8)
+			return false;
+	}
+	return length != 0;
+}
+
+static int
+set_languages_inner(struct dssh_session_s *sess, size_t direction,
+    const char * const *names, size_t count)
+{
+	/* Even one-byte tags need a separator or terminating NUL each. */
+	if (names != NULL && count > sess->trans.packet_buf_sz / 2)
+		return DSSH_ERROR_TOOLONG;
+	size_t needed;
+	int ret = filter_csv_size(names, count, &needed);
+	if (ret < 0)
+		return ret;
+	if (needed > sess->trans.packet_buf_sz)
+		return DSSH_ERROR_TOOLONG;
+	if (names != NULL) {
+		for (size_t i = 0; i < count; i++) {
+			if (!language_tag_valid(names[i]))
+				return DSSH_ERROR_INVALID;
+		}
+	}
+	struct dssh_language_field *field = &sess->local_languages[direction];
+	char *candidate = NULL;
+	char *old = NULL;
+	int lr = mtx_lock(&sess->mtx);
+	if (lr != thrd_success) {
+		session_set_terminate(sess);
+		return DSSH_ERROR_TERMINATED;
+	}
+	if (needed > field->capacity && !sess->terminate) {
+		dssh_mtx_unlock(&sess->mtx);
+		candidate = malloc(needed);
+		if (candidate == NULL)
+			return DSSH_ERROR_ALLOC;
+		lr = mtx_lock(&sess->mtx);
+		if (lr != thrd_success) {
+			free(candidate);
+			session_set_terminate(sess);
+			return DSSH_ERROR_TERMINATED;
+		}
+	}
+	if (sess->terminate) {
+		dssh_mtx_unlock(&sess->mtx);
+		free(candidate);
+		return DSSH_ERROR_TERMINATED;
+	}
+	if (needed > field->capacity) {
+		old = field->data;
+		field->data = candidate;
+		field->capacity = needed;
+		candidate = NULL;
+	}
+	if (needed != 0)
+		write_filter_csv(names, count, field->data);
+	else if (field->data != NULL)
+		field->data[0] = 0;
+	field->len = needed != 0 ? needed - 1 : 0;
+	dssh_mtx_unlock(&sess->mtx);
+	free(old);
+	free(candidate);
+	return 0;
+}
+
+DSSH_PUBLIC int
+dssh_session_set_languages(struct dssh_session_s *sess,
+    enum dssh_language_direction direction, const char * const *names, size_t count)
+{
+	if (sess == NULL || (direction != DSSH_LANG_CLIENT_TO_SERVER
+	    && direction != DSSH_LANG_SERVER_TO_CLIENT) || session_api_forbidden(sess))
+		return DSSH_ERROR_INVALID;
+	size_t index = (size_t)direction;
+	struct dssh_session_scope scope;
+	session_scope_enter(&scope, sess);
+	int ret = set_languages_inner(sess, index, names, count);
+	session_scope_leave(&scope);
+	return ret;
+}
+
+static int64_t
+get_languages_inner(struct dssh_session_s *sess, size_t direction,
+    bool peer, char *buf, size_t bufsz)
+{
+	int lr = mtx_lock(&sess->mtx);
+	if (lr != thrd_success) {
+		session_set_terminate(sess);
+		return DSSH_ERROR_TERMINATED;
+	}
+	if (peer && !sess->peer_languages_available) {
+		dssh_mtx_unlock(&sess->mtx);
+		return DSSH_ERROR_INIT;
+	}
+	size_t length = peer ? sess->peer_languages_len[direction]
+	    : sess->local_languages[direction].len;
+	const char *data = peer ? sess->peer_languages
+	    : sess->local_languages[direction].data;
+	if (peer && direction == 1 && data != NULL)
+		data += sess->peer_languages_len[0] + 1;
+	/* Both writers bound lengths by the immutable packet buffer, which is
+	 * below SIZE_MAX - 4 and at most 64 MiB. Include the terminating NUL. */
+	size_t needed = length + 1;
+	int64_t result = (int64_t)needed;
+	if (buf != NULL && bufsz != 0) {
+		if (bufsz < needed)
+			result = DSSH_ERROR_TOOLONG;
+		else if (length == 0)
+			buf[0] = 0;
+		else
+			memcpy(buf, data, needed);
+	}
+	dssh_mtx_unlock(&sess->mtx);
+	return result;
+}
+
+static int64_t
+get_languages(struct dssh_session_s *sess, enum dssh_language_direction direction,
+    bool peer, char *buf, size_t bufsz)
+{
+	if (sess == NULL || (direction != DSSH_LANG_CLIENT_TO_SERVER
+	    && direction != DSSH_LANG_SERVER_TO_CLIENT) || session_api_forbidden(sess))
+		return DSSH_ERROR_INVALID;
+	size_t index = (size_t)direction;
+	struct dssh_session_scope scope;
+	session_scope_enter(&scope, sess);
+	int64_t result = get_languages_inner(sess, index, peer, buf, bufsz);
+
+	session_scope_leave(&scope);
+	return result;
+}
+
+DSSH_PUBLIC int64_t
+dssh_session_get_languages(struct dssh_session_s *sess,
+    enum dssh_language_direction direction, char *buf, size_t bufsz)
+{
+	return get_languages(sess, direction, false, buf, bufsz);
+}
+
+DSSH_PUBLIC int64_t
+dssh_session_get_peer_languages(struct dssh_session_s *sess,
+    enum dssh_language_direction direction, char *buf, size_t bufsz)
+{
+	return get_languages(sess, direction, true, buf, bufsz);
 }
 
 /*

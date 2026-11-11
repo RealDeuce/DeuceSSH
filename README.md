@@ -850,6 +850,46 @@ if (connecting_to_mystic) {
 /* ... set callbacks, start handshake ... */
 ```
 
+## Language Preferences
+
+Include `deucessh-lang.h` to set and read the two KEXINIT language fields.
+Each session has independent client-to-server and server-to-client lists.
+The setters copy arrays of language tags, preserve their order and case, and
+clear a field when the array is NULL or its count is zero.
+
+Getters copy comma-separated, NUL-terminated strings into application buffers.
+Their return value includes the NUL. A NULL buffer or zero capacity queries
+the required size. An undersized buffer returns `DSSH_ERROR_TOOLONG` and
+retains its previous contents. Peer reads return `DSSH_ERROR_INIT` until a
+complete peer KEXINIT has been validated.
+
+An application with known language preferences can configure them before its
+handshake and read the peer's corresponding field afterward.
+
+```c
+#include "deucessh.h"
+#include "deucessh-lang.h"
+
+static int64_t
+handshake_with_language_preferences(dssh_session sess, char *peer, size_t capacity)
+{
+	const char *names[] = {"en-US", "fr"};
+	int ret = dssh_session_set_languages(sess, DSSH_LANG_SERVER_TO_CLIENT, names, 2);
+	if (ret == 0)
+		ret = dssh_transport_handshake(sess);
+	if (ret < 0)
+		return ret;
+	return dssh_session_get_peer_languages(sess, DSSH_LANG_SERVER_TO_CLIENT,
+	    peer, capacity);
+}
+```
+
+`dssh_session_get_languages()` reads a configured local field. Setters can
+update that configuration during a session. Both local fields are captured
+together when an outgoing KEXINIT is built, and a later update applies to a
+subsequent offer. Peer getters report the latest validated peer KEXINIT,
+including rekey updates. The application chooses how to use the preferences.
+
 ## Custom Algorithm Modules
 
 You can implement custom encryption, MAC, compression, host key, or

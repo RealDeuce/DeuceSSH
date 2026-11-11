@@ -441,7 +441,19 @@ struct dssh_channel_id {
 	bool close_received;
 };
 
+struct dssh_language_field {
+	char *data;
+	size_t len;
+	size_t capacity;
+};
+
 struct dssh_session_s {
+	/* Language fields are protected by mtx. Peer fields share one allocation. */
+	struct dssh_language_field local_languages[2];
+	char *peer_languages;
+	size_t peer_languages_capacity;
+	size_t peer_languages_len[2];
+	bool peer_languages_available;
 	/* Pointers and size_t (pointer-sized) -- callbacks and cbdata */
 	void *tx_cbdata;
 	void *rx_cbdata;

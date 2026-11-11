@@ -620,21 +620,24 @@ application.
 ### 7.1-14
 > Both parties **MAY** ignore this name-list [languages].
 
-**CONFORMS** — Language name-lists are sent as empty strings.  Received
-language lists are parsed but not used.
+**CONFORMS** — R032 exposes both peer lists to the application without
+selecting a language. The application may ignore them. See
+[the selected contract](release-1.0-evidence/language-preference-design.md).
 
 ### 7.1-15
 > If there are no language preferences, this name-list **SHOULD** be
 > empty.
 
-**CONFORMS** — KEXINIT sends empty language name-lists
-(`serialize_namelist_from_str("")`).
+**CONFORMS** — Both per-session fields default to empty. NULL or zero-count
+setters clear a configured field. KEXINIT captures the configured fields.
 
 ### 7.1-16
 > Language tags **SHOULD NOT** be present unless they are known to be
 > needed by the sending party.
 
-**CONFORMS** — No language tags are sent.
+**APPLICATION** — Empty fields are the default. Applications explicitly set
+known preferences through `dssh_session_set_languages()`. The README example
+places configuration in an application with known preferences.
 
 ### 7.1-17
 > If a guessed packet will be sent, [first_kex_packet_follows] **MUST**

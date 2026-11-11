@@ -15,6 +15,7 @@
 #include "deucessh-algorithms.h"
 #include "deucessh-auth.h"
 #include "deucessh-conn.h"
+#include "deucessh-lang.h"
 
 #define OUTPUT_SIZE 262144
 static const uint8_t digits[] = "0123456789abcdef";
@@ -305,12 +306,35 @@ client_channel(dssh_session session)
 	return ret == 0 ? closed : ret;
 }
 
+static int
+check_language_fields(dssh_session sess, bool updated)
+{
+	const enum dssh_language_direction directions[] = {
+		DSSH_LANG_CLIENT_TO_SERVER, DSSH_LANG_SERVER_TO_CLIENT
+	};
+	const char *expected[] = {
+		updated ? "de-DE" : "en-US,fr", updated ? "sv-SE" : "x-interop"
+	};
+	for (size_t i = 0; i < 2; i++) {
+		char local[64], peer[64];
+		/* Both fixed expected strings fit the buffer and int64_t. */
+		int64_t needed = (int64_t)(strlen(expected[i]) + 1);
+		if (dssh_session_get_languages(sess, directions[i], local, sizeof(local)) != needed
+		    || strcmp(local, expected[i]) != 0
+		    || dssh_session_get_peer_languages(sess, directions[i], peer, sizeof(peer)) != 1
+		    || peer[0] != 0)
+			return DSSH_ERROR_INVALID;
+	}
+	return 0;
+}
+
 int
 main(int argc, char **argv)
 {
 	if (argc != 6 || (strcmp(argv[1], "server") != 0 && strcmp(argv[1], "client") != 0))
 		return 2;
 	bool client = strcmp(argv[1], "client") == 0;
+	bool language_fields = getenv("DSSH_TEST_LANGUAGE_FIELDS") != NULL;
 	const char *cipher = getenv("DSSH_TEST_ENC");
 	if (cipher == NULL)
 		cipher = "aes256-ctr";
@@ -357,12 +381,25 @@ main(int argc, char **argv)
 		return 2;
 	const char *stage = "configuration";
 	bool channel_ack = false;
+	unsigned language_checks = 0;
 	ret = dssh_session_set_timeout(session, 75000);
+	if (ret == 0 && language_fields) {
+		const char *first[] = {"en-US", "fr"};
+		const char *second[] = {"x-interop"};
+		ret = dssh_session_set_languages(session, DSSH_LANG_CLIENT_TO_SERVER, first, 2);
+		if (ret == 0)
+			ret = dssh_session_set_languages(session, DSSH_LANG_SERVER_TO_CLIENT, second, 1);
+	}
 	if (ret == 0 && client)
 		ret = dssh_session_set_hostkey_verify_cb(session, verify_host, &auth);
 	if (ret == 0) {
 		stage = "handshake";
 		ret = dssh_transport_handshake(session);
+	}
+	if (ret == 0 && language_fields) {
+		ret = check_language_fields(session, false);
+		if (ret == 0)
+			language_checks++;
 	}
 	if (ret == 0 && (strcmp(dssh_transport_get_kex_name(session), argv[2]) != 0
 	    || strcmp(dssh_transport_get_hostkey_name(session), "rsa-sha2-256") != 0
@@ -382,14 +419,26 @@ main(int argc, char **argv)
 		stage = "start";
 		ret = dssh_session_start(session);
 	}
+	if (ret == 0 && language_fields) {
+		const char *first[] = {"de-DE"};
+		const char *second[] = {"sv-SE"};
+		ret = dssh_session_set_languages(session, DSSH_LANG_CLIENT_TO_SERVER, first, 1);
+		if (ret == 0)
+			ret = dssh_session_set_languages(session, DSSH_LANG_SERVER_TO_CLIENT, second, 1);
+	}
 	if (ret == 0) {
 		stage = "channel";
 		ret = client ? client_channel(session) : server_channel(session, &channel_ack);
 	}
+	if (ret == 0 && language_fields) {
+		ret = check_language_fields(session, true);
+		if (ret == 0)
+			language_checks++;
+	}
 	dssh_session_cleanup(session);
 	if (ret == 0 && client && auth.host_checks < 2)
 		ret = DSSH_ERROR_INVALID;
-	fprintf(stderr, "DeuceSSH interop: role=%s kex=%s cipher=%s stage=%s result=%d host-checks=%u signed-auth=%d channel-ack=%u\n",
-	    argv[1], argv[2], cipher, stage, ret, auth.host_checks, auth.signed_auth, channel_ack ? 1U : 0U);
+	fprintf(stderr, "DeuceSSH interop: role=%s kex=%s cipher=%s stage=%s result=%d host-checks=%u signed-auth=%d channel-ack=%u language-checks=%u\n",
+	    argv[1], argv[2], cipher, stage, ret, auth.host_checks, auth.signed_auth, channel_ack ? 1U : 0U, language_checks);
 	return ret == 0 ? 0 : 1;
 }

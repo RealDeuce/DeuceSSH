@@ -922,6 +922,19 @@ foreach(part IN ITEMS group_selection group_validation peer_validation mpint_val
 		ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys)
 endforeach()
 dssh_add_variant_tests(dssh_transport dssh_test_transport)
+foreach(part IN ITEMS local bounds storage wire handshake_rekey concurrent entry_failures)
+	dssh_add_output_test(dssh_language_${part} dssh_test_transport
+		"1 tests: 1 passed, 0 failed, 0 skipped" --exact language/${part})
+	set_tests_properties(dssh_language_${part} PROPERTIES
+		ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys TIMEOUT 180)
+endforeach()
+foreach(method IN ITEMS dh-gex group14 group16 sntrup mlkem)
+	dssh_add_output_test(dssh_language_handshake_rekey_${method} dssh_test_transport
+		"1 tests: 1 passed, 0 failed, 0 skipped" --exact language/handshake_rekey)
+	set_tests_properties(dssh_language_handshake_rekey_${method} PROPERTIES
+		ENVIRONMENT "${DSSH_TEST_KEY_ENV};DSSH_TEST_KEX=${method}"
+		FIXTURES_REQUIRED dssh_cached_keys TIMEOUT 180)
+endforeach()
 foreach(key IN ITEMS ed25519 rsa512)
 	dssh_add_output_test(dssh_cipher_cbc_rekey_${key} dssh_test_transport
 		"1 tests: 1 passed, 0 failed, 0 skipped" --exact release/rekey_changes_algorithms)
@@ -1658,6 +1671,17 @@ if(DEUCESSH_TEST_OPENSSH)
 				endforeach()
 			endforeach()
 			set(cbc_name dssh_openssh_${form}_client_aes128-cbc)
+			foreach(role IN ITEMS client server)
+				set(language_name dssh_openssh_${form}_${role}_languages)
+				add_test(NAME ${language_name} COMMAND ${Python3_EXECUTABLE}
+					${CMAKE_CURRENT_SOURCE_DIR}/openssh_interop.py run
+					--peer $<TARGET_FILE:dssh_openssh_${form}> --role ${role} --algorithm curve25519-sha256
+					--ssh ${DSSH_OPENSSH_EXECUTABLE} --sshd ${DSSH_OPENSSH_DAEMON}
+					--keygen ${DSSH_OPENSSH_KEYGEN}
+					--evidence ${CMAKE_CURRENT_BINARY_DIR}/openssh-evidence/${language_name})
+				set_tests_properties(${language_name} PROPERTIES TIMEOUT 210 LABELS openssh
+					ENVIRONMENT "DSSH_TEST_LANGUAGE_FIELDS=1")
+			endforeach()
 			add_test(NAME ${cbc_name} COMMAND ${Python3_EXECUTABLE}
 				${CMAKE_CURRENT_SOURCE_DIR}/openssh_interop.py run
 				--peer $<TARGET_FILE:dssh_openssh_${form}> --role client --algorithm curve25519-sha256

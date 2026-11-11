@@ -29,6 +29,7 @@ late_calls(unsigned int *rejected)
 		dssh_register_none_enc(),
 		dssh_register_none_mac(),
 		dssh_register_none_comp(),
+		dssh_register_aes128_cbc(),
 		dssh_ed25519_generate_key(),
 		dssh_rsa_sha2_256_generate_key(2048),
 		dssh_rsa_sha2_512_generate_key(2048),
@@ -42,19 +43,7 @@ late_calls(unsigned int *rejected)
 		*rejected += one ? 1U : 0U;
 		valid = one && valid;
 	}
-	if (sizeof(struct dssh_language_s) > SIZE_MAX - 3)
-		return false;
-	struct dssh_language_s *language = malloc(sizeof(*language) + 3);
-	if (language == NULL)
-		return false;
-	*language = (struct dssh_language_s){0};
-	memcpy(language->name, "en", 3);
-	int ret = dssh_transport_register_lang(language);
-	if (ret != 0)
-		free(language);
-	bool one = ret == DSSH_ERROR_TOOLATE;
-	*rejected += one ? 1U : 0U;
-	return one && valid;
+	return valid;
 }
 
 static void

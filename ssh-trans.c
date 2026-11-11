@@ -2994,6 +2994,94 @@ append_registry_namelist(uint8_t *buf, size_t bufsz,
 	return 0;
 }
 
+/* Capture both configured fields together in the retained local transcript. */
+static int
+append_language_fields(struct dssh_session_s *sess, uint8_t *buf, size_t capacity, size_t *pos)
+{
+	int lr = mtx_lock(&sess->mtx);
+	if (lr != thrd_success) {
+		session_set_terminate(sess);
+		return DSSH_ERROR_TERMINATED;
+	}
+	size_t first = sess->local_languages[0].len;
+	size_t second = sess->local_languages[1].len;
+	/* Reserve both length prefixes and the KEXINIT Boolean/reserved tail. */
+	if (!dssh_buffer_has(capacity, *pos, 13)
+	    || first > capacity - *pos - 13
+	    || second > capacity - *pos - 13 - first) {
+		dssh_mtx_unlock(&sess->mtx);
+		return DSSH_ERROR_TOOLONG;
+	}
+	for (size_t i = 0; i < 2; i++) {
+		struct dssh_language_field *field = &sess->local_languages[i];
+		/* The checked packet capacity is at most 64 MiB. */
+		uint32_t length = (uint32_t)field->len;
+		DSSH_PUT_U32(length, buf, pos);
+		if (field->len != 0)
+			memcpy(&buf[*pos], field->data, field->len);
+		*pos += field->len;
+	}
+	dssh_mtx_unlock(&sess->mtx);
+	return 0;
+}
+
+/* Both views belong to the validated retained peer transcript. Store one
+ * reusable, bounded string pair for public queries after transcript release. */
+static int
+publish_peer_languages(struct dssh_session_s *sess, const struct dssh_name_list lists[10])
+{
+	size_t first = lists[8].len;
+	size_t second = lists[9].len;
+	if (first > SIZE_MAX - 2 || second > SIZE_MAX - 2 - first)
+		return DSSH_ERROR_TOOLONG;
+	size_t needed = first + second + 2;
+	if (needed > sess->trans.packet_buf_sz)
+		return DSSH_ERROR_TOOLONG;
+	if (first == 0 && second == 0)
+		needed = 0;
+	char *candidate = NULL;
+	char *old = NULL;
+	int lr = mtx_lock(&sess->mtx);
+	if (lr != thrd_success) {
+		session_set_terminate(sess);
+		return DSSH_ERROR_TERMINATED;
+	}
+	if (needed > sess->peer_languages_capacity) {
+		dssh_mtx_unlock(&sess->mtx);
+		candidate = malloc(needed);
+		if (candidate == NULL)
+			return DSSH_ERROR_ALLOC;
+		lr = mtx_lock(&sess->mtx);
+		if (lr != thrd_success) {
+			free(candidate);
+			session_set_terminate(sess);
+			return DSSH_ERROR_TERMINATED;
+		}
+	}
+	if (needed > sess->peer_languages_capacity) {
+		old = sess->peer_languages;
+		sess->peer_languages = candidate;
+		sess->peer_languages_capacity = needed;
+		candidate = NULL;
+	}
+	char *data = sess->peer_languages;
+	if (data != NULL) {
+		if (first != 0)
+			memcpy(data, lists[8].data, first);
+		data[first] = 0;
+		if (second != 0)
+			memcpy(&data[first + 1], lists[9].data, second);
+		data[first + 1 + second] = 0;
+	}
+	sess->peer_languages_len[0] = first;
+	sess->peer_languages_len[1] = second;
+	sess->peer_languages_available = true;
+	dssh_mtx_unlock(&sess->mtx);
+	free(old);
+	free(candidate);
+	return 0;
+}
+
 /* Build the complete offer directly in its retained transcript buffer. */
 static int
 build_kexinit_packet(struct dssh_session_s *sess, uint8_t **buf_out, size_t *pos_out)
@@ -3053,13 +3141,11 @@ build_kexinit_packet(struct dssh_session_s *sess, uint8_t **buf_out, size_t *pos
 	OFFER(gconf.comp_head, struct dssh_comp_s, sess->comp_filter, false);
 	OFFER(gconf.comp_head, struct dssh_comp_s, sess->comp_filter, false);
 #undef OFFER
-	/* Language preferences are not yet implemented. */
-	if (!dssh_buffer_has(bufsz, pos, 8 + 5)) {
+	ret = append_language_fields(sess, buf, bufsz, &pos);
+	if (ret < 0) {
 		free(buf);
-		return DSSH_ERROR_TOOLONG;
+		return ret;
 	}
-	DSSH_PUT_U32(0, buf, &pos);
-	DSSH_PUT_U32(0, buf, &pos);
 	buf[pos++] = 0;
 	DSSH_PUT_U32(0, buf, &pos);
 	*buf_out = buf;
@@ -3287,6 +3373,10 @@ finish_kexinit(struct dssh_session_s *sess)
 
 	res = parse_peer_kexinit(sess->trans.peer_kexinit, sess->trans.peer_kexinit_sz, peer_lists,
 	    &peer_first_kex_follows);
+	if (res < 0)
+		return res;
+
+	res = publish_peer_languages(sess, peer_lists);
 	if (res < 0)
 		return res;
 
@@ -4200,12 +4290,17 @@ transport_cleanup(struct dssh_session_s *sess)
 
 	sess->trans.remote_id_str_sz = 0;
 	sess->trans.remote_id_str[0] = 0;
-	if (sess->trans.remote_languages) {
-		for (size_t i = 0; sess->trans.remote_languages[i]; i++)
-			free(sess->trans.remote_languages[i]);
-		free(sess->trans.remote_languages);
-		sess->trans.remote_languages = NULL;
+	for (size_t i = 0; i < 2; i++) {
+		free(sess->local_languages[i].data);
+		sess->local_languages[i].data = NULL;
+		sess->local_languages[i].len = 0;
+		sess->local_languages[i].capacity = 0;
+		sess->peer_languages_len[i] = 0;
 	}
+	free(sess->peer_languages);
+	sess->peer_languages = NULL;
+	sess->peer_languages_capacity = 0;
+	sess->peer_languages_available = false;
 }
 
 /* ================================================================
@@ -4437,7 +4532,6 @@ DEFINE_REGISTER(dssh_transport_register_mac, dssh_mac, mac_head, mac_tail, mac_e
 DEFINE_REGISTER(dssh_transport_register_comp, dssh_comp, comp_head, comp_tail, comp_entries,
     item->init != NULL && item->bound != NULL && item->compress != NULL
         && item->uncompress != NULL && item->cleanup != NULL)
-DEFINE_REGISTER(dssh_transport_register_lang, dssh_language, lang_head, lang_tail, lang_entries, true)
 #undef DEFINE_REGISTER
 
 /*
@@ -4600,7 +4694,6 @@ dssh_test_reset_global_config(void)
 	FREE_LIST(dssh_enc, gconf.enc_head);
 	FREE_LIST(dssh_mac, gconf.mac_head);
 	FREE_LIST(dssh_comp, gconf.comp_head);
-	FREE_LIST(dssh_language, gconf.lang_head);
  #undef FREE_LIST
 
 	gconf = (struct dssh_transport_global_config){.software_version = sw_ver};

@@ -118,6 +118,8 @@ def run(args):
               "negative_host": args.negative_host, "status": "FAILED"}
     cipher = os.environ.get("DSSH_TEST_ENC", "aes256-ctr")
     result["cipher"] = cipher
+    language_fields = "DSSH_TEST_LANGUAGE_FIELDS" in os.environ
+    result["language_fields"] = language_fields
     for name in ("proxy-result.json", "proxy-result.json.pending", "result.json", "openssh.log", "peer.log", "stderr.log"):
         (evidence / name).unlink(missing_ok=True)
 
@@ -265,6 +267,8 @@ def run(args):
             raise RuntimeError("forced directional cipher oracle missing")
         if f"cipher={cipher}" not in peer_text:
             raise RuntimeError("production peer cipher oracle missing")
+        if language_fields and not args.negative_host and "language-checks=2" not in peer_text:
+            raise RuntimeError("initial/rekey public language-field checks missing")
         result.update(status="PASSED", openssh_newkeys_received=newkeys)
         if not args.negative_host:
             result.update(stdout_bytes=len(OUTPUT), stderr_bytes=len(ERROR), remote_exit_status=23)

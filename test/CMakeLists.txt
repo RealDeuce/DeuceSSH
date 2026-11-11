@@ -1684,6 +1684,18 @@ if(DEUCESSH_TEST_OPENSSH)
 	find_program(DSSH_OPENSSH_EXECUTABLE NAMES ssh REQUIRED)
 	find_program(DSSH_OPENSSH_DAEMON NAMES sshd PATHS /usr/sbin /usr/local/sbin REQUIRED)
 	find_program(DSSH_OPENSSH_KEYGEN NAMES ssh-keygen REQUIRED)
+	find_package(PkgConfig QUIET)
+	if(PkgConfig_FOUND)
+		pkg_check_modules(DSSH_MAC_LIBSSH QUIET IMPORTED_TARGET "libssh>=0.12.0")
+		if(DSSH_MAC_LIBSSH_FOUND)
+			add_executable(dssh_libssh_mac_peer libssh_mac_peer.c)
+			set_property(TARGET dssh_libssh_mac_peer PROPERTY C_STANDARD 17)
+			set_property(TARGET dssh_libssh_mac_peer PROPERTY C_STANDARD_REQUIRED ON)
+			target_compile_definitions(dssh_libssh_mac_peer PRIVATE _POSIX_C_SOURCE=200809L)
+			target_compile_options(dssh_libssh_mac_peer PRIVATE ${DEUCESSH_COMPILE_OPTIONS})
+			target_link_libraries(dssh_libssh_mac_peer PRIVATE PkgConfig::DSSH_MAC_LIBSSH)
+		endif()
+	endif()
 	foreach(form IN ITEMS static shared)
 		if(TARGET deucessh_${form})
 			# Deliberately link the production target, without DSSH_TESTING,
@@ -1694,6 +1706,20 @@ if(DEUCESSH_TEST_OPENSSH)
 			set_property(TARGET dssh_openssh_${form} PROPERTY C_STANDARD_REQUIRED ON)
 			target_compile_options(dssh_openssh_${form} PRIVATE ${DEUCESSH_COMPILE_OPTIONS})
 			target_link_libraries(dssh_openssh_${form} PRIVATE deucessh_${form})
+			if(TARGET dssh_libssh_mac_peer)
+				foreach(role IN ITEMS client server)
+					foreach(first IN ITEMS 256 512)
+						set(mac_case dssh_libssh_mac_${form}_${role}_${first})
+						add_test(NAME ${mac_case} COMMAND ${Python3_EXECUTABLE}
+							${CMAKE_CURRENT_SOURCE_DIR}/libssh_mac_interop.py
+							--peer $<TARGET_FILE:dssh_openssh_${form}>
+							--libssh $<TARGET_FILE:dssh_libssh_mac_peer>
+							--role ${role} --c2s ${first} --keygen ${DSSH_OPENSSH_KEYGEN}
+							--evidence ${CMAKE_CURRENT_BINARY_DIR}/libssh-mac-evidence/${mac_case})
+						set_tests_properties(${mac_case} PROPERTIES TIMEOUT 90 LABELS libssh)
+					endforeach()
+				endforeach()
+			endif()
 			foreach(method IN ITEMS curve25519-sha256 diffie-hellman-group-exchange-sha256
 					sntrup761x25519-sha512 mlkem768x25519-sha256
 					diffie-hellman-group14-sha256 diffie-hellman-group16-sha512)

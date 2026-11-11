@@ -1,4 +1,4 @@
-/* Deterministic POSIX stdio peer for the optional OpenSSH tests.
+/* Deterministic POSIX stdio peer for the optional independent-peer tests.
  * Only public headers and the production library are used. No listener,
  * account changes, demo authentication or internal test hooks are needed. */
 #include <errno.h>
@@ -165,18 +165,60 @@ write_all(dssh_channel channel, int stream, const uint8_t *data, size_t length)
 }
 
 static int
-server_channel(dssh_session session, bool *acknowledged)
+send_pattern(dssh_channel channel)
 {
-	struct dssh_chan_accept_cbs callbacks = { .exec = accept_command };
-	dssh_channel channel = dssh_chan_accept(session, &callbacks, 10000);
-	if (channel == NULL)
-		return DSSH_ERROR_INIT;
 	uint8_t block[1024];
 	for (size_t i = 0; i < sizeof(block); i++)
 		block[i] = digits[i % 16];
 	int ret = 0;
 	for (unsigned i = 0; i < OUTPUT_SIZE / sizeof(block) && ret == 0; i++)
 		ret = write_all(channel, 0, block, sizeof(block));
+	return ret;
+}
+
+static int
+receive_pattern(dssh_channel channel)
+{
+	uint32_t offset = 0;
+	while (offset < OUTPUT_SIZE) {
+		int ret = remaining();
+		if (ret < 0)
+			return ret;
+		int ready = dssh_chan_poll(channel, DSSH_POLL_READ, 100);
+		if (ready < 0)
+			return ready;
+		if ((ready & DSSH_POLL_READ) == 0)
+			continue;
+		uint8_t block[4096];
+		uint32_t left = OUTPUT_SIZE - offset;
+		size_t wanted = sizeof(block);
+		if (left < wanted) {
+			size_t available = (size_t)left;
+			wanted = available;
+		}
+		int64_t amount = dssh_chan_read(channel, 0, block, wanted);
+		if (amount <= 0 || amount > wanted)
+			return DSSH_ERROR_INVALID;
+		uint32_t advanced = (uint32_t)amount;
+		for (uint32_t i = 0; i < advanced; i++) {
+			if (block[i] != digits[(offset + i) % 16])
+				return DSSH_ERROR_INVALID;
+		}
+		offset += advanced;
+	}
+	return 0;
+}
+
+static int
+server_channel(dssh_session session, bool *acknowledged, bool bidirectional)
+{
+	struct dssh_chan_accept_cbs callbacks = { .exec = accept_command };
+	dssh_channel channel = dssh_chan_accept(session, &callbacks, 10000);
+	if (channel == NULL)
+		return DSSH_ERROR_INIT;
+	int ret = bidirectional ? receive_pattern(channel) : 0;
+	if (ret == 0)
+		ret = send_pattern(channel);
 	/* OpenSSH sends this application acknowledgement only after its reader has
 	 * checked all stdout. During rekey it queues channel data until NEWKEYS,
 	 * keeping this channel alive through the peer-initiated exchange. */
@@ -227,7 +269,7 @@ server_channel(dssh_session session, bool *acknowledged)
 }
 
 static int
-client_channel(dssh_session session)
+client_channel(dssh_session session, bool bidirectional)
 {
 	struct dssh_chan_params params;
 	int ret = dssh_chan_params_init(&params, DSSH_CHAN_EXEC);
@@ -240,7 +282,9 @@ client_channel(dssh_session session)
 	dssh_chan_params_free(&params);
 	if (channel == NULL)
 		return ret < 0 ? ret : DSSH_ERROR_INIT;
-	ret = dssh_chan_shutwr(channel);
+	ret = bidirectional ? send_pattern(channel) : 0;
+	if (ret == 0)
+		ret = dssh_chan_shutwr(channel);
 	size_t received[2] = { 0, 0 };
 	bool eof[2] = { false, false };
 	bool exit_seen = false;
@@ -345,6 +389,11 @@ main(int argc, char **argv)
 		mac = "hmac-sha2-256";
 	if (strcmp(mac, "hmac-sha2-256") != 0 && strcmp(mac, "hmac-sha2-512") != 0)
 		return 2;
+	const char *mac_s2c = getenv("DSSH_TEST_MAC_S2C");
+	if (mac_s2c == NULL)
+		mac_s2c = mac;
+	if (strcmp(mac_s2c, "hmac-sha2-256") != 0 && strcmp(mac_s2c, "hmac-sha2-512") != 0)
+		return 2;
 	struct authorization auth = { .user = argv[5] };
 	FILE *key = fopen(argv[4], "rb");
 	if (key == NULL)
@@ -378,6 +427,9 @@ main(int argc, char **argv)
 		    ? dssh_register_aes128_cbc() : dssh_register_aes256_ctr();
 	if (ret == 0)
 		ret = strcmp(mac, "hmac-sha2-512") == 0
+		    ? dssh_register_hmac_sha2_512() : dssh_register_hmac_sha2_256();
+	if (ret == 0 && strcmp(mac, mac_s2c) != 0)
+		ret = strcmp(mac_s2c, "hmac-sha2-512") == 0
 		    ? dssh_register_hmac_sha2_512() : dssh_register_hmac_sha2_256();
 	if (ret != 0 || dssh_transport_set_callbacks(stdio_tx, stdio_rx, NULL, NULL) != 0
 	    || dssh_register_rsa_sha2_256() != 0
@@ -436,7 +488,8 @@ main(int argc, char **argv)
 	}
 	if (ret == 0) {
 		stage = "channel";
-		ret = client ? client_channel(session) : server_channel(session, &channel_ack);
+		bool bidirectional = strcmp(mac, mac_s2c) != 0;
+		ret = client ? client_channel(session, bidirectional) : server_channel(session, &channel_ack, bidirectional);
 	}
 	if (ret == 0 && language_fields) {
 		ret = check_language_fields(session, true);
@@ -446,7 +499,7 @@ main(int argc, char **argv)
 	dssh_session_cleanup(session);
 	if (ret == 0 && client && auth.host_checks < 2)
 		ret = DSSH_ERROR_INVALID;
-	fprintf(stderr, "DeuceSSH interop: role=%s kex=%s cipher=%s mac=%s stage=%s result=%d host-checks=%u signed-auth=%d channel-ack=%u language-checks=%u\n",
-	    argv[1], argv[2], cipher, mac, stage, ret, auth.host_checks, auth.signed_auth, channel_ack ? 1U : 0U, language_checks);
+	fprintf(stderr, "DeuceSSH interop: role=%s kex=%s cipher=%s mac=%s stage=%s result=%d host-checks=%u signed-auth=%d channel-ack=%u language-checks=%u mac-s2c=%s\n",
+	    argv[1], argv[2], cipher, mac, stage, ret, auth.host_checks, auth.signed_auth, channel_ack ? 1U : 0U, language_checks, mac_s2c);
 	return ret == 0 ? 0 : 1;
 }

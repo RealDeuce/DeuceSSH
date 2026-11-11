@@ -12,6 +12,7 @@
 #include "ssh-trans.h"
 #include "test/dssh_test_internal.h"
 #include "test/dssh_test_alloc.h"
+#include "test_mac.h"
 
 #ifdef DSSH_CRYPTO_OPENSSL
 #include "dssh_test_ossl.h"
@@ -790,6 +791,123 @@ test_mac_registration_contract(void)
 	return TEST_PASS;
 }
 
+static void
+test_mac_observe_free(const void *ptr, void *data)
+{
+	(void)ptr;
+	unsigned *count = data;
+	if (*count == UINT_MAX)
+		abort();
+	(*count)++;
+}
+
+static int
+test_mac_test_module_ownership(void)
+{
+	bool valid = true;
+	for (unsigned oversized = 0; oversized < 2; oversized++) {
+		dssh_test_reset_global_config();
+		test_mac_reset();
+		int ret = oversized != 0 ? register_test_mac_oversized() : register_test_mac();
+		if (ret != 0)
+			return TEST_FAIL;
+		dssh_mac mac = gconf.mac_head;
+		unsigned duplicate_frees = 0;
+		dssh_test_alloc_observe_frees(test_mac_observe_free, &duplicate_frees);
+		ret = oversized != 0 ? register_test_mac() : register_test_mac_oversized();
+		dssh_test_alloc_observe_frees(NULL, NULL);
+		valid = valid && ret == DSSH_ERROR_INVALID && gconf.mac_head == mac
+		    && mac->next == NULL && duplicate_frees == 1;
+		dssh_session sess = dssh_session_init(true, 0);
+		valid = valid && sess != NULL;
+		unsigned late_frees = 0;
+		dssh_test_alloc_observe_frees(test_mac_observe_free, &late_frees);
+		ret = oversized != 0 ? register_test_mac() : register_test_mac_oversized();
+		dssh_test_alloc_observe_frees(NULL, NULL);
+		valid = valid && ret == DSSH_ERROR_TOOLATE && late_frees == 1;
+		uint8_t key[32] = {0};
+		const uint8_t data[] = {0};
+		uint8_t output[130];
+		memset(output, 0x5a, sizeof(output));
+		dssh_mac_ctx *ctx = NULL;
+		ret = mac->init(key, &ctx);
+		if (ret == 0)
+			ret = mac->generate(data, sizeof(data), &output[1], ctx);
+		valid = valid && ret == 0 && output[0] == 0x5a;
+		for (size_t i = 1; i < sizeof(output); i++)
+			valid = valid && output[i] == (i <= mac->digest_size ? 0 : 0x5a);
+		/* The fixture's key is the first 32-byte member of its owned context. */
+		dssh_test_alloc_watch_free(ctx, sizeof(key));
+		mac->cleanup(ctx);
+		bool cleared = false;
+		bool released = dssh_test_alloc_watched_free(&cleared);
+		dssh_test_alloc_watch_free(NULL, 0);
+		valid = valid && released && cleared;
+		dssh_session_cleanup(sess);
+		dssh_test_reset_global_config();
+	}
+	ASSERT_TRUE(valid);
+	return TEST_PASS;
+}
+
+static int
+test_mac_test_module_failures(void)
+{
+	bool valid = true;
+	for (unsigned oversized = 0; oversized < 2; oversized++) {
+		dssh_test_reset_global_config();
+		test_mac_reset();
+		dssh_test_alloc_fail_after(0);
+		int ret = oversized != 0 ? register_test_mac_oversized() : register_test_mac();
+		int calls = dssh_test_alloc_count();
+		dssh_test_alloc_reset();
+		valid = valid && ret == DSSH_ERROR_ALLOC && calls == 1 && gconf.mac_head == NULL;
+		ret = oversized != 0 ? register_test_mac_oversized() : register_test_mac();
+		if (ret != 0)
+			return TEST_FAIL;
+		dssh_mac mac = gconf.mac_head;
+		uint8_t key[32] = {0};
+		dssh_mac_ctx *ctx = NULL;
+		dssh_test_alloc_fail_after(0);
+		ret = mac->init(key, &ctx);
+		calls = dssh_test_alloc_count();
+		dssh_test_alloc_reset();
+		valid = valid && ret == DSSH_ERROR_ALLOC && calls == 1 && ctx == NULL;
+		mac->cleanup(ctx);
+		ctx = NULL;
+		test_mac_fail_init_at(0);
+		dssh_test_alloc_fail_after(0);
+		ret = mac->init(key, &ctx);
+		calls = dssh_test_alloc_count();
+		dssh_test_alloc_reset();
+		valid = valid && ret == DSSH_ERROR_INIT && calls == 0 && ctx == NULL
+		    && test_mac_init_failure_seen();
+		mac->cleanup(ctx);
+		ctx = NULL;
+		test_mac_reset();
+		ret = mac->init(key, &ctx);
+		uint8_t output[130];
+		memset(output, 0x5a, sizeof(output));
+		if (ret == 0) {
+			const uint8_t data[] = {0};
+			test_mac_fail_generate_at(0);
+			ret = mac->generate(data, sizeof(data), &output[1], ctx);
+			valid = valid && ret == DSSH_ERROR_INIT;
+			for (size_t i = 0; i < sizeof(output); i++)
+				valid = valid && output[i] == 0x5a;
+			test_mac_reset();
+			ret = mac->generate(data, sizeof(data), &output[1], ctx);
+		}
+		valid = valid && ret == 0 && output[0] == 0x5a
+		    && output[mac->digest_size + 1U] == 0x5a;
+		mac->cleanup(ctx);
+		dssh_test_reset_global_config();
+		test_mac_reset();
+	}
+	ASSERT_TRUE(valid);
+	return TEST_PASS;
+}
+
 static int
 test_none_mac_no_init(void)
 {
@@ -1005,6 +1123,8 @@ test_mac_native_failures(void)
 
 static struct dssh_test_entry tests[] = {
 	{ "mac/registration_contract",       test_mac_registration_contract },
+	{ "mac/test_module_ownership",       test_mac_test_module_ownership },
+	{ "mac/test_module_failures",        test_mac_test_module_failures },
 #ifdef DSSH_CRYPTO_OPENSSL
 	{ "mac/native_failures",             test_mac_native_failures },
 #endif

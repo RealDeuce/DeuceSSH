@@ -45,6 +45,9 @@ bool dssh_test_alloc_watched_free(bool *cleared);
  * The observer must not release ptr or reenter the allocator. Reset clears it. */
 typedef void (*dssh_test_free_observer)(const void *ptr, void *data);
 void dssh_test_alloc_observe_frees(dssh_test_free_observer observer, void *data);
+/* Allocator forwarding for test modules without preprocessor redirection. */
+void *dssh_test_malloc(size_t size);
+void dssh_test_free(void *ptr);
 
 /* Read-only notification before a library allocation attempt on this thread.
  * count/size are separate to avoid introducing unchecked observer arithmetic.

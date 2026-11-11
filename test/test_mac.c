@@ -16,6 +16,7 @@
 #include "deucessh.h"
 #include "ssh-trans.h"
 #include "test_mac.h"
+#include "dssh_test_alloc.h"
 
 #define TEST_MAC_DIGEST_SIZE 32
 #define TEST_MAC_KEY_SIZE    32
@@ -71,10 +72,8 @@ struct dssh_mac_ctx {
 	uint16_t digest_size;
 };
 
-static _Atomic uint16_t current_digest_size = TEST_MAC_DIGEST_SIZE;
-
 static int
-test_mac_init(const uint8_t *key, dssh_mac_ctx **out)
+test_mac_init_size(const uint8_t *key, dssh_mac_ctx **out, uint16_t digest_size)
 {
 	int fail_at = atomic_load(&init_fail_at);
 	if (fail_at >= 0 && atomic_fetch_add(&init_count, 1) == fail_at) {
@@ -82,13 +81,27 @@ test_mac_init(const uint8_t *key, dssh_mac_ctx **out)
 		return DSSH_ERROR_INIT;
 	}
 
-	struct dssh_mac_ctx *cbd = malloc(sizeof(*cbd));
+	struct dssh_mac_ctx *cbd = dssh_test_malloc(sizeof(*cbd));
 	if (cbd == NULL)
 		return DSSH_ERROR_ALLOC;
 	memcpy(cbd->key, key, TEST_MAC_KEY_SIZE);
-	cbd->digest_size = current_digest_size;
+	cbd->digest_size = digest_size;
 	*out = cbd;
 	return 0;
+}
+
+static int
+test_mac_init(const uint8_t *key, dssh_mac_ctx **out)
+{
+	return test_mac_init_size(key, out, TEST_MAC_DIGEST_SIZE);
+}
+
+#define TEST_MAC_OVERSIZED_DIGEST 128
+
+static int
+test_mac_oversized_init(const uint8_t *key, dssh_mac_ctx **out)
+{
+	return test_mac_init_size(key, out, TEST_MAC_OVERSIZED_DIGEST);
 }
 
 static int
@@ -115,43 +128,39 @@ test_mac_generate(const uint8_t *buf, size_t bufsz,
 static void
 test_mac_cleanup(dssh_mac_ctx *ctx)
 {
-	free(ctx);
+	if (ctx != NULL)
+		dssh_secure_zero(ctx, sizeof(*ctx));
+	dssh_test_free(ctx);
+}
+
+static int
+register_test_mac_size(dssh_mac_init init, uint16_t digest_size)
+{
+	static const char name[] = "hmac-sha2-256";
+	struct dssh_mac_s *mac = dssh_test_malloc(sizeof(*mac) + sizeof(name));
+	if (mac == NULL)
+		return DSSH_ERROR_ALLOC;
+	mac->next = NULL;
+	mac->init = init;
+	mac->generate = test_mac_generate;
+	mac->cleanup = test_mac_cleanup;
+	mac->digest_size = digest_size;
+	mac->key_size = TEST_MAC_KEY_SIZE;
+	memcpy(mac->name, name, sizeof(name));
+	int ret = dssh_transport_register_mac(mac);
+	if (ret < 0)
+		dssh_test_free(mac);
+	return ret;
 }
 
 int
 register_test_mac(void)
 {
-	current_digest_size = TEST_MAC_DIGEST_SIZE;
-	static const char name[] = "hmac-sha2-256";
-	struct dssh_mac_s *mac = malloc(sizeof(*mac) + sizeof(name));
-	if (mac == NULL)
-		return DSSH_ERROR_ALLOC;
-	mac->next = NULL;
-	mac->init = test_mac_init;
-	mac->generate = test_mac_generate;
-	mac->cleanup = test_mac_cleanup;
-	mac->digest_size = TEST_MAC_DIGEST_SIZE;
-	mac->key_size = TEST_MAC_KEY_SIZE;
-	memcpy(mac->name, name, sizeof(name));
-	return dssh_transport_register_mac(mac);
+	return register_test_mac_size(test_mac_init, TEST_MAC_DIGEST_SIZE);
 }
-
-#define TEST_MAC_OVERSIZED_DIGEST 128
 
 int
 register_test_mac_oversized(void)
 {
-	current_digest_size = TEST_MAC_OVERSIZED_DIGEST;
-	static const char name[] = "hmac-sha2-256";
-	struct dssh_mac_s *mac = malloc(sizeof(*mac) + sizeof(name));
-	if (mac == NULL)
-		return DSSH_ERROR_ALLOC;
-	mac->next = NULL;
-	mac->init = test_mac_init;
-	mac->generate = test_mac_generate;
-	mac->cleanup = test_mac_cleanup;
-	mac->digest_size = TEST_MAC_OVERSIZED_DIGEST;
-	mac->key_size = TEST_MAC_KEY_SIZE;
-	memcpy(mac->name, name, sizeof(name));
-	return dssh_transport_register_mac(mac);
+	return register_test_mac_size(test_mac_oversized_init, TEST_MAC_OVERSIZED_DIGEST);
 }

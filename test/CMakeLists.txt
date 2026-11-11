@@ -616,7 +616,7 @@ elseif(DEUCESSH_CRYPTO_BACKEND STREQUAL "Botan")
 	target_link_libraries(dssh_test_algo_mac PRIVATE PkgConfig::BOTAN3)
 endif()
 add_test(NAME dssh_unit_algo_mac COMMAND dssh_test_algo_mac)
-foreach(part IN ITEMS registration_contract module_rfc4231_vectors)
+foreach(part IN ITEMS registration_contract module_rfc4231_vectors test_module_ownership test_module_failures)
 	dssh_add_output_test(dssh_mac_${part} dssh_test_algo_mac
 		"1 tests: 1 passed, 0 failed, 0 skipped" --exact mac/${part})
 endforeach()
@@ -1498,6 +1498,7 @@ target_include_directories(dssh_test_algos PUBLIC
 	${PROJECT_SOURCE_DIR}
 	${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(dssh_test_algos PRIVATE deucessh_test_lib)
+target_link_libraries(dssh_test_algo_mac PRIVATE dssh_test_algos)
 
 # ================================================================
 # Tier 2b: Transport error tests (need test enc/mac + mock I/O)
@@ -1640,7 +1641,9 @@ endforeach()
 # ================================================================
 
 dssh_add_test(asymmetric_mac test_asymmetric_mac.c)
-add_test(NAME dssh_asymmetric_mac COMMAND dssh_test_asymmetric_mac)
+dssh_add_output_test(dssh_asymmetric_mac dssh_test_asymmetric_mac
+	"4 tests: 4 passed, 0 failed, 0 skipped")
+set_tests_properties(dssh_asymmetric_mac PROPERTIES TIMEOUT 60)
 
 # ================================================================
 # Tier 3c/3d: Optional interop tests

@@ -337,8 +337,8 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
 	# Blanket -Werror is Debug-only.  Release/RelWithDebInfo/MinSizeRel
 	# must tolerate future compiler warnings — failing a packager's
 	# build on a new diagnostic is hostile.
-	if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-		list(APPEND DEUCESSH_COMPILE_OPTIONS -Werror)
+	list(APPEND DEUCESSH_COMPILE_OPTIONS $<$<CONFIG:Debug>:-Werror>)
+	if(CMAKE_CONFIGURATION_TYPES OR CMAKE_BUILD_TYPE STREQUAL "Debug")
 		set(DEUCESSH_PROBE_WERROR "-Werror")
 	else()
 		set(DEUCESSH_PROBE_WERROR "")
@@ -351,12 +351,14 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
 	# would then return HAVE_X=YES even though the resulting binary
 	# gets none of the actual mitigation.  Gate the probe on the
 	# unused-arg warning so silently-discarded flags are correctly
-	# rejected.  In Debug builds we additionally inherit -Werror so
-	# the probe matches the real compile discipline. CMake selects the
+	# rejected.  Debug and multi-config probes additionally use -Werror so
+	# accepted flags also satisfy Debug's compile discipline. CMake selects the
 	# same C dialect for these probes and the real targets.
 	set(_dssh_saved_required_flags "${CMAKE_REQUIRED_FLAGS}")
-	string(APPEND CMAKE_REQUIRED_FLAGS
-	    " -Werror=unused-command-line-argument ${DEUCESSH_PROBE_WERROR}")
+	if(CMAKE_C_COMPILER_ID MATCHES "Clang|AppleClang")
+		string(APPEND CMAKE_REQUIRED_FLAGS " -Werror=unused-command-line-argument")
+	endif()
+	string(APPEND CMAKE_REQUIRED_FLAGS " ${DEUCESSH_PROBE_WERROR}")
 
 	check_c_compiler_flag(-Wconversion HAVE_WCONVERSION)
 	if(HAVE_WCONVERSION)
@@ -418,10 +420,9 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
 	endif()
 
 	# FORTIFY_SOURCE (requires -O1+, incompatible with sanitizers)
-	if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
-		list(APPEND DEUCESSH_COMPILE_OPTIONS
-			-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=3)
-	endif()
+	list(APPEND DEUCESSH_COMPILE_OPTIONS
+		$<$<NOT:$<CONFIG:Debug>>:-U_FORTIFY_SOURCE>
+		$<$<NOT:$<CONFIG:Debug>>:-D_FORTIFY_SOURCE=3>)
 
 	# Architecture-specific control-flow protection
 	if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|AMD64")
@@ -555,8 +556,16 @@ endif()
 
 include(CMakePackageConfigHelpers)
 
+set(DSSH_INSTALL_CONFIGURATIONS "${CMAKE_CONFIGURATION_TYPES}")
+if(NOT DSSH_INSTALL_CONFIGURATIONS)
+	set(DSSH_INSTALL_CONFIGURATIONS "${CMAKE_BUILD_TYPE}")
+endif()
+configure_file(cmake/DeuceSSHInstallConfig.cmake.in
+	${CMAKE_CURRENT_BINARY_DIR}/DeuceSSHInstallConfig.cmake @ONLY)
+install(SCRIPT ${CMAKE_CURRENT_BINARY_DIR}/DeuceSSHInstallConfig.cmake)
+
 if(DEUCESSH_CRYPTO_BACKEND STREQUAL "Botan")
-	install(CODE "include(\"${CMAKE_CURRENT_BINARY_DIR}/botan-package/check-\${CMAKE_INSTALL_CONFIG_NAME}.cmake\")")
+	install(CODE "include(\"${CMAKE_CURRENT_BINARY_DIR}/botan-package/check-$<CONFIG>.cmake\")")
 endif()
 
 install(TARGETS ${DEUCESSH_INSTALL_TARGETS}

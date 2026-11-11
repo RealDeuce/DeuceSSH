@@ -129,6 +129,14 @@ struct dssh_tx_slot {
 #define DSSH_REKEY_QUEUE_MAX_MESSAGES 128
 #define DSSH_REKEY_QUEUE_MAX_BYTES UINT32_C(1048576)
 
+/* The receive owner advertises the physical read boundary. A transmit
+ * owner can claim that boundary until the receiver takes over the exchange. */
+enum dssh_rekey_read_state {
+	DSSH_REKEY_READ_IDLE,
+	DSSH_REKEY_READ_AVAILABLE,
+	DSSH_REKEY_READ_CLAIMED
+};
+
 struct dssh_transport_state_s {
 	/* 8-byte fixed */
 	uint64_t rx_bytes_since_rekey; /* bytes received since last (re)key (RX owner) */
@@ -231,6 +239,8 @@ struct dssh_transport_state_s {
 	bool        ext_info_receive;     /* our original role indicator */
 	bool        ext_info_peer;        /* peer's original receive indicator */
 	atomic_bool rekey_in_progress;     /* true between KEXINIT and NEWKEYS */
+	_Atomic enum dssh_rekey_read_state rekey_read;
+	bool        rekey_offer_sent;      /* packet-engine owner */
 	atomic_bool tx_owner_active;       /* exclusive packet-engine owner */
 	bool        rekey_pending;         /* deferred auto-rekey (set in recv_packet) */
 	bool        tx_slots_pending;      /* protected by tx_queue_mtx */

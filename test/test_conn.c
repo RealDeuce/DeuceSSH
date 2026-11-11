@@ -80,14 +80,36 @@ window_mock_gather(const struct dssh_tx_iov *iov, size_t count,
 	return 0;
 }
 
+struct conn_rx_gate {
+	dssh_session sess;
+	atomic_bool empty;
+	atomic_bool resume;
+};
+
+/* Published before the demux starts and retired after it joins. */
+static struct conn_rx_gate *conn_rx_gate;
+
+static void
+conn_pause_empty_read(void *opaque)
+{
+	struct conn_rx_gate *gate = opaque;
+	atomic_store(&gate->empty, true);
+	while (!atomic_load(&gate->resume) && !gate->sess->terminate)
+		thrd_yield();
+}
+
 static int
 mock_rx_dispatch(uint8_t *buf, size_t bufsz,
     dssh_session sess, void *cbdata)
 {
-	if (sess->trans.client)
-		return mock_rx_client(buf, bufsz, sess, cbdata);
-	else
-		return mock_rx_server(buf, bufsz, sess, cbdata);
+	bool observe = conn_rx_gate != NULL && conn_rx_gate->sess == sess;
+	if (observe)
+		mock_io_set_read_retry_hook(conn_pause_empty_read, conn_rx_gate);
+	int ret = sess->trans.client ? mock_rx_client(buf, bufsz, sess, cbdata)
+	    : mock_rx_server(buf, bufsz, sess, cbdata);
+	if (observe)
+		mock_io_set_read_retry_hook(NULL, NULL);
+	return ret;
 }
 
 static int
@@ -8335,6 +8357,7 @@ test_compression_window_rekey(void)
 #include "window_credit_cases.h"
 #include "queued_control_cases.h"
 #include "tx_slot_cases.h"
+#include "transmit_rekey_cases.h"
 #include "accept_callback_cases.h"
 #include "channel_params_cases.h"
 #include "event_overflow_cases.h"
@@ -8343,6 +8366,10 @@ static struct dssh_test_entry tests[] = {
 	{ "release/tx_slot_admission", test_tx_slot_admission },
 	{ "release/tx_slot_resize", test_tx_slot_resize },
 	{ "release/tx_slot_refusal", test_tx_slot_refusal },
+	{ "release/transmit_rekey_threshold", test_transmit_rekey_threshold },
+	{ "release/transmit_rekey_inflight", test_transmit_rekey_inflight },
+	{ "release/transmit_rekey_simultaneous", test_transmit_rekey_simultaneous },
+	{ "release/transmit_rekey_failure", test_transmit_rekey_failure },
 	{ "release/channel_id_lifetime", test_channel_id_lifetime },
 	{ "release/channel_id_late_reply", test_channel_id_late_reply },
 	{ "release/channel_id_backpressure", test_channel_id_backpressure },

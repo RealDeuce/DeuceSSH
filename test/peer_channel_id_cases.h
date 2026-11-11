@@ -316,6 +316,9 @@ peer_id_ordered_terminal_run(struct conn_ctx *ctx, bool close)
 	const uint32_t remote = UINT32_MAX;
 	ASSERT_OK(dssh_session_start(ctx->server));
 	ASSERT_OK(peer_id_send_open(ctx->client, remote));
+	/* Finish admission before arming the process-wide allocation failure.
+	 * The failure must belong to the acceptor's channel construction. */
+	ASSERT_TRUE(channel_id_wire_barrier(ctx->client));
 	struct peer_id_terminal_job job = {.sess = ctx->server};
 	if (close) {
 		struct dssh_incoming_open incoming;
@@ -337,6 +340,7 @@ peer_id_ordered_terminal_run(struct conn_ctx *ctx, bool close)
 	thrd_t thread;
 	ASSERT_EQ(thrd_create(&thread, peer_id_terminal_worker, &job), thrd_success);
 	bool valid = true;
+	bool acquiring = true;
 	if (close) {
 		/* A close sender has claimed the operation but has not acquired the
 		 * packet engine. Its peer number must remain unavailable. */
@@ -349,11 +353,13 @@ peer_id_ordered_terminal_run(struct conn_ctx *ctx, bool close)
 		    && next.peer_channel == 0;
 		if (!valid)
 			atomic_store(&job.resume, true);
+		acquiring = valid;
 		dssh_test_thrd_resume_mutex();
 	}
-	valid = valid && dssh_test_wait_bool(&job.returning, true)
-	    && peer_id_receive_control(ctx->client, close ? SSH_MSG_CHANNEL_CLOSE
+	bool returning = valid && dssh_test_wait_bool(&job.returning, true);
+	bool received = returning && peer_id_receive_control(ctx->client, close ? SSH_MSG_CHANNEL_CLOSE
 	        : SSH_MSG_CHANNEL_OPEN_FAILURE, close ? 5 : 17, remote);
+	valid = received;
 	struct dssh_incoming_open replacement;
 	if (valid) {
 		valid = peer_id_send_open(ctx->client, remote) == 0
@@ -364,6 +370,8 @@ peer_id_ordered_terminal_run(struct conn_ctx *ctx, bool close)
 	int ret;
 	if (thrd_join(thread, &ret) != thrd_success)
 		abort();
+	printf("peer_id_terminal close=%d acquiring=%d returning=%d received=%d replacement=%d worker=%d\n",
+	    close, acquiring, returning, received, valid, ret);
 	ASSERT_TRUE(valid);
 	ASSERT_OK(ret);
 	ASSERT_FALSE(dssh_session_is_terminated(ctx->server));

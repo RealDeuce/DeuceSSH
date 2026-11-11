@@ -1153,6 +1153,22 @@ foreach(kind IN ITEMS key size)
 		ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys)
 endforeach()
 set_property(TEST dssh_conn_tx_slot_refusal_size APPEND PROPERTY ENVIRONMENT "DSSH_TEST_COMPRESSION=test-growth")
+foreach(part IN ITEMS threshold inflight simultaneous failure)
+	dssh_add_output_test(dssh_conn_transmit_rekey_${part} dssh_test_conn
+		"1 tests: 1 passed, 0 failed, 0 skipped" --exact release/transmit_rekey_${part})
+	set_tests_properties(dssh_conn_transmit_rekey_${part} PROPERTIES TIMEOUT 120
+		ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys)
+endforeach()
+foreach(method IN ITEMS dh-gex group14 group16 sntrup mlkem)
+	dssh_add_output_test(dssh_conn_transmit_rekey_threshold_${method} dssh_test_conn
+		"1 tests: 1 passed, 0 failed, 0 skipped" --exact release/transmit_rekey_threshold)
+	set_tests_properties(dssh_conn_transmit_rekey_threshold_${method} PROPERTIES TIMEOUT 120
+		ENVIRONMENT "${DSSH_TEST_KEY_ENV};DSSH_TEST_KEX=${method}" FIXTURES_REQUIRED dssh_cached_keys)
+endforeach()
+dssh_add_output_test(dssh_conn_transmit_rekey_inflight_growth dssh_test_conn
+	"1 tests: 1 passed, 0 failed, 0 skipped" --exact release/transmit_rekey_inflight)
+set_tests_properties(dssh_conn_transmit_rekey_inflight_growth PROPERTIES TIMEOUT 120
+	ENVIRONMENT "${DSSH_TEST_KEY_ENV};DSSH_TEST_COMPRESSION=test-growth" FIXTURES_REQUIRED dssh_cached_keys)
 foreach(part IN ITEMS lifetime late_reply backpressure)
 	dssh_add_output_test(dssh_conn_channel_id_${part} dssh_test_conn
 		"1 tests: 1 passed, 0 failed, 0 skipped" --exact release/channel_id_${part})

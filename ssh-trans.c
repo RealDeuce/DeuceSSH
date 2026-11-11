@@ -22,6 +22,8 @@ static void kex_cleanup_state(struct dssh_session_s *sess);
 static int send_packet_inner(struct dssh_session_s *sess, const uint8_t *payload,
     size_t payload_len, uint32_t *seq_out);
 DSSH_TESTABLE int kexinit(struct dssh_session_s *sess);
+static int finish_kexinit(struct dssh_session_s *sess);
+static int prepare_kexinit(struct dssh_session_s *sess);
 DSSH_TESTABLE int kex(struct dssh_session_s *sess);
 static int kex_exchange(struct dssh_session_s *sess);
 DSSH_TESTABLE int newkeys(struct dssh_session_s *sess);
@@ -497,31 +499,34 @@ dssh_transport_handshake(struct dssh_session_s *sess)
  * Rekeying (RFC 4253 s9)
  * ================================================================ */
 
+/* TX counters and selected descriptors can be read by either owner. */
+static bool
+rekey_transmit_needed(struct dssh_session_s *sess, uint_fast32_t packets)
+{
+	if (packets >= DSSH_REKEY_SOFT_LIMIT)
+		return true;
+	dssh_enc enc = sess->trans.client ? atomic_load(&sess->trans.enc_c2s_selected)
+	                                 : atomic_load(&sess->trans.enc_s2c_selected);
+	return enc != NULL && atomic_load(&sess->trans.tx_bytes_since_rekey) >= enc->bytes_per_key;
+}
+
+static bool
+rekey_transmit_due(struct dssh_session_s *sess)
+{
+	uint_fast32_t packets = atomic_load(&sess->trans.tx_since_rekey);
+	/* KEXINIT itself still uses the active key and its hard packet guard. */
+	return packets < DSSH_REKEY_HARD_LIMIT && rekey_transmit_needed(sess, packets);
+}
+
 DSSH_TESTABLE bool
 rekey_needed(struct dssh_session_s *sess)
 {
-	/* tx counters are atomic.  RX counters are owned by the sole receive
-	 * thread (handshake caller before start, demux afterward).
-	 * Match the atomic's fast-type; atomic_uint_fast32_t is 64-bit on
-	 * glibc x86_64, and -Werror=conversion balks at the narrowing. */
-	uint_fast32_t tx_pkts = atomic_load(&sess->trans.tx_since_rekey);
-	if ((tx_pkts >= DSSH_REKEY_SOFT_LIMIT) || (sess->trans.rx_since_rekey >= DSSH_REKEY_SOFT_LIMIT))
+	if (rekey_transmit_needed(sess, atomic_load(&sess->trans.tx_since_rekey))
+	    || sess->trans.rx_since_rekey >= DSSH_REKEY_SOFT_LIMIT)
 		return true;
-
-	/* Per-direction byte threshold: each direction is encrypted with
-	 * its own key, so compare each counter against the negotiated
-	 * cipher's bytes_per_key (RFC 4344 s3.2: 2^(L/4) blocks for
-	 * L-bit block ciphers).  Pre-handshake, enc_*_selected is NULL
-	 * and the byte check is skipped. */
-	dssh_enc enc_tx = sess->trans.client ? atomic_load(&sess->trans.enc_c2s_selected)
-	                                    : atomic_load(&sess->trans.enc_s2c_selected);
-	dssh_enc enc_rx = sess->trans.client ? atomic_load(&sess->trans.enc_s2c_selected)
-	                                    : atomic_load(&sess->trans.enc_c2s_selected);
-	uint64_t tx_bytes = atomic_load(&sess->trans.tx_bytes_since_rekey);
-	uint64_t rx_bytes = sess->trans.rx_bytes_since_rekey;
-	if (enc_tx != NULL && tx_bytes >= enc_tx->bytes_per_key)
-		return true;
-	if (enc_rx != NULL && rx_bytes >= enc_rx->bytes_per_key)
+	dssh_enc enc = sess->trans.client ? atomic_load(&sess->trans.enc_s2c_selected)
+	                                 : atomic_load(&sess->trans.enc_c2s_selected);
+	if (enc != NULL && sess->trans.rx_bytes_since_rekey >= enc->bytes_per_key)
 		return true;
 	/* Time threshold has no cryptographic justification (the byte
 	 * and packet thresholds do), so apps that need to interop with
@@ -562,9 +567,15 @@ rekey(struct dssh_session_s *sess)
 
 	if (res < 0)
 		return res;
-	res = drain_tx_slots(sess);
-	if (res < 0)
-		return tx_unlock_with_result(sess, res);
+	/* Synchronize with any transmitter that claimed the read boundary.
+	 * Its offer and transcript are complete before the engine is free. */
+	bool offered = sess->trans.rekey_offer_sent;
+	sess->trans.rekey_offer_sent = false;
+	if (!offered) {
+		res = drain_tx_slots(sess);
+		if (res < 0)
+			return tx_unlock_with_result(sess, res);
+	}
 	if (atomic_load_explicit(&sess->terminate, memory_order_acquire)) {
 		tx_unlock_with_slots(sess);
 		return DSSH_ERROR_TERMINATED;
@@ -586,31 +597,29 @@ rekey(struct dssh_session_s *sess)
 	}
 	tx_unlock_with_slots(sess);
 
-	/* Re-negotiate algorithms */
-	res = kexinit(sess);
+	res = offered ? finish_kexinit(sess) : kexinit(sess);
 
 	if (res == 0)
 		res = kex_exchange(sess);
 	if (res == 0)
 		res = newkeys(sess);
 
-	/* Clear the flag and wake any blocked senders */
+	/* An offer may already be on the wire. Publish failure before
+	 * removing the send gate so old-key application traffic cannot resume. */
+	if (res < 0)
+		session_set_terminate_no_wake(sess);
 	state_lr = mtx_lock(&sess->trans.tx_mtx);
 	if (state_lr == thrd_success) {
 		atomic_store_explicit(&sess->trans.rekey_in_progress, false, memory_order_release);
 		int br = cnd_broadcast(&sess->trans.rekey_cnd);
-		state_ur = dssh_mtx_unlock(&sess->trans.tx_mtx);
-		if (state_ur != thrd_success) {
-			dssh_thrd_check_unlock(sess, state_ur);
+		if (br != thrd_success) {
+			session_set_terminate_no_wake(sess);
 			res = DSSH_ERROR_TERMINATED;
 		}
-		else if (br != thrd_success) {
-			dssh_thrd_check(sess, br);
-			res = DSSH_ERROR_TERMINATED;
-		}
+		dssh_mtx_unlock(&sess->trans.tx_mtx);
 	}
 	else {
-		dssh_thrd_check(sess, state_lr);
+		session_set_terminate_no_wake(sess);
 		res = DSSH_ERROR_TERMINATED;
 	}
 	/* Claim and release once to drain connection work accumulated during
@@ -624,8 +633,12 @@ rekey(struct dssh_session_s *sess)
 		}
 	}
 
-	if (res < 0)
-		session_set_terminate(sess);
+	if (res < 0) {
+		if (tx_owner_is_current(sess))
+			tx_unlock_with_slots(sess);
+		else
+			session_set_terminate(sess);
+	}
 	return res;
 }
 
@@ -1657,6 +1670,45 @@ tx_owner_is_current(struct dssh_session_s *sess)
 	return tx_owned_session == sess;
 }
 
+/* Called after the final slot drain, with queue mutex and engine owned.
+ * Claiming the read boundary prevents dispatch of a second occupied-slot
+ * reply while the receive owner must finish this exchange. */
+static bool
+claim_rekey_read(struct dssh_session_s *sess)
+{
+	if (session_on_demux_thread(sess)
+	    || atomic_load(&sess->trans.rekey_read) != DSSH_REKEY_READ_AVAILABLE
+	    || !rekey_transmit_due(sess))
+		return false;
+	enum dssh_rekey_read_state expected = DSSH_REKEY_READ_AVAILABLE;
+	if (!atomic_compare_exchange_strong(&sess->trans.rekey_read, &expected,
+	    DSSH_REKEY_READ_CLAIMED))
+		return false;
+	atomic_store(&sess->trans.rekey_in_progress, true);
+	return true;
+}
+
+static void
+send_claimed_rekey_offer(struct dssh_session_s *sess)
+{
+	int ret = prepare_kexinit(sess);
+	if (ret == 0)
+		ret = send_packet_inner(sess, sess->trans.our_kexinit, sess->trans.our_kexinit_sz, NULL);
+	if (ret == 0)
+		sess->trans.rekey_offer_sent = true;
+	else
+		session_set_terminate_no_wake(sess);
+	tx_owned_session = NULL;
+	atomic_store_explicit(&sess->trans.tx_owner_active, false, memory_order_release);
+	if (ret < 0) {
+		DSSH_LOGF(sess, DSSH_LOG_ERROR, ret, "Failed to start transmit rekey: %s",
+		    dssh_strerror(ret));
+	}
+	if (sess->terminate)
+		session_set_terminate(sess);
+	tx_wake_owners(sess);
+}
+
 /* Drain slots queued while a TX callback was active, then publish the
  * packet engine as free.  tx_queue_mtx closes the otherwise-stranded gap
  * between the last ready check and ownership release. */
@@ -1735,6 +1787,11 @@ tx_unlock_with_slots(struct dssh_session_s *sess)
 			continue;
 		}
 		sess->trans.tx_slot_refusal = drain_ret;
+		if (drain_ret == 0 && claim_rekey_read(sess)) {
+			dssh_mtx_unlock(&sess->trans.tx_queue_mtx);
+			send_claimed_rekey_offer(sess);
+			return;
+		}
 		tx_owned_session = NULL;
 		atomic_store_explicit(&sess->trans.tx_owner_active, false, memory_order_release);
 		/* The occupied predicate stayed true. Wake producers so they can
@@ -2388,6 +2445,52 @@ check_ext_info_position(struct dssh_session_s *sess, uint8_t type,
 	return 0;
 }
 
+/* The receive owner retains at most one bounded transcript per exchange. */
+static int
+retain_peer_kexinit(struct dssh_session_s *sess, const uint8_t *payload, size_t len)
+{
+	uint8_t *copy = malloc(len);
+	if (copy == NULL)
+		return DSSH_ERROR_ALLOC;
+	memcpy(copy, payload, len);
+	free(sess->trans.peer_kexinit);
+	sess->trans.peer_kexinit = copy;
+	sess->trans.peer_kexinit_sz = len;
+	return 0;
+}
+
+static int
+queue_rekey_packet(struct dssh_session_s *sess, uint8_t msg_type, const uint8_t *payload, size_t len)
+{
+	if (sess->trans.rekey_queue_count >= DSSH_REKEY_QUEUE_MAX_MESSAGES)
+		return DSSH_ERROR_TOOLONG;
+	if (len > SIZE_MAX - sizeof(struct dssh_rekey_msg))
+		return DSSH_ERROR_TOOLONG;
+	size_t alloc_size = sizeof(struct dssh_rekey_msg) + len;
+	if (alloc_size > DSSH_REKEY_QUEUE_MAX_BYTES
+	    || alloc_size > SIZE_MAX - sess->trans.rekey_queue_bytes
+	    || sess->trans.rekey_queue_bytes > DSSH_REKEY_QUEUE_MAX_BYTES - alloc_size)
+		return DSSH_ERROR_TOOLONG;
+
+	/* Buffer for replay after rekey completes */
+	struct dssh_rekey_msg *rmsg = malloc(alloc_size);
+	if (rmsg == NULL)
+		return DSSH_ERROR_ALLOC;
+	rmsg->next     = NULL;
+	rmsg->msg_type = msg_type;
+	rmsg->sequence = sess->trans.last_rx_seq;
+	rmsg->len      = len;
+	memcpy(rmsg->data, payload, len);
+	if (sess->trans.rekey_queue_tail != NULL)
+		sess->trans.rekey_queue_tail->next = rmsg;
+	else
+		sess->trans.rekey_queue_head = rmsg;
+	sess->trans.rekey_queue_tail = rmsg;
+	sess->trans.rekey_queue_count++;
+	sess->trans.rekey_queue_bytes += alloc_size;
+	return 0;
+}
+
 /*
  * Public recv_packet: transparently handles transport messages
  * per RFC 4253 s11:
@@ -2401,6 +2504,7 @@ recv_packet_inner(struct dssh_session_s *sess, uint8_t *msg_type, uint8_t **payl
 {
 	int res;
 	bool consumed_packet = false;
+	bool finish_transmit_rekey = false;
 	for (;;) {
 		if (atomic_load_explicit(&sess->terminate, memory_order_acquire))
 			return DSSH_ERROR_TERMINATED;
@@ -2412,7 +2516,9 @@ recv_packet_inner(struct dssh_session_s *sess, uint8_t *msg_type, uint8_t **payl
 			sess->trans.rekey_pending = true;
 		if (sess->terminate)
 			return DSSH_ERROR_TERMINATED;
-		if (sess->trans.rekey_pending && !sess->trans.rekey_in_progress) {
+		if (finish_transmit_rekey
+		    || (sess->trans.rekey_pending && !sess->trans.rekey_in_progress)) {
+			finish_transmit_rekey = false;
 			sess->trans.rekey_pending = false;
 			res = rekey(sess);
 			if (res < 0)
@@ -2440,7 +2546,22 @@ recv_packet_inner(struct dssh_session_s *sess, uint8_t *msg_type, uint8_t **payl
 			replayed = true;
 		}
 		else {
+			bool advertise_read = session_on_demux_thread(sess)
+			    && sess->trans.session_id != NULL && !sess->trans.rekey_in_progress;
+			if (advertise_read) {
+				atomic_store(&sess->trans.rekey_read, DSSH_REKEY_READ_AVAILABLE);
+				/* Close the race with a send finishing just before the
+				 * receive boundary was published. */
+				if (rekey_transmit_due(sess)) {
+					atomic_store(&sess->trans.rekey_read, DSSH_REKEY_READ_IDLE);
+					finish_transmit_rekey = true;
+					continue;
+				}
+			}
 			res = recv_packet_raw(sess, msg_type, payload, payload_len);
+			if (advertise_read)
+				finish_transmit_rekey = atomic_exchange(&sess->trans.rekey_read,
+				    DSSH_REKEY_READ_IDLE) == DSSH_REKEY_READ_CLAIMED;
 			if (res < 0)
 				return res;
 			res = check_ext_info_position(sess, *msg_type, *payload, *payload_len);
@@ -2454,6 +2575,10 @@ recv_packet_inner(struct dssh_session_s *sess, uint8_t *msg_type, uint8_t **payl
 			return res;
 		/* An intercepted KEXINIT completes its own exchange below. */
 		consumed_packet = !replayed && *msg_type != SSH_MSG_KEXINIT;
+		/* A diagnostic callback may itself try to send. Keep it behind
+		 * the exchange when this receive owner must finish rekey. */
+		bool defer_callbacks = finish_transmit_rekey
+		    || (sess->trans.session_id != NULL && sess->trans.rekey_in_progress);
 
 		switch (*msg_type) {
 			case SSH_MSG_EXT_INFO:
@@ -2494,36 +2619,16 @@ recv_packet_inner(struct dssh_session_s *sess, uint8_t *msg_type, uint8_t **payl
 			case SSH_MSG_IGNORE:
 				continue;
 			case SSH_MSG_KEXINIT:
-				/*
-                                 * During initial handshake (session_id not yet set),
-                                 * return KEXINIT to the caller (kexinit()).
-                                 *
-                                 * During a self-initiated rekey (rekey_in_progress
-                                 * is true), kexinit() called us to receive the
-                                 * peer's response -- return KEXINIT to the caller
-                                 * so kexinit() can save it and proceed.
-                                 *
-                                 * Otherwise this is a peer-initiated rekey -- save
-                                 * the peer's KEXINIT and run the rekey cycle.
-                                 */
-				if ((sess->trans.session_id == NULL) || sess->trans.rekey_in_progress)
+				/* Initial and nested receives return the offer to their
+				 * current exchange. The outer receiver takes over a
+				 * transmit-started exchange or starts a peer-initiated one. */
+				if (sess->trans.session_id == NULL
+				    || (sess->trans.rekey_in_progress && !finish_transmit_rekey))
 					return 0;
-				{
-					free(sess->trans.peer_kexinit);
-					sess->trans.peer_kexinit = malloc(*payload_len);
-					if (sess->trans.peer_kexinit == NULL)
-						return DSSH_ERROR_ALLOC;
-					memcpy(sess->trans.peer_kexinit, *payload, *payload_len);
-					sess->trans.peer_kexinit_sz = *payload_len;
-
-					/* rekey() handles the rest: sends our
-                                         * KEXINIT, runs KEX, exchanges NEWKEYS,
-                                         * and installs new keys. */
-					int rk = rekey(sess);
-
-					if (rk < 0)
-						return rk;
-				}
+				res = retain_peer_kexinit(sess, *payload, *payload_len);
+				if (res < 0)
+					return res;
+				finish_transmit_rekey = true;
 				continue;
 			case SSH_MSG_DEBUG:
 			{
@@ -2551,6 +2656,12 @@ recv_packet_inner(struct dssh_session_s *sess, uint8_t *msg_type, uint8_t **payl
 					return transport_disconnect_result(sess, SSH_DISCONNECT_PROTOCOL_ERROR,
 					    "malformed SSH_MSG_DEBUG", DSSH_ERROR_PARSE);
 				}
+				if (defer_callbacks) {
+					res = queue_rekey_packet(sess, *msg_type, *payload, *payload_len);
+					if (res < 0)
+						return res;
+					continue;
+				}
 				dssh_debug_cb dcb = sess->debug_cb;
 
 				if (dcb != NULL)
@@ -2561,6 +2672,12 @@ recv_packet_inner(struct dssh_session_s *sess, uint8_t *msg_type, uint8_t **payl
 			}
 			case SSH_MSG_UNIMPLEMENTED:
 			{
+				if (defer_callbacks && *payload_len >= 5) {
+					res = queue_rekey_packet(sess, *msg_type, *payload, *payload_len);
+					if (res < 0)
+						return res;
+					continue;
+				}
 				dssh_unimplemented_cb ucb = sess->unimplemented_cb;
 
 				if ((ucb != NULL) && (*payload_len >= 5)) {
@@ -2591,6 +2708,12 @@ recv_packet_inner(struct dssh_session_s *sess, uint8_t *msg_type, uint8_t **payl
 				 * and replies through this same path when replayed afterward.
 				 * During the method exchange an unexpected message instead
 				 * reaches the method's normal type validation. */
+				if (finish_transmit_rekey) {
+					res = queue_rekey_packet(sess, *msg_type, *payload, *payload_len);
+					if (res < 0)
+						return res;
+					continue;
+				}
 				if (sess->trans.session_id == NULL || sess->trans.rekey_in_progress)
 					return 0;
 				bool want_reply = (*payload)[pos] != 0;
@@ -2612,6 +2735,12 @@ recv_packet_inner(struct dssh_session_s *sess, uint8_t *msg_type, uint8_t **payl
 				continue;
 			}
 			default:
+				if (finish_transmit_rekey) {
+					res = queue_rekey_packet(sess, *msg_type, *payload, *payload_len);
+					if (res < 0)
+						return res;
+					continue;
+				}
 				/*
                                  * Auto-rekey: if any threshold (packet count,
                                  * bytes, or time) has been exceeded, note it.
@@ -2964,40 +3093,12 @@ receive_peer_kexinit(struct dssh_session_s *sess)
 		 * before a rekey. Initial KEX must not populate the replay queue. */
 		if (sess->trans.session_id == NULL)
 			return DSSH_ERROR_PARSE;
-		if (sess->trans.rekey_queue_count >= DSSH_REKEY_QUEUE_MAX_MESSAGES)
-			return DSSH_ERROR_TOOLONG;
-		if (peer_len > SIZE_MAX - sizeof(struct dssh_rekey_msg))
-			return DSSH_ERROR_TOOLONG;
-		size_t alloc_size = sizeof(struct dssh_rekey_msg) + peer_len;
-		if (alloc_size > DSSH_REKEY_QUEUE_MAX_BYTES
-		    || alloc_size > SIZE_MAX - sess->trans.rekey_queue_bytes
-		    || sess->trans.rekey_queue_bytes > DSSH_REKEY_QUEUE_MAX_BYTES - alloc_size)
-			return DSSH_ERROR_TOOLONG;
-
-		/* Buffer for replay after rekey completes */
-		struct dssh_rekey_msg *rmsg = malloc(alloc_size);
-		if (rmsg == NULL)
-			return DSSH_ERROR_ALLOC;
-		rmsg->next     = NULL;
-		rmsg->msg_type = msg_type;
-		rmsg->sequence = sess->trans.last_rx_seq;
-		rmsg->len      = peer_len;
-		memcpy(rmsg->data, peer_payload, peer_len);
-		if (sess->trans.rekey_queue_tail != NULL)
-			sess->trans.rekey_queue_tail->next = rmsg;
-		else
-			sess->trans.rekey_queue_head = rmsg;
-		sess->trans.rekey_queue_tail = rmsg;
-		sess->trans.rekey_queue_count++;
-		sess->trans.rekey_queue_bytes += alloc_size;
+		res = queue_rekey_packet(sess, msg_type, peer_payload, peer_len);
+		if (res < 0)
+			return res;
 	}
 
-	sess->trans.peer_kexinit = malloc(peer_len);
-	if (sess->trans.peer_kexinit == NULL)
-		return DSSH_ERROR_ALLOC;
-	memcpy(sess->trans.peer_kexinit, peer_payload, peer_len);
-	sess->trans.peer_kexinit_sz = peer_len;
-	return 0;
+	return retain_peer_kexinit(sess, peer_payload, peer_len);
 }
 
 /* Views remain valid while their saved KEXINIT buffer is retained. */
@@ -3156,8 +3257,8 @@ negotiate_algorithms(struct dssh_session_s *sess,
 	return 0;
 }
 
-DSSH_TESTABLE int
-kexinit(struct dssh_session_s *sess)
+static int
+prepare_kexinit(struct dssh_session_s *sess)
 {
 	uint8_t *kexinit;
 	size_t   kexinit_sz;
@@ -3171,11 +3272,13 @@ kexinit(struct dssh_session_s *sess)
 	sess->trans.our_kexinit    = kexinit;
 	sess->trans.our_kexinit_sz = kexinit_sz;
 
-	res = send_packet(sess, kexinit, kexinit_sz, NULL);
-	if (res < 0)
-		return res;
+	return 0;
+}
 
-	res = receive_peer_kexinit(sess);
+static int
+finish_kexinit(struct dssh_session_s *sess)
+{
+	int res = receive_peer_kexinit(sess);
 	if (res < 0)
 		return res;
 
@@ -3188,6 +3291,16 @@ kexinit(struct dssh_session_s *sess)
 		return res;
 
 	return negotiate_algorithms(sess, peer_lists, peer_first_kex_follows);
+}
+
+DSSH_TESTABLE int
+kexinit(struct dssh_session_s *sess)
+{
+	int res = prepare_kexinit(sess);
+	if (res < 0)
+		return res;
+	res = send_packet(sess, sess->trans.our_kexinit, sess->trans.our_kexinit_sz, NULL);
+	return res < 0 ? res : finish_kexinit(sess);
 }
 
 /* ================================================================
@@ -4138,6 +4251,7 @@ dssh_session_init(bool client, size_t max_packet_size)
 	atomic_init(&sess->trans.tx_since_rekey, 0);
 	atomic_init(&sess->trans.tx_bytes_since_rekey, 0);
 	atomic_init(&sess->trans.rekey_in_progress, false);
+	atomic_init(&sess->trans.rekey_read, DSSH_REKEY_READ_IDLE);
 	atomic_init(&sess->trans.tx_owner_active, false);
 	/* TX slots remain empty until newkeys allocates their byte buffers. */
 	atomic_init(&sess->trans.global_reply_slot.ready, false);

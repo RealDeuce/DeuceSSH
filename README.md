@@ -1869,9 +1869,12 @@ and `UINT64_MAX` for the `none` cipher (no key wear).  Each
 direction's byte counter is compared independently against the
 selected cipher's limit, so c2s and s2c use their own keys' budgets.
 
-Auto-rekey is triggered transparently by the demux thread.  Peer-
-initiated rekey (incoming `SSH_MSG_KEXINIT`) is also handled
-transparently.  The application does not need to do anything.
+The demux handles incoming `SSH_MSG_KEXINIT` and checks rekey
+thresholds as it receives traffic. If a send reaches the outbound
+packet or byte threshold while the demux is waiting for input, the
+packet-engine owner sends KEXINIT and the demux finishes the
+exchange. The optional time threshold is checked as the demux
+processes traffic.
 
 For send-only sessions without a receive thread, a hard packet limit
 (2^31) returns `DSSH_ERROR_REKEY_NEEDED`.

@@ -681,6 +681,8 @@ static struct dssh_test_entry tests[] = {
 	{ "key_availability/auth", test_key_availability_auth },
 	{ "key_availability/offer", test_key_availability_offer },
 	{ "packet/metadata_bounds", test_packet_metadata_bounds },
+	{ "packet/receive_extents", test_packet_receive_extents },
+	{ "packet/receive_length_refusal", test_packet_receive_length_refusal },
 	{ "packet/receive_block_bounds", test_receive_block_bounds },
 	{ "packet/slot_size_bounds", test_slot_size_bounds },
 	{ "handler/digest_failure", test_handler_digest_failure },

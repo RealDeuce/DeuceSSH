@@ -315,6 +315,24 @@ function(dssh_add_test test_name source_file)
 	endif()
 endfunction()
 
+# Exercise the exact production packet arithmetic under unsigned size models.
+foreach(model IN ITEMS native u16 u32 u64)
+	add_executable(dssh_test_packet_sizes_${model} test_packet_sizes.c)
+	set_property(TARGET dssh_test_packet_sizes_${model} PROPERTY C_STANDARD ${DEUCESSH_C_STANDARD})
+	set_property(TARGET dssh_test_packet_sizes_${model} PROPERTY C_STANDARD_REQUIRED ON)
+	target_include_directories(dssh_test_packet_sizes_${model} PRIVATE ${PROJECT_SOURCE_DIR})
+	target_compile_options(dssh_test_packet_sizes_${model} PRIVATE ${DEUCESSH_COMPILE_OPTIONS})
+	target_compile_definitions(dssh_test_packet_sizes_${model} PRIVATE DSSH_PACKET_MODEL_NAME="${model}")
+	if(NOT model STREQUAL "native")
+		string(SUBSTRING ${model} 1 -1 bits)
+		target_compile_definitions(dssh_test_packet_sizes_${model} PRIVATE
+			DSSH_PACKET_SIZE_TYPE=uint${bits}_t DSSH_PACKET_SIZE_LIMIT=UINT${bits}_MAX
+			DSSH_PACKET_MODEL_BITS=${bits})
+	endif()
+	dssh_add_output_test(dssh_packet_sizes_${model} dssh_test_packet_sizes_${model}
+		"packet_sizes model=${model} width=[0-9]+ checks=[1-9][0-9]* failed=0")
+endforeach()
+
 # Exercise the exact production time arithmetic under different C type models.
 foreach(model IN ITEMS i16 u16 i32 u32 i64 u64 f32 f64 fwide)
 	if(model STREQUAL "i16")
@@ -919,6 +937,10 @@ dssh_add_test(kex_framing test_kex_framing.c)
 add_test(NAME dssh_unit_kex_framing COMMAND dssh_test_kex_framing)
 dssh_add_test(module_contract test_module_contract.c)
 add_test(NAME dssh_unit_module_contract COMMAND dssh_test_module_contract)
+foreach(part IN ITEMS receive_extents receive_length_refusal)
+	dssh_add_output_test(dssh_packet_${part} dssh_test_module_contract
+		"1 tests: 1 passed, 0 failed, 0 skipped" --exact packet/${part})
+endforeach()
 dssh_add_test(dhgex_contract test_dhgex_contract.c)
 add_test(NAME dssh_unit_dhgex_contract COMMAND dssh_test_dhgex_contract)
 target_link_libraries(dssh_test_transport PRIVATE dssh_mock_io dssh_mock_comp)

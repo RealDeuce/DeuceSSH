@@ -9,6 +9,7 @@
 #include "deucessh-crypto.h"
 #include "ssh-internal.h"
 #include "ssh-window.h"
+#include "ssh-packet.h"
 #include "key_algo/private-key-file.h"
 
 /* DSSH_TESTABLE is defined in ssh-internal.h */
@@ -1168,13 +1169,12 @@ tx_finalize_prepare(struct dssh_session_s *sess, uint8_t *buf, size_t payload_le
 	}
 	uint32_t packet_length = (uint32_t)pkt_sz;
 
-#if UINT32_MAX > SIZE_MAX - 4
-	if (packet_length > SIZE_MAX - 4) {
+	size_t total;
+	size_t mac_input;
+	if (!dssh_packet_extents(packet_length, sess->trans.packet_buf_sz, &total, &mac_input)) {
 		ret = DSSH_ERROR_TOOLONG;
 		goto done;
 	}
-#endif
-	size_t   total   = 4 + packet_length;
 	uint16_t mac_len = tx_mac_size(sess);
 
 	if (!dssh_buffer_has(sess->trans.packet_buf_sz, total, mac_len)) {
@@ -1212,7 +1212,7 @@ tx_finalize_prepare(struct dssh_session_s *sess, uint8_t *buf, size_t payload_le
 			mac_ctx = sess->trans.mac_s2c_ctx;
 		}
 		crypto_called = true;
-		ret = mac->generate(buf, 4 + total, &buf[4 + total], mac_ctx);
+		ret = mac->generate(buf, mac_input, &buf[mac_input], mac_ctx);
 		if (ret > 0)
 			ret = DSSH_ERROR_INVALID;
 		if (ret < 0) {
@@ -2221,12 +2221,12 @@ recv_packet_raw(struct dssh_session_s *sess, uint8_t *msg_type, uint8_t **payloa
 		ret = DSSH_ERROR_PARSE;
 		goto rx_done;
 	}
-	if (!dssh_buffer_has(sess->trans.packet_buf_sz, 4, packet_length)) {
+	size_t packet_total;
+	size_t mac_input;
+	if (!dssh_packet_extents(packet_length, sess->trans.packet_buf_sz, &packet_total, &mac_input)) {
 		ret = DSSH_ERROR_TOOLONG;
 		goto rx_done;
 	}
-	size_t packet_total = 4 + (size_t)packet_length;
-
 	if (packet_total < bs || packet_total % bs != 0) {
 		ret = DSSH_ERROR_PARSE;
 		goto rx_done;
@@ -2269,7 +2269,7 @@ recv_packet_raw(struct dssh_session_s *sess, uint8_t *msg_type, uint8_t **payloa
 			mac     = mac_c2s_module(sess);
 			mac_ctx = sess->trans.mac_c2s_ctx;
 		}
-		ret = mac->generate(sess->trans.rx_packet, 4 + packet_length + 4, sess->trans.rx_mac_computed,
+		ret = mac->generate(sess->trans.rx_packet, mac_input, sess->trans.rx_mac_computed,
 		    mac_ctx);
 		if (ret > 0)
 			ret = DSSH_ERROR_INVALID;
@@ -2288,7 +2288,7 @@ recv_packet_raw(struct dssh_session_s *sess, uint8_t *msg_type, uint8_t **payloa
 		goto rx_done;
 	}
 	*payload     = &sess->trans.rx_packet[9];
-	*payload_len = packet_length - padding_length - 1;
+	*payload_len = packet_total - padding_length - 5;
 	dssh_comp comp = sess->trans.client ? sess->trans.comp_s2c_active : sess->trans.comp_c2s_active;
 	if (compression_enabled(comp)) {
 		dssh_comp_ctx *ctx = sess->trans.client ? sess->trans.comp_s2c_ctx : sess->trans.comp_c2s_ctx;
@@ -2329,7 +2329,7 @@ recv_packet_raw(struct dssh_session_s *sess, uint8_t *msg_type, uint8_t **payloa
 	sess->trans.rx_seq++;
 	sess->trans.rx_since_rekey++;
 	{
-		size_t rx_bytes = (size_t)packet_length + 4 + mac_len;
+		uint64_t rx_bytes = dssh_packet_wire_bytes(packet_length, mac_len);
 
 		if (rx_bytes > UINT64_MAX - sess->trans.rx_bytes_since_rekey)
 			sess->trans.rx_bytes_since_rekey = UINT64_MAX;

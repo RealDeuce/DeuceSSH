@@ -28,7 +28,11 @@ struct peer {
 	const char *user;
 	const char *c2s;
 	const char *s2c;
+	const char *cipher_c2s;
+	const char *cipher_s2c;
 	bool client;
+	bool swap_rekey;
+	bool rekey_configured;
 	bool signed_auth;
 	bool exec_seen;
 	bool remote_closed;
@@ -68,19 +72,47 @@ log_message(int priority, const char *function, const char *message, void *data)
 static int
 check_directions(struct peer *peer)
 {
+	if (peer->checks >= 2)
+		return SSH_ERROR;
+	bool swapped = peer->swap_rekey && peer->checks != 0;
+	const char *c2s = swapped ? peer->s2c : peer->c2s;
+	const char *s2c = swapped ? peer->c2s : peer->s2c;
+	const char *enc_c2s = swapped ? peer->cipher_s2c : peer->cipher_c2s;
+	const char *enc_s2c = swapped ? peer->cipher_c2s : peer->cipher_s2c;
 	const char *incoming = ssh_get_hmac_in(peer->session);
 	const char *outgoing = ssh_get_hmac_out(peer->session);
-	const char *expected_in = peer->client ? peer->s2c : peer->c2s;
-	const char *expected_out = peer->client ? peer->c2s : peer->s2c;
+	const char *expected_in = peer->client ? s2c : c2s;
+	const char *expected_out = peer->client ? c2s : s2c;
 	const char *kex = ssh_get_kex_algo(peer->session);
 	const char *cipher_in = ssh_get_cipher_in(peer->session);
 	const char *cipher_out = ssh_get_cipher_out(peer->session);
 	if (incoming == NULL || outgoing == NULL || kex == NULL || cipher_in == NULL || cipher_out == NULL
 	    || strcmp(incoming, expected_in) != 0 || strcmp(outgoing, expected_out) != 0
 	    || strcmp(incoming, outgoing) == 0 || strcmp(kex, "curve25519-sha256") != 0
-	    || strcmp(cipher_in, "aes256-ctr") != 0 || strcmp(cipher_out, "aes256-ctr") != 0)
+	    || strcmp(cipher_in, peer->client ? enc_s2c : enc_c2s) != 0
+	    || strcmp(cipher_out, peer->client ? enc_c2s : enc_s2c) != 0)
+		return SSH_ERROR;
+	if (fprintf(stderr, "libssh_algorithms epoch=%u cipher-c2s=%s cipher-s2c=%s mac-c2s=%s mac-s2c=%s\n",
+	    peer->checks, peer->client ? cipher_out : cipher_in, peer->client ? cipher_in : cipher_out,
+	    peer->client ? outgoing : incoming, peer->client ? incoming : outgoing) < 0)
 		return SSH_ERROR;
 	peer->checks++;
+	return SSH_OK;
+}
+
+static int
+prepare_rekey(struct peer *peer)
+{
+	if (!peer->swap_rekey)
+		return SSH_OK;
+	/* Change only later proposals, after the initial active selection was
+	 * checked. Actual post-NEWKEYS getters must prove the new selections. */
+	if (ssh_options_set(peer->session, SSH_OPTIONS_CIPHERS_C_S, peer->cipher_s2c) != SSH_OK
+	    || ssh_options_set(peer->session, SSH_OPTIONS_CIPHERS_S_C, peer->cipher_c2s) != SSH_OK
+	    || ssh_options_set(peer->session, SSH_OPTIONS_HMAC_C_S, peer->s2c) != SSH_OK
+	    || ssh_options_set(peer->session, SSH_OPTIONS_HMAC_S_C, peer->c2s) != SSH_OK)
+		return SSH_ERROR;
+	peer->rekey_configured = true;
 	return SSH_OK;
 }
 
@@ -144,7 +176,7 @@ static int
 client_run(struct peer *peer)
 {
 	int ret = ssh_connect(peer->session);
-	if (ret != SSH_OK || check_directions(peer) != SSH_OK)
+	if (ret != SSH_OK || check_directions(peer) != SSH_OK || prepare_rekey(peer) != SSH_OK)
 		return SSH_ERROR;
 	ssh_key host = NULL;
 	ret = ssh_get_server_publickey(peer->session, &host);
@@ -246,7 +278,8 @@ server_run(struct peer *peer, ssh_bind bind, int fd)
 	    || ssh_bind_accept_fd(bind, peer->session, fd) != SSH_OK)
 		return SSH_ERROR;
 	ssh_set_auth_methods(peer->session, SSH_AUTH_METHOD_PUBLICKEY);
-	if (ssh_handle_key_exchange(peer->session) != SSH_OK || check_directions(peer) != SSH_OK)
+	if (ssh_handle_key_exchange(peer->session) != SSH_OK || check_directions(peer) != SSH_OK
+	    || prepare_rekey(peer) != SSH_OK)
 		return SSH_ERROR;
 	ssh_event event = ssh_event_new();
 	if (event == NULL)
@@ -294,10 +327,14 @@ server_run(struct peer *peer, ssh_bind bind, int fd)
 int
 main(int argc, char **argv)
 {
-	if (argc != 7 || (strcmp(argv[1], "client") != 0 && strcmp(argv[1], "server") != 0)
+	if ((argc != 7 && argc != 10) || (strcmp(argv[1], "client") != 0 && strcmp(argv[1], "server") != 0)
 	    || (strcmp(argv[3], "hmac-sha2-256") != 0 && strcmp(argv[3], "hmac-sha2-512") != 0)
 	    || (strcmp(argv[4], "hmac-sha2-256") != 0 && strcmp(argv[4], "hmac-sha2-512") != 0)
 	    || strcmp(argv[3], argv[4]) == 0)
+		return 2;
+	if (argc == 10 && ((strcmp(argv[7], "aes256-ctr") != 0 && strcmp(argv[7], "aes128-cbc") != 0)
+	    || (strcmp(argv[8], "aes256-ctr") != 0 && strcmp(argv[8], "aes128-cbc") != 0)
+	    || strcmp(argv[7], argv[8]) == 0 || (strcmp(argv[9], "keep") != 0 && strcmp(argv[9], "swap") != 0)))
 		return 2;
 	char *end;
 	errno = 0;
@@ -306,7 +343,10 @@ main(int argc, char **argv)
 		return 2;
 	int fd = (int)descriptor;
 	struct peer peer = {.client = strcmp(argv[1], "client") == 0,
-		.c2s = argv[3], .s2c = argv[4], .user = argv[6]};
+		.c2s = argv[3], .s2c = argv[4], .user = argv[6],
+		.cipher_c2s = argc == 10 ? argv[7] : "aes256-ctr",
+		.cipher_s2c = argc == 10 ? argv[8] : "aes256-ctr",
+		.swap_rekey = argc == 10 && strcmp(argv[9], "swap") == 0};
 	if (signal(SIGPIPE, SIG_IGN) == SIG_ERR || clock_gettime(CLOCK_MONOTONIC, &peer.started) != 0
 	    || ssh_init() != SSH_OK)
 		return 2;
@@ -340,8 +380,8 @@ main(int argc, char **argv)
 		OPTION(SSH_OPTIONS_KEY_EXCHANGE, "curve25519-sha256");
 		OPTION(SSH_OPTIONS_HOSTKEYS, "rsa-sha2-256");
 		OPTION(SSH_OPTIONS_PUBLICKEY_ACCEPTED_TYPES, "rsa-sha2-256");
-		OPTION(SSH_OPTIONS_CIPHERS_C_S, "aes256-ctr");
-		OPTION(SSH_OPTIONS_CIPHERS_S_C, "aes256-ctr");
+		OPTION(SSH_OPTIONS_CIPHERS_C_S, peer.cipher_c2s);
+		OPTION(SSH_OPTIONS_CIPHERS_S_C, peer.cipher_s2c);
 		OPTION(SSH_OPTIONS_HMAC_C_S, peer.c2s);
 		OPTION(SSH_OPTIONS_HMAC_S_C, peer.s2c);
 		OPTION(SSH_OPTIONS_COMPRESSION_C_S, "none");
@@ -364,8 +404,8 @@ main(int argc, char **argv)
 		BIND(SSH_BIND_OPTIONS_KEY_EXCHANGE, "curve25519-sha256");
 		BIND(SSH_BIND_OPTIONS_HOSTKEY_ALGORITHMS, "rsa-sha2-256");
 		BIND(SSH_BIND_OPTIONS_PUBKEY_ACCEPTED_KEY_TYPES, "rsa-sha2-256");
-		BIND(SSH_BIND_OPTIONS_CIPHERS_C_S, "aes256-ctr");
-		BIND(SSH_BIND_OPTIONS_CIPHERS_S_C, "aes256-ctr");
+		BIND(SSH_BIND_OPTIONS_CIPHERS_C_S, peer.cipher_c2s);
+		BIND(SSH_BIND_OPTIONS_CIPHERS_S_C, peer.cipher_s2c);
 		BIND(SSH_BIND_OPTIONS_HMAC_C_S, peer.c2s);
 		BIND(SSH_BIND_OPTIONS_HMAC_S_C, peer.s2c);
 #undef BIND
@@ -376,7 +416,7 @@ done:
 	if (ret != SSH_OK && peer.session != NULL)
 		fprintf(stderr, "libssh error: %s\n", ssh_get_error(peer.session));
 	bool valid = ret == SSH_OK && peer.newkeys >= 2 && peer.checks == 2
-	    && peer.signed_auth && peer.exec_seen && !peer.log_error;
+	    && peer.signed_auth && peer.exec_seen && !peer.log_error && peer.rekey_configured == peer.swap_rekey;
 	if (peer.channel != NULL) {
 		ssh_channel_free(peer.channel);
 		peer.channel = NULL;
@@ -392,6 +432,11 @@ done:
 	if (fprintf(stderr, "libssh_mac role=%s c2s=%s s2c=%s bytes-each-way=%u newkeys=%u direction-checks=%u signed-auth=%u exec=%u valid=%u version=%s\n",
 	    argv[1], peer.c2s, peer.s2c, OUTPUT_SIZE, peer.newkeys, peer.checks,
 	    peer.signed_auth ? 1U : 0U, peer.exec_seen ? 1U : 0U, valid ? 1U : 0U, ssh_version(0)) < 0)
+		valid = false;
+	if (fprintf(stderr, "libssh_cipher initial-c2s=%s initial-s2c=%s final-c2s=%s final-s2c=%s swap=%u configured=%u checks=%u valid=%u\n",
+	    peer.cipher_c2s, peer.cipher_s2c, peer.swap_rekey ? peer.cipher_s2c : peer.cipher_c2s,
+	    peer.swap_rekey ? peer.cipher_c2s : peer.cipher_s2c, peer.swap_rekey ? 1U : 0U,
+	    peer.rekey_configured ? 1U : 0U, peer.checks, valid ? 1U : 0U) < 0)
 		valid = false;
 	if (ssh_finalize() != SSH_OK)
 		valid = false;

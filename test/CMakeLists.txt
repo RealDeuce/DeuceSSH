@@ -1736,6 +1736,25 @@ if(DEUCESSH_TEST_OPENSSH)
 							--evidence ${CMAKE_CURRENT_BINARY_DIR}/libssh-mac-evidence/${mac_case})
 						set_tests_properties(${mac_case} PROPERTIES TIMEOUT 90 LABELS libssh)
 					endforeach()
+					foreach(first IN ITEMS cbc ctr)
+						foreach(mac_first IN ITEMS 256 512)
+							foreach(mode IN ITEMS keep swap)
+								set(cipher_case dssh_libssh_cipher_${form}_${role}_${first}_${mac_first}_${mode})
+								set(cipher_command ${Python3_EXECUTABLE}
+									${CMAKE_CURRENT_SOURCE_DIR}/libssh_mac_interop.py
+									--peer $<TARGET_FILE:dssh_openssh_${form}>
+									--libssh $<TARGET_FILE:dssh_libssh_mac_peer>
+									--role ${role} --c2s ${mac_first} --cipher-c2s ${first}
+									--keygen ${DSSH_OPENSSH_KEYGEN}
+									--evidence ${CMAKE_CURRENT_BINARY_DIR}/libssh-cipher-evidence/${cipher_case})
+								if(mode STREQUAL "swap")
+									list(APPEND cipher_command --swap-rekey)
+								endif()
+								add_test(NAME ${cipher_case} COMMAND ${cipher_command})
+								set_tests_properties(${cipher_case} PROPERTIES TIMEOUT 90 LABELS libssh)
+							endforeach()
+						endforeach()
+					endforeach()
 				endforeach()
 			endif()
 			foreach(method IN ITEMS curve25519-sha256 diffie-hellman-group-exchange-sha256

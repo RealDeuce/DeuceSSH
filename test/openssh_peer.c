@@ -351,17 +351,22 @@ client_channel(dssh_session session, bool bidirectional)
 }
 
 static int
-check_algorithm_fields(dssh_session sess, const char *cipher, const char *c2s, const char *s2c)
+check_algorithm_fields(dssh_session sess, const char *cipher_c2s, const char *cipher_s2c,
+    const char *c2s, const char *s2c, unsigned epoch)
 {
 	const enum dssh_direction directions[] = {DSSH_CLIENT_TO_SERVER, DSSH_SERVER_TO_CLIENT};
 	const char *expected[] = {c2s, s2c};
+	const char *ciphers[] = {cipher_c2s, cipher_s2c};
 	for (size_t i = 0; i < 2; i++) {
 		const char *enc = dssh_transport_get_enc_name(sess, directions[i]);
 		const char *mac = dssh_transport_get_mac_name(sess, directions[i]);
 		const char *comp = dssh_transport_get_comp_name(sess, directions[i]);
-		if (enc == NULL || mac == NULL || comp == NULL || strcmp(enc, cipher) != 0
+		if (enc == NULL || mac == NULL || comp == NULL || strcmp(enc, ciphers[i]) != 0
 		    || strcmp(mac, expected[i]) != 0 || strcmp(comp, "none") != 0)
 			return DSSH_ERROR_INVALID;
+		if (fprintf(stderr, "DeuceSSH algorithm epoch=%u direction=%s cipher=%s mac=%s comp=%s\n",
+		    epoch, i == 0 ? "c2s" : "s2c", enc, mac, comp) < 0)
+			return DSSH_ERROR_INIT;
 	}
 	return 0;
 }
@@ -400,6 +405,12 @@ main(int argc, char **argv)
 		cipher = "aes256-ctr";
 	if (strcmp(cipher, "aes256-ctr") != 0 && strcmp(cipher, "aes128-cbc") != 0)
 		return 2;
+	const char *cipher_s2c = getenv("DSSH_TEST_ENC_S2C");
+	if (cipher_s2c == NULL)
+		cipher_s2c = cipher;
+	if (strcmp(cipher_s2c, "aes256-ctr") != 0 && strcmp(cipher_s2c, "aes128-cbc") != 0)
+		return 2;
+	bool swap_rekey = getenv("DSSH_TEST_REKEY_SWAP") != NULL;
 	const char *mac = getenv("DSSH_TEST_MAC");
 	if (mac == NULL)
 		mac = "hmac-sha2-256";
@@ -409,6 +420,8 @@ main(int argc, char **argv)
 	if (mac_s2c == NULL)
 		mac_s2c = mac;
 	if (strcmp(mac_s2c, "hmac-sha2-256") != 0 && strcmp(mac_s2c, "hmac-sha2-512") != 0)
+		return 2;
+	if (swap_rekey && (strcmp(cipher, cipher_s2c) == 0 || strcmp(mac, mac_s2c) == 0))
 		return 2;
 	struct authorization auth = { .user = argv[5] };
 	FILE *key = fopen(argv[4], "rb");
@@ -440,6 +453,9 @@ main(int argc, char **argv)
 		ret = dssh_register_mlkem768x25519_sha256();
 	if (ret == 0)
 		ret = strcmp(cipher, "aes128-cbc") == 0
+		    ? dssh_register_aes128_cbc() : dssh_register_aes256_ctr();
+	if (ret == 0 && strcmp(cipher, cipher_s2c) != 0)
+		ret = strcmp(cipher_s2c, "aes128-cbc") == 0
 		    ? dssh_register_aes128_cbc() : dssh_register_aes256_ctr();
 	if (ret == 0)
 		ret = strcmp(mac, "hmac-sha2-512") == 0
@@ -482,7 +498,7 @@ main(int argc, char **argv)
 	    || strcmp(dssh_transport_get_hostkey_name(session), "rsa-sha2-256") != 0))
 		ret = DSSH_ERROR_INVALID;
 	if (ret == 0) {
-		ret = check_algorithm_fields(session, cipher, mac, mac_s2c);
+		ret = check_algorithm_fields(session, cipher, cipher_s2c, mac, mac_s2c, 0);
 		if (ret == 0)
 			algorithm_checks++;
 	}
@@ -508,7 +524,7 @@ main(int argc, char **argv)
 	}
 	if (ret == 0) {
 		stage = "channel";
-		bool bidirectional = strcmp(mac, mac_s2c) != 0;
+		bool bidirectional = strcmp(mac, mac_s2c) != 0 || strcmp(cipher, cipher_s2c) != 0;
 		ret = client ? client_channel(session, bidirectional) : server_channel(session, &channel_ack, bidirectional);
 	}
 	if (ret == 0 && language_fields) {
@@ -517,7 +533,9 @@ main(int argc, char **argv)
 			language_checks++;
 	}
 	if (ret == 0) {
-		ret = check_algorithm_fields(session, cipher, mac, mac_s2c);
+		ret = check_algorithm_fields(session, swap_rekey ? cipher_s2c : cipher,
+		    swap_rekey ? cipher : cipher_s2c, swap_rekey ? mac_s2c : mac,
+		    swap_rekey ? mac : mac_s2c, 1);
 		if (ret == 0)
 			algorithm_checks++;
 	}

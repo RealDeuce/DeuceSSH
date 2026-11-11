@@ -4542,9 +4542,10 @@ DEFINE_REGISTER(dssh_transport_register_kex, dssh_kex, kex_head, kex_tail, kex_e
     item->init != NULL && item->handler != NULL && item->cleanup != NULL && item->hash_name != NULL
         && strcmp(item->name, "ext-info-c") != 0 && strcmp(item->name, "ext-info-s") != 0)
 DEFINE_REGISTER(dssh_transport_register_key_algo, dssh_key_algo, key_algo_head, key_algo_tail, key_algo_entries, true)
-DEFINE_REGISTER(dssh_transport_register_enc, dssh_enc, enc_head, enc_tail, enc_entries, true)
+DEFINE_REGISTER(dssh_transport_register_enc, dssh_enc, enc_head, enc_tail, enc_entries,
+    item->key_size == 0 || (item->init != NULL && item->encrypt != NULL && item->decrypt != NULL))
 DEFINE_REGISTER(dssh_transport_register_mac, dssh_mac, mac_head, mac_tail, mac_entries,
-    item->digest_size == 0 || item->generate != NULL)
+    (item->key_size == 0 || item->init != NULL) && (item->digest_size == 0 || item->generate != NULL))
 DEFINE_REGISTER(dssh_transport_register_comp, dssh_comp, comp_head, comp_tail, comp_entries,
     item->init != NULL && item->bound != NULL && item->compress != NULL
         && item->uncompress != NULL && item->cleanup != NULL)

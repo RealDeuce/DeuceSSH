@@ -5912,7 +5912,7 @@ test_blocksize_lt8(void)
 	struct dssh_enc_s *enc = calloc(1, sizeof(*enc) + sizeof(name));
 	ASSERT_NOT_NULL(enc);
 	enc->blocksize = 1;
-	enc->key_size = 16;
+	enc->key_size = 0;
 	memcpy(enc->name, name, sizeof(name));
 	ASSERT_EQ(dssh_transport_register_enc(enc), 0);
 	ASSERT_EQ(dssh_register_none_comp(), 0);

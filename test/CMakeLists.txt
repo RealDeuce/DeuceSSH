@@ -950,6 +950,8 @@ endforeach()
 dssh_add_test(kex_framing test_kex_framing.c)
 add_test(NAME dssh_unit_kex_framing COMMAND dssh_test_kex_framing)
 dssh_add_test(module_contract test_module_contract.c)
+dssh_add_output_test(dssh_module_keyed_registration dssh_test_module_contract
+	"keyed_admission cases=32 mismatches=0" --exact registration/keyed_callbacks)
 add_test(NAME dssh_unit_module_contract COMMAND dssh_test_module_contract)
 foreach(part IN ITEMS receive_extents receive_length_refusal)
 	dssh_add_output_test(dssh_packet_${part} dssh_test_module_contract

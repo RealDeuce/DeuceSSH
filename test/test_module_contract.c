@@ -274,6 +274,98 @@ mac_cleanup(dssh_mac_ctx *ctx)
 	}
 }
 
+/* Admission must leave a rejected producer-owned definition and the existing
+ * registry untouched. Zero-key/stateless definitions retain their contract. */
+static int
+test_keyed_registration(void)
+{
+	unsigned checked = 0;
+	unsigned mismatches = 0;
+	for (unsigned keyed = 0; keyed < 2; keyed++) {
+		for (unsigned mask = 0; mask < 8; mask++) {
+			dssh_test_reset_global_config();
+			ASSERT_OK(dssh_register_none_enc());
+			dssh_enc head = gconf.enc_head;
+			dssh_enc candidate = calloc(1, sizeof(*candidate) + sizeof("admission"));
+			ASSERT_NOT_NULL(candidate);
+			memcpy(candidate->name, "admission", sizeof("admission"));
+			candidate->key_size = keyed != 0 ? 16 : 0;
+			candidate->blocksize = 16;
+			candidate->bytes_per_key = UINT64_MAX;
+			candidate->init = (mask & 1U) != 0 ? enc_init : NULL;
+			candidate->encrypt = (mask & 2U) != 0 ? stateless_encrypt : NULL;
+			candidate->decrypt = (mask & 4U) != 0 ? stateless_decrypt : NULL;
+			bool accepted = keyed == 0 || mask == 7;
+			int expected = accepted ? 0 : DSSH_ERROR_INVALID;
+			dssh_test_alloc_fail_after(0);
+			int ret = dssh_transport_register_enc(candidate);
+			int calls = dssh_test_alloc_count();
+			dssh_test_alloc_reset();
+			bool valid = ret == expected && calls == 0 && gconf.enc_head == head
+			    && candidate->next == NULL && candidate->key_size == (keyed != 0 ? 16 : 0)
+			    && candidate->init == ((mask & 1U) != 0 ? enc_init : NULL)
+			    && candidate->encrypt == ((mask & 2U) != 0 ? stateless_encrypt : NULL)
+			    && candidate->decrypt == ((mask & 4U) != 0 ? stateless_decrypt : NULL)
+			    && strcmp(candidate->name, "admission") == 0;
+			if (ret == 0)
+				valid = gconf.enc_tail == candidate && head->next == candidate && gconf.enc_entries == 2 && valid;
+			else {
+				valid = gconf.enc_tail == head && head->next == NULL && gconf.enc_entries == 1 && valid;
+				free(candidate);
+			}
+			if (!valid) {
+				fprintf(stderr, "enc admission key=%u mask=%u result=%d expected=%d\n", keyed, mask, ret, expected);
+				mismatches++;
+			}
+			checked++;
+			dssh_test_reset_global_config();
+		}
+		for (unsigned tagged = 0; tagged < 2; tagged++) {
+			for (unsigned mask = 0; mask < 4; mask++) {
+				dssh_test_reset_global_config();
+				ASSERT_OK(dssh_register_none_mac());
+				dssh_mac head = gconf.mac_head;
+				dssh_mac candidate = calloc(1, sizeof(*candidate) + sizeof("admission"));
+				ASSERT_NOT_NULL(candidate);
+				memcpy(candidate->name, "admission", sizeof("admission"));
+				candidate->key_size = keyed != 0 ? 16 : 0;
+				candidate->digest_size = tagged != 0 ? 16 : 0;
+				candidate->init = (mask & 1U) != 0 ? mac_init : NULL;
+				candidate->generate = (mask & 2U) != 0 ? stateless_mac : NULL;
+				bool accepted = (keyed == 0 || (mask & 1U) != 0) && (tagged == 0 || (mask & 2U) != 0);
+				int expected = accepted ? 0 : DSSH_ERROR_INVALID;
+				dssh_test_alloc_fail_after(0);
+				int ret = dssh_transport_register_mac(candidate);
+				int calls = dssh_test_alloc_count();
+				dssh_test_alloc_reset();
+				bool valid = ret == expected && calls == 0 && gconf.mac_head == head
+				    && candidate->next == NULL && candidate->key_size == (keyed != 0 ? 16 : 0)
+				    && candidate->digest_size == (tagged != 0 ? 16 : 0)
+				    && candidate->init == ((mask & 1U) != 0 ? mac_init : NULL)
+				    && candidate->generate == ((mask & 2U) != 0 ? stateless_mac : NULL)
+				    && strcmp(candidate->name, "admission") == 0;
+				if (ret == 0)
+					valid = gconf.mac_tail == candidate && head->next == candidate && gconf.mac_entries == 2 && valid;
+				else {
+					valid = gconf.mac_tail == head && head->next == NULL && gconf.mac_entries == 1 && valid;
+					free(candidate);
+				}
+				if (!valid) {
+					fprintf(stderr, "mac admission key=%u tag=%u mask=%u result=%d expected=%d\n",
+					    keyed, tagged, mask, ret, expected);
+					mismatches++;
+				}
+				checked++;
+				dssh_test_reset_global_config();
+			}
+		}
+	}
+	fprintf(stderr, "keyed_admission cases=%u mismatches=%u\n", checked, mismatches);
+	ASSERT_EQ_U(checked, 32);
+	ASSERT_EQ_U(mismatches, 0);
+	return TEST_PASS;
+}
+
 static int
 test_init_results(void)
 {
@@ -672,6 +764,7 @@ test_auth_server_results(void)
 #include "kex_state_cases.h"
 
 static struct dssh_test_entry tests[] = {
+	{ "registration/keyed_callbacks", test_keyed_registration },
 	{ "kex/state_ownership", test_kex_state_ownership },
 	{ "kex/state_init_failure", test_kex_state_init_failure },
 	{ "kex/result_lease", test_kex_state_result_lease },

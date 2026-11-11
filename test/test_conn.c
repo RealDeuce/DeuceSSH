@@ -8342,6 +8342,7 @@ test_compression_window_rekey(void)
 static struct dssh_test_entry tests[] = {
 	{ "release/tx_slot_admission", test_tx_slot_admission },
 	{ "release/tx_slot_resize", test_tx_slot_resize },
+	{ "release/tx_slot_refusal", test_tx_slot_refusal },
 	{ "release/channel_id_lifetime", test_channel_id_lifetime },
 	{ "release/channel_id_late_reply", test_channel_id_late_reply },
 	{ "release/channel_id_backpressure", test_channel_id_backpressure },

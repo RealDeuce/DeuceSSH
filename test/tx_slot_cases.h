@@ -179,4 +179,139 @@ test_tx_slot_resize(void)
 	return TEST_PASS;
 }
 
+struct tx_slot_refusal_peer {
+	dssh_session sess;
+	bool global;
+};
+
+static int
+tx_slot_refusal_send_requests(void *opaque)
+{
+	struct tx_slot_refusal_peer *peer = opaque;
+	for (uint32_t number = 0; number < 2; number++) {
+		uint8_t msg[32];
+		size_t len;
+		if (peer->global) {
+			const uint8_t request[] = {SSH_MSG_GLOBAL_REQUEST, 0, 0, 0, 1,
+			    number == 0 ? 'a' : 'b', 1};
+			memcpy(msg, request, sizeof(request));
+			len = sizeof(request);
+		}
+		else {
+			len = build_channel_open(msg, sizeof(msg), "unknown", number, 0, 0);
+			if (len == 0)
+				return DSSH_ERROR_INIT;
+		}
+		int ret = send_packet(peer->sess, msg, len, NULL);
+		if (ret < 0)
+			return ret;
+	}
+	return 0;
+}
+
+static int
+tx_slot_refusal_global(const uint8_t *name, size_t name_len, bool want_reply,
+    const uint8_t *payload, size_t len, void *data)
+{
+	(void)payload;
+	(void)len;
+	(void)data;
+	return want_reply && name_len == 1 && name[0] == 'a' ? 0 : DSSH_ERROR_REJECTED;
+}
+
+static bool
+tx_slot_wait_transmitted(dssh_session sess, uint_fast32_t count)
+{
+	struct timespec started;
+	if (clock_gettime(CLOCK_MONOTONIC, &started) != 0)
+		return false;
+	while (atomic_load(&sess->trans.tx_since_rekey) < count) {
+		if (sess->terminate || !dssh_test_wait_tick(&started))
+			return false;
+	}
+	return true;
+}
+
+enum tx_slot_refusal_mode {
+	TX_SLOT_NO_REFUSAL,
+	TX_SLOT_KEY_REFUSAL,
+	TX_SLOT_SIZE_REFUSAL,
+};
+
+static int
+tx_slot_refusal_run(struct conn_ctx *ctx, bool global, enum tx_slot_refusal_mode mode)
+{
+	dssh_session sess = ctx->server;
+	ASSERT_OK(dssh_session_set_global_request_cb(sess, tx_slot_refusal_global, NULL));
+	ASSERT_TRUE(compression_fixture_selected(ctx->client, sess));
+	ASSERT_OK(dssh_session_start(sess));
+	ASSERT_OK(tx_acquire(sess, SSH_MSG_IGNORE));
+	struct dssh_tx_slot *slot = global ? &sess->trans.global_reply_slot : &sess->trans.open_fail_slot;
+	uint_fast32_t count = atomic_load(&sess->trans.tx_since_rekey);
+	uint32_t seq = sess->trans.tx_seq;
+	struct tx_slot_refusal_peer peer = {.sess = ctx->client, .global = global};
+	atomic_bool *waiting = dssh_test_thrd_watch_condition(&sess->trans.tx_slot_cnd);
+	thrd_t writer;
+	bool started = thrd_create(&writer, tx_slot_refusal_send_requests, &peer) == thrd_success;
+	int result = DSSH_ERROR_INIT;
+	if (started && thrd_join(writer, &result) != thrd_success)
+		abort();
+	bool valid = started && result == 0 && dssh_test_wait_bool(waiting, true)
+	    && atomic_load(&slot->ready);
+	if (valid && mode == TX_SLOT_KEY_REFUSAL)
+		atomic_store(&sess->trans.tx_since_rekey, DSSH_REKEY_HARD_LIMIT);
+	else if (valid && mode == TX_SLOT_SIZE_REFUSAL)
+		sess->trans.comp_tx_payload_limit = 0;
+	tx_unlock_with_slots(sess);
+	dssh_test_thrd_watch_condition(NULL);
+
+	if (mode == TX_SLOT_NO_REFUSAL) {
+		ASSERT_TRUE(valid);
+		ASSERT_TRUE(count <= UINT_FAST32_MAX - 2 && tx_slot_wait_transmitted(sess, count + 2));
+		if (global) {
+			ASSERT_TRUE(tx_slot_receive_reply(ctx->client, SSH_MSG_REQUEST_SUCCESS));
+			ASSERT_TRUE(tx_slot_receive_reply(ctx->client, SSH_MSG_REQUEST_FAILURE));
+		}
+		else {
+			ASSERT_TRUE(peer_id_receive_control(ctx->client, SSH_MSG_CHANNEL_OPEN_FAILURE, 17, 0));
+			ASSERT_TRUE(peer_id_receive_control(ctx->client, SSH_MSG_CHANNEL_OPEN_FAILURE, 17, 1));
+		}
+		ASSERT_FALSE(dssh_session_is_terminated(sess));
+		return TEST_PASS;
+	}
+
+	bool stopped = valid && dssh_test_wait_bool(&sess->demux_running, false);
+	bool preserved = atomic_load(&slot->ready);
+	bool emitted = sess->trans.tx_seq != seq;
+	printf("tx_slot_refusal global=%d mode=%d waited=%d stopped=%d preserved=%d emitted=%d\n",
+	    global, mode, valid, stopped, preserved, emitted);
+	if (!stopped)
+		session_set_terminate(sess);
+	ASSERT_TRUE(stopped);
+	ASSERT_TRUE(dssh_session_is_terminated(sess));
+	ASSERT_TRUE(preserved);
+	ASSERT_FALSE(emitted);
+	return TEST_PASS;
+}
+
+static int
+test_tx_slot_refusal(void)
+{
+	const char *compression = getenv("DSSH_TEST_COMPRESSION");
+	bool growth = compression != NULL && strcmp(compression, "test-growth") == 0;
+	bool passed = true;
+	for (unsigned i = 0; i < 4; i++) {
+		struct conn_ctx ctx;
+		if (conn_setup_mode(&ctx, false) != 0)
+			return TEST_FAIL;
+		enum tx_slot_refusal_mode mode = i < 2 ? TX_SLOT_NO_REFUSAL
+		    : growth ? TX_SLOT_SIZE_REFUSAL : TX_SLOT_KEY_REFUSAL;
+		int ret = tx_slot_refusal_run(&ctx, i % 2 == 0, mode);
+		conn_cleanup(&ctx);
+		passed = ret == TEST_PASS && passed;
+	}
+	ASSERT_TRUE(passed);
+	return TEST_PASS;
+}
+
 #endif

@@ -1146,6 +1146,13 @@ foreach(part IN ITEMS admission resize)
 	set_tests_properties(dssh_conn_tx_slot_${part} PROPERTIES TIMEOUT 120
 		ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys)
 endforeach()
+foreach(kind IN ITEMS key size)
+	dssh_add_output_test(dssh_conn_tx_slot_refusal_${kind} dssh_test_conn
+		"1 tests: 1 passed, 0 failed, 0 skipped" --exact release/tx_slot_refusal)
+	set_tests_properties(dssh_conn_tx_slot_refusal_${kind} PROPERTIES TIMEOUT 120
+		ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys)
+endforeach()
+set_property(TEST dssh_conn_tx_slot_refusal_size APPEND PROPERTY ENVIRONMENT "DSSH_TEST_COMPRESSION=test-growth")
 foreach(part IN ITEMS lifetime late_reply backpressure)
 	dssh_add_output_test(dssh_conn_channel_id_${part} dssh_test_conn
 		"1 tests: 1 passed, 0 failed, 0 skipped" --exact release/channel_id_${part})

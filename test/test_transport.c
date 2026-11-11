@@ -8465,6 +8465,112 @@ test_rekey_queue_bounded(void)
 	return TEST_PASS;
 }
 
+/* Explicit policy answers include saturated counters, the opt-out sentinel,
+ * unequal directional limits and independent packet-count triggers. */
+static int
+test_rekey_optout_policy(void)
+{
+	static const struct {
+		uint64_t tx_limit, rx_limit, tx_bytes, rx_bytes;
+		uint_fast32_t tx_packets, rx_packets;
+		bool expected;
+	} cases[] = {
+		{UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX, 0, 0, false},
+		{UINT64_MAX, 1024, UINT64_MAX, 1023, 0, 0, false},
+		{UINT64_MAX, 1024, UINT64_MAX, 1024, 0, 0, true},
+		{1024, UINT64_MAX, 1023, UINT64_MAX, 0, 0, false},
+		{1024, UINT64_MAX, 1024, UINT64_MAX, 0, 0, true},
+		{UINT64_MAX - 1, UINT64_MAX, UINT64_MAX - 2, UINT64_MAX, 0, 0, false},
+		{UINT64_MAX - 1, UINT64_MAX, UINT64_MAX - 1, UINT64_MAX, 0, 0, true},
+		{UINT64_MAX, UINT64_MAX - 1, UINT64_MAX, UINT64_MAX - 2, 0, 0, false},
+		{UINT64_MAX, UINT64_MAX - 1, UINT64_MAX, UINT64_MAX - 1, 0, 0, true},
+		{0, UINT64_MAX, 0, UINT64_MAX, 0, 0, true},
+		{UINT64_MAX, 0, UINT64_MAX, 0, 0, 0, true},
+		{UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX, DSSH_REKEY_SOFT_LIMIT, 0, true},
+		{UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX, 0, DSSH_REKEY_SOFT_LIMIT, true},
+	};
+	unsigned checked = 0, mismatches = 0;
+	for (unsigned role = 0; role < 2; role++) {
+		dssh_test_reset_global_config();
+		dssh_session sess = dssh_session_init(role == 0, 0);
+		if (sess == NULL)
+			return TEST_FAIL;
+		struct dssh_enc_s tx = {0}, rx = {0};
+		sess->trans.enc_c2s_selected = role == 0 ? &tx : &rx;
+		sess->trans.enc_s2c_selected = role == 0 ? &rx : &tx;
+		for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+			tx.bytes_per_key = cases[i].tx_limit;
+			rx.bytes_per_key = cases[i].rx_limit;
+			atomic_store(&sess->trans.tx_bytes_since_rekey, cases[i].tx_bytes);
+			sess->trans.rx_bytes_since_rekey = cases[i].rx_bytes;
+			atomic_store(&sess->trans.tx_since_rekey, cases[i].tx_packets);
+			sess->trans.rx_since_rekey = cases[i].rx_packets;
+			bool actual = rekey_needed(sess);
+			checked++;
+			if (actual != cases[i].expected) {
+				mismatches++;
+				fprintf(stderr, "rekey optout role=%u case=%zu actual=%u expected=%u\n",
+				    role, i, actual ? 1U : 0U, cases[i].expected ? 1U : 0U);
+			}
+		}
+		dssh_session_cleanup(sess);
+		dssh_test_reset_global_config();
+	}
+	fprintf(stderr, "rekey_optout_policy cases=%u mismatches=%u\n", checked, mismatches);
+	ASSERT_EQ_U(checked, 26);
+	ASSERT_EQ_U(mismatches, 0);
+	return TEST_PASS;
+}
+
+static int
+test_rekey_optout_packets(void)
+{
+	struct handshake_ctx ctx;
+	extra_algorithm_registration = dssh_register_none_enc;
+	int ret = handshake_setup_filtered(&ctx, false, NULL, "none", NULL);
+	extra_algorithm_registration = NULL;
+	bool valid = ret == 0;
+	static const uint8_t packet[] = {SSH_MSG_SERVICE_REQUEST, 0, 0, 0, 1, 'x'};
+	unsigned checked = 0;
+	for (unsigned role = 0; valid && role < 2; role++) {
+		dssh_session sender = role == 0 ? ctx.client : ctx.server;
+		dssh_session receiver = role == 0 ? ctx.server : ctx.client;
+		valid = sender->trans.enc_c2s_active != NULL && sender->trans.enc_s2c_active != NULL
+		    && strcmp(sender->trans.enc_c2s_active->name, "none") == 0
+		    && strcmp(sender->trans.enc_s2c_active->name, "none") == 0;
+		if (!valid)
+			break;
+		/* Cross saturation through actual successful packet accounting. */
+		atomic_store(&sender->trans.tx_bytes_since_rekey, UINT64_MAX - 1);
+		sender->trans.rx_bytes_since_rekey = UINT64_MAX - 1;
+		atomic_store(&receiver->trans.tx_bytes_since_rekey, UINT64_MAX - 1);
+		receiver->trans.rx_bytes_since_rekey = UINT64_MAX - 1;
+		ret = send_packet(sender, packet, sizeof(packet), NULL);
+		valid = ret == 0 && atomic_load(&sender->trans.tx_bytes_since_rekey) == UINT64_MAX;
+		uint8_t type, *payload;
+		size_t len;
+		if (valid) {
+			ret = recv_packet(receiver, &type, &payload, &len);
+			valid = ret == 0 && type == packet[0] && len == sizeof(packet)
+			    && memcmp(payload, packet, sizeof(packet)) == 0
+			    && receiver->trans.rx_bytes_since_rekey == UINT64_MAX;
+		}
+		if (valid)
+			valid = !rekey_needed(sender) && !rekey_needed(receiver)
+			    && !sender->trans.rekey_pending && !receiver->trans.rekey_pending
+			    && !atomic_load(&sender->trans.rekey_in_progress)
+			    && !atomic_load(&receiver->trans.rekey_in_progress)
+			    && !dssh_session_is_terminated(sender) && !dssh_session_is_terminated(receiver);
+		if (valid)
+			checked++;
+	}
+	handshake_cleanup(&ctx);
+	fprintf(stderr, "rekey_optout_packets directions=%u valid=%u\n", checked, valid ? 1U : 0U);
+	ASSERT_TRUE(valid);
+	ASSERT_EQ_U(checked, 2);
+	return TEST_PASS;
+}
+
 static int
 test_rekey_server_direction_limits(void)
 {
@@ -9587,6 +9693,8 @@ static struct dssh_test_entry tests[] = {
 	{ "rekey/needed_tx_packets",         test_rekey_needed_tx_packets },
 	{ "rekey/needed_rx_packets",         test_rekey_needed_rx_packets },
 	{ "rekey/needed_bytes",              test_rekey_needed_bytes },
+	{ "rekey/optout_policy",             test_rekey_optout_policy },
+	{ "rekey/optout_packets",            test_rekey_optout_packets },
 	{ "rekey/needed_time",               test_rekey_needed_time },
 	{ "rekey/seconds_disabled",          test_rekey_seconds_disabled },
 	{ "rekey/needed_below_threshold",    test_rekey_needed_below_threshold },

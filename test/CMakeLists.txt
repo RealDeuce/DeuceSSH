@@ -1037,6 +1037,11 @@ foreach(provider IN ITEMS none test-growth zlib)
 		TIMEOUT 240)
 endforeach()
 
+dssh_add_output_test(dssh_transport_rekey_optout dssh_test_transport "2 tests: 2 passed, 0 failed, 0 skipped"
+	rekey/optout_)
+set_tests_properties(dssh_transport_rekey_optout PROPERTIES
+	ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys TIMEOUT 180)
+
 dssh_add_output_test(dssh_transport_modules_stateless dssh_test_transport "1 passed, 0 failed, 0 skipped"
 	--exact modules/stateless)
 set_tests_properties(dssh_transport_modules_stateless PROPERTIES

@@ -523,7 +523,8 @@ rekey_transmit_needed(struct dssh_session_s *sess, uint_fast32_t packets)
 		return true;
 	dssh_enc enc = sess->trans.client ? atomic_load(&sess->trans.enc_c2s_selected)
 	                                 : atomic_load(&sess->trans.enc_s2c_selected);
-	return enc != NULL && atomic_load(&sess->trans.tx_bytes_since_rekey) >= enc->bytes_per_key;
+	return enc != NULL && enc->bytes_per_key != UINT64_MAX
+	    && atomic_load(&sess->trans.tx_bytes_since_rekey) >= enc->bytes_per_key;
 }
 
 static bool
@@ -542,7 +543,8 @@ rekey_needed(struct dssh_session_s *sess)
 		return true;
 	dssh_enc enc = sess->trans.client ? atomic_load(&sess->trans.enc_s2c_selected)
 	                                 : atomic_load(&sess->trans.enc_c2s_selected);
-	if (enc != NULL && sess->trans.rx_bytes_since_rekey >= enc->bytes_per_key)
+	if (enc != NULL && enc->bytes_per_key != UINT64_MAX
+	    && sess->trans.rx_bytes_since_rekey >= enc->bytes_per_key)
 		return true;
 	/* Time threshold has no cryptographic justification (the byte
 	 * and packet thresholds do), so apps that need to interop with

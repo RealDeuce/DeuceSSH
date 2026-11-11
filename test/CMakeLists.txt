@@ -1158,6 +1158,10 @@ foreach(part IN ITEMS queued popped confirmed late_confirmation concurrent_accep
 	set_tests_properties(dssh_conn_peer_id_${part} PROPERTIES TIMEOUT 120
 		ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys)
 endforeach()
+dssh_add_output_test(dssh_conn_post_close_direct dssh_test_conn
+	"1 tests: 1 passed, 0 failed, 0 skipped" --exact release/post_close_direct)
+set_tests_properties(dssh_conn_post_close_direct PROPERTIES TIMEOUT 120
+	ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys)
 dssh_add_output_test(dssh_conn_channel_worker_ownership dssh_test_conn
 	"1 tests: 1 passed, 0 failed, 0 skipped" --exact release/channel_worker_ownership)
 set_tests_properties(dssh_conn_channel_worker_ownership PROPERTIES TIMEOUT 120

@@ -8327,6 +8327,7 @@ test_compression_window_rekey(void)
 #include "channel_worker_cases.h"
 #include "channel_id_cases.h"
 #include "peer_channel_id_cases.h"
+#include "post_close_cases.h"
 #include "setup_mailbox_cases.h"
 #include "accept_failure_cases.h"
 #include "request_framing_cases.h"
@@ -8350,6 +8351,7 @@ static struct dssh_test_entry tests[] = {
 	{ "release/peer_id_late_confirmation", test_peer_id_late_confirmation },
 	{ "release/peer_id_concurrent_accept", test_peer_id_concurrent_accept },
 	{ "release/peer_id_ordered_terminal", test_peer_id_ordered_terminal },
+	{ "release/post_close_direct", test_post_close_direct },
 	{ "release/channel_worker_ownership", test_channel_worker_ownership },
 	{ "release/conn_setup_ownership", test_conn_setup_ownership },
 	{ "release/conn_no_start_ownership", test_conn_no_start_ownership },

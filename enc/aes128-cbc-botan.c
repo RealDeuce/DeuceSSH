@@ -10,6 +10,9 @@
 
 #include "deucessh-enc.h"
 #include "deucessh.h"
+#ifdef DSSH_TESTING
+ #include "ssh-internal.h"
+#endif
 
 #define AES128_CBC_BLOCK_SIZE 16
 #define AES128_CBC_KEY_SIZE   16

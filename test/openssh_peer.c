@@ -311,6 +311,11 @@ main(int argc, char **argv)
 	if (argc != 6 || (strcmp(argv[1], "server") != 0 && strcmp(argv[1], "client") != 0))
 		return 2;
 	bool client = strcmp(argv[1], "client") == 0;
+	const char *cipher = getenv("DSSH_TEST_ENC");
+	if (cipher == NULL)
+		cipher = "aes256-ctr";
+	if (strcmp(cipher, "aes256-ctr") != 0 && strcmp(cipher, "aes128-cbc") != 0)
+		return 2;
 	struct authorization auth = { .user = argv[5] };
 	FILE *key = fopen(argv[4], "rb");
 	if (key == NULL)
@@ -339,8 +344,11 @@ main(int argc, char **argv)
 		ret = dssh_register_sntrup761x25519_sha512();
 	else if (strcmp(argv[2], "mlkem768x25519-sha256") == 0)
 		ret = dssh_register_mlkem768x25519_sha256();
+	if (ret == 0)
+		ret = strcmp(cipher, "aes128-cbc") == 0
+		    ? dssh_register_aes128_cbc() : dssh_register_aes256_ctr();
 	if (ret != 0 || dssh_transport_set_callbacks(stdio_tx, stdio_rx, NULL, NULL) != 0
-	    || dssh_register_rsa_sha2_256() != 0 || dssh_register_aes256_ctr() != 0
+	    || dssh_register_rsa_sha2_256() != 0
 	    || dssh_register_hmac_sha2_256() != 0 || dssh_register_none_comp() != 0
 	    || dssh_rsa_sha2_256_load_key_file(argv[3], NULL, NULL) != 0)
 		return 2;
@@ -358,7 +366,7 @@ main(int argc, char **argv)
 	}
 	if (ret == 0 && (strcmp(dssh_transport_get_kex_name(session), argv[2]) != 0
 	    || strcmp(dssh_transport_get_hostkey_name(session), "rsa-sha2-256") != 0
-	    || strcmp(dssh_transport_get_enc_name(session), "aes256-ctr") != 0
+	    || strcmp(dssh_transport_get_enc_name(session), cipher) != 0
 	    || strcmp(dssh_transport_get_mac_name(session), "hmac-sha2-256") != 0))
 		ret = DSSH_ERROR_INVALID;
 	if (ret == 0) {
@@ -381,7 +389,7 @@ main(int argc, char **argv)
 	dssh_session_cleanup(session);
 	if (ret == 0 && client && auth.host_checks < 2)
 		ret = DSSH_ERROR_INVALID;
-	fprintf(stderr, "DeuceSSH interop: role=%s kex=%s stage=%s result=%d host-checks=%u signed-auth=%d channel-ack=%u\n",
-	    argv[1], argv[2], stage, ret, auth.host_checks, auth.signed_auth, channel_ack ? 1U : 0U);
+	fprintf(stderr, "DeuceSSH interop: role=%s kex=%s cipher=%s stage=%s result=%d host-checks=%u signed-auth=%d channel-ack=%u\n",
+	    argv[1], argv[2], cipher, stage, ret, auth.host_checks, auth.signed_auth, channel_ack ? 1U : 0U);
 	return ret == 0 ? 0 : 1;
 }

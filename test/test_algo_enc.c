@@ -1,8 +1,9 @@
 /*
  * test_algo_enc.c -- Unit tests for DeuceSSH encryption algorithm modules.
  *
- * Tests registration of aes256-ctr and none ciphers, AES-256-CTR
+ * Tests registration of AES-256-CTR, AES-128-CBC and none ciphers, AES-256-CTR
  * correctness against NIST SP 800-38A test vectors (F.5.5/F.5.6),
+ * AES-128-CBC answers (F.2.1/F.2.2), streaming and failure boundaries,
  * encrypt/decrypt roundtrips, and none cipher passthrough.
  */
 
@@ -11,10 +12,12 @@
 #include "deucessh-algorithms.h"
 #include "ssh-trans.h"
 #include "test/dssh_test_internal.h"
+#include "dssh_test_alloc.h"
 
 #ifdef DSSH_CRYPTO_OPENSSL
 #include "dssh_test_ossl.h"
 #include <openssl/evp.h>
+#include <openssl/err.h>
 #elif defined(DSSH_CRYPTO_BOTAN)
 #include <botan/ffi.h>
 #endif
@@ -142,6 +145,29 @@ static const uint8_t nist_ct[64] = {
 	0xe8, 0x70, 0x17, 0xba, 0x2d, 0x84, 0x98, 0x8d,
 	0xdf, 0xc9, 0xc5, 0x8d, 0xb6, 0x7a, 0xad, 0xa6,
 	0x13, 0xc2, 0xdd, 0x08, 0x45, 0x79, 0x41, 0xa6
+};
+
+
+/* NIST SP 800-38A F.2.1/F.2.2. The plaintext is nist_pt above. */
+static const uint8_t cbc_key[16] = {
+	0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6,
+	0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf, 0x4f, 0x3c
+};
+
+static const uint8_t cbc_iv[16] = {
+	0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+	0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f
+};
+
+static const uint8_t cbc_ct[64] = {
+	0x76, 0x49, 0xab, 0xac, 0x81, 0x19, 0xb2, 0x46,
+	0xce, 0xe9, 0x8e, 0x9b, 0x12, 0xe9, 0x19, 0x7d,
+	0x50, 0x86, 0xcb, 0x9b, 0x50, 0x72, 0x19, 0xee,
+	0x95, 0xdb, 0x11, 0x3a, 0x91, 0x76, 0x78, 0xb2,
+	0x73, 0xbe, 0xd6, 0xb8, 0xe3, 0xc1, 0x74, 0x3b,
+	0x71, 0x16, 0xe6, 0x9e, 0x22, 0x22, 0x95, 0x16,
+	0x3f, 0xf1, 0xca, 0xa1, 0x68, 0x1f, 0xac, 0x09,
+	0x12, 0x0e, 0xca, 0x30, 0x75, 0x86, 0xe1, 0xa7
 };
 
 /* ================================================================
@@ -524,7 +550,8 @@ test_aes256_ctr_module_vectors(void)
 
 #ifdef DSSH_CRYPTO_OPENSSL
 static int
-test_aes256_ctr_module_extents(void)
+test_cipher_module_extents(int (*register_cipher)(void), const uint8_t *key,
+    const uint8_t *iv, const uint8_t *ciphertext)
 {
 	const int reported[] = { INT_MIN, -1, 0, 15, 16, 17, INT_MAX,
 #if INT_MAX > UINT16_MAX
@@ -532,14 +559,14 @@ test_aes256_ctr_module_extents(void)
 #endif
 	};
 	dssh_test_reset_global_config();
-	ASSERT_OK(dssh_register_aes256_ctr());
+	ASSERT_OK(register_cipher());
 	dssh_enc enc = gconf.enc_head;
 	bool valid = enc != NULL;
 	for (unsigned direction = 0; direction < 2 && valid; direction++) {
 		for (size_t i = 0; i < sizeof(reported) / sizeof(reported[0]) && valid; i++) {
 			dssh_test_ossl_reset();
 			dssh_enc_ctx *ctx = NULL;
-			int ret = enc->init(nist_key, nist_iv, direction == 0, &ctx);
+			int ret = enc->init(key, iv, direction == 0, &ctx);
 			if (ret != 0 || ctx == NULL) {
 				valid = false;
 				if (ctx != NULL)
@@ -548,7 +575,7 @@ test_aes256_ctr_module_extents(void)
 			}
 			uint8_t guarded[18];
 			memset(guarded, 0xA5, sizeof(guarded));
-			memcpy(&guarded[1], direction == 0 ? nist_pt : nist_ct, 16);
+			memcpy(&guarded[1], direction == 0 ? nist_pt : ciphertext, 16);
 			dssh_test_ossl_encrypt_length(reported[i]);
 			ret = direction == 0 ? enc->encrypt(&guarded[1], 16, ctx)
 			    : enc->decrypt(&guarded[1], 16, ctx);
@@ -558,7 +585,7 @@ test_aes256_ctr_module_extents(void)
 			valid = observed && native_length == 16
 			    && ret == (reported[i] == 16 ? 0 : DSSH_ERROR_INIT)
 			    && guarded[0] == 0xA5 && guarded[17] == 0xA5
-			    && memcmp(&guarded[1], direction == 0 ? nist_ct : nist_pt, 16) == 0;
+			    && memcmp(&guarded[1], direction == 0 ? ciphertext : nist_pt, 16) == 0;
 			enc->cleanup(ctx);
 		}
 	}
@@ -566,6 +593,18 @@ test_aes256_ctr_module_extents(void)
 	dssh_test_reset_global_config();
 	ASSERT_TRUE(valid);
 	return TEST_PASS;
+}
+
+static int
+test_aes256_ctr_module_extents(void)
+{
+	return test_cipher_module_extents(dssh_register_aes256_ctr, nist_key, nist_iv, nist_ct);
+}
+
+static int
+test_aes128_cbc_module_extents(void)
+{
+	return test_cipher_module_extents(dssh_register_aes128_cbc, cbc_key, cbc_iv, cbc_ct);
 }
 #endif
 
@@ -690,6 +729,184 @@ test_aes256_ctr_symmetric(void)
 	return TEST_PASS;
 }
 
+/* NIST SP 800-38A F.2.1/F.2.2, through the registered callbacks. */
+static int
+test_aes128_cbc_module_vectors(void)
+{
+	dssh_test_reset_global_config();
+	ASSERT_OK(dssh_register_aes128_cbc());
+	dssh_enc enc = gconf.enc_head;
+	ASSERT_NOT_NULL(enc);
+	ASSERT_STR_EQ(enc->name, "aes128-cbc");
+	ASSERT_EQ_U(enc->blocksize, 16);
+	ASSERT_EQ_U(enc->key_size, 16);
+	ASSERT_EQ_U(enc->bytes_per_key, UINT64_C(1) << 36);
+	bool valid = true;
+	/* Each bit selects a cut after one of the first three blocks. */
+	for (unsigned cuts = 0; cuts < 8; cuts++) {
+		dssh_enc_ctx *tx = NULL;
+		dssh_enc_ctx *rx = NULL;
+		uint8_t encrypted[sizeof(nist_pt)];
+		uint8_t decrypted[sizeof(cbc_ct)];
+		memcpy(encrypted, nist_pt, sizeof(encrypted));
+		memcpy(decrypted, cbc_ct, sizeof(decrypted));
+		int ret = enc->init(cbc_key, cbc_iv, true, &tx);
+		if (ret == 0)
+			ret = enc->init(cbc_key, cbc_iv, false, &rx);
+		if (ret == 0 && (tx == NULL || rx == NULL || tx == rx))
+			ret = DSSH_ERROR_INIT;
+		size_t start = 0;
+		for (unsigned block = 0; block < 4 && ret == 0; block++) {
+			if (block != 3 && (cuts & (1U << block)) == 0)
+				continue;
+			size_t end = (block + 1) * 16;
+			ret = enc->encrypt(&encrypted[start], end - start, tx);
+			if (ret == 0)
+				ret = enc->decrypt(&decrypted[start], end - start, rx);
+			start = end;
+		}
+		valid = valid && ret == 0
+		    && memcmp(encrypted, cbc_ct, sizeof(encrypted)) == 0
+		    && memcmp(decrypted, nist_pt, sizeof(decrypted)) == 0;
+		if (rx != NULL && rx != tx)
+			enc->cleanup(rx);
+		if (tx != NULL)
+			enc->cleanup(tx);
+	}
+	dssh_test_reset_global_config();
+	ASSERT_TRUE(valid);
+	return TEST_PASS;
+}
+
+static int
+test_aes128_cbc_inputs(void)
+{
+	dssh_test_reset_global_config();
+	ASSERT_OK(dssh_register_aes128_cbc());
+	dssh_enc enc = gconf.enc_head;
+	const size_t invalid[] = {1, 15, 17, 63,
+#if SIZE_MAX > INT_MAX && defined(DSSH_CRYPTO_OPENSSL)
+	    (size_t)INT_MAX + 1,
+#endif
+	};
+	bool valid = enc->encrypt(NULL, 0, NULL) == DSSH_ERROR_INIT
+	    && enc->decrypt(NULL, 0, NULL) == DSSH_ERROR_INIT;
+	for (unsigned direction = 0; direction < 2; direction++) {
+		dssh_enc_ctx *ctx = NULL;
+		int ret = enc->init(cbc_key, cbc_iv, direction == 0, &ctx);
+		uint8_t buffer[sizeof(nist_pt) + 2];
+		memset(buffer, 0xa5, sizeof(buffer));
+		const uint8_t *input = direction == 0 ? nist_pt : cbc_ct;
+		const uint8_t *expected = direction == 0 ? cbc_ct : nist_pt;
+		memcpy(&buffer[1], input, sizeof(nist_pt));
+		if (ret == 0) {
+			for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+				ret = direction == 0 ? enc->encrypt(&buffer[1], invalid[i], ctx)
+				    : enc->decrypt(&buffer[1], invalid[i], ctx);
+				valid = valid && ret == DSSH_ERROR_INVALID
+				    && memcmp(&buffer[1], input, sizeof(nist_pt)) == 0;
+			}
+			ret = direction == 0 ? enc->encrypt(&buffer[1], 0, ctx)
+			    : enc->decrypt(&buffer[1], 0, ctx);
+			valid = valid && ret == 0
+			    && memcmp(&buffer[1], input, sizeof(nist_pt)) == 0;
+			ret = direction == 0 ? enc->encrypt(&buffer[1], sizeof(nist_pt), ctx)
+			    : enc->decrypt(&buffer[1], sizeof(nist_pt), ctx);
+		}
+		valid = valid && ret == 0 && buffer[0] == 0xa5
+		    && buffer[sizeof(buffer) - 1] == 0xa5
+		    && memcmp(&buffer[1], expected, sizeof(nist_pt)) == 0;
+		enc->cleanup(ctx);
+	}
+	dssh_test_reset_global_config();
+	ASSERT_TRUE(valid);
+	return TEST_PASS;
+}
+
+static int
+test_aes128_cbc_registration(void)
+{
+	dssh_test_reset_global_config();
+	dssh_test_alloc_fail_after(0);
+	int ret = dssh_register_aes128_cbc();
+	dssh_test_alloc_reset();
+	ASSERT_EQ(ret, DSSH_ERROR_ALLOC);
+	ASSERT_NULL(gconf.enc_head);
+	ASSERT_OK(dssh_register_aes128_cbc());
+	ASSERT_OK(dssh_register_none_comp());
+	ASSERT_OK(dssh_register_none_mac());
+	ASSERT_OK(dssh_register_curve25519_sha256());
+	ASSERT_OK(dssh_register_ssh_ed25519());
+	dssh_session sess = dssh_session_init(true, 0);
+	ASSERT_NOT_NULL(sess);
+	ret = dssh_register_aes128_cbc();
+	dssh_session_cleanup(sess);
+	bool single = gconf.enc_head != NULL && gconf.enc_head->next == NULL;
+	dssh_test_reset_global_config();
+	ASSERT_EQ(ret, DSSH_ERROR_TOOLATE);
+	ASSERT_TRUE(single);
+	return TEST_PASS;
+}
+
+#ifdef DSSH_CRYPTO_OPENSSL
+static int
+test_aes128_cbc_provider_failures(void)
+{
+	dssh_test_reset_global_config();
+	ASSERT_OK(dssh_register_aes128_cbc());
+	dssh_enc enc = gconf.enc_head;
+	bool valid = true;
+	for (unsigned direction = 0; direction < 2; direction++) {
+		for (int fail = 0; fail < 4; fail++) {
+			dssh_enc_ctx *ctx = NULL;
+			if (fail == 0)
+				dssh_test_alloc_fail_after(0);
+			else
+				dssh_test_ossl_fail_after(fail - 1);
+			int ret = enc->init(cbc_key, cbc_iv, direction == 0, &ctx);
+			int calls = dssh_test_ossl_count();
+			dssh_test_alloc_reset();
+			dssh_test_ossl_reset();
+			valid = valid && ctx == NULL
+			    && ret == (fail < 2 ? DSSH_ERROR_ALLOC : DSSH_ERROR_INIT)
+			    && (fail == 0 || calls == fail);
+			enc->cleanup(ctx);
+		}
+		dssh_enc_ctx *ctx = NULL;
+		int ret = enc->init(cbc_key, cbc_iv, direction == 0, &ctx);
+		uint8_t buffer[16];
+		memcpy(buffer, direction == 0 ? nist_pt : cbc_ct, sizeof(buffer));
+		if (ret == 0) {
+			dssh_test_ossl_fail_after(0);
+			ret = direction == 0 ? enc->encrypt(buffer, sizeof(buffer), ctx)
+			    : enc->decrypt(buffer, sizeof(buffer), ctx);
+			valid = valid && dssh_test_ossl_count() == 1;
+		}
+		dssh_test_ossl_reset();
+		valid = valid && ret == DSSH_ERROR_INIT
+		    && memcmp(buffer, direction == 0 ? nist_pt : cbc_ct, sizeof(buffer)) == 0;
+		enc->cleanup(ctx);
+	}
+	/* Exercise a real cipher-fetch refusal after the native context exists. */
+	int configured = EVP_set_default_properties(NULL, "provider=deucessh_missing_provider");
+	if (configured == 1) {
+		for (unsigned direction = 0; direction < 2; direction++) {
+			dssh_enc_ctx *ctx = NULL;
+			int ret = enc->init(cbc_key, cbc_iv, direction == 0, &ctx);
+			valid = valid && ret == DSSH_ERROR_INIT && ctx == NULL;
+			enc->cleanup(ctx);
+		}
+	}
+	int restored = EVP_set_default_properties(NULL, "");
+	ERR_clear_error();
+	dssh_test_reset_global_config();
+	ASSERT_EQ(configured, 1);
+	ASSERT_EQ(restored, 1);
+	ASSERT_TRUE(valid);
+	return TEST_PASS;
+}
+#endif
+
 /* ================================================================
  * Test table
  * ================================================================ */
@@ -725,6 +942,15 @@ static struct dssh_test_entry tests[] = {
 	{ "enc/aes256_ctr/large_buffer",    test_aes256_ctr_large_buffer },
 	{ "enc/aes256_ctr/single_byte",     test_aes256_ctr_single_byte },
 	{ "enc/aes256_ctr/symmetric",       test_aes256_ctr_symmetric },
+
+	/* Registered AES-128-CBC callbacks and their failure boundaries. */
+	{ "enc/aes128_cbc/module_vectors", test_aes128_cbc_module_vectors },
+	{ "enc/aes128_cbc/inputs", test_aes128_cbc_inputs },
+	{ "enc/aes128_cbc/registration", test_aes128_cbc_registration },
+#ifdef DSSH_CRYPTO_OPENSSL
+	{ "enc/aes128_cbc/provider_failures", test_aes128_cbc_provider_failures },
+	{ "enc/aes128_cbc/module_extents", test_aes128_cbc_module_extents },
+#endif
 
 	/* None cipher */
 	{ "enc/none/passthrough",           test_none_enc_passthrough },

@@ -598,6 +598,16 @@ elseif(DEUCESSH_CRYPTO_BACKEND STREQUAL "Botan")
 	target_link_libraries(dssh_test_algo_enc PRIVATE PkgConfig::BOTAN3)
 endif()
 add_test(NAME dssh_unit_algo_enc COMMAND dssh_test_algo_enc)
+foreach(part IN ITEMS module_vectors inputs registration)
+	dssh_add_output_test(dssh_cipher_cbc_${part} dssh_test_algo_enc
+		"1 tests: 1 passed, 0 failed, 0 skipped" --exact enc/aes128_cbc/${part})
+endforeach()
+if(DEUCESSH_CRYPTO_BACKEND STREQUAL "OpenSSL")
+	foreach(part IN ITEMS provider_failures module_extents)
+		dssh_add_output_test(dssh_cipher_cbc_${part} dssh_test_algo_enc
+			"1 tests: 1 passed, 0 failed, 0 skipped" --exact enc/aes128_cbc/${part})
+	endforeach()
+endif()
 
 dssh_add_test(algo_mac test_algo_mac.c)
 if(DEUCESSH_CRYPTO_BACKEND STREQUAL "OpenSSL")
@@ -912,6 +922,13 @@ foreach(part IN ITEMS group_selection group_validation peer_validation mpint_val
 		ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys)
 endforeach()
 dssh_add_variant_tests(dssh_transport dssh_test_transport)
+foreach(key IN ITEMS ed25519 rsa512)
+	dssh_add_output_test(dssh_cipher_cbc_rekey_${key} dssh_test_transport
+		"1 tests: 1 passed, 0 failed, 0 skipped" --exact release/rekey_changes_algorithms)
+	set_tests_properties(dssh_cipher_cbc_rekey_${key} PROPERTIES
+		ENVIRONMENT "DSSH_TEST_KEY=${key};${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys
+		TIMEOUT 180)
+endforeach()
 foreach(key IN ITEMS ed25519 rsa rsa512)
 	add_test(NAME dssh_fixed_rekey_${key} COMMAND dssh_test_transport --exact release/fixed_rekey_methods)
 	set_tests_properties(dssh_fixed_rekey_${key} PROPERTIES
@@ -1640,6 +1657,15 @@ if(DEUCESSH_TEST_OPENSSH)
 					set_tests_properties(${interop_name} PROPERTIES TIMEOUT 210 LABELS openssh)
 				endforeach()
 			endforeach()
+			set(cbc_name dssh_openssh_${form}_client_aes128-cbc)
+			add_test(NAME ${cbc_name} COMMAND ${Python3_EXECUTABLE}
+				${CMAKE_CURRENT_SOURCE_DIR}/openssh_interop.py run
+				--peer $<TARGET_FILE:dssh_openssh_${form}> --role client --algorithm curve25519-sha256
+				--ssh ${DSSH_OPENSSH_EXECUTABLE} --sshd ${DSSH_OPENSSH_DAEMON}
+				--keygen ${DSSH_OPENSSH_KEYGEN}
+				--evidence ${CMAKE_CURRENT_BINARY_DIR}/openssh-evidence/${cbc_name})
+			set_tests_properties(${cbc_name} PROPERTIES TIMEOUT 210 LABELS openssh
+				ENVIRONMENT "DSSH_TEST_ENC=aes128-cbc")
 			set(reject_name dssh_openssh_${form}_reject_host)
 			add_test(NAME ${reject_name} COMMAND ${Python3_EXECUTABLE}
 				${CMAKE_CURRENT_SOURCE_DIR}/openssh_interop.py run

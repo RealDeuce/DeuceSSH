@@ -341,7 +341,13 @@ register it by default.  The application must explicitly opt in.
 > To implement CBC mode, outer chaining **MUST** be used (i.e., there
 > is only one initialization vector).
 
-**N/A** — No CBC ciphers are implemented.
+**Verified in the native audit scope** — AES-128-CBC uses one persistent CBC
+context per direction on OpenSSL and Botan. NIST F.2.1/F.2.2 checks cover all
+eight partitions of four consecutive blocks, with interleaved encrypt/decrypt
+contexts. Production client/OpenSSH exchanges verify CBC data and rekey for
+both library forms and backends. See the
+[CBC review](release-1.0-evidence/cbc-review.md) for commands, scope and remaining
+platform/module obligations.
 
 ---
 

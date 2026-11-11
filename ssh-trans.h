@@ -408,6 +408,10 @@ int dssh_test_EVP_EncryptInit_ex(EVP_CIPHER_CTX *ctx, const EVP_CIPHER *cipher, 
     const unsigned char *key, const unsigned char *iv);
 int dssh_test_EVP_EncryptUpdate(EVP_CIPHER_CTX *ctx, unsigned char *out, int *outl, const unsigned char *in,
     int inl);
+int dssh_test_EVP_CipherInit_ex(EVP_CIPHER_CTX *ctx, const EVP_CIPHER *cipher, ENGINE *impl,
+    const unsigned char *key, const unsigned char *iv, int encrypt);
+int dssh_test_EVP_CipherUpdate(EVP_CIPHER_CTX *ctx, unsigned char *out, int *outl, const unsigned char *in,
+    int inl);
 int dssh_test_EVP_MAC_init(EVP_MAC_CTX *ctx, const unsigned char *key, size_t keylen, const OSSL_PARAM params[]);
 int dssh_test_EVP_MAC_update(EVP_MAC_CTX *ctx, const unsigned char *data, size_t datalen);
 int dssh_test_EVP_MAC_final(EVP_MAC_CTX *ctx, unsigned char *out, size_t *outl, size_t outsize);
@@ -444,6 +448,8 @@ int     dssh_test_EVP_PKEY_CTX_set_params(EVP_PKEY_CTX *ctx, const OSSL_PARAM *p
  #define EVP_DigestVerify(c, s, sl, t, tl)    dssh_test_EVP_DigestVerify(c, s, sl, t, tl)
  #define EVP_EncryptInit_ex(c, ci, i, k, iv)  dssh_test_EVP_EncryptInit_ex(c, ci, i, k, iv)
  #define EVP_EncryptUpdate(c, o, ol, i, il)   dssh_test_EVP_EncryptUpdate(c, o, ol, i, il)
+ #define EVP_CipherInit_ex(c, ci, i, k, iv, e) dssh_test_EVP_CipherInit_ex(c, ci, i, k, iv, e)
+ #define EVP_CipherUpdate(c, o, ol, i, il)    dssh_test_EVP_CipherUpdate(c, o, ol, i, il)
  #define EVP_MAC_init(c, k, kl, p)            dssh_test_EVP_MAC_init(c, k, kl, p)
  #define EVP_MAC_update(c, d, dl)             dssh_test_EVP_MAC_update(c, d, dl)
  #define EVP_MAC_final(c, o, ol, os)          dssh_test_EVP_MAC_final(c, o, ol, os)

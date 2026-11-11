@@ -772,6 +772,30 @@ dssh_test_EVP_EncryptUpdate(EVP_CIPHER_CTX *ctx, unsigned char *out,
 }
 
 int
+dssh_test_EVP_CipherInit_ex(EVP_CIPHER_CTX *ctx, const EVP_CIPHER *cipher,
+    ENGINE *impl, const unsigned char *key, const unsigned char *iv, int encrypt)
+{
+	if (should_fail())
+		return 0;
+	return EVP_CipherInit_ex(ctx, cipher, impl, key, iv, encrypt);
+}
+
+int
+dssh_test_EVP_CipherUpdate(EVP_CIPHER_CTX *ctx, unsigned char *out,
+    int *outl, const unsigned char *in, int inl)
+{
+	if (should_fail())
+		return 0;
+	int ret = EVP_CipherUpdate(ctx, out, outl, in, inl);
+	if (ret == 1 && encrypt_length_override && outl != NULL) {
+		encrypt_native_length = *outl;
+		encrypt_length_seen = true;
+		*outl = encrypt_length_value;
+	}
+	return ret;
+}
+
+int
 dssh_test_EVP_MAC_init(EVP_MAC_CTX *ctx, const unsigned char *key,
     size_t keylen, const OSSL_PARAM params[])
 {

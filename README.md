@@ -1863,8 +1863,8 @@ any of these thresholds is exceeded:
 | Time per key | disabled (opt-in) | `DSSH_REKEY_SECONDS` (3600 s suggestion) |
 
 Byte limits come from each `enc` module: 64 GiB (2^36) for 128-bit
-block ciphers (every cipher we ship — aes128-cbc, aes128-ctr,
-aes256-ctr — derives from RFC 4344 s3.2's 2^(L/4) blocks for L=128),
+block ciphers (`aes128-cbc` and `aes256-ctr`, using RFC 4344
+s3.2's 2^(L/4) blocks for L=128),
 and `UINT64_MAX` for the `none` cipher (no key wear).  Each
 direction's byte counter is compared independently against the
 selected cipher's limit, so c2s and s2c use their own keys' budgets.

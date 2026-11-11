@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import pwd
+import re
 import select
 import hashlib
 import shlex
@@ -115,6 +116,8 @@ def run(args):
     temporary = None
     result = {"role": args.role, "algorithm": args.algorithm,
               "negative_host": args.negative_host, "status": "FAILED"}
+    cipher = os.environ.get("DSSH_TEST_ENC", "aes256-ctr")
+    result["cipher"] = cipher
     for name in ("proxy-result.json", "proxy-result.json.pending", "result.json", "openssh.log", "peer.log", "stderr.log"):
         (evidence / name).unlink(missing_ok=True)
 
@@ -126,6 +129,8 @@ def run(args):
             raise RuntimeError(f"{name}: exit {completed.returncode}")
 
     try:
+        if cipher not in ("aes256-ctr", "aes128-cbc"):
+            raise RuntimeError("unsupported fixture cipher")
         # All credentials stay in this private directory, including paths that
         # exercise shell/config quoting. It is removed even on failed runs.
         temporary = tempfile.TemporaryDirectory(prefix="dssh interop-")
@@ -172,7 +177,7 @@ def run(args):
                    "-o", "GlobalKnownHostsFile=/dev/null", "-o", "VerifyHostKeyDNS=no",
                    "-o", "HostKeyAlias=dssh-interop", "-o", "Compression=no",
                    "-o", "RekeyLimit=128K", "-o", f"KexAlgorithms={args.algorithm}",
-                   "-c", "aes256-ctr", "-m", "hmac-sha2-256", "-i", str(key),
+                   "-c", cipher, "-m", "hmac-sha2-256", "-i", str(key),
                    "-o", "ProxyCommand=" + proxy_text, "-l", user, "dssh-interop", "dssh-interop"]
             with (evidence / "stderr.log").open("wb") as error:
                 until = time.monotonic() + 140
@@ -215,7 +220,7 @@ def run(args):
                 f"AllowUsers {user}\nStrictModes no\nUsePAM no\n"
                 "PasswordAuthentication no\nKbdInteractiveAuthentication no\n"
                 "AuthenticationMethods publickey\nPubkeyAcceptedAlgorithms rsa-sha2-256\n"
-                "HostKeyAlgorithms rsa-sha2-256\nCiphers aes256-ctr\nMACs hmac-sha2-256\n"
+                f"HostKeyAlgorithms rsa-sha2-256\nCiphers {cipher}\nMACs hmac-sha2-256\n"
                 f"KexAlgorithms {args.algorithm}\nCompression no\nRekeyLimit 128K\n"
                 "PermitUserEnvironment no\nAllowAgentForwarding no\nAllowTcpForwarding no\n"
                 "X11Forwarding no\nPermitTTY no\nLogLevel DEBUG1\n"
@@ -254,6 +259,12 @@ def run(args):
         newkeys = log.count("SSH2_MSG_NEWKEYS received")
         if (not args.negative_host and newkeys < 2) or f"kex: algorithm: {args.algorithm}" not in log:
             raise RuntimeError(f"forced method/rekey oracle missing, NEWKEYS={newkeys}")
+        ciphers = re.findall(r"kex: (client->server|server->client) cipher: (\S+)", log)
+        if {direction for direction, _ in ciphers} != {"client->server", "server->client"} \
+                or any(selected != cipher for _, selected in ciphers):
+            raise RuntimeError("forced directional cipher oracle missing")
+        if f"cipher={cipher}" not in peer_text:
+            raise RuntimeError("production peer cipher oracle missing")
         result.update(status="PASSED", openssh_newkeys_received=newkeys)
         if not args.negative_host:
             result.update(stdout_bytes=len(OUTPUT), stderr_bytes=len(ERROR), remote_exit_status=23)

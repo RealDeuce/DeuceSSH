@@ -417,20 +417,35 @@ dssh_transport_get_hostkey_name(struct dssh_session_s *sess)
 }
 
 DSSH_PUBLIC const char *
-dssh_transport_get_enc_name(struct dssh_session_s *sess)
+dssh_transport_get_enc_name(struct dssh_session_s *sess, enum dssh_direction direction)
 {
-	if (sess == NULL || dssh_io_callback_active(sess))
+	if (sess == NULL || (direction != DSSH_CLIENT_TO_SERVER && direction != DSSH_SERVER_TO_CLIENT)
+	    || dssh_io_callback_active(sess))
 		return NULL;
-	dssh_enc selected = sess->trans.enc_c2s_selected;
+	dssh_enc selected = direction == DSSH_CLIENT_TO_SERVER ? sess->trans.enc_c2s_selected
+	    : sess->trans.enc_s2c_selected;
 	return selected != NULL ? selected->name : NULL;
 }
 
 DSSH_PUBLIC const char *
-dssh_transport_get_mac_name(struct dssh_session_s *sess)
+dssh_transport_get_mac_name(struct dssh_session_s *sess, enum dssh_direction direction)
 {
-	if (sess == NULL || dssh_io_callback_active(sess))
+	if (sess == NULL || (direction != DSSH_CLIENT_TO_SERVER && direction != DSSH_SERVER_TO_CLIENT)
+	    || dssh_io_callback_active(sess))
 		return NULL;
-	dssh_mac selected = sess->trans.mac_c2s_selected;
+	dssh_mac selected = direction == DSSH_CLIENT_TO_SERVER ? sess->trans.mac_c2s_selected
+	    : sess->trans.mac_s2c_selected;
+	return selected != NULL ? selected->name : NULL;
+}
+
+DSSH_PUBLIC const char *
+dssh_transport_get_comp_name(struct dssh_session_s *sess, enum dssh_direction direction)
+{
+	if (sess == NULL || (direction != DSSH_CLIENT_TO_SERVER && direction != DSSH_SERVER_TO_CLIENT)
+	    || dssh_io_callback_active(sess))
+		return NULL;
+	dssh_comp selected = direction == DSSH_CLIENT_TO_SERVER ? sess->trans.comp_c2s_selected
+	    : sess->trans.comp_s2c_selected;
 	return selected != NULL ? selected->name : NULL;
 }
 

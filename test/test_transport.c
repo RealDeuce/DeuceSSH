@@ -1925,14 +1925,14 @@ test_handshake_negotiated_algorithms(void)
 	ASSERT_NOT_NULL(s_hk);
 	ASSERT_STR_EQ(c_hk, s_hk);
 
-	const char *c_enc = dssh_transport_get_enc_name(ctx.client);
-	const char *s_enc = dssh_transport_get_enc_name(ctx.server);
+	const char *c_enc = dssh_transport_get_enc_name(ctx.client, DSSH_CLIENT_TO_SERVER);
+	const char *s_enc = dssh_transport_get_enc_name(ctx.server, DSSH_CLIENT_TO_SERVER);
 	ASSERT_NOT_NULL(c_enc);
 	ASSERT_NOT_NULL(s_enc);
 	ASSERT_STR_EQ(c_enc, s_enc);
 
-	const char *c_mac = dssh_transport_get_mac_name(ctx.client);
-	const char *s_mac = dssh_transport_get_mac_name(ctx.server);
+	const char *c_mac = dssh_transport_get_mac_name(ctx.client, DSSH_CLIENT_TO_SERVER);
+	const char *s_mac = dssh_transport_get_mac_name(ctx.server, DSSH_CLIENT_TO_SERVER);
 	ASSERT_NOT_NULL(c_mac);
 	ASSERT_NOT_NULL(s_mac);
 	ASSERT_STR_EQ(c_mac, s_mac);
@@ -3421,8 +3421,8 @@ test_get_names_before_handshake(void)
 
 	ASSERT_NULL(dssh_transport_get_kex_name(sess));
 	ASSERT_NULL(dssh_transport_get_hostkey_name(sess));
-	ASSERT_NULL(dssh_transport_get_enc_name(sess));
-	ASSERT_NULL(dssh_transport_get_mac_name(sess));
+	ASSERT_NULL(dssh_transport_get_enc_name(sess, DSSH_CLIENT_TO_SERVER));
+	ASSERT_NULL(dssh_transport_get_mac_name(sess, DSSH_CLIENT_TO_SERVER));
 
 	dssh_session_cleanup(sess);
 	dssh_test_reset_global_config();
@@ -7951,10 +7951,10 @@ test_rekey_changes_algorithms(void)
 		if (client_result < 0 || server_result < 0)
 			break;
 		changed = changed
-		    && strcmp(dssh_transport_get_mac_name(ctx.client), mac_name) == 0
-		    && strcmp(dssh_transport_get_mac_name(ctx.server), mac_name) == 0
-		    && strcmp(dssh_transport_get_enc_name(ctx.client), cipher_name) == 0
-		    && strcmp(dssh_transport_get_enc_name(ctx.server), cipher_name) == 0;
+		    && strcmp(dssh_transport_get_mac_name(ctx.client, DSSH_CLIENT_TO_SERVER), mac_name) == 0
+		    && strcmp(dssh_transport_get_mac_name(ctx.server, DSSH_CLIENT_TO_SERVER), mac_name) == 0
+		    && strcmp(dssh_transport_get_enc_name(ctx.client, DSSH_CLIENT_TO_SERVER), cipher_name) == 0
+		    && strcmp(dssh_transport_get_enc_name(ctx.server, DSSH_CLIENT_TO_SERVER), cipher_name) == 0;
 	}
 	handshake_cleanup(&ctx);
 	ASSERT_EQ(client_result, 0);
@@ -9494,6 +9494,7 @@ static struct dssh_test_entry tests[] = {
 	{ "identification/bounds", test_identification_bounds },
 	{ "identification/setters", test_identification_setters },
 	{ "identification/output", test_identification_output },
+	{ "release/query_arguments", test_query_arguments },
 	{ "release/query_snapshot", test_query_snapshot },
 	{ "release/auth_replayed_message_state", test_auth_replayed_message_state },
 	{ "release/auth_kbi_request_state", test_auth_kbi_request_state },

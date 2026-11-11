@@ -11,10 +11,6 @@
 extern "C" {
 #endif
 
-enum dssh_language_direction {
-	DSSH_LANG_CLIENT_TO_SERVER,
-	DSSH_LANG_SERVER_TO_CLIENT
-};
 
 /* Set one outgoing field to these language tags in this order. The library
  * copies the strings. names == NULL or count == 0 clears the field. Tags use
@@ -24,7 +20,7 @@ enum dssh_language_direction {
  * Return zero or a negative error. Failed replacement preserves the field.
  * Calls after termination return DSSH_ERROR_TERMINATED. */
 DSSH_PUBLIC int dssh_session_set_languages(dssh_session sess,
-    enum dssh_language_direction direction, const char * const *names, size_t count);
+    enum dssh_direction direction, const char * const *names, size_t count);
 
 /* Copy a complete comma-separated field as a NUL-terminated string. The
  * successful return is its required buffer size INCLUDING the NUL, matching
@@ -41,9 +37,9 @@ DSSH_PUBLIC int dssh_session_set_languages(dssh_session sess,
  * NULL sessions and unknown directions return DSSH_ERROR_INVALID.
  * The caller coordinates session cleanup with calls using the handle. */
 DSSH_PUBLIC int64_t dssh_session_get_languages(dssh_session sess,
-    enum dssh_language_direction direction, char *buf, size_t bufsz);
+    enum dssh_direction direction, char *buf, size_t bufsz);
 DSSH_PUBLIC int64_t dssh_session_get_peer_languages(dssh_session sess,
-    enum dssh_language_direction direction, char *buf, size_t bufsz);
+    enum dssh_direction direction, char *buf, size_t bufsz);
 
 #ifdef __cplusplus
 }

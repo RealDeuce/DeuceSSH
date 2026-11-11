@@ -408,13 +408,20 @@ peer version string.  Returns NULL if not yet negotiated:
 const char *peer = dssh_transport_get_remote_version(sess);
 const char *kex  = dssh_transport_get_kex_name(sess);
 const char *hk   = dssh_transport_get_hostkey_name(sess);
-const char *enc  = dssh_transport_get_enc_name(sess);
-const char *mac  = dssh_transport_get_mac_name(sess);
+const char *enc  = dssh_transport_get_enc_name(sess, DSSH_CLIENT_TO_SERVER);
+const char *mac  = dssh_transport_get_mac_name(sess, DSSH_SERVER_TO_CLIENT);
+const char *comp = dssh_transport_get_comp_name(sess, DSSH_SERVER_TO_CLIENT);
 ```
 
-The returned strings point into internal state and remain valid
-until the session is cleaned up (or until the next rekey, which
-updates them atomically).
+Use `DSSH_CLIENT_TO_SERVER` or `DSSH_SERVER_TO_CLIENT` for each cipher,
+MAC or compression query, regardless of the application's endpoint role.
+The language field functions use the same `enum dssh_direction`.
+
+Each call snapshots the latest negotiated selection. During rekey a selection
+can be visible before its keys become active; separate calls are separate
+snapshots. Algorithm names are borrowed from process-lifetime registered
+definitions. The remote version string is session-owned. Coordinate all calls
+using the handle with session cleanup.
 
 ## Secure Memory
 
@@ -878,12 +885,12 @@ static int64_t
 handshake_with_language_preferences(dssh_session sess, char *peer, size_t capacity)
 {
 	const char *names[] = {"en-US", "fr"};
-	int ret = dssh_session_set_languages(sess, DSSH_LANG_SERVER_TO_CLIENT, names, 2);
+	int ret = dssh_session_set_languages(sess, DSSH_SERVER_TO_CLIENT, names, 2);
 	if (ret == 0)
 		ret = dssh_transport_handshake(sess);
 	if (ret < 0)
 		return ret;
-	return dssh_session_get_peer_languages(sess, DSSH_LANG_SERVER_TO_CLIENT,
+	return dssh_session_get_peer_languages(sess, DSSH_SERVER_TO_CLIENT,
 	    peer, capacity);
 }
 ```

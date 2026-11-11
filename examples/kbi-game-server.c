@@ -810,9 +810,16 @@ handle_connection(void)
 		return 1;
 	}
 	fprintf(stderr, "Remote: %s\n", dssh_transport_get_remote_version(sess));
-	fprintf(stderr, "KEX: %s, Host key: %s, Enc: %s, MAC: %s\n", dssh_transport_get_kex_name(sess),
-	    dssh_transport_get_hostkey_name(sess), dssh_transport_get_enc_name(sess),
-	    dssh_transport_get_mac_name(sess));
+	fprintf(stderr, "KEX: %s, Host key: %s\n", dssh_transport_get_kex_name(sess),
+	    dssh_transport_get_hostkey_name(sess));
+	const enum dssh_direction directions[] = {DSSH_CLIENT_TO_SERVER, DSSH_SERVER_TO_CLIENT};
+	const char *labels[] = {"Client to server", "Server to client"};
+	for (size_t i = 0; i < 2; i++) {
+		fprintf(stderr, "%s: Enc: %s, MAC: %s, Compression: %s\n", labels[i],
+		    dssh_transport_get_enc_name(sess, directions[i]),
+		    dssh_transport_get_mac_name(sess, directions[i]),
+		    dssh_transport_get_comp_name(sess, directions[i]));
+	}
 
 	/* Auth */
 	fprintf(stderr, "Handling auth...\n");

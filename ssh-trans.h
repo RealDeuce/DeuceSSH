@@ -258,7 +258,7 @@ struct dssh_transport_state_s {
  * Applications may register their own custom modules alongside or
  * instead of the library's built-in algorithms.
  */
-/* register_kex/key_algo/enc/mac/comp/lang are now in their public headers */
+/* register_kex/key_algo/enc/mac/comp are now in their public headers */
 /*
  * Initialize transport state for a session.  Allocates packet buffers
  * sized to max_packet_size (pass 0 for the RFC minimum of 33280 bytes).
@@ -268,7 +268,7 @@ struct dssh_transport_state_s {
  *   dssh_transport_handshake, dssh_transport_disconnect,
  *   dssh_transport_get_remote_version, dssh_transport_get_kex_name,
  *   dssh_transport_get_hostkey_name, dssh_transport_get_enc_name,
- *   dssh_transport_get_mac_name
+ *   dssh_transport_get_mac_name, dssh_transport_get_comp_name
  */
 /* ================================================================
  * Internal functions -- used by other library modules, not by

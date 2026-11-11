@@ -127,6 +127,19 @@ echo_channel(dssh_channel channel)
 }
 
 static int
+check_negotiated(dssh_session sess, const char *c2s, const char *s2c)
+{
+	const enum dssh_direction directions[] = {DSSH_CLIENT_TO_SERVER, DSSH_SERVER_TO_CLIENT};
+	const char *expected[] = {c2s, s2c};
+	for (size_t i = 0; i < 2; i++) {
+		const char *comp = dssh_transport_get_comp_name(sess, directions[i]);
+		if (comp == NULL || strcmp(comp, expected[i]) != 0)
+			return DSSH_ERROR_INVALID;
+	}
+	return 0;
+}
+
+static int
 wait_for_peer_disconnect(dssh_session sess)
 {
 	/* Keep the transport available while the independent client completes
@@ -153,8 +166,11 @@ wait_for_peer_disconnect(dssh_session sess)
 }
 
 int
-main(void)
+main(int argc, char **argv)
 {
+	if (argc != 3 || (strcmp(argv[1], "none") != 0 && strcmp(argv[1], "zlib") != 0)
+	    || (strcmp(argv[2], "none") != 0 && strcmp(argv[2], "zlib") != 0))
+		return 1;
 	/* A peer may close between readiness and write. Let the I/O callback
 	 * return the write error instead of terminating this fixture process. */
 	if (signal(SIGPIPE, SIG_IGN) == SIG_ERR)
@@ -179,7 +195,13 @@ main(void)
 	struct dssh_auth_server_cbs auth = { .methods_str = "", .none_cb = accept_none };
 	struct dssh_chan_accept_cbs accept = { .exec = accept_echo };
 	const char *stage = "handshake";
+	unsigned query_checks = 0;
 	int ret = dssh_transport_handshake(sess);
+	if (ret == 0) {
+		ret = check_negotiated(sess, argv[1], argv[2]);
+		if (ret == 0)
+			query_checks++;
+	}
 	if (ret == 0) {
 		stage = "auth";
 		ret = dssh_auth_server(sess, &auth, NULL, NULL);
@@ -205,12 +227,17 @@ main(void)
 		stage = "peer-disconnect";
 		ret = wait_for_peer_disconnect(sess);
 	}
+	if (ret == 0) {
+		ret = check_negotiated(sess, argv[1], argv[2]);
+		if (ret == 0)
+			query_checks++;
+	}
 	dssh_session_cleanup(sess);
 	unsigned allocated, live, errors;
 	dssh_test_zlib_stats(&allocated, &live, &errors);
 	unsigned resets = dssh_example_zlib_resets();
-	fprintf(stderr, "DeuceSSH echo: stage=%s result=%d zlib-allocations=%u live=%u cleanup-errors=%u resets=%u\n",
-	    stage, ret, allocated, live, errors, resets);
+	fprintf(stderr, "DeuceSSH echo: stage=%s result=%d zlib-allocations=%u live=%u cleanup-errors=%u resets=%u query-checks=%u\n",
+	    stage, ret, allocated, live, errors, resets, query_checks);
 	/* The independent peer must actually exercise rekey and both dictionaries. */
-	return ret == 0 && live == 0 && errors == 0 && resets >= 2 ? 0 : 1;
+	return ret == 0 && live == 0 && errors == 0 && resets >= 2 && query_checks == 2 ? 0 : 1;
 }

@@ -351,10 +351,26 @@ client_channel(dssh_session session, bool bidirectional)
 }
 
 static int
+check_algorithm_fields(dssh_session sess, const char *cipher, const char *c2s, const char *s2c)
+{
+	const enum dssh_direction directions[] = {DSSH_CLIENT_TO_SERVER, DSSH_SERVER_TO_CLIENT};
+	const char *expected[] = {c2s, s2c};
+	for (size_t i = 0; i < 2; i++) {
+		const char *enc = dssh_transport_get_enc_name(sess, directions[i]);
+		const char *mac = dssh_transport_get_mac_name(sess, directions[i]);
+		const char *comp = dssh_transport_get_comp_name(sess, directions[i]);
+		if (enc == NULL || mac == NULL || comp == NULL || strcmp(enc, cipher) != 0
+		    || strcmp(mac, expected[i]) != 0 || strcmp(comp, "none") != 0)
+			return DSSH_ERROR_INVALID;
+	}
+	return 0;
+}
+
+static int
 check_language_fields(dssh_session sess, bool updated)
 {
-	const enum dssh_language_direction directions[] = {
-		DSSH_LANG_CLIENT_TO_SERVER, DSSH_LANG_SERVER_TO_CLIENT
+	const enum dssh_direction directions[] = {
+		DSSH_CLIENT_TO_SERVER, DSSH_SERVER_TO_CLIENT
 	};
 	const char *expected[] = {
 		updated ? "de-DE" : "en-US,fr", updated ? "sv-SE" : "x-interop"
@@ -442,13 +458,14 @@ main(int argc, char **argv)
 	const char *stage = "configuration";
 	bool channel_ack = false;
 	unsigned language_checks = 0;
+	unsigned algorithm_checks = 0;
 	ret = dssh_session_set_timeout(session, 75000);
 	if (ret == 0 && language_fields) {
 		const char *first[] = {"en-US", "fr"};
 		const char *second[] = {"x-interop"};
-		ret = dssh_session_set_languages(session, DSSH_LANG_CLIENT_TO_SERVER, first, 2);
+		ret = dssh_session_set_languages(session, DSSH_CLIENT_TO_SERVER, first, 2);
 		if (ret == 0)
-			ret = dssh_session_set_languages(session, DSSH_LANG_SERVER_TO_CLIENT, second, 1);
+			ret = dssh_session_set_languages(session, DSSH_SERVER_TO_CLIENT, second, 1);
 	}
 	if (ret == 0 && client)
 		ret = dssh_session_set_hostkey_verify_cb(session, verify_host, &auth);
@@ -462,10 +479,13 @@ main(int argc, char **argv)
 			language_checks++;
 	}
 	if (ret == 0 && (strcmp(dssh_transport_get_kex_name(session), argv[2]) != 0
-	    || strcmp(dssh_transport_get_hostkey_name(session), "rsa-sha2-256") != 0
-	    || strcmp(dssh_transport_get_enc_name(session), cipher) != 0
-	    || strcmp(dssh_transport_get_mac_name(session), mac) != 0))
+	    || strcmp(dssh_transport_get_hostkey_name(session), "rsa-sha2-256") != 0))
 		ret = DSSH_ERROR_INVALID;
+	if (ret == 0) {
+		ret = check_algorithm_fields(session, cipher, mac, mac_s2c);
+		if (ret == 0)
+			algorithm_checks++;
+	}
 	if (ret == 0) {
 		stage = "authentication";
 		struct dssh_auth_server_cbs callbacks = {
@@ -482,9 +502,9 @@ main(int argc, char **argv)
 	if (ret == 0 && language_fields) {
 		const char *first[] = {"de-DE"};
 		const char *second[] = {"sv-SE"};
-		ret = dssh_session_set_languages(session, DSSH_LANG_CLIENT_TO_SERVER, first, 1);
+		ret = dssh_session_set_languages(session, DSSH_CLIENT_TO_SERVER, first, 1);
 		if (ret == 0)
-			ret = dssh_session_set_languages(session, DSSH_LANG_SERVER_TO_CLIENT, second, 1);
+			ret = dssh_session_set_languages(session, DSSH_SERVER_TO_CLIENT, second, 1);
 	}
 	if (ret == 0) {
 		stage = "channel";
@@ -496,10 +516,15 @@ main(int argc, char **argv)
 		if (ret == 0)
 			language_checks++;
 	}
+	if (ret == 0) {
+		ret = check_algorithm_fields(session, cipher, mac, mac_s2c);
+		if (ret == 0)
+			algorithm_checks++;
+	}
 	dssh_session_cleanup(session);
 	if (ret == 0 && client && auth.host_checks < 2)
 		ret = DSSH_ERROR_INVALID;
-	fprintf(stderr, "DeuceSSH interop: role=%s kex=%s cipher=%s mac=%s stage=%s result=%d host-checks=%u signed-auth=%d channel-ack=%u language-checks=%u mac-s2c=%s\n",
-	    argv[1], argv[2], cipher, mac, stage, ret, auth.host_checks, auth.signed_auth, channel_ack ? 1U : 0U, language_checks, mac_s2c);
+	fprintf(stderr, "DeuceSSH interop: role=%s kex=%s cipher=%s mac=%s stage=%s result=%d host-checks=%u signed-auth=%d channel-ack=%u language-checks=%u mac-s2c=%s algorithm-checks=%u\n",
+	    argv[1], argv[2], cipher, mac, stage, ret, auth.host_checks, auth.signed_auth, channel_ack ? 1U : 0U, language_checks, mac_s2c, algorithm_checks);
 	return ret == 0 ? 0 : 1;
 }

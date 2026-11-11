@@ -93,7 +93,7 @@ def run(args):
             if foreign_text.count("Received SSH_MSG_NEWKEYS") != int(match[1]):
                 raise RuntimeError("independent NEWKEYS log count disagrees")
             pattern = (rf"DeuceSSH interop: role={args.role} kex=curve25519-sha256 cipher=aes256-ctr mac={c2s} "
-                       rf"stage=channel result=0 host-checks=(\d+) signed-auth=(\d+) channel-ack=(\d+) language-checks=0 mac-s2c={s2c}")
+                       rf"stage=channel result=0 host-checks=(\d+) signed-auth=(\d+) channel-ack=(\d+) language-checks=0 mac-s2c={s2c} algorithm-checks=2")
             native = re.search(pattern, peer_text)
             if native is None or (args.role == "client" and int(native[1]) < 2) \
                     or (args.role == "server" and (native[2] != "1" or native[3] != "1")):
@@ -106,7 +106,8 @@ def run(args):
                     raise RuntimeError("native program changed during execution")
             result.update(status="PASSED", independent_newkeys=int(match[1]),
                           libssh_version=match[2], direction_checks=2, bytes_each_way=262144,
-                          host_checks=int(native[1]), signed_auth=int(native[2]), channel_ack=int(native[3]))
+                          host_checks=int(native[1]), signed_auth=int(native[2]), channel_ack=int(native[3]),
+                          public_algorithm_checks=2)
     except Exception as error:
         result["error"] = str(error)
     finally:

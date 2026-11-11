@@ -97,6 +97,11 @@ typedef dssh_log_action (*dssh_log_cb)(const struct dssh_log_record *record, voi
 /* Opaque session handle.  Created by session_init, freed by session_cleanup. */
 typedef struct dssh_session_s *dssh_session;
 
+enum dssh_direction {
+	DSSH_CLIENT_TO_SERVER,
+	DSSH_SERVER_TO_CLIENT
+};
+
 /*
  * I/O callback: send or receive exactly bufsz bytes.
  * Must block until all bytes are transferred or
@@ -457,8 +462,18 @@ DSSH_PUBLIC int dssh_transport_disconnect(dssh_session sess, uint32_t reason_cod
 DSSH_PUBLIC const char *dssh_transport_get_remote_version(dssh_session sess);
 DSSH_PUBLIC const char *dssh_transport_get_kex_name(dssh_session sess);
 DSSH_PUBLIC const char *dssh_transport_get_hostkey_name(dssh_session sess);
-DSSH_PUBLIC const char *dssh_transport_get_enc_name(dssh_session sess);
-DSSH_PUBLIC const char *dssh_transport_get_mac_name(dssh_session sess);
+/* Snapshot the latest negotiated selection for this wire direction.
+ * Return NULL for a NULL session, unknown direction, forbidden I/O callback
+ * entry or an unavailable selection. During rekey, a new selection can be
+ * visible before its keys become active. Separate calls are separate snapshots.
+ * Names are borrowed from process-lifetime registered definitions; callers
+ * must coordinate handle use with session cleanup. */
+DSSH_PUBLIC const char *dssh_transport_get_enc_name(dssh_session sess,
+    enum dssh_direction direction);
+DSSH_PUBLIC const char *dssh_transport_get_mac_name(dssh_session sess,
+    enum dssh_direction direction);
+DSSH_PUBLIC const char *dssh_transport_get_comp_name(dssh_session sess,
+    enum dssh_direction direction);
 
 #ifdef __cplusplus
 }

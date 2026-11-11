@@ -66,7 +66,7 @@ main(int argc, char **argv)
 		    || dup2(descriptors[1], STDOUT_FILENO) < 0
 		    || close(descriptors[1]) < 0)
 			_exit(1);
-		execl(argv[1], argv[1], NULL);
+		execl(argv[1], argv[1], c2s, s2c, NULL);
 		_exit(1);
 	}
 	int ret = close(descriptors[1]);

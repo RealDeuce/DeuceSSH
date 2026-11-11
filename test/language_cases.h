@@ -1,6 +1,6 @@
 /* Public language fields, with separate raw-offer and real KEX controls. */
 static bool
-language_value(dssh_session sess, bool peer, enum dssh_language_direction direction,
+language_value(dssh_session sess, bool peer, enum dssh_direction direction,
     const char *expected)
 {
 	char guarded[130];
@@ -26,49 +26,49 @@ test_language_local(void)
 	const char *other[] = {"ja-JP"};
 	const char expected[] = "en-US,fr,x-private";
 	const int64_t expected_size = sizeof(expected);
-	bool valid = language_value(sess, false, DSSH_LANG_CLIENT_TO_SERVER, "")
-	    && language_value(sess, false, DSSH_LANG_SERVER_TO_CLIENT, "")
-	    && dssh_session_get_peer_languages(sess, DSSH_LANG_CLIENT_TO_SERVER, NULL, 0) == DSSH_ERROR_INIT
-	    && dssh_session_set_languages(sess, DSSH_LANG_CLIENT_TO_SERVER, names, 3) == 0
-	    && dssh_session_set_languages(sess, DSSH_LANG_SERVER_TO_CLIENT, other, 1) == 0
-	    && language_value(sess, false, DSSH_LANG_CLIENT_TO_SERVER, expected)
-	    && language_value(sess, false, DSSH_LANG_SERVER_TO_CLIENT, "ja-JP")
-	    && dssh_session_get_languages(sess, DSSH_LANG_CLIENT_TO_SERVER, NULL, 0) == expected_size
-	    && dssh_session_get_languages(sess, DSSH_LANG_CLIENT_TO_SERVER, NULL, 99) == expected_size;
+	bool valid = language_value(sess, false, DSSH_CLIENT_TO_SERVER, "")
+	    && language_value(sess, false, DSSH_SERVER_TO_CLIENT, "")
+	    && dssh_session_get_peer_languages(sess, DSSH_CLIENT_TO_SERVER, NULL, 0) == DSSH_ERROR_INIT
+	    && dssh_session_set_languages(sess, DSSH_CLIENT_TO_SERVER, names, 3) == 0
+	    && dssh_session_set_languages(sess, DSSH_SERVER_TO_CLIENT, other, 1) == 0
+	    && language_value(sess, false, DSSH_CLIENT_TO_SERVER, expected)
+	    && language_value(sess, false, DSSH_SERVER_TO_CLIENT, "ja-JP")
+	    && dssh_session_get_languages(sess, DSSH_CLIENT_TO_SERVER, NULL, 0) == expected_size
+	    && dssh_session_get_languages(sess, DSSH_CLIENT_TO_SERVER, NULL, 99) == expected_size;
 	char buffer[sizeof(expected)];
 	memset(buffer, 0x5a, sizeof(buffer));
-	valid = valid && dssh_session_get_languages(sess, DSSH_LANG_CLIENT_TO_SERVER,
+	valid = valid && dssh_session_get_languages(sess, DSSH_CLIENT_TO_SERVER,
 	    buffer, 0) == expected_size && buffer[0] == 0x5a
-	    && dssh_session_get_languages(sess, DSSH_LANG_CLIENT_TO_SERVER,
+	    && dssh_session_get_languages(sess, DSSH_CLIENT_TO_SERVER,
 	        buffer, sizeof(buffer) - 1) == DSSH_ERROR_TOOLONG;
 	for (size_t i = 0; i < sizeof(buffer); i++)
 		valid = valid && buffer[i] == 0x5a;
 	const char *bad[] = {"", " en", "en,fr", "en_US", "1en", "-en", "en-",
 	    "en--US", "abcdefghi", "en-abcdefghi", "en-\001", "en-\200"};
 	for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
-		valid = valid && dssh_session_set_languages(sess, DSSH_LANG_CLIENT_TO_SERVER,
+		valid = valid && dssh_session_set_languages(sess, DSSH_CLIENT_TO_SERVER,
 		    &bad[i], 1) == DSSH_ERROR_INVALID;
 	}
 	const char *missing[] = {NULL};
-	enum dssh_language_direction invalid = (enum dssh_language_direction)-1;
-	valid = valid && dssh_session_set_languages(sess, DSSH_LANG_CLIENT_TO_SERVER,
+	enum dssh_direction invalid = (enum dssh_direction)-1;
+	valid = valid && dssh_session_set_languages(sess, DSSH_CLIENT_TO_SERVER,
 	    missing, 1) == DSSH_ERROR_INVALID
-	    && dssh_session_set_languages(NULL, DSSH_LANG_CLIENT_TO_SERVER, names, 3) == DSSH_ERROR_INVALID
+	    && dssh_session_set_languages(NULL, DSSH_CLIENT_TO_SERVER, names, 3) == DSSH_ERROR_INVALID
 	    && dssh_session_set_languages(sess, invalid, names, 3) == DSSH_ERROR_INVALID
 	    && dssh_session_get_languages(sess, invalid, NULL, 0) == DSSH_ERROR_INVALID
 	    && dssh_session_get_peer_languages(sess, invalid, NULL, 0) == DSSH_ERROR_INVALID
-	    && dssh_session_get_languages(NULL, DSSH_LANG_CLIENT_TO_SERVER, NULL, 0) == DSSH_ERROR_INVALID
-	    && dssh_session_get_peer_languages(NULL, DSSH_LANG_CLIENT_TO_SERVER, NULL, 0) == DSSH_ERROR_INVALID
-	    && dssh_session_set_languages(sess, DSSH_LANG_CLIENT_TO_SERVER, names, SIZE_MAX) == DSSH_ERROR_TOOLONG
-	    && language_value(sess, false, DSSH_LANG_CLIENT_TO_SERVER, expected)
-	    && dssh_session_set_languages(sess, DSSH_LANG_CLIENT_TO_SERVER, NULL, SIZE_MAX) == 0
-	    && language_value(sess, false, DSSH_LANG_CLIENT_TO_SERVER, "")
-	    && language_value(sess, false, DSSH_LANG_SERVER_TO_CLIENT, "ja-JP")
-	    && dssh_session_set_languages(sess, DSSH_LANG_SERVER_TO_CLIENT, other, 0) == 0
-	    && language_value(sess, false, DSSH_LANG_SERVER_TO_CLIENT, "");
+	    && dssh_session_get_languages(NULL, DSSH_CLIENT_TO_SERVER, NULL, 0) == DSSH_ERROR_INVALID
+	    && dssh_session_get_peer_languages(NULL, DSSH_CLIENT_TO_SERVER, NULL, 0) == DSSH_ERROR_INVALID
+	    && dssh_session_set_languages(sess, DSSH_CLIENT_TO_SERVER, names, SIZE_MAX) == DSSH_ERROR_TOOLONG
+	    && language_value(sess, false, DSSH_CLIENT_TO_SERVER, expected)
+	    && dssh_session_set_languages(sess, DSSH_CLIENT_TO_SERVER, NULL, SIZE_MAX) == 0
+	    && language_value(sess, false, DSSH_CLIENT_TO_SERVER, "")
+	    && language_value(sess, false, DSSH_SERVER_TO_CLIENT, "ja-JP")
+	    && dssh_session_set_languages(sess, DSSH_SERVER_TO_CLIENT, other, 0) == 0
+	    && language_value(sess, false, DSSH_SERVER_TO_CLIENT, "");
 	dssh_session_terminate(sess);
-	valid = valid && dssh_session_set_languages(sess, DSSH_LANG_SERVER_TO_CLIENT, other, 1)
-	    == DSSH_ERROR_TERMINATED && language_value(sess, false, DSSH_LANG_SERVER_TO_CLIENT, "");
+	valid = valid && dssh_session_set_languages(sess, DSSH_SERVER_TO_CLIENT, other, 1)
+	    == DSSH_ERROR_TERMINATED && language_value(sess, false, DSSH_SERVER_TO_CLIENT, "");
 	dssh_session_cleanup(sess);
 	dssh_test_reset_global_config();
 	ASSERT_TRUE(valid);
@@ -93,27 +93,27 @@ test_language_storage(void)
 		return TEST_FAIL;
 	const char *longer[] = {"en-US", "fr", "de-DE", "sv-SE"};
 	const char *shorter[] = {"en"};
-	bool valid = dssh_session_set_languages(sess, DSSH_LANG_CLIENT_TO_SERVER, longer, 4) == 0;
+	bool valid = dssh_session_set_languages(sess, DSSH_CLIENT_TO_SERVER, longer, 4) == 0;
 	char *allocation = sess->local_languages[0].data;
 	dssh_test_alloc_fail_after(0);
-	valid = valid && dssh_session_set_languages(sess, DSSH_LANG_CLIENT_TO_SERVER, shorter, 1) == 0
-	    && language_value(sess, false, DSSH_LANG_CLIENT_TO_SERVER, "en")
+	valid = valid && dssh_session_set_languages(sess, DSSH_CLIENT_TO_SERVER, shorter, 1) == 0
+	    && language_value(sess, false, DSSH_CLIENT_TO_SERVER, "en")
 	    && dssh_test_alloc_count() == 0 && sess->local_languages[0].data == allocation
-	    && dssh_session_set_languages(sess, DSSH_LANG_CLIENT_TO_SERVER, NULL, 0) == 0
+	    && dssh_session_set_languages(sess, DSSH_CLIENT_TO_SERVER, NULL, 0) == 0
 	    && sess->local_languages[0].data == allocation;
 	dssh_test_alloc_reset();
-	valid = valid && dssh_session_set_languages(sess, DSSH_LANG_SERVER_TO_CLIENT, shorter, 1) == 0;
+	valid = valid && dssh_session_set_languages(sess, DSSH_SERVER_TO_CLIENT, shorter, 1) == 0;
 	dssh_test_alloc_fail_after(0);
-	int ret = dssh_session_set_languages(sess, DSSH_LANG_SERVER_TO_CLIENT, longer, 4);
+	int ret = dssh_session_set_languages(sess, DSSH_SERVER_TO_CLIENT, longer, 4);
 	int allocations = dssh_test_alloc_count();
 	dssh_test_alloc_reset();
 	valid = valid && ret == DSSH_ERROR_ALLOC && allocations == 1
-	    && language_value(sess, false, DSSH_LANG_SERVER_TO_CLIENT, "en");
+	    && language_value(sess, false, DSSH_SERVER_TO_CLIENT, "en");
 	dssh_test_alloc_observe_allocations(language_reject_growth, sess);
-	ret = dssh_session_set_languages(sess, DSSH_LANG_SERVER_TO_CLIENT, longer, 4);
+	ret = dssh_session_set_languages(sess, DSSH_SERVER_TO_CLIENT, longer, 4);
 	dssh_test_alloc_observe_allocations(NULL, NULL);
 	valid = valid && ret == DSSH_ERROR_TERMINATED && dssh_test_mtx_rejected_unlocks() == 0
-	    && language_value(sess, false, DSSH_LANG_SERVER_TO_CLIENT, "en");
+	    && language_value(sess, false, DSSH_SERVER_TO_CLIENT, "en");
 	dssh_session_cleanup(sess);
 	dssh_test_reset_global_config();
 	ASSERT_TRUE(valid);
@@ -229,13 +229,13 @@ test_language_bounds(void)
 	}
 	for (size_t i = 0; i < count; i++)
 		names[i] = "a";
-	bool valid = dssh_session_set_languages(sess, DSSH_LANG_CLIENT_TO_SERVER, names, count) == 0
-	    && dssh_session_set_languages(sess, DSSH_LANG_SERVER_TO_CLIENT, names, count) == 0
+	bool valid = dssh_session_set_languages(sess, DSSH_CLIENT_TO_SERVER, names, count) == 0
+	    && dssh_session_set_languages(sess, DSSH_SERVER_TO_CLIENT, names, count) == 0
 	    && kexinit(sess) == DSSH_ERROR_TOOLONG && capture.len == 0;
 	/* A longer tag makes even a single field exceed the configured bound. */
 	for (size_t i = 0; i < count; i++)
 		names[i] = "en";
-	valid = valid && dssh_session_set_languages(sess, DSSH_LANG_CLIENT_TO_SERVER,
+	valid = valid && dssh_session_set_languages(sess, DSSH_CLIENT_TO_SERVER,
 	    names, count) == DSSH_ERROR_TOOLONG;
 	free(names);
 	dssh_session_cleanup(sess);
@@ -272,25 +272,25 @@ test_language_wire(void)
 	const char *first[] = {"en-US", "fr"};
 	const char *second[] = {"x-private"};
 	dssh_test_mtx_watch_ownership(&sess->mtx);
-	bool valid = dssh_session_set_languages(sess, DSSH_LANG_CLIENT_TO_SERVER, first, 2) == 0
-	    && dssh_session_set_languages(sess, DSSH_LANG_SERVER_TO_CLIENT, second, 1) == 0
+	bool valid = dssh_session_set_languages(sess, DSSH_CLIENT_TO_SERVER, first, 2) == 0
+	    && dssh_session_set_languages(sess, DSSH_SERVER_TO_CLIENT, second, 1) == 0
 	    && language_peer_offer(sess, "de-CH,fr", "ja-JP,x-private") == 0 && kexinit(sess) == 0
 	    && language_wire_fields(&capture, "en-US,fr", "x-private")
-	    && language_value(sess, true, DSSH_LANG_CLIENT_TO_SERVER, "de-CH,fr")
-	    && language_value(sess, true, DSSH_LANG_SERVER_TO_CLIENT, "ja-JP,x-private");
+	    && language_value(sess, true, DSSH_CLIENT_TO_SERVER, "de-CH,fr")
+	    && language_value(sess, true, DSSH_SERVER_TO_CLIENT, "ja-JP,x-private");
 	valid = valid && language_peer_offer(sess, "x_opaque", "Some.WireValue") == 0 && kexinit(sess) == 0
-	    && language_value(sess, true, DSSH_LANG_CLIENT_TO_SERVER, "x_opaque")
-	    && language_value(sess, true, DSSH_LANG_SERVER_TO_CLIENT, "Some.WireValue");
+	    && language_value(sess, true, DSSH_CLIENT_TO_SERVER, "x_opaque")
+	    && language_value(sess, true, DSSH_SERVER_TO_CLIENT, "Some.WireValue");
 	char *storage = sess->peer_languages;
 	size_t capacity = sess->peer_languages_capacity;
 	valid = valid && language_peer_offer(sess, "es-ES", "sv-SE") == 0 && kexinit(sess) == 0
 	    && sess->peer_languages == storage && sess->peer_languages_capacity == capacity
-	    && language_value(sess, true, DSSH_LANG_CLIENT_TO_SERVER, "es-ES")
-	    && language_value(sess, true, DSSH_LANG_SERVER_TO_CLIENT, "sv-SE");
+	    && language_value(sess, true, DSSH_CLIENT_TO_SERVER, "es-ES")
+	    && language_value(sess, true, DSSH_SERVER_TO_CLIENT, "sv-SE");
 	valid = valid && language_peer_offer(sess, "", "") == 0 && kexinit(sess) == 0
 	    && sess->peer_languages == storage
-	    && language_value(sess, true, DSSH_LANG_CLIENT_TO_SERVER, "")
-	    && language_value(sess, true, DSSH_LANG_SERVER_TO_CLIENT, "");
+	    && language_value(sess, true, DSSH_CLIENT_TO_SERVER, "")
+	    && language_value(sess, true, DSSH_SERVER_TO_CLIENT, "");
 	valid = valid && language_peer_offer(sess, "de-CH,fr,x-private,en-US", "ja-JP,x-private,en-US,fr") == 0;
 	dssh_test_alloc_fail_after(1);
 	int ret = kexinit(sess);
@@ -298,12 +298,12 @@ test_language_wire(void)
 	dssh_test_alloc_reset();
 	valid = valid && ret == DSSH_ERROR_ALLOC && allocations == 2
 	    && sess->peer_languages == storage
-	    && language_value(sess, true, DSSH_LANG_CLIENT_TO_SERVER, "")
-	    && language_value(sess, true, DSSH_LANG_SERVER_TO_CLIENT, "");
+	    && language_value(sess, true, DSSH_CLIENT_TO_SERVER, "")
+	    && language_value(sess, true, DSSH_SERVER_TO_CLIENT, "");
 	valid = valid && language_peer_offer(sess, "en,,fr", "ja-JP") == 0
 	    && kexinit(sess) == DSSH_ERROR_PARSE
-	    && language_value(sess, true, DSSH_LANG_CLIENT_TO_SERVER, "")
-	    && language_value(sess, true, DSSH_LANG_SERVER_TO_CLIENT, "");
+	    && language_value(sess, true, DSSH_CLIENT_TO_SERVER, "")
+	    && language_value(sess, true, DSSH_SERVER_TO_CLIENT, "");
 	const char *large_first = "de-CH,fr,x-private,en-US";
 	const char *large_second = "ja-JP,x-private,en-US,fr";
 	valid = valid && language_peer_offer(sess, large_first, large_second) == 0;
@@ -314,8 +314,8 @@ test_language_wire(void)
 	dssh_test_alloc_observe_allocations(NULL, NULL);
 	valid = valid && failure.armed && ret == DSSH_ERROR_TERMINATED
 	    && dssh_test_mtx_rejected_unlocks() == 0
-	    && language_value(sess, true, DSSH_LANG_CLIENT_TO_SERVER, "")
-	    && language_value(sess, true, DSSH_LANG_SERVER_TO_CLIENT, "");
+	    && language_value(sess, true, DSSH_CLIENT_TO_SERVER, "")
+	    && language_value(sess, true, DSSH_SERVER_TO_CLIENT, "");
 	dssh_test_mtx_watch_ownership(NULL);
 	dssh_session_cleanup(sess);
 	dssh_test_reset_global_config();
@@ -330,13 +330,13 @@ language_configure_pair(dssh_session client, dssh_session server)
 	const char *client_second[] = {"x-client"};
 	const char *server_first[] = {"de-DE"};
 	const char *server_second[] = {"ja-JP", "x-server"};
-	int ret = dssh_session_set_languages(client, DSSH_LANG_CLIENT_TO_SERVER, client_first, 2);
+	int ret = dssh_session_set_languages(client, DSSH_CLIENT_TO_SERVER, client_first, 2);
 	if (ret == 0)
-		ret = dssh_session_set_languages(client, DSSH_LANG_SERVER_TO_CLIENT, client_second, 1);
+		ret = dssh_session_set_languages(client, DSSH_SERVER_TO_CLIENT, client_second, 1);
 	if (ret == 0)
-		ret = dssh_session_set_languages(server, DSSH_LANG_CLIENT_TO_SERVER, server_first, 1);
+		ret = dssh_session_set_languages(server, DSSH_CLIENT_TO_SERVER, server_first, 1);
 	if (ret == 0)
-		ret = dssh_session_set_languages(server, DSSH_LANG_SERVER_TO_CLIENT, server_second, 2);
+		ret = dssh_session_set_languages(server, DSSH_SERVER_TO_CLIENT, server_second, 2);
 	return ret;
 }
 
@@ -351,13 +351,13 @@ test_language_handshake_rekey(void)
 		handshake_cleanup(&ctx);
 		return TEST_FAIL;
 	}
-	bool valid = language_value(ctx.client, true, DSSH_LANG_CLIENT_TO_SERVER, "de-DE")
-	    && language_value(ctx.client, true, DSSH_LANG_SERVER_TO_CLIENT, "ja-JP,x-server")
-	    && language_value(ctx.server, true, DSSH_LANG_CLIENT_TO_SERVER, "en-US,fr")
-	    && language_value(ctx.server, true, DSSH_LANG_SERVER_TO_CLIENT, "x-client");
+	bool valid = language_value(ctx.client, true, DSSH_CLIENT_TO_SERVER, "de-DE")
+	    && language_value(ctx.client, true, DSSH_SERVER_TO_CLIENT, "ja-JP,x-server")
+	    && language_value(ctx.server, true, DSSH_CLIENT_TO_SERVER, "en-US,fr")
+	    && language_value(ctx.server, true, DSSH_SERVER_TO_CLIENT, "x-client");
 	const char *replacement[] = {"sv-SE"};
-	valid = valid && dssh_session_set_languages(ctx.client, DSSH_LANG_SERVER_TO_CLIENT, replacement, 1) == 0
-	    && dssh_session_set_languages(ctx.server, DSSH_LANG_CLIENT_TO_SERVER, NULL, 0) == 0;
+	valid = valid && dssh_session_set_languages(ctx.client, DSSH_SERVER_TO_CLIENT, replacement, 1) == 0
+	    && dssh_session_set_languages(ctx.server, DSSH_CLIENT_TO_SERVER, NULL, 0) == 0;
 	struct rekey_thread_arg ca = {&ctx, DSSH_ERROR_INIT};
 	struct rekey_thread_arg sa = {&ctx, DSSH_ERROR_INIT};
 	thrd_t client, server;
@@ -378,10 +378,10 @@ test_language_handshake_rekey(void)
 	if (server_started && thrd_join(server, NULL) != thrd_success)
 		abort();
 	valid = valid && ca.result == 0 && sa.result == 0
-	    && language_value(ctx.client, true, DSSH_LANG_CLIENT_TO_SERVER, "")
-	    && language_value(ctx.client, true, DSSH_LANG_SERVER_TO_CLIENT, "ja-JP,x-server")
-	    && language_value(ctx.server, true, DSSH_LANG_CLIENT_TO_SERVER, "en-US,fr")
-	    && language_value(ctx.server, true, DSSH_LANG_SERVER_TO_CLIENT, "sv-SE");
+	    && language_value(ctx.client, true, DSSH_CLIENT_TO_SERVER, "")
+	    && language_value(ctx.client, true, DSSH_SERVER_TO_CLIENT, "ja-JP,x-server")
+	    && language_value(ctx.server, true, DSSH_CLIENT_TO_SERVER, "en-US,fr")
+	    && language_value(ctx.server, true, DSSH_SERVER_TO_CLIENT, "sv-SE");
 	handshake_cleanup(&ctx);
 	ASSERT_TRUE(valid);
 	return TEST_PASS;
@@ -402,9 +402,9 @@ language_read_fields(void *opaque)
 	while (!atomic_load(&reader->stop)) {
 		char local[80], peer[80];
 		int64_t first = dssh_session_get_languages(reader->sess,
-		    DSSH_LANG_CLIENT_TO_SERVER, local, sizeof(local));
+		    DSSH_CLIENT_TO_SERVER, local, sizeof(local));
 		int64_t second = dssh_session_get_peer_languages(reader->sess,
-		    DSSH_LANG_CLIENT_TO_SERVER, peer, sizeof(peer));
+		    DSSH_CLIENT_TO_SERVER, peer, sizeof(peer));
 		if (first < 0 || second < 0
 		    || (strcmp(local, "en-US,fr") != 0 && strcmp(local, "de-DE") != 0)
 		    || (strcmp(peer, "de-CH,fr") != 0 && strcmp(peer, "es-ES") != 0))
@@ -426,7 +426,7 @@ test_language_concurrent(void)
 	}
 	const char *first[] = {"en-US", "fr"};
 	const char *second[] = {"de-DE"};
-	bool valid = dssh_session_set_languages(sess, DSSH_LANG_CLIENT_TO_SERVER, first, 2) == 0
+	bool valid = dssh_session_set_languages(sess, DSSH_CLIENT_TO_SERVER, first, 2) == 0
 	    && language_peer_offer(sess, "de-CH,fr", "ja-JP") == 0 && kexinit(sess) == 0;
 	struct language_reader reader = {.sess = sess};
 	atomic_init(&reader.ready, false);
@@ -438,7 +438,7 @@ test_language_concurrent(void)
 	valid = valid && started && dssh_test_wait_bool(&reader.ready, true);
 	for (unsigned i = 0; i < 1000 && started && valid; i++) {
 		bool alternate = i % 2 == 0;
-		valid = dssh_session_set_languages(sess, DSSH_LANG_CLIENT_TO_SERVER,
+		valid = dssh_session_set_languages(sess, DSSH_CLIENT_TO_SERVER,
 		    alternate ? first : second, alternate ? 2 : 1) == 0
 		    && language_peer_offer(sess, alternate ? "de-CH,fr" : "es-ES", "ja-JP") == 0
 		    && kexinit(sess) == 0;
@@ -465,11 +465,11 @@ language_release_entries(void *opaque)
 {
 	struct language_release_probe *probe = opaque;
 	const char *names[] = {"en"};
-	probe->valid = dssh_session_set_languages(probe->sess, DSSH_LANG_CLIENT_TO_SERVER,
+	probe->valid = dssh_session_set_languages(probe->sess, DSSH_CLIENT_TO_SERVER,
 	    names, 1) == DSSH_ERROR_INVALID
-	    && dssh_session_get_languages(probe->sess, DSSH_LANG_CLIENT_TO_SERVER,
+	    && dssh_session_get_languages(probe->sess, DSSH_CLIENT_TO_SERVER,
 	        NULL, 0) == DSSH_ERROR_INVALID
-	    && dssh_session_get_peer_languages(probe->sess, DSSH_LANG_CLIENT_TO_SERVER,
+	    && dssh_session_get_peer_languages(probe->sess, DSSH_CLIENT_TO_SERVER,
 	        NULL, 0) == DSSH_ERROR_INVALID;
 }
 
@@ -485,27 +485,27 @@ test_language_entry_failures(void)
 			valid = false;
 			break;
 		}
-		valid = valid && dssh_session_set_languages(sess, DSSH_LANG_CLIENT_TO_SERVER, names, 1) == 0;
+		valid = valid && dssh_session_set_languages(sess, DSSH_CLIENT_TO_SERVER, names, 1) == 0;
 		if (operation == 3) {
 			struct language_release_probe probe = {.sess = sess};
 			struct dssh_result_lease lease = {.release = language_release_entries, .owner = &probe};
 			dssh_result_release(&lease);
 			valid = valid && probe.valid && lease.release == NULL
-			    && language_value(sess, false, DSSH_LANG_CLIENT_TO_SERVER, "en");
+			    && language_value(sess, false, DSSH_CLIENT_TO_SERVER, "en");
 		}
 		else {
 			dssh_test_mtx_reject_once(&sess->mtx);
 			int64_t ret;
 			if (operation == 0)
-				ret = dssh_session_set_languages(sess, DSSH_LANG_CLIENT_TO_SERVER, names, 1);
+				ret = dssh_session_set_languages(sess, DSSH_CLIENT_TO_SERVER, names, 1);
 			else if (operation == 1)
-				ret = dssh_session_get_languages(sess, DSSH_LANG_CLIENT_TO_SERVER, NULL, 0);
+				ret = dssh_session_get_languages(sess, DSSH_CLIENT_TO_SERVER, NULL, 0);
 			else
-				ret = dssh_session_get_peer_languages(sess, DSSH_LANG_CLIENT_TO_SERVER, NULL, 0);
+				ret = dssh_session_get_peer_languages(sess, DSSH_CLIENT_TO_SERVER, NULL, 0);
 			valid = valid && ret == DSSH_ERROR_TERMINATED
 			    && dssh_test_mtx_rejected_unlocks() == 0
 			    && dssh_session_is_terminated(sess)
-			    && language_value(sess, false, DSSH_LANG_CLIENT_TO_SERVER, "en");
+			    && language_value(sess, false, DSSH_CLIENT_TO_SERVER, "en");
 		}
 		dssh_session_cleanup(sess);
 	}

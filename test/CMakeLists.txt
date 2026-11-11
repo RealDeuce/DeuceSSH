@@ -1029,6 +1029,8 @@ foreach(part IN ITEMS grammar bytes bounds setters output)
 	add_test(NAME dssh_transport_identification_${part}
 		COMMAND dssh_test_transport --exact identification/${part})
 endforeach()
+dssh_add_output_test(dssh_transport_query_arguments dssh_test_transport
+	"1 tests: 1 passed, 0 failed, 0 skipped" --exact release/query_arguments)
 dssh_add_output_test(dssh_transport_query_snapshot dssh_test_transport "1 tests: 1 passed, 0 failed, 0 skipped"
 	--exact release/query_snapshot)
 set_tests_properties(dssh_transport_query_snapshot PROPERTIES TIMEOUT 120

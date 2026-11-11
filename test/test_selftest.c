@@ -831,15 +831,15 @@ test_self_handshake_curve25519(void)
 	/* Verify negotiated algorithms */
 	ASSERT_NOT_NULL(dssh_transport_get_kex_name(ctx.client));
 	ASSERT_NOT_NULL(dssh_transport_get_hostkey_name(ctx.client));
-	ASSERT_NOT_NULL(dssh_transport_get_enc_name(ctx.client));
-	ASSERT_NOT_NULL(dssh_transport_get_mac_name(ctx.client));
+	ASSERT_NOT_NULL(dssh_transport_get_enc_name(ctx.client, DSSH_CLIENT_TO_SERVER));
+	ASSERT_NOT_NULL(dssh_transport_get_mac_name(ctx.client, DSSH_CLIENT_TO_SERVER));
 
 	ASSERT_STR_EQ(dssh_transport_get_kex_name(ctx.client), test_kex_algo_name());
 	ASSERT_STR_EQ(dssh_transport_get_kex_name(ctx.server), test_kex_algo_name());
 	ASSERT_STR_EQ(dssh_transport_get_hostkey_name(ctx.client),
 	    test_key_algo_name());
-	ASSERT_STR_EQ(dssh_transport_get_enc_name(ctx.client),
-	    dssh_transport_get_enc_name(ctx.server));
+	ASSERT_STR_EQ(dssh_transport_get_enc_name(ctx.client, DSSH_CLIENT_TO_SERVER),
+	    dssh_transport_get_enc_name(ctx.server, DSSH_CLIENT_TO_SERVER));
 
 	selftest_cleanup(&ctx);
 	return TEST_PASS;

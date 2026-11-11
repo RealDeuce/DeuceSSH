@@ -783,10 +783,10 @@ set_languages_inner(struct dssh_session_s *sess, size_t direction,
 
 DSSH_PUBLIC int
 dssh_session_set_languages(struct dssh_session_s *sess,
-    enum dssh_language_direction direction, const char * const *names, size_t count)
+    enum dssh_direction direction, const char * const *names, size_t count)
 {
-	if (sess == NULL || (direction != DSSH_LANG_CLIENT_TO_SERVER
-	    && direction != DSSH_LANG_SERVER_TO_CLIENT) || session_api_forbidden(sess))
+	if (sess == NULL || (direction != DSSH_CLIENT_TO_SERVER
+	    && direction != DSSH_SERVER_TO_CLIENT) || session_api_forbidden(sess))
 		return DSSH_ERROR_INVALID;
 	size_t index = (size_t)direction;
 	struct dssh_session_scope scope;
@@ -832,11 +832,11 @@ get_languages_inner(struct dssh_session_s *sess, size_t direction,
 }
 
 static int64_t
-get_languages(struct dssh_session_s *sess, enum dssh_language_direction direction,
+get_languages(struct dssh_session_s *sess, enum dssh_direction direction,
     bool peer, char *buf, size_t bufsz)
 {
-	if (sess == NULL || (direction != DSSH_LANG_CLIENT_TO_SERVER
-	    && direction != DSSH_LANG_SERVER_TO_CLIENT) || session_api_forbidden(sess))
+	if (sess == NULL || (direction != DSSH_CLIENT_TO_SERVER
+	    && direction != DSSH_SERVER_TO_CLIENT) || session_api_forbidden(sess))
 		return DSSH_ERROR_INVALID;
 	size_t index = (size_t)direction;
 	struct dssh_session_scope scope;
@@ -849,14 +849,14 @@ get_languages(struct dssh_session_s *sess, enum dssh_language_direction directio
 
 DSSH_PUBLIC int64_t
 dssh_session_get_languages(struct dssh_session_s *sess,
-    enum dssh_language_direction direction, char *buf, size_t bufsz)
+    enum dssh_direction direction, char *buf, size_t bufsz)
 {
 	return get_languages(sess, direction, false, buf, bufsz);
 }
 
 DSSH_PUBLIC int64_t
 dssh_session_get_peer_languages(struct dssh_session_s *sess,
-    enum dssh_language_direction direction, char *buf, size_t bufsz)
+    enum dssh_direction direction, char *buf, size_t bufsz)
 {
 	return get_languages(sess, direction, true, buf, bufsz);
 }

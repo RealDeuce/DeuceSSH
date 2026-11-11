@@ -1053,6 +1053,8 @@ parse_env_data(const uint8_t *data, size_t data_len, const uint8_t **name, size_
 static uint32_t
 queue_window_adjust_locked(struct dssh_channel_s *ch, uint32_t bytes)
 {
+	if (ch->close_sent)
+		return 0;
 	uint32_t outstanding = window_add(ch->local_window, ch->window_adjust_pending);
 
 	outstanding = window_add(outstanding, ch->window_adjust_inflight);
@@ -1241,6 +1243,15 @@ send_peer_channel_terminal(struct dssh_session_s *sess, struct dssh_channel_id *
 		send_cancel(sess);
 		return DSSH_ERROR_TOOLONG;
 	}
+	/* Gather normally drains in send_commit(). Preserve the ordering of
+	 * already queued channel controls before publishing CLOSE. */
+	if (msg[0] == SSH_MSG_CHANNEL_CLOSE && tx_gather_enabled()) {
+		ret = drain_tx_slots(sess);
+		if (ret < 0) {
+			send_cancel(sess);
+			return ret;
+		}
+	}
 	ret = mtx_lock(&sess->channel_mtx);
 	if (ret != thrd_success) {
 		send_cancel(sess);
@@ -1367,24 +1378,66 @@ send_channel_open(struct dssh_session_s *sess, struct dssh_channel_s *ch,
 
 #define SSH_EXTENDED_DATA_STDERR UINT32_C(1)
 
+/* Success leaves BUF locked and the packet engine owned. A positive return
+ * means local CLOSE already owns this channel's send side. */
+static int
+begin_channel_packet(struct dssh_session_s *sess, struct dssh_channel_s *ch,
+    uint8_t type, size_t len, uint8_t **out)
+{
+	size_t capacity;
+	int ret;
+	uint8_t *packet = send_begin(sess, type, &capacity, &ret);
+	if (packet == NULL)
+		return ret;
+	if (len > capacity) {
+		send_cancel(sess);
+		return DSSH_ERROR_TOOLONG;
+	}
+	ret = mtx_lock(&ch->buf_mtx);
+	if (ret != thrd_success) {
+		session_set_terminate_no_wake(sess);
+		send_cancel(sess);
+		session_set_terminate(sess);
+		return DSSH_ERROR_TERMINATED;
+	}
+	if (ch->close_sent) {
+		dssh_mtx_unlock(&ch->buf_mtx);
+		send_cancel(sess);
+		return 1;
+	}
+	*out = packet;
+	return 0;
+}
+
+static int
+send_channel_packet(struct dssh_session_s *sess, struct dssh_channel_s *ch,
+    const uint8_t *msg, size_t len)
+{
+	uint8_t *packet;
+	int ret = begin_channel_packet(sess, ch, msg[0], len, &packet);
+	if (ret != 0)
+		return ret < 0 ? ret : DSSH_ERROR_TERMINATED;
+	dssh_mtx_unlock(&ch->buf_mtx);
+	memcpy(packet, msg, len);
+	return send_commit(sess, len, NULL);
+}
+
 DSSH_TESTABLE int
 send_window_adjust(struct dssh_session_s *sess, struct dssh_channel_s *ch, uint32_t bytes)
 {
-	uint8_t msg[32];
-	size_t  pos = 0;
-	int     ret;
-
-	msg[pos++] = SSH_MSG_CHANNEL_WINDOW_ADJUST;
-	DSSH_PUT_U32(ch->remote_id, msg, &pos);
-	DSSH_PUT_U32(bytes, msg, &pos);
-
-	if (dssh_thrd_check(sess, mtx_lock(&ch->buf_mtx)) != thrd_success)
-		return DSSH_ERROR_TERMINATED;
+	uint8_t *packet;
+	int ret = begin_channel_packet(sess, ch, SSH_MSG_CHANNEL_WINDOW_ADJUST, 9, &packet);
+	if (ret != 0)
+		return ret < 0 ? ret : DSSH_ERROR_TERMINATED;
 	ch->window_adjust_inflight = window_add(ch->window_adjust_inflight, bytes);
-	if (dssh_thrd_check_unlock(sess, dssh_mtx_unlock(&ch->buf_mtx)) != thrd_success)
-		return DSSH_ERROR_TERMINATED;
+	uint32_t remote = ch->remote_id;
+	dssh_mtx_unlock(&ch->buf_mtx);
 
-	ret = send_packet(sess, msg, pos, NULL);
+	size_t pos = 0;
+	packet[pos++] = SSH_MSG_CHANNEL_WINDOW_ADJUST;
+	DSSH_PUT_U32(remote, packet, &pos);
+	DSSH_PUT_U32(bytes, packet, &pos);
+	ret = send_commit(sess, pos, NULL);
 
 	if (dssh_thrd_check(sess, mtx_lock(&ch->buf_mtx)) != thrd_success)
 		return DSSH_ERROR_TERMINATED;
@@ -1425,7 +1478,7 @@ send_empty_channel_data_kick(struct dssh_session_s *sess, struct dssh_channel_s 
 	msg[pos++] = SSH_MSG_CHANNEL_DATA;
 	DSSH_PUT_U32(ch->remote_id, msg, &pos);
 	DSSH_PUT_U32(0, msg, &pos);
-	return send_packet(sess, msg, pos, NULL);
+	return send_channel_packet(sess, ch, msg, pos);
 }
 
 static int
@@ -1441,7 +1494,7 @@ dssh_conn_send_exit_status(struct dssh_session_s *sess, struct dssh_channel_s *c
 	pos += DSSH_STRLEN(str_exit_status);
 	msg[pos++] = 0; /* want_reply = false */
 	DSSH_PUT_U32(exit_code, msg, &pos);
-	return send_packet(sess, msg, pos, NULL);
+	return send_channel_packet(sess, ch, msg, pos);
 }
 
 DSSH_TESTABLE int
@@ -1449,22 +1502,28 @@ send_eof(struct dssh_session_s *sess, struct dssh_channel_s *ch)
 {
 	if (dssh_thrd_check(sess, mtx_lock(&ch->buf_mtx)) != thrd_success)
 		return DSSH_ERROR_TERMINATED;
+	bool done = ch->eof_sent || ch->close_sent;
+	dssh_mtx_unlock(&ch->buf_mtx);
+	if (done)
+		return 0;
+
+	uint8_t *packet;
+	int ret = begin_channel_packet(sess, ch, SSH_MSG_CHANNEL_EOF, 5, &packet);
+	if (ret != 0)
+		return ret < 0 ? ret : 0;
 	if (ch->eof_sent) {
-		if (dssh_thrd_check_unlock(sess, dssh_mtx_unlock(&ch->buf_mtx)) != thrd_success)
-			return DSSH_ERROR_TERMINATED;
+		dssh_mtx_unlock(&ch->buf_mtx);
+		send_cancel(sess);
 		return 0;
 	}
 	ch->eof_sent = true;
-	if (dssh_thrd_check_unlock(sess, dssh_mtx_unlock(&ch->buf_mtx)) != thrd_success)
-		return DSSH_ERROR_TERMINATED;
+	uint32_t remote = ch->remote_id;
+	dssh_mtx_unlock(&ch->buf_mtx);
 
-	uint8_t msg[8];
-	size_t  pos = 0;
-
-	msg[pos++] = SSH_MSG_CHANNEL_EOF;
-	DSSH_PUT_U32(ch->remote_id, msg, &pos);
-
-	return send_packet(sess, msg, pos, NULL);
+	size_t pos = 0;
+	packet[pos++] = SSH_MSG_CHANNEL_EOF;
+	DSSH_PUT_U32(remote, packet, &pos);
+	return send_commit(sess, pos, NULL);
 }
 
 DSSH_TESTABLE int
@@ -2252,6 +2311,8 @@ event_request_valid(const uint8_t *type, uint32_t type_len,
 static int
 channel_request_failure(struct dssh_session_s *sess, struct dssh_channel_s *ch)
 {
+	if (ch->close_sent)
+		return 0;
 	uint8_t fail[8];
 	size_t  fp = 0;
 
@@ -2259,7 +2320,7 @@ channel_request_failure(struct dssh_session_s *sess, struct dssh_channel_s *ch)
 	DSSH_PUT_U32(ch->remote_id, fail, &fp);
 	if (dispatch_unlock_channel(sess, ch) < 0)
 		return DSSH_ERROR_TERMINATED;
-	int send_ret = send_to_slot(sess, &ch->chan_fail_slot, fail, fp);
+	int send_ret = send_channel_failure(sess, ch, fail, fp);
 
 	if (send_ret < 0) {
 		release_channel_unlocked(sess, ch);
@@ -3515,23 +3576,11 @@ send_channel_request(struct dssh_session_s *sess, struct dssh_channel_s *ch, con
 	    || extra_len > SIZE_MAX - CHAN_REQUEST_FIXED - rtlen)
 		return DSSH_ERROR_INVALID;
 	size_t total = CHAN_REQUEST_FIXED + rtlen + extra_len;
-	size_t max;
-	int err;
-	uint8_t *msg = send_begin(sess, SSH_MSG_CHANNEL_REQUEST, &max, &err);
-	if (msg == NULL)
-		return err;
-	if (total > max) {
-		send_cancel(sess);
-		return DSSH_ERROR_TOOLONG;
-	}
-	int ret = mtx_lock(&ch->buf_mtx);
-	if (ret != thrd_success) {
-		session_set_terminate_no_wake(sess);
-		send_cancel(sess);
-		session_set_terminate(sess);
-		return DSSH_ERROR_TERMINATED;
-	}
-	if (!ch->open || ch->close_received || ch->close_sent || ch->request_pending) {
+	uint8_t *msg;
+	int ret = begin_channel_packet(sess, ch, SSH_MSG_CHANNEL_REQUEST, total, &msg);
+	if (ret != 0)
+		return ret < 0 ? ret : DSSH_ERROR_TERMINATED;
+	if (!ch->open || ch->close_received || ch->request_pending) {
 		int result = ch->request_pending ? DSSH_ERROR_INVALID : DSSH_ERROR_TERMINATED;
 		if (channel_unlock_lifecycle(sess, ch) < 0)
 			result = DSSH_ERROR_TERMINATED;
@@ -3738,7 +3787,7 @@ setup_reply(struct dssh_session_s *sess, struct dssh_channel_s *ch, bool success
 
 	msg[pos++] = success ? SSH_MSG_CHANNEL_SUCCESS : SSH_MSG_CHANNEL_FAILURE;
 	DSSH_PUT_U32(ch->remote_id, msg, &pos);
-	return send_packet(sess, msg, pos, NULL);
+	return send_channel_packet(sess, ch, msg, pos);
 }
 
 static int
@@ -4603,15 +4652,11 @@ dssh_chan_send_signal(struct dssh_channel_s *ch, const char *signal_name)
 	size_t                 fixed = CHAN_REQUEST_FIXED + rtlen + 4;
 	if (slen > UINT32_MAX || slen > SIZE_MAX - fixed)
 		return DSSH_ERROR_INVALID;
-	size_t   max;
-	int      err;
-	uint8_t *msg = send_begin(sess, SSH_MSG_CHANNEL_REQUEST, &max, &err);
-	if (msg == NULL)
-		return err;
-	if (fixed + slen > max) {
-		send_cancel(sess);
-		return DSSH_ERROR_TOOLONG;
-	}
+	uint8_t *msg;
+	int ret = begin_channel_packet(sess, ch, SSH_MSG_CHANNEL_REQUEST, fixed + slen, &msg);
+	if (ret != 0)
+		return ret < 0 ? ret : DSSH_ERROR_TERMINATED;
+	dssh_mtx_unlock(&ch->buf_mtx);
 	size_t pos = 0;
 	msg[pos++] = SSH_MSG_CHANNEL_REQUEST;
 	DSSH_PUT_U32(ch->remote_id, msg, &pos);
@@ -4641,22 +4686,23 @@ dssh_chan_send_window_change(struct dssh_channel_s *ch, uint32_t cols, uint32_t 
 	DSSH_PUT_U32(rows, extra, &ep);
 	DSSH_PUT_U32(wpx, extra, &ep);
 	DSSH_PUT_U32(hpx, extra, &ep);
-	size_t   rtlen = DSSH_STRLEN(str_window_change);
-	size_t   max;
-	int      err;
-	uint8_t *msg = send_begin(sess, SSH_MSG_CHANNEL_REQUEST, &max, &err);
-	if (msg == NULL)
-		return err;
+	size_t rtlen = sizeof(str_window_change) - 1;
+	size_t total = CHAN_REQUEST_FIXED + rtlen + sizeof(extra);
+	uint8_t *msg;
+	int ret = begin_channel_packet(sess, ch, SSH_MSG_CHANNEL_REQUEST, total, &msg);
+	if (ret != 0)
+		return ret < 0 ? ret : DSSH_ERROR_TERMINATED;
+	uint32_t remote = ch->remote_id;
+	dssh_mtx_unlock(&ch->buf_mtx);
 	size_t pos = 0;
 	msg[pos++] = SSH_MSG_CHANNEL_REQUEST;
-	DSSH_PUT_U32(ch->remote_id, msg, &pos);
-	DSSH_PUT_U32((uint32_t)rtlen, msg, &pos);
+	DSSH_PUT_U32(remote, msg, &pos);
+	DSSH_PUT_U32(DSSH_STRLEN(str_window_change), msg, &pos);
 	memcpy(&msg[pos], str_window_change, rtlen);
 	pos += rtlen;
 	msg[pos++] = 0;
 	memcpy(&msg[pos], extra, ep);
-	pos += ep;
-	return send_commit(sess, pos, NULL);
+	return send_commit(sess, total, NULL);
 }
 
 DSSH_PUBLIC int
@@ -4672,22 +4718,23 @@ dssh_chan_send_break(struct dssh_channel_s *ch, uint32_t length)
 	uint8_t                extra[4];
 	size_t                 ep = 0;
 	DSSH_PUT_U32(length, extra, &ep);
-	size_t   rtlen = 5;
-	size_t   max;
-	int      err;
-	uint8_t *msg = send_begin(sess, SSH_MSG_CHANNEL_REQUEST, &max, &err);
-	if (msg == NULL)
-		return err;
+	size_t rtlen = sizeof("break") - 1;
+	size_t total = CHAN_REQUEST_FIXED + rtlen + sizeof(extra);
+	uint8_t *msg;
+	int ret = begin_channel_packet(sess, ch, SSH_MSG_CHANNEL_REQUEST, total, &msg);
+	if (ret != 0)
+		return ret < 0 ? ret : DSSH_ERROR_TERMINATED;
+	uint32_t remote = ch->remote_id;
+	dssh_mtx_unlock(&ch->buf_mtx);
 	size_t pos = 0;
 	msg[pos++] = SSH_MSG_CHANNEL_REQUEST;
-	DSSH_PUT_U32(ch->remote_id, msg, &pos);
-	DSSH_PUT_U32((uint32_t)rtlen, msg, &pos);
+	DSSH_PUT_U32(remote, msg, &pos);
+	DSSH_PUT_U32(DSSH_STRLEN("break"), msg, &pos);
 	memcpy(&msg[pos], "break", rtlen);
 	pos += rtlen;
 	msg[pos++] = 0;
 	memcpy(&msg[pos], extra, ep);
-	pos += ep;
-	return send_commit(sess, pos, NULL);
+	return send_commit(sess, total, NULL);
 }
 
 DSSH_PUBLIC enum dssh_chan_type

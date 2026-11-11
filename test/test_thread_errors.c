@@ -784,7 +784,7 @@ unlock_fatal_child(const char *name, const char *mode)
 		}
 		dssh_test_unlock_fail_after(&ch.buf_mtx, wire ? 1U : 0U, release_real);
 		bool progress = false;
-		int status = drain_one_wa_slot(sess, &ch, &progress);
+		int status = drain_one_wa_slot(sess, &ch, &progress, false);
 		_Exit(status == 0 ? 4 : 5);
 	}
 	mtx_t *target = strcmp(name, "event") == 0 ? &ch.cb_mtx : &ch.buf_mtx;

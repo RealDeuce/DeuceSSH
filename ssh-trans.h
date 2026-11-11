@@ -275,6 +275,8 @@ DSSH_PRIVATE int      send_commit_sensitive(struct dssh_session_s *sess, size_t 
 DSSH_PRIVATE void     send_cancel(struct dssh_session_s *sess);
 DSSH_PRIVATE int      send_to_slot(struct dssh_session_s *sess, struct dssh_tx_slot *slot, const uint8_t *payload,
 	 size_t payload_len);
+DSSH_PRIVATE int      send_channel_failure(struct dssh_session_s *sess, struct dssh_channel_s *ch,
+	const uint8_t *payload, size_t payload_len);
 DSSH_PRIVATE int      schedule_wa_slot(struct dssh_session_s *sess);
 DSSH_PRIVATE int      tx_acquire(struct dssh_session_s *sess, uint8_t msg_type);
 DSSH_PRIVATE bool     tx_owner_is_current(struct dssh_session_s *sess);

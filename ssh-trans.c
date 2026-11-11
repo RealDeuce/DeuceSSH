@@ -1385,11 +1385,11 @@ tx_drain_refused(struct dssh_session_s *sess, int result)
 /* Caller owns the packet engine. Set progress only after retiring this entry;
  * a recoverable refusal preserves its bytes, length and ready publication. */
 static int
-drain_one_slot(struct dssh_session_s *sess, struct dssh_tx_slot *slot, bool *progress)
+drain_one_slot(struct dssh_session_s *sess, struct dssh_tx_slot *slot, bool *progress, bool discard)
 {
 	if (!atomic_load(&slot->ready))
 		return 0;
-	int ret = tx_finalize(sess, slot->buf, slot->payload_len);
+	int ret = discard ? 0 : tx_finalize(sess, slot->buf, slot->payload_len);
 	if (tx_drain_refused(sess, ret))
 		return ret;
 	atomic_store(&slot->ready, false);
@@ -1401,7 +1401,7 @@ drain_one_slot(struct dssh_session_s *sess, struct dssh_tx_slot *slot, bool *pro
  * pre-wire refusal, move that grant back under BUF without replacing new work.
  * The packet-engine owner exclusively uses wa_slot.buf; no mutex spans I/O. */
 DSSH_TESTABLE int
-drain_one_wa_slot(struct dssh_session_s *sess, struct dssh_channel_s *ch, bool *progress)
+drain_one_wa_slot(struct dssh_session_s *sess, struct dssh_channel_s *ch, bool *progress, bool discard)
 {
 	int lr = mtx_lock(&ch->buf_mtx);
 	if (lr != thrd_success)
@@ -1410,7 +1410,7 @@ drain_one_wa_slot(struct dssh_session_s *sess, struct dssh_channel_s *ch, bool *
 		dssh_mtx_unlock(&ch->buf_mtx);
 		return 0;
 	}
-	uint32_t bytes = ch->window_adjust_pending;
+	uint32_t bytes = discard ? 0 : ch->window_adjust_pending;
 	uint32_t remote_id = ch->remote_id;
 	ch->window_adjust_pending = 0;
 	atomic_store(&ch->wa_slot.ready, false);
@@ -1469,13 +1469,14 @@ drain_tx_slots(struct dssh_session_s *sess)
 	if (atomic_load_explicit(&sess->trans.rekey_in_progress, memory_order_acquire))
 		return 0;
 	bool progress = false;
-	int result = drain_one_slot(sess, &sess->trans.global_reply_slot, &progress);
+	int result = drain_one_slot(sess, &sess->trans.global_reply_slot, &progress, false);
 	if (result == 0)
-		result = drain_one_slot(sess, &sess->trans.open_fail_slot, &progress);
+		result = drain_one_slot(sess, &sess->trans.open_fail_slot, &progress, false);
 
 	if (result == 0 && sess->conn_initialized) {
 		for (;;) {
 			struct dssh_channel_s *ch = NULL;
+			bool discard = false;
 			int lr = mtx_lock(&sess->channel_mtx);
 			if (lr != thrd_success) {
 				result = DSSH_ERROR_TERMINATED;
@@ -1490,6 +1491,7 @@ drain_tx_slots(struct dssh_session_s *sess)
 					    || atomic_load(&candidate->chan_fail_slot.ready)) {
 						atomic_fetch_add_explicit(&candidate->tx_refs, 1, memory_order_acq_rel);
 						ch = candidate;
+						discard = candidate->protocol_id->close_ordered;
 						sess->trans.drain_next_ch = idx == n - 1 ? 0 : idx + 1;
 						break;
 					}
@@ -1499,9 +1501,9 @@ drain_tx_slots(struct dssh_session_s *sess)
 			dssh_mtx_unlock(&sess->channel_mtx);
 			if (ch == NULL)
 				break;
-			result = drain_one_wa_slot(sess, ch, &progress);
+			result = drain_one_wa_slot(sess, ch, &progress, discard);
 			if (result == 0)
-				result = drain_one_slot(sess, &ch->chan_fail_slot, &progress);
+				result = drain_one_slot(sess, &ch->chan_fail_slot, &progress, discard);
 			atomic_fetch_sub_explicit(&ch->tx_refs, 1, memory_order_acq_rel);
 			if (result < 0)
 				break;
@@ -1810,8 +1812,9 @@ tx_gather_with_packet(struct dssh_session_s *sess, uint8_t *buf, size_t payload_
  * thread stops reading packets until the slot is drained by the next
  * send_packet() caller.
  */
-DSSH_PRIVATE int
-send_to_slot(struct dssh_session_s *sess, struct dssh_tx_slot *slot, const uint8_t *payload, size_t payload_len)
+static int
+send_to_slot_inner(struct dssh_session_s *sess, struct dssh_tx_slot *slot,
+    const uint8_t *payload, size_t payload_len, struct dssh_channel_s *channel)
 {
 	if (payload == NULL || payload_len == 0 || payload_len > UINT8_MAX
 	    || !tx_slot_context_allowed(sess))
@@ -1832,6 +1835,19 @@ send_to_slot(struct dssh_session_s *sess, struct dssh_tx_slot *slot, const uint8
 		if (sess->terminate) {
 			tx_unlock_with_slots(sess);
 			return DSSH_ERROR_TERMINATED;
+		}
+		/* A channel failure prepared before CLOSE can acquire the engine
+		 * after it. The queued path checks the same state in the drainer. */
+		if (channel != NULL) {
+			int lr = mtx_lock(&sess->channel_mtx);
+			if (lr != thrd_success) {
+				session_set_terminate_no_wake(sess);
+				return tx_unlock_with_result(sess, DSSH_ERROR_TERMINATED);
+			}
+			bool closed = channel->protocol_id->close_ordered;
+			dssh_mtx_unlock(&sess->channel_mtx);
+			if (closed)
+				return tx_unlock_with_result(sess, 0);
 		}
 		int ret = send_packet_inner(sess, payload, payload_len, NULL);
 
@@ -1892,6 +1908,20 @@ send_to_slot(struct dssh_session_s *sess, struct dssh_tx_slot *slot, const uint8
 		return DSSH_ERROR_TERMINATED;
 	}
 	return 0;
+}
+
+DSSH_PRIVATE int
+send_to_slot(struct dssh_session_s *sess, struct dssh_tx_slot *slot, const uint8_t *payload,
+    size_t payload_len)
+{
+	return send_to_slot_inner(sess, slot, payload, payload_len, NULL);
+}
+
+DSSH_PRIVATE int
+send_channel_failure(struct dssh_session_s *sess, struct dssh_channel_s *ch,
+    const uint8_t *payload, size_t payload_len)
+{
+	return send_to_slot_inner(sess, &ch->chan_fail_slot, payload, payload_len, ch);
 }
 
 /*

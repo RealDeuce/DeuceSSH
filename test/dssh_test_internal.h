@@ -22,7 +22,7 @@ int demux_thread_func(void *arg);
 void tx_wake_owners(dssh_session sess);
 int dssh_test_unlock_boundary(mtx_t *mutex);
 int drain_log_forwards(dssh_session sess);
-int drain_one_wa_slot(dssh_session sess, struct dssh_channel_s *ch, bool *progress);
+int drain_one_wa_slot(dssh_session sess, struct dssh_channel_s *ch, bool *progress, bool discard);
 
 /*
  * Reset the global algorithm registry and configuration.

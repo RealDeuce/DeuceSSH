@@ -224,6 +224,7 @@ buffer_is_zero(const uint8_t *buf, size_t len)
 
 struct channel_slot_fixture {
 	struct dssh_channel_s  channel;
+	struct dssh_channel_id protocol_id;
 	struct dssh_channel_s *channels[1];
 };
 
@@ -276,11 +277,15 @@ channel_slot_fixture_setup(dssh_session sess, struct channel_slot_fixture *fixtu
 		return -1;
 	}
 
+	fixture->protocol_id = (struct dssh_channel_id){.refs = 1,
+	    .phase = DSSH_CHANNEL_ID_CONFIRMED, .local_assigned = true};
 	fixture->channel.sess = sess;
+	fixture->channel.protocol_id = &fixture->protocol_id;
 	atomic_init(&fixture->channel.tx_refs, 0);
 	atomic_init(&fixture->channel.terminate_woken, false);
 	fixture->channels[0]  = &fixture->channel;
 	sess->channels         = fixture->channels;
+	sess->channel_ids      = &fixture->protocol_id;
 	sess->channel_count    = 1;
 	sess->channel_capacity = 1;
 	atomic_store(&sess->conn_initialized, true);
@@ -292,6 +297,7 @@ channel_slot_fixture_cleanup(dssh_session sess, struct channel_slot_fixture *fix
 {
 	atomic_store(&sess->conn_initialized, false);
 	sess->channels         = NULL;
+	sess->channel_ids      = NULL;
 	sess->channel_count    = 0;
 	sess->channel_capacity = 0;
 

@@ -30,10 +30,10 @@ if(DEUCESSH_CRYPTO_BACKEND STREQUAL "")
 	# Auto-detect: try Botan first, then OpenSSL
 	find_package(PkgConfig QUIET)
 	if(PkgConfig_FOUND)
-		pkg_check_modules(BOTAN3 QUIET IMPORTED_TARGET
+		pkg_check_modules(DEUCESSH_BOTAN QUIET IMPORTED_TARGET
 			"botan-3>=${DEUCESSH_BOTAN_MIN_VERSION}")
 	endif()
-	if(BOTAN3_FOUND)
+	if(DEUCESSH_BOTAN_FOUND)
 		set(DEUCESSH_CRYPTO_BACKEND "Botan")
 		message(STATUS "Auto-detected crypto backend: Botan")
 	else()
@@ -54,7 +54,7 @@ elseif(DEUCESSH_CRYPTO_BACKEND STREQUAL "Botan")
 	# at configure time).  BOTAN3_VENDORED_TARGET is the cache hint.
 	if(NOT BOTAN3_VENDORED_TARGET)
 		find_package(PkgConfig REQUIRED)
-		pkg_check_modules(BOTAN3 REQUIRED IMPORTED_TARGET
+		pkg_check_modules(DEUCESSH_BOTAN REQUIRED IMPORTED_TARGET
 			"botan-3>=${DEUCESSH_BOTAN_MIN_VERSION}")
 	endif()
 elseif(DEUCESSH_CRYPTO_BACKEND STREQUAL "OpenSSL")
@@ -68,17 +68,21 @@ endif()
 if(DEUCESSH_CRYPTO_BACKEND STREQUAL "Botan")
 	if(BOTAN3_VENDORED_TARGET)
 		set(DSSH_CRYPTO_LIB_PRIVATE ${BOTAN3_VENDORED_TARGET})
-		set(DSSH_CRYPTO_LIB_INTERFACE "")
+		set(DSSH_CRYPTO_LIB_INTERFACE
+			$<BUILD_INTERFACE:${BOTAN3_VENDORED_TARGET}>
+			$<INSTALL_INTERFACE:PkgConfig::DEUCESSH_BOTAN_BINARY>)
 		get_target_property(DSSH_CRYPTO_INCLUDE
 		    ${BOTAN3_VENDORED_TARGET} INTERFACE_INCLUDE_DIRECTORIES)
 	else()
-		set(DSSH_CRYPTO_LIB_PRIVATE PkgConfig::BOTAN3)
-		set(DSSH_CRYPTO_LIB_INTERFACE PkgConfig::BOTAN3)
-		set(DSSH_CRYPTO_INCLUDE ${BOTAN3_INCLUDE_DIRS})
+		set(DSSH_CRYPTO_LIB_PRIVATE PkgConfig::DEUCESSH_BOTAN)
+		set(DSSH_CRYPTO_LIB_INTERFACE
+			$<BUILD_INTERFACE:PkgConfig::DEUCESSH_BOTAN>
+			$<INSTALL_INTERFACE:PkgConfig::DEUCESSH_BOTAN_BINARY>)
+		set(DSSH_CRYPTO_INCLUDE ${DEUCESSH_BOTAN_INCLUDE_DIRS})
 	endif()
 	set(DSSH_CRYPTO_IMPL crypto/botan.cpp)
-	set(DSSH_CONFIG_FIND_DEPENDENCY "find_dependency(PkgConfig)\npkg_check_modules(BOTAN3 REQUIRED IMPORTED_TARGET \"botan-3>=${DEUCESSH_BOTAN_MIN_VERSION}\")")
-	set(DSSH_PC_REQUIRES_PRIVATE "botan-3 >= ${DEUCESSH_BOTAN_MIN_VERSION}")
+	set(DSSH_CONFIG_FIND_DEPENDENCY "find_dependency(PkgConfig)\npkg_check_modules(DEUCESSH_BOTAN_BINARY REQUIRED IMPORTED_TARGET \"botan-3=DSSH_BOTAN_BINARY_VERSION\")")
+	set(DSSH_PC_REQUIRES_PRIVATE "botan-3 = DSSH_BOTAN_BINARY_VERSION")
 elseif(DEUCESSH_CRYPTO_BACKEND STREQUAL "OpenSSL")
 	set(DSSH_CRYPTO_LIB_PRIVATE OpenSSL::Crypto)
 	set(DSSH_CRYPTO_LIB_INTERFACE OpenSSL::Crypto)
@@ -551,6 +555,10 @@ endif()
 
 include(CMakePackageConfigHelpers)
 
+if(DEUCESSH_CRYPTO_BACKEND STREQUAL "Botan")
+	install(CODE "include(\"${CMAKE_CURRENT_BINARY_DIR}/botan-package/check-\${CMAKE_INSTALL_CONFIG_NAME}.cmake\")")
+endif()
+
 install(TARGETS ${DEUCESSH_INSTALL_TARGETS}
 	EXPORT deucesshTargets
 	ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
@@ -570,8 +578,12 @@ write_basic_package_version_file(
 	VERSION ${PROJECT_VERSION}
 	COMPATIBILITY SameMajorVersion)
 
+set(DSSH_PACKAGE_TEMPLATE_DIR "${CMAKE_CURRENT_BINARY_DIR}")
+if(DEUCESSH_CRYPTO_BACKEND STREQUAL "Botan")
+	set(DSSH_PACKAGE_TEMPLATE_DIR "${CMAKE_CURRENT_BINARY_DIR}/botan-package/base")
+endif()
 configure_file(deucesshConfig.cmake.in
-	${CMAKE_CURRENT_BINARY_DIR}/deucesshConfig.cmake @ONLY)
+	${DSSH_PACKAGE_TEMPLATE_DIR}/deucesshConfig.cmake @ONLY)
 
 # Derive the pkg-config prefix from the installed .pc file so packages remain
 # usable after `cmake --install --prefix ...` and when an MSYS/MinGW package is
@@ -615,18 +627,28 @@ else()
 endif()
 
 configure_file(deucessh.pc.in
-	${CMAKE_CURRENT_BINARY_DIR}/deucessh.pc @ONLY)
+	${DSSH_PACKAGE_TEMPLATE_DIR}/deucessh.pc @ONLY)
 
-set(DEUCESSH_PC_FILES ${CMAKE_CURRENT_BINARY_DIR}/deucessh.pc)
 if(DEUCESSH_BUILD_STATIC)
 	configure_file(deucessh-static.pc.in
-		${CMAKE_CURRENT_BINARY_DIR}/deucessh-static.pc @ONLY)
+		${DSSH_PACKAGE_TEMPLATE_DIR}/deucessh-static.pc @ONLY)
+endif()
+
+if(DEUCESSH_CRYPTO_BACKEND STREQUAL "Botan")
+	include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/DeuceSSHBotanPackage.cmake")
+	dssh_configure_botan_package()
+else()
+	set(DSSH_PACKAGE_INSTALL_DIR "${CMAKE_CURRENT_BINARY_DIR}")
+endif()
+
+set(DEUCESSH_PC_FILES ${DSSH_PACKAGE_INSTALL_DIR}/deucessh.pc)
+if(DEUCESSH_BUILD_STATIC)
 	list(APPEND DEUCESSH_PC_FILES
-		${CMAKE_CURRENT_BINARY_DIR}/deucessh-static.pc)
+		${DSSH_PACKAGE_INSTALL_DIR}/deucessh-static.pc)
 endif()
 
 install(FILES
-	${CMAKE_CURRENT_BINARY_DIR}/deucesshConfig.cmake
+	${DSSH_PACKAGE_INSTALL_DIR}/deucesshConfig.cmake
 	${CMAKE_CURRENT_BINARY_DIR}/deucesshConfigVersion.cmake
 	DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/deucessh)
 

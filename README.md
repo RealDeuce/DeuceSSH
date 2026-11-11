@@ -27,6 +27,10 @@ No proprietary extensions (no `@` algorithm names).
   (libcrypto only — no libssl)
 - **C11 threads** (`<threads.h>`, `<stdatomic.h>`) — used internally only, not exposed in public headers
 
+Botan-backed binary packages require the Botan version used to compile them.
+The installed CMake and pkg-config metadata record that version. Rebuild
+DeuceSSH when changing Botan versions; the source-build minimum remains 3.13.0.
+
 ## Building
 
 CMake selects C17 when supported. On macOS x86 only, a compiler without

@@ -91,13 +91,14 @@ struct dssh_event_queue {
 };
 
 /* Incoming channel open queue (for dssh_chan_accept).
- * Fixed-capacity ring buffer without allocation.  The demux rejects new
- * opens at capacity and continues dispatching existing channels. */
+ * Fixed-capacity ring buffer. Each admitted open owns a protocol record.
+ * The demux rejects new opens at capacity and continues dispatching channels. */
 #define DSSH_ACCEPT_QUEUE_CAP 8
 /* Stop admitting channels while this many detached IDs await retirement. */
 #define DSSH_RETIRED_CHANNEL_ID_CAP 1024
 
 struct dssh_incoming_open {
+	struct dssh_channel_id *protocol_id;
 	size_t   channel_type_len;
 	uint32_t peer_channel;
 	uint32_t peer_window;
@@ -415,10 +416,12 @@ struct dssh_channel_s {
 };
 
 /* Private protocol ownership outlives an application channel when a peer
- * response is still outstanding. The local number is immutable while
- * referenced. All other fields are protected by channel_mtx. */
+ * response is still outstanding. The local number is immutable once
+ * assigned. All other fields are protected by channel_mtx. */
 enum dssh_channel_id_phase {
 	DSSH_CHANNEL_ID_RESERVED,
+	DSSH_CHANNEL_ID_QUEUED,
+	DSSH_CHANNEL_ID_ACCEPTING,
 	DSSH_CHANNEL_ID_OPENING,
 	DSSH_CHANNEL_ID_CONFIRMED,
 	DSSH_CHANNEL_ID_FAILED
@@ -430,8 +433,10 @@ struct dssh_channel_id {
 	uint32_t local;
 	uint32_t remote;
 	enum dssh_channel_id_phase phase;
+	bool local_assigned;
 	bool retired;
 	bool close_started;
+	bool close_ordered;
 	bool close_sent;
 	bool close_received;
 };

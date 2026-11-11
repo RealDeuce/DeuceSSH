@@ -1152,7 +1152,7 @@ foreach(part IN ITEMS lifetime late_reply backpressure)
 	set_tests_properties(dssh_conn_channel_id_${part} PROPERTIES TIMEOUT 120
 		ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys)
 endforeach()
-foreach(part IN ITEMS queued popped confirmed late_confirmation)
+foreach(part IN ITEMS queued popped confirmed late_confirmation concurrent_accept ordered_terminal)
 	dssh_add_output_test(dssh_conn_peer_id_${part} dssh_test_conn
 		"1 tests: 1 passed, 0 failed, 0 skipped" --exact release/peer_id_${part})
 	set_tests_properties(dssh_conn_peer_id_${part} PROPERTIES TIMEOUT 120

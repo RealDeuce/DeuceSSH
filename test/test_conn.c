@@ -8348,6 +8348,8 @@ static struct dssh_test_entry tests[] = {
 	{ "release/peer_id_popped", test_peer_id_popped },
 	{ "release/peer_id_confirmed", test_peer_id_confirmed },
 	{ "release/peer_id_late_confirmation", test_peer_id_late_confirmation },
+	{ "release/peer_id_concurrent_accept", test_peer_id_concurrent_accept },
+	{ "release/peer_id_ordered_terminal", test_peer_id_ordered_terminal },
 	{ "release/channel_worker_ownership", test_channel_worker_ownership },
 	{ "release/conn_setup_ownership", test_conn_setup_ownership },
 	{ "release/conn_no_start_ownership", test_conn_no_start_ownership },

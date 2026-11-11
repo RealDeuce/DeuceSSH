@@ -1994,7 +1994,8 @@ send_begin(struct dssh_session_s *sess, uint8_t msg_type, size_t *max_len, int *
  * sensitive is true, scrub the payload before invoking a termination
  * callback or releasing packet-engine ownership. */
 static int
-send_commit_inner(struct dssh_session_s *sess, size_t payload_len, uint32_t *seq_out, bool sensitive)
+send_commit_inner(struct dssh_session_s *sess, size_t payload_len, uint32_t *seq_out,
+    bool sensitive, bool required)
 {
 	if (!tx_owner_is_current(sess))
 		return DSSH_ERROR_INVALID;
@@ -2023,7 +2024,7 @@ done:
 
 		dssh_cleanse(&sess->trans.tx_packet[9], cleanse_len);
 	}
-	if ((ret < 0) && (ret != DSSH_ERROR_TOOLONG) && (ret != DSSH_ERROR_REKEY_NEEDED))
+	if (ret < 0 && (required || (ret != DSSH_ERROR_TOOLONG && ret != DSSH_ERROR_REKEY_NEEDED)))
 		session_set_terminate(sess);
 	return tx_unlock_with_result(sess, ret);
 }
@@ -2035,7 +2036,15 @@ done:
 DSSH_PRIVATE int
 send_commit(struct dssh_session_s *sess, size_t payload_len, uint32_t *seq_out)
 {
-	return send_commit_inner(sess, payload_len, seq_out, false);
+	return send_commit_inner(sess, payload_len, seq_out, false, false);
+}
+
+/* A protocol ownership transition already orders this packet ahead of later
+ * traffic. Terminate on pre-wire refusal before relinquishing the engine. */
+DSSH_PRIVATE int
+send_commit_required(struct dssh_session_s *sess, size_t payload_len)
+{
+	return send_commit_inner(sess, payload_len, NULL, false, true);
 }
 
 /*
@@ -2045,7 +2054,7 @@ send_commit(struct dssh_session_s *sess, size_t payload_len, uint32_t *seq_out)
 DSSH_PRIVATE int
 send_commit_sensitive(struct dssh_session_s *sess, size_t payload_len, uint32_t *seq_out)
 {
-	return send_commit_inner(sess, payload_len, seq_out, true);
+	return send_commit_inner(sess, payload_len, seq_out, true, false);
 }
 
 /*

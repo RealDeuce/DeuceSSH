@@ -3,6 +3,7 @@
 struct wake_fixture {
 	dssh_session sess;
 	struct dssh_channel_s channel;
+	struct dssh_channel_id protocol_id;
 	struct dssh_channel_s *entries[1];
 	struct dssh_tx_slot slot;
 	struct dssh_incoming_open incoming;
@@ -63,6 +64,7 @@ wake_finish(struct wake_fixture *fixture)
 	if (fixture->owner)
 		tx_unlock_with_slots(fixture->sess);
 	fixture->sess->channels = NULL;
+	fixture->sess->channel_ids = NULL;
 	fixture->sess->channel_count = 0;
 	fixture->sess->channel_capacity = 0;
 	atomic_store(&fixture->sess->conn_initialized, false);
@@ -107,7 +109,10 @@ wake_init(struct wake_fixture *fixture, unsigned kind)
 	if (cnd_init(&fixture->sess->accept_cnd) != thrd_success)
 		return false;
 	fixture->initialized = 3;
+	fixture->protocol_id = (struct dssh_channel_id){.refs = 1,
+	    .phase = DSSH_CHANNEL_ID_CONFIRMED, .local_assigned = true};
 	fixture->channel.sess = fixture->sess;
+	fixture->channel.protocol_id = &fixture->protocol_id;
 	fixture->channel.open = true;
 	fixture->channel.chan_type = DSSH_CHAN_SESSION;
 	fixture->channel.io_model = DSSH_IO_STREAM;
@@ -126,6 +131,7 @@ wake_init(struct wake_fixture *fixture, unsigned kind)
 	fixture->initialized = 6;
 	fixture->entries[0] = &fixture->channel;
 	fixture->sess->channels = fixture->entries;
+	fixture->sess->channel_ids = &fixture->protocol_id;
 	fixture->sess->channel_count = 1;
 	fixture->sess->channel_capacity = 1;
 	atomic_store(&fixture->sess->conn_initialized, true);

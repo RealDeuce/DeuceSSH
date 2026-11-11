@@ -446,8 +446,9 @@ test_setup_confirmation_cleanup(void)
 {
 	struct conn_ctx ctx = {0};
 	ASSERT_OK(conn_setup(&ctx));
-	struct dssh_incoming_open incoming = {.peer_channel = 7, .peer_window = 1024,
-	    .peer_max_packet = 1024};
+	ASSERT_OK(peer_id_dispatch_open(ctx.server, "session", 7));
+	struct dssh_incoming_open incoming;
+	ASSERT_OK(accept_incoming(ctx.server, &incoming, 0));
 	setup_confirmation_storage = NULL;
 	setup_confirmation_published = false;
 	setup_tx_test_hook = setup_confirmation_fail;

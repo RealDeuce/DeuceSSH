@@ -261,6 +261,7 @@ acceptqueue_push(struct dssh_accept_queue *q, uint32_t peer_channel, uint32_t pe
 	size_t                     idx = (q->head + q->count) % DSSH_ACCEPT_QUEUE_CAP;
 	struct dssh_incoming_open *e   = &q->entries[idx];
 
+	e->protocol_id     = NULL;
 	e->peer_channel    = peer_channel;
 	e->peer_window     = peer_window;
 	e->peer_max_packet = peer_max_packet;
@@ -1078,7 +1079,7 @@ channel_id_candidate_locked(struct dssh_session_s *sess)
 		sess->next_channel_id = candidate == UINT32_MAX ? 0 : candidate + 1;
 		bool in_use = false;
 		for (struct dssh_channel_id *id = sess->channel_ids; id != NULL; id = id->next) {
-			if (id->local == candidate) {
+			if (id->local_assigned && id->local == candidate) {
 				in_use = true;
 				break;
 			}
@@ -1142,7 +1143,8 @@ channel_id_admit_locked(struct dssh_session_s *sess)
 }
 
 static int
-channel_id_reserve(struct dssh_session_s *sess, struct dssh_channel_id **out)
+channel_id_reserve(struct dssh_session_s *sess, enum dssh_channel_id_phase phase,
+    uint32_t remote, struct dssh_channel_id **out)
 {
 	int ret = mtx_lock(&sess->channel_mtx);
 	if (ret != thrd_success) {
@@ -1177,7 +1179,7 @@ channel_id_reserve(struct dssh_session_s *sess, struct dssh_channel_id **out)
 			return ret;
 		}
 	}
-	int64_t candidate = channel_id_candidate_locked(sess);
+	int64_t candidate = phase == DSSH_CHANNEL_ID_QUEUED ? 0 : channel_id_candidate_locked(sess);
 	if (candidate < 0) {
 		dssh_mtx_unlock(&sess->channel_mtx);
 		free(id);
@@ -1187,11 +1189,71 @@ channel_id_reserve(struct dssh_session_s *sess, struct dssh_channel_id **out)
 	/* The candidate is nonnegative and was selected from uint32_t. */
 	uint32_t local = (uint32_t)candidate;
 	*id = (struct dssh_channel_id){.next = sess->channel_ids, .refs = 1,
-	    .local = local, .phase = DSSH_CHANNEL_ID_RESERVED};
+	    .local = local, .remote = remote, .phase = phase,
+	    .local_assigned = phase != DSSH_CHANNEL_ID_QUEUED};
 	sess->channel_ids = id;
 	*out = id;
 	dssh_mtx_unlock(&sess->channel_mtx);
 	return 0;
+}
+
+/* Caller holds channel_mtx. Reuse becomes possible after reciprocal CLOSE
+ * is ordered, even while the old transport callback is returning. */
+static bool
+channel_id_peer_owned_locked(struct dssh_session_s *sess, uint32_t remote)
+{
+	for (struct dssh_channel_id *id = sess->channel_ids; id != NULL; id = id->next) {
+		if (id->remote == remote && (id->phase == DSSH_CHANNEL_ID_QUEUED
+		    || id->phase == DSSH_CHANNEL_ID_ACCEPTING
+		    || (id->phase == DSSH_CHANNEL_ID_CONFIRMED
+		        && !(id->close_ordered && id->close_received))))
+			return true;
+	}
+	return false;
+}
+
+static int
+check_peer_channel_id(struct dssh_session_s *sess, uint32_t remote)
+{
+	int ret = mtx_lock(&sess->channel_mtx);
+	if (ret != thrd_success) {
+		dssh_thrd_check(sess, ret);
+		return DSSH_ERROR_TERMINATED;
+	}
+	bool owned = channel_id_peer_owned_locked(sess, remote);
+	dssh_mtx_unlock(&sess->channel_mtx);
+	return owned ? DSSH_ERROR_PARSE : 0;
+}
+
+/* Order the terminal response while holding the packet engine. If it cannot
+ * reach the wire, the required commit terminates before another sender can
+ * confirm a reuse of the number. */
+static int
+send_peer_channel_terminal(struct dssh_session_s *sess, struct dssh_channel_id *id,
+    const uint8_t *msg, size_t len)
+{
+	size_t capacity;
+	int ret;
+	uint8_t *packet = send_begin(sess, msg[0], &capacity, &ret);
+	if (packet == NULL)
+		return ret;
+	if (len > capacity) {
+		send_cancel(sess);
+		return DSSH_ERROR_TOOLONG;
+	}
+	ret = mtx_lock(&sess->channel_mtx);
+	if (ret != thrd_success) {
+		send_cancel(sess);
+		dssh_thrd_check(sess, ret);
+		return DSSH_ERROR_TERMINATED;
+	}
+	if (msg[0] == SSH_MSG_CHANNEL_CLOSE)
+		id->close_ordered = true;
+	else
+		id->phase = DSSH_CHANNEL_ID_FAILED;
+	dssh_mtx_unlock(&sess->channel_mtx);
+	memcpy(packet, msg, len);
+	return send_commit_required(sess, len);
 }
 
 /* The caller owns a channel or dispatch reference. The demux uses a
@@ -1220,7 +1282,7 @@ channel_id_close(struct dssh_session_s *sess, struct dssh_channel_id *id, bool r
 	DSSH_PUT_U32(remote, msg, &pos);
 	bool queue = retired_only && session_on_demux_thread(sess);
 	ret = queue ? send_to_slot(sess, &sess->trans.open_fail_slot, msg, pos)
-	    : send_packet(sess, msg, pos, NULL);
+	    : send_peer_channel_terminal(sess, id, msg, pos);
 	if (ret < 0) {
 		/* CLOSE cannot be retried through the application handle. Keep the
 		 * number reserved until session cleanup on mandatory failure. */
@@ -1232,6 +1294,7 @@ channel_id_close(struct dssh_session_s *sess, struct dssh_channel_id *id, bool r
 		dssh_thrd_check(sess, ret);
 		return DSSH_ERROR_TERMINATED;
 	}
+	id->close_ordered = true;
 	id->close_sent = true;
 	dssh_mtx_unlock(&sess->channel_mtx);
 	return 0;
@@ -1272,6 +1335,7 @@ send_channel_open(struct dssh_session_s *sess, struct dssh_channel_s *ch,
 		dssh_thrd_check(sess, ret);
 		return DSSH_ERROR_TERMINATED;
 	}
+	enum dssh_channel_id_phase previous = ch->protocol_id->phase;
 	ch->protocol_id->phase = phase;
 	ch->protocol_id->remote = ch->remote_id;
 	dssh_mtx_unlock(&sess->channel_mtx);
@@ -1289,7 +1353,7 @@ send_channel_open(struct dssh_session_s *sess, struct dssh_channel_s *ch,
 	struct dssh_channel_id *id = ch->protocol_id;
 	bool unused = id->refs == 1 && id->phase == phase && !id->close_received;
 	if (unused)
-		id->phase = DSSH_CHANNEL_ID_RESERVED;
+		id->phase = previous;
 	dssh_mtx_unlock(&sess->channel_mtx);
 	if (!unused)
 		session_set_terminate(sess);
@@ -1557,6 +1621,10 @@ find_channel(struct dssh_session_s *sess, uint32_t local_id, struct dssh_channel
 	for (size_t i = 0; i < sess->channel_count; i++) {
 		if (sess->channels[i]->local_id == local_id) {
 			struct dssh_channel_s *ch = sess->channels[i];
+			if (ch->protocol_id->phase == DSSH_CHANNEL_ID_ACCEPTING) {
+				dssh_mtx_unlock(&sess->channel_mtx);
+				return DSSH_ERROR_PARSE;
+			}
 
 			atomic_fetch_add_explicit(&ch->tx_refs, 1, memory_order_acq_rel);
 			atomic_store_explicit(&ch->dispatch_state, DSSH_CHANNEL_DISPATCH_ACTIVE,
@@ -1885,18 +1953,50 @@ alloc_channel_id(struct dssh_session_s *sess)
  * Channel buffer initialization
  * ================================================================ */
 
+static int
+assign_incoming_channel_id(struct dssh_session_s *sess, struct dssh_channel_id *id)
+{
+	int ret = mtx_lock(&sess->channel_mtx);
+	if (ret != thrd_success) {
+		dssh_thrd_check(sess, ret);
+		return DSSH_ERROR_TERMINATED;
+	}
+	ret = channel_id_admit_locked(sess);
+	if (ret < 0) {
+		dssh_mtx_unlock(&sess->channel_mtx);
+		return ret;
+	}
+	if (id->phase != DSSH_CHANNEL_ID_QUEUED)
+		abort();
+	int64_t candidate = channel_id_candidate_locked(sess);
+	if (candidate < 0) {
+		dssh_mtx_unlock(&sess->channel_mtx);
+		return DSSH_ERROR_TOOMANY;
+	}
+	/* The candidate is nonnegative and came from uint32_t. */
+	uint32_t local = (uint32_t)candidate;
+	id->local = local;
+	id->local_assigned = true;
+	id->phase = DSSH_CHANNEL_ID_ACCEPTING;
+	dssh_mtx_unlock(&sess->channel_mtx);
+	return 0;
+}
+
 /* Only for a fresh, unpublished channel: native objects are constructed below
  * and atomic initialization must precede every operation/publication. */
 static struct dssh_channel_s *
-new_channel(struct dssh_session_s *sess)
+new_channel(struct dssh_session_s *sess, struct dssh_channel_id *id)
 {
-	struct dssh_channel_id *id;
-	if (channel_id_reserve(sess, &id) < 0)
+	bool reserve = id == NULL;
+	int ret = reserve ? channel_id_reserve(sess, DSSH_CHANNEL_ID_RESERVED, 0, &id)
+	    : assign_incoming_channel_id(sess, id);
+	if (ret < 0)
 		return NULL;
 	struct dssh_channel_s *ch = malloc(sizeof(*ch));
 	if (ch == NULL) {
-		/* The unused number can go straight back into the pool. */
-		(void)channel_id_put(sess, id);
+		/* An incoming open still owns its record on constructor failure. */
+		if (reserve)
+			(void)channel_id_put(sess, id);
 		return NULL;
 	}
 	*ch = (struct dssh_channel_s){0};
@@ -2712,41 +2812,68 @@ test_dispatch_leave(void)
 
 #endif
 
-/*
- * Handle CHANNEL_OPEN_CONFIRMATION -- recipient_channel is at offset 1.
- */
-static int
-demux_open_confirmation(struct dssh_session_s *sess, uint8_t *payload)
+static bool
+channel_expects_confirmation(struct dssh_channel_s *ch)
 {
-	uint32_t local_id = DSSH_GET_U32(&payload[1]);
+	return ch->open_pending && !ch->open && !ch->close_sent && !ch->close_received;
+}
 
-	struct dssh_channel_s *ch;
-	int find_ret = find_channel(sess, local_id, &ch);
-
-	if (find_ret == DSSH_ERROR_NOMORE)
-		return 0; /* late message for closed channel */
-	if (find_ret < 0)
-		return find_ret;
-
-	/* find_channel() returns with buf_mtx held */
-	if (!ch->open_pending || ch->open || ch->close_sent || ch->close_received) {
-		if (release_channel_locked(sess, ch) < 0)
-			return DSSH_ERROR_TERMINATED;
-		return DSSH_ERROR_PARSE;
+/* Publish protocol ownership before the application can send to the new
+ * channel. The dispatch pin keeps the handle alive between the two locks. */
+static int
+demux_open_confirmation(struct dssh_session_s *sess, struct dssh_channel_id *id,
+    const uint8_t *payload, bool attached)
+{
+	struct dssh_channel_s *ch = NULL;
+	if (attached) {
+		int ret = find_channel(sess, id->local, &ch);
+		if (ret < 0 && ret != DSSH_ERROR_NOMORE)
+			return ret;
+		if (ch != NULL) {
+			if (!channel_expects_confirmation(ch)) {
+				release_channel_locked(sess, ch);
+				return DSSH_ERROR_PARSE;
+			}
+			dssh_mtx_unlock(&ch->buf_mtx);
+		}
 	}
-	ch->remote_id = DSSH_GET_U32(&payload[5]);
+
+	uint32_t remote = DSSH_GET_U32(&payload[5]);
+	int ret = mtx_lock(&sess->channel_mtx);
+	if (ret != thrd_success) {
+		if (ch != NULL)
+			release_channel_unlocked(sess, ch);
+		dssh_thrd_check(sess, ret);
+		return DSSH_ERROR_TERMINATED;
+	}
+	id->remote = remote;
+	id->phase = DSSH_CHANNEL_ID_CONFIRMED;
+	dssh_mtx_unlock(&sess->channel_mtx);
+	if (ch == NULL)
+		return 0;
+
+	if (dispatch_lock_channel(sess, ch) < 0)
+		return DSSH_ERROR_TERMINATED;
+	if (atomic_load(&ch->closing))
+		return release_channel_locked(sess, ch);
+	if (!channel_expects_confirmation(ch)) {
+		release_channel_locked(sess, ch);
+		session_set_terminate(sess);
+		return DSSH_ERROR_TERMINATED;
+	}
+	ch->remote_id = remote;
 	atomic_store_explicit(&ch->remote_window, DSSH_GET_U32(&payload[9]), memory_order_release);
 	ch->remote_max_packet = DSSH_GET_U32(&payload[13]);
 	ch->open_pending      = false;
 	ch->open              = true;
-	if (publish_and_release_channel(sess, ch) < 0)
-		return DSSH_ERROR_TERMINATED;
-	return 0;
+	return publish_and_release_channel(sess, ch);
 }
 
-/* Reply without allocating storage or taking an accept/channel lock. */
+/* Unadmitted opens use the preallocated reply slot. For a claimed open the
+ * application orders the rejection before releasing the claim. */
 static int
-send_open_failure(struct dssh_session_s *sess, uint32_t peer_channel, uint32_t reason)
+send_open_failure(struct dssh_session_s *sess, uint32_t peer_channel, uint32_t reason,
+    struct dssh_channel_id *id)
 {
 	uint8_t fail[17];
 	size_t pos = 0;
@@ -2756,7 +2883,11 @@ send_open_failure(struct dssh_session_s *sess, uint32_t peer_channel, uint32_t r
 	DSSH_PUT_U32(reason, fail, &pos);
 	DSSH_PUT_U32(0, fail, &pos); /* description */
 	DSSH_PUT_U32(0, fail, &pos); /* language */
-	return send_to_slot(sess, &sess->trans.open_fail_slot, fail, pos);
+	if (id == NULL)
+		return send_to_slot(sess, &sess->trans.open_fail_slot, fail, pos);
+	int ret = send_peer_channel_terminal(sess, id, fail, pos);
+	int put_ret = channel_id_put(sess, id);
+	return ret < 0 ? ret : put_ret;
 }
 
 /* Handle incoming CHANNEL_OPEN -- only server-side session channels exist. */
@@ -2785,9 +2916,15 @@ demux_channel_open(struct dssh_session_s *sess, uint8_t *payload, size_t payload
 	pos += type_len;
 	if (!dssh_buffer_has(payload_len, pos, 12)) {
 		int ret = 0;
-		if (dssh_buffer_has(payload_len, pos, 4))
-			ret = send_open_failure(sess, DSSH_GET_U32(&payload[pos]),
-			    SSH_OPEN_ADMINISTRATIVELY_PROHIBITED);
+		if (dssh_buffer_has(payload_len, pos, 4)) {
+			uint32_t peer_channel = DSSH_GET_U32(&payload[pos]);
+			ret = check_peer_channel_id(sess, peer_channel);
+			if (ret == DSSH_ERROR_TERMINATED)
+				return ret;
+			if (ret == 0)
+				ret = send_open_failure(sess, peer_channel,
+				    SSH_OPEN_ADMINISTRATIVELY_PROHIBITED, NULL);
+		}
 		int disconnect_ret = transport_disconnect_result(sess, SSH_DISCONNECT_PROTOCOL_ERROR,
 		    "malformed CHANNEL_OPEN", DSSH_ERROR_TERMINATED);
 		return ret < 0 ? ret : disconnect_ret;
@@ -2798,6 +2935,9 @@ demux_channel_open(struct dssh_session_s *sess, uint8_t *payload, size_t payload
 	pos += 4;
 	uint32_t peer_max_packet = DSSH_GET_U32(&payload[pos]);
 	pos += 4;
+	int ret = check_peer_channel_id(sess, peer_channel);
+	if (ret < 0)
+		return ret;
 
 	bool session_type = type_len == DSSH_STRLEN(str_session)
 	    && memcmp(type, str_session, DSSH_STRLEN(str_session)) == 0;
@@ -2810,41 +2950,56 @@ demux_channel_open(struct dssh_session_s *sess, uint8_t *payload, size_t payload
 	if (!session_type || sess->trans.client) {
 		uint32_t reason = forbidden_type ? SSH_OPEN_ADMINISTRATIVELY_PROHIBITED
 		    : SSH_OPEN_UNKNOWN_CHANNEL_TYPE;
-		return send_open_failure(sess, peer_channel, reason);
+		return send_open_failure(sess, peer_channel, reason, NULL);
 	}
 	/* Session opens have no channel-specific fields. */
 	if (pos != payload_len) {
-		int ret = send_open_failure(sess, peer_channel, SSH_OPEN_ADMINISTRATIVELY_PROHIBITED);
+		ret = send_open_failure(sess, peer_channel, SSH_OPEN_ADMINISTRATIVELY_PROHIBITED, NULL);
 		int disconnect_ret = transport_disconnect_result(sess, SSH_DISCONNECT_PROTOCOL_ERROR,
 		    "malformed session CHANNEL_OPEN", DSSH_ERROR_TERMINATED);
 		return ret < 0 ? ret : disconnect_ret;
 	}
 
-	int ret = mtx_lock(&sess->accept_mtx);
+	/* The sole demux producer can check the FIFO before reserving an ID.
+	 * Acceptors can only remove entries until this producer publishes. */
+	ret = mtx_lock(&sess->accept_mtx);
+	if (ret != thrd_success) {
+		dssh_thrd_check(sess, ret);
+		return DSSH_ERROR_TERMINATED;
+	}
+	bool full = sess->accept_queue.count >= DSSH_ACCEPT_QUEUE_CAP;
+	dssh_mtx_unlock(&sess->accept_mtx);
+	if (full)
+		return send_open_failure(sess, peer_channel, SSH_OPEN_RESOURCE_SHORTAGE, NULL);
+
+	struct dssh_channel_id *id;
+	ret = channel_id_reserve(sess, DSSH_CHANNEL_ID_QUEUED, peer_channel, &id);
+	if (ret == DSSH_ERROR_TOOMANY || ret == DSSH_ERROR_ALLOC)
+		return send_open_failure(sess, peer_channel, SSH_OPEN_RESOURCE_SHORTAGE, NULL);
+	if (ret < 0)
+		return ret;
+	ret = mtx_lock(&sess->accept_mtx);
 	if (ret != thrd_success) {
 		dssh_thrd_check(sess, ret);
 		return DSSH_ERROR_TERMINATED;
 	}
 	if (sess->terminate) {
-		dssh_thrd_check_unlock(sess, dssh_mtx_unlock(&sess->accept_mtx));
+		dssh_mtx_unlock(&sess->accept_mtx);
 		return DSSH_ERROR_TERMINATED;
 	}
+	size_t tail = (sess->accept_queue.head + sess->accept_queue.count) % DSSH_ACCEPT_QUEUE_CAP;
 	ret = acceptqueue_push(&sess->accept_queue, peer_channel, peer_window,
 	    peer_max_packet, type, type_len);
-	int signal_ret = ret == 0 ? cnd_signal(&sess->accept_cnd) : thrd_success;
-	int unlock_ret = dssh_mtx_unlock(&sess->accept_mtx);
-	if (unlock_ret != thrd_success) {
-		dssh_thrd_check_unlock(sess, unlock_ret);
-		return DSSH_ERROR_TERMINATED;
-	}
+	if (ret != 0)
+		abort();
+	sess->accept_queue.entries[tail].protocol_id = id;
+	int signal_ret = cnd_signal(&sess->accept_cnd);
+	dssh_mtx_unlock(&sess->accept_mtx);
 	if (signal_ret != thrd_success) {
 		dssh_thrd_check(sess, signal_ret);
 		return DSSH_ERROR_TERMINATED;
 	}
-	/* Keep processing existing channels when the bounded queue is full. */
-	if (ret == DSSH_ERROR_TOOMANY)
-		return send_open_failure(sess, peer_channel, SSH_OPEN_RESOURCE_SHORTAGE);
-	return ret;
+	return 0;
 }
 
 /* Complete framing is checked before a late reply can release an ID. */
@@ -2890,7 +3045,7 @@ channel_id_dispatch(struct dssh_session_s *sess, uint8_t msg_type,
 		return DSSH_ERROR_TERMINATED;
 	}
 	struct dssh_channel_id *id = sess->channel_ids;
-	while (id != NULL && id->local != local)
+	while (id != NULL && (!id->local_assigned || id->local != local))
 		id = id->next;
 	if (id == NULL) {
 		dssh_mtx_unlock(&sess->channel_mtx);
@@ -2903,36 +3058,36 @@ channel_id_dispatch(struct dssh_session_s *sess, uint8_t msg_type,
 		dssh_mtx_unlock(&sess->channel_mtx);
 		return valid ? DSSH_ERROR_TOOMANY : DSSH_ERROR_PARSE;
 	}
+	if (msg_type == SSH_MSG_CHANNEL_OPEN_CONFIRMATION
+	    && channel_id_peer_owned_locked(sess, DSSH_GET_U32(&payload[5]))) {
+		dssh_mtx_unlock(&sess->channel_mtx);
+		return DSSH_ERROR_PARSE;
+	}
 	id->refs++;
 	bool attached = !id->retired;
 	dssh_mtx_unlock(&sess->channel_mtx);
-	ret = 0;
-	if (attached) {
-		ret = msg_type == SSH_MSG_CHANNEL_OPEN_CONFIRMATION
-		    ? demux_open_confirmation(sess, payload)
-		    : demux_dispatch(sess, msg_type, payload, payload_len);
+	if (msg_type == SSH_MSG_CHANNEL_OPEN_CONFIRMATION) {
+		ret = demux_open_confirmation(sess, id, payload, attached);
 	}
-	if (ret == 0) {
-		int lock_ret = mtx_lock(&sess->channel_mtx);
-		if (lock_ret != thrd_success) {
-			dssh_thrd_check(sess, lock_ret);
-			ret = DSSH_ERROR_TERMINATED;
-		}
-		else {
-			if (msg_type == SSH_MSG_CHANNEL_OPEN_CONFIRMATION) {
-				id->remote = DSSH_GET_U32(&payload[5]);
-				id->phase = DSSH_CHANNEL_ID_CONFIRMED;
-			}
-			else if (msg_type == SSH_MSG_CHANNEL_OPEN_FAILURE) {
-				id->phase = DSSH_CHANNEL_ID_FAILED;
+	else {
+		ret = attached ? demux_dispatch(sess, msg_type, payload, payload_len) : 0;
+		if (ret == 0) {
+			int lock_ret = mtx_lock(&sess->channel_mtx);
+			if (lock_ret != thrd_success) {
+				dssh_thrd_check(sess, lock_ret);
+				ret = DSSH_ERROR_TERMINATED;
 			}
 			else {
-				id->close_received = true;
+				if (msg_type == SSH_MSG_CHANNEL_OPEN_FAILURE)
+					id->phase = DSSH_CHANNEL_ID_FAILED;
+				else
+					id->close_received = true;
+				dssh_mtx_unlock(&sess->channel_mtx);
 			}
-			dssh_mtx_unlock(&sess->channel_mtx);
-			ret = channel_id_close(sess, id, true);
 		}
 	}
+	if (ret == 0)
+		ret = channel_id_close(sess, id, true);
 	int put_ret = channel_id_put(sess, id);
 	return ret < 0 ? ret : put_ret;
 }
@@ -3603,13 +3758,13 @@ setup_finish(struct dssh_session_s *sess, struct dssh_channel_s *ch,
 
 /*
  * Allocate a channel, init sync primitives, register with the session,
- * and send CHANNEL_OPEN_CONFIRMATION. `inc` is borrowed for the call.
- * Returns the channel or NULL on failure.
+ * and send CHANNEL_OPEN_CONFIRMATION. The channel takes over the incoming
+ * protocol record on success. On failure the accept operation keeps it.
  */
 DSSH_TESTABLE struct dssh_channel_s *
 accept_channel_init(struct dssh_session_s *sess, struct dssh_incoming_open *inc)
 {
-	struct dssh_channel_s *ch = new_channel(sess);
+	struct dssh_channel_s *ch = new_channel(sess, inc->protocol_id);
 
 	if (ch == NULL)
 		return NULL;
@@ -3624,18 +3779,18 @@ accept_channel_init(struct dssh_session_s *sess, struct dssh_incoming_open *inc)
 	ch->event_cbdata = sess->default_event_cbdata;
 
 	if (mtx_init(&ch->buf_mtx, mtx_plain) != thrd_success) {
-		free_channel(ch);
+		free(ch);
 		return NULL;
 	}
 	if (mtx_init(&ch->cb_mtx, mtx_plain) != thrd_success) {
 		mtx_destroy(&ch->buf_mtx);
-		free_channel(ch);
+		free(ch);
 		return NULL;
 	}
 	if (cnd_init(&ch->poll_cnd) != thrd_success) {
 		mtx_destroy(&ch->cb_mtx);
 		mtx_destroy(&ch->buf_mtx);
-		free_channel(ch);
+		free(ch);
 		return NULL;
 	}
 	int queue_ret = event_queue_init(&ch->events, sess->default_max_events, sess->trans.packet_buf_sz);
@@ -3643,7 +3798,7 @@ accept_channel_init(struct dssh_session_s *sess, struct dssh_incoming_open *inc)
 		cnd_destroy(&ch->poll_cnd);
 		mtx_destroy(&ch->cb_mtx);
 		mtx_destroy(&ch->buf_mtx);
-		free_channel(ch);
+		free(ch);
 		return NULL;
 	}
 	if (alloc_channel_slots(sess, ch) < 0) {
@@ -3653,7 +3808,7 @@ accept_channel_init(struct dssh_session_s *sess, struct dssh_incoming_open *inc)
 		cnd_destroy(&ch->poll_cnd);
 		mtx_destroy(&ch->cb_mtx);
 		mtx_destroy(&ch->buf_mtx);
-		free_channel(ch);
+		free(ch);
 		return NULL;
 	}
 	ch->setup_mode = true;
@@ -3672,7 +3827,7 @@ accept_channel_init(struct dssh_session_s *sess, struct dssh_incoming_open *inc)
 		cnd_destroy(&ch->poll_cnd);
 		mtx_destroy(&ch->cb_mtx);
 		mtx_destroy(&ch->buf_mtx);
-		free_channel(ch);
+		free(ch);
 		return NULL;
 	}
 
@@ -3687,7 +3842,7 @@ accept_channel_init(struct dssh_session_s *sess, struct dssh_incoming_open *inc)
 		cnd_destroy(&ch->poll_cnd);
 		mtx_destroy(&ch->cb_mtx);
 		mtx_destroy(&ch->buf_mtx);
-		free_channel(ch);
+		free(ch);
 		return NULL;
 	}
 	return ch;
@@ -4100,7 +4255,7 @@ dssh_chan_open(struct dssh_session_s *sess, const struct dssh_chan_params *param
 	    && params->type != DSSH_CHAN_SHELL && params->type != DSSH_CHAN_EXEC)
 		return NULL;
 
-	struct dssh_channel_s *ch = new_channel(sess);
+	struct dssh_channel_s *ch = new_channel(sess, NULL);
 
 	if (ch == NULL)
 		return NULL;
@@ -4637,7 +4792,7 @@ dssh_chan_zc_open(struct dssh_session_s *sess, const struct dssh_chan_params *pa
 	    && params->type != DSSH_CHAN_SHELL && params->type != DSSH_CHAN_EXEC)
 		return NULL;
 
-	struct dssh_channel_s *ch = new_channel(sess);
+	struct dssh_channel_s *ch = new_channel(sess, NULL);
 
 	if (ch == NULL)
 		return NULL;
@@ -5213,7 +5368,8 @@ chan_accept_inner(struct dssh_session_s *sess, const struct dssh_chan_accept_cbs
 
 		if (ch == NULL) {
 			if (!sess->terminate) {
-				res = send_open_failure(sess, inc.peer_channel, SSH_OPEN_RESOURCE_SHORTAGE);
+				res = send_open_failure(sess, inc.peer_channel, SSH_OPEN_RESOURCE_SHORTAGE,
+				    inc.protocol_id);
 				if (res < 0)
 					session_set_terminate(sess);
 			}

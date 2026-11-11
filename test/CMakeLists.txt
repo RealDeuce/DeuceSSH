@@ -186,7 +186,7 @@ endif()
 target_link_libraries(deucessh_test_lib INTERFACE
 	dssh_test_allocator dssh_test_ossl)
 if(DEUCESSH_CRYPTO_BACKEND STREQUAL "Botan")
-	foreach(adapter IN ITEMS hash mac)
+	foreach(adapter IN ITEMS hash mac cipher)
 		set(adapter_target dssh_test_botan_${adapter})
 		add_library(${adapter_target} STATIC dssh_test_botan_${adapter}.cpp)
 		set_property(TARGET ${adapter_target} PROPERTY CXX_STANDARD 20)
@@ -655,6 +655,11 @@ else()
 	set_property(TARGET dssh_test_botan_mac_faults PROPERTY CXX_STANDARD_REQUIRED ON)
 	dssh_add_output_test(dssh_mac_native_failures dssh_test_botan_mac_faults
 		"Botan MAC boundaries: 34 passed, 0 failed")
+	dssh_add_test(botan_cipher_faults test_botan_cipher_faults.cpp)
+	set_property(TARGET dssh_test_botan_cipher_faults PROPERTY CXX_STANDARD 20)
+	set_property(TARGET dssh_test_botan_cipher_faults PROPERTY CXX_STANDARD_REQUIRED ON)
+	dssh_add_output_test(dssh_cipher_botan_native_boundaries dssh_test_botan_cipher_faults
+		"Botan cipher boundaries: 80 passed, 0 failed")
 endif()
 
 dssh_add_test(algo_key test_algo_key.c)

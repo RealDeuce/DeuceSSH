@@ -35,6 +35,8 @@ void dssh_test_ossl_digest_length(unsigned int value);
 void dssh_test_ossl_encoded_length(int value);
 void dssh_test_ossl_encrypt_length(int value);
 bool dssh_test_ossl_encrypt_observed(int *actual_length);
+void dssh_test_ossl_mac_length(size_t value);
+bool dssh_test_ossl_mac_observed(size_t *actual_length);
 /* Observe the actual private RNG request. Post-failure runs native generation
  * first and reports failure afterward; it does not promise output rollback. */
 void dssh_test_ossl_random_post_failure(bool enabled);

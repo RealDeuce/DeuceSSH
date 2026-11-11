@@ -118,6 +118,8 @@ def run(args):
               "negative_host": args.negative_host, "status": "FAILED"}
     cipher = os.environ.get("DSSH_TEST_ENC", "aes256-ctr")
     result["cipher"] = cipher
+    mac = os.environ.get("DSSH_TEST_MAC", "hmac-sha2-256")
+    result["mac"] = mac
     language_fields = "DSSH_TEST_LANGUAGE_FIELDS" in os.environ
     result["language_fields"] = language_fields
     for name in ("proxy-result.json", "proxy-result.json.pending", "result.json", "openssh.log", "peer.log", "stderr.log"):
@@ -133,6 +135,8 @@ def run(args):
     try:
         if cipher not in ("aes256-ctr", "aes128-cbc"):
             raise RuntimeError("unsupported fixture cipher")
+        if mac not in ("hmac-sha2-256", "hmac-sha2-512"):
+            raise RuntimeError("unsupported fixture MAC")
         # All credentials stay in this private directory, including paths that
         # exercise shell/config quoting. It is removed even on failed runs.
         temporary = tempfile.TemporaryDirectory(prefix="dssh interop-")
@@ -179,7 +183,7 @@ def run(args):
                    "-o", "GlobalKnownHostsFile=/dev/null", "-o", "VerifyHostKeyDNS=no",
                    "-o", "HostKeyAlias=dssh-interop", "-o", "Compression=no",
                    "-o", "RekeyLimit=128K", "-o", f"KexAlgorithms={args.algorithm}",
-                   "-c", cipher, "-m", "hmac-sha2-256", "-i", str(key),
+                   "-c", cipher, "-m", mac, "-i", str(key),
                    "-o", "ProxyCommand=" + proxy_text, "-l", user, "dssh-interop", "dssh-interop"]
             with (evidence / "stderr.log").open("wb") as error:
                 until = time.monotonic() + 140
@@ -222,7 +226,7 @@ def run(args):
                 f"AllowUsers {user}\nStrictModes no\nUsePAM no\n"
                 "PasswordAuthentication no\nKbdInteractiveAuthentication no\n"
                 "AuthenticationMethods publickey\nPubkeyAcceptedAlgorithms rsa-sha2-256\n"
-                f"HostKeyAlgorithms rsa-sha2-256\nCiphers {cipher}\nMACs hmac-sha2-256\n"
+                f"HostKeyAlgorithms rsa-sha2-256\nCiphers {cipher}\nMACs {mac}\n"
                 f"KexAlgorithms {args.algorithm}\nCompression no\nRekeyLimit 128K\n"
                 "PermitUserEnvironment no\nAllowAgentForwarding no\nAllowTcpForwarding no\n"
                 "X11Forwarding no\nPermitTTY no\nLogLevel DEBUG1\n"
@@ -267,6 +271,10 @@ def run(args):
             raise RuntimeError("forced directional cipher oracle missing")
         if f"cipher={cipher}" not in peer_text:
             raise RuntimeError("production peer cipher oracle missing")
+        macs = re.findall(r"kex: (client->server|server->client) cipher: \S+ MAC: (\S+)", log)
+        if {direction for direction, _ in macs} != {"client->server", "server->client"} \
+                or any(selected != mac for _, selected in macs) or f"mac={mac}" not in peer_text:
+            raise RuntimeError("forced directional MAC oracle missing")
         if language_fields and not args.negative_host and "language-checks=2" not in peer_text:
             raise RuntimeError("initial/rekey public language-field checks missing")
         result.update(status="PASSED", openssh_newkeys_received=newkeys)

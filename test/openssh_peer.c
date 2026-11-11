@@ -340,6 +340,11 @@ main(int argc, char **argv)
 		cipher = "aes256-ctr";
 	if (strcmp(cipher, "aes256-ctr") != 0 && strcmp(cipher, "aes128-cbc") != 0)
 		return 2;
+	const char *mac = getenv("DSSH_TEST_MAC");
+	if (mac == NULL)
+		mac = "hmac-sha2-256";
+	if (strcmp(mac, "hmac-sha2-256") != 0 && strcmp(mac, "hmac-sha2-512") != 0)
+		return 2;
 	struct authorization auth = { .user = argv[5] };
 	FILE *key = fopen(argv[4], "rb");
 	if (key == NULL)
@@ -371,9 +376,12 @@ main(int argc, char **argv)
 	if (ret == 0)
 		ret = strcmp(cipher, "aes128-cbc") == 0
 		    ? dssh_register_aes128_cbc() : dssh_register_aes256_ctr();
+	if (ret == 0)
+		ret = strcmp(mac, "hmac-sha2-512") == 0
+		    ? dssh_register_hmac_sha2_512() : dssh_register_hmac_sha2_256();
 	if (ret != 0 || dssh_transport_set_callbacks(stdio_tx, stdio_rx, NULL, NULL) != 0
 	    || dssh_register_rsa_sha2_256() != 0
-	    || dssh_register_hmac_sha2_256() != 0 || dssh_register_none_comp() != 0
+	    || dssh_register_none_comp() != 0
 	    || dssh_rsa_sha2_256_load_key_file(argv[3], NULL, NULL) != 0)
 		return 2;
 	dssh_session session = dssh_session_init(client, 0);
@@ -404,7 +412,7 @@ main(int argc, char **argv)
 	if (ret == 0 && (strcmp(dssh_transport_get_kex_name(session), argv[2]) != 0
 	    || strcmp(dssh_transport_get_hostkey_name(session), "rsa-sha2-256") != 0
 	    || strcmp(dssh_transport_get_enc_name(session), cipher) != 0
-	    || strcmp(dssh_transport_get_mac_name(session), "hmac-sha2-256") != 0))
+	    || strcmp(dssh_transport_get_mac_name(session), mac) != 0))
 		ret = DSSH_ERROR_INVALID;
 	if (ret == 0) {
 		stage = "authentication";
@@ -438,7 +446,7 @@ main(int argc, char **argv)
 	dssh_session_cleanup(session);
 	if (ret == 0 && client && auth.host_checks < 2)
 		ret = DSSH_ERROR_INVALID;
-	fprintf(stderr, "DeuceSSH interop: role=%s kex=%s cipher=%s stage=%s result=%d host-checks=%u signed-auth=%d channel-ack=%u language-checks=%u\n",
-	    argv[1], argv[2], cipher, stage, ret, auth.host_checks, auth.signed_auth, channel_ack ? 1U : 0U, language_checks);
+	fprintf(stderr, "DeuceSSH interop: role=%s kex=%s cipher=%s mac=%s stage=%s result=%d host-checks=%u signed-auth=%d channel-ack=%u language-checks=%u\n",
+	    argv[1], argv[2], cipher, mac, stage, ret, auth.host_checks, auth.signed_auth, channel_ack ? 1U : 0U, language_checks);
 	return ret == 0 ? 0 : 1;
 }

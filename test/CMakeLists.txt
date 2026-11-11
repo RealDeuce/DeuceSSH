@@ -616,6 +616,14 @@ elseif(DEUCESSH_CRYPTO_BACKEND STREQUAL "Botan")
 	target_link_libraries(dssh_test_algo_mac PRIVATE PkgConfig::BOTAN3)
 endif()
 add_test(NAME dssh_unit_algo_mac COMMAND dssh_test_algo_mac)
+foreach(part IN ITEMS registration_contract module_rfc4231_vectors)
+	dssh_add_output_test(dssh_mac_${part} dssh_test_algo_mac
+		"1 tests: 1 passed, 0 failed, 0 skipped" --exact mac/${part})
+endforeach()
+if(DEUCESSH_CRYPTO_BACKEND STREQUAL "OpenSSL")
+	dssh_add_output_test(dssh_mac_native_failures dssh_test_algo_mac
+		"1 tests: 1 passed, 0 failed, 0 skipped" --exact mac/native_failures)
+endif()
 
 dssh_add_test(algo_key test_algo_key.c)
 foreach(result_case IN ITEMS ed25519 rsa256 rsa512 concurrent)
@@ -1671,6 +1679,17 @@ if(DEUCESSH_TEST_OPENSSH)
 				endforeach()
 			endforeach()
 			set(cbc_name dssh_openssh_${form}_client_aes128-cbc)
+			foreach(role IN ITEMS client server)
+				set(mac_name dssh_openssh_${form}_${role}_hmac-sha2-512)
+				add_test(NAME ${mac_name} COMMAND ${Python3_EXECUTABLE}
+					${CMAKE_CURRENT_SOURCE_DIR}/openssh_interop.py run
+					--peer $<TARGET_FILE:dssh_openssh_${form}> --role ${role} --algorithm curve25519-sha256
+					--ssh ${DSSH_OPENSSH_EXECUTABLE} --sshd ${DSSH_OPENSSH_DAEMON}
+					--keygen ${DSSH_OPENSSH_KEYGEN}
+					--evidence ${CMAKE_CURRENT_BINARY_DIR}/openssh-evidence/${mac_name})
+				set_tests_properties(${mac_name} PROPERTIES TIMEOUT 210 LABELS openssh
+					ENVIRONMENT "DSSH_TEST_MAC=hmac-sha2-512")
+			endforeach()
 			foreach(role IN ITEMS client server)
 				set(language_name dssh_openssh_${form}_${role}_languages)
 				add_test(NAME ${language_name} COMMAND ${Python3_EXECUTABLE}

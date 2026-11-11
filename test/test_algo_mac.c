@@ -14,7 +14,9 @@
 #include "test/dssh_test_alloc.h"
 
 #ifdef DSSH_CRYPTO_OPENSSL
+#include "dssh_test_ossl.h"
 #include <openssl/core_names.h>
+#include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/params.h>
 #elif defined(DSSH_CRYPTO_BOTAN)
@@ -728,9 +730,63 @@ test_none_mac_passthrough(void)
 {
 	dssh_test_reset_global_config();
 	ASSERT_EQ(dssh_register_none_mac(), 0);
-	/* The none MAC has digest_size=0, key_size=0, init=NULL.
-	 * Its generate function returns 0 without writing any output.
-	 * Registration success confirms proper initialization. */
+	dssh_mac mac = gconf.mac_head;
+	ASSERT_NOT_NULL(mac);
+	ASSERT_EQ(mac->digest_size, 0);
+	ASSERT_EQ(mac->key_size, 0);
+	ASSERT_NULL(mac->init);
+	ASSERT_NOT_NULL(mac->generate);
+	ASSERT_NOT_NULL(mac->cleanup);
+	uint8_t output[3] = {0x5a, 0x5a, 0x5a};
+	ASSERT_OK(mac->generate(NULL, 0, &output[1], NULL));
+	ASSERT_EQ(output[0], 0x5a);
+	ASSERT_EQ(output[1], 0x5a);
+	ASSERT_EQ(output[2], 0x5a);
+	mac->cleanup(NULL);
+	return TEST_PASS;
+}
+
+static int
+mac_contract_generate(const uint8_t *buf, size_t bufsz, uint8_t *out, dssh_mac_ctx *ctx)
+{
+	(void)buf;
+	(void)bufsz;
+	(void)ctx;
+	memset(out, 0, 32);
+	return 0;
+}
+
+static int
+test_mac_registration_contract(void)
+{
+	bool valid = true;
+	for (unsigned variant = 0; variant < 4; variant++) {
+		dssh_test_reset_global_config();
+		if (dssh_register_hmac_sha2_256() != 0)
+			return TEST_FAIL;
+		dssh_mac head = gconf.mac_head;
+		dssh_mac mac = calloc(1, sizeof(*mac) + sizeof("contract-mac"));
+		if (mac == NULL) {
+			dssh_test_reset_global_config();
+			return TEST_FAIL;
+		}
+		memcpy(mac->name, "contract-mac", sizeof("contract-mac"));
+		mac->digest_size = variant < 2 ? 32 : 0;
+		mac->generate = variant % 2 == 0 ? NULL : mac_contract_generate;
+		int ret = dssh_transport_register_mac(mac);
+		int expected = variant == 0 ? DSSH_ERROR_INVALID : 0;
+		valid = valid && ret == expected && gconf.mac_head == head;
+		if (expected != 0)
+			valid = valid && head->next == NULL && gconf.mac_tail == head
+			    && gconf.mac_entries == 1 && mac->next == NULL;
+		else
+			valid = valid && head->next == mac && gconf.mac_tail == mac
+			    && gconf.mac_entries == 2;
+		if (ret != 0)
+			free(mac);
+		dssh_test_reset_global_config();
+	}
+	ASSERT_TRUE(valid);
 	return TEST_PASS;
 }
 
@@ -866,11 +922,92 @@ test_mac_module_rfc4231_vectors(void)
 	return TEST_PASS;
 }
 
+#ifdef DSSH_CRYPTO_OPENSSL
+static int
+test_mac_native_failures(void)
+{
+	int (*registrations[])(void) = {
+		dssh_register_hmac_sha2_256, dssh_register_hmac_sha2_512,
+	};
+	bool valid = true;
+	for (size_t algorithm = 0; algorithm < 2; algorithm++) {
+		dssh_test_reset_global_config();
+		ASSERT_OK(registrations[algorithm]());
+		dssh_mac mac = gconf.mac_head;
+		uint8_t key[64] = {0};
+		memcpy(key, rfc4231_tc1_key, sizeof(rfc4231_tc1_key));
+		const uint8_t *expected = algorithm == 0 ? rfc4231_tc1_hmac : rfc4231_tc1_hmac512;
+		for (int fail = 0; fail < 4; fail++) {
+			dssh_mac_ctx *ctx = NULL;
+			if (fail == 0)
+				dssh_test_alloc_fail_after(0);
+			else
+				dssh_test_ossl_fail_after(fail - 1);
+			int ret = mac->init(key, &ctx);
+			int calls = dssh_test_ossl_count();
+			dssh_test_alloc_reset();
+			dssh_test_ossl_reset();
+			int error = fail == 0 || fail == 2 ? DSSH_ERROR_ALLOC : DSSH_ERROR_INIT;
+			valid = valid && ret == error && ctx == NULL && (fail == 0 || calls == fail);
+			mac->cleanup(ctx);
+		}
+		for (int fail = 0; fail < 3; fail++) {
+			dssh_mac_ctx *ctx = NULL;
+			int ret = mac->init(key, &ctx);
+			uint8_t output[66];
+			memset(output, 0x5a, sizeof(output));
+			if (ret == 0) {
+				dssh_test_ossl_fail_after(fail);
+				ret = mac->generate(rfc4231_tc1_data, rfc4231_tc1_data_len, &output[1], ctx);
+				valid = valid && dssh_test_ossl_count() == fail + 1;
+			}
+			dssh_test_ossl_reset();
+			valid = valid && ret == DSSH_ERROR_INIT;
+			for (size_t i = 0; i < sizeof(output); i++)
+				valid = valid && output[i] == 0x5a;
+			mac->cleanup(ctx);
+		}
+		const size_t lengths[] = {0, mac->digest_size - 1U, mac->digest_size + 1U, SIZE_MAX};
+		for (size_t i = 0; i < sizeof(lengths) / sizeof(lengths[0]); i++) {
+			dssh_mac_ctx *ctx = NULL;
+			int ret = mac->init(key, &ctx);
+			uint8_t output[66];
+			memset(output, 0x5a, sizeof(output));
+			size_t actual = 0;
+			if (ret == 0) {
+				dssh_test_ossl_mac_length(lengths[i]);
+				ret = mac->generate(rfc4231_tc1_data, rfc4231_tc1_data_len, &output[1], ctx);
+				valid = valid && dssh_test_ossl_mac_observed(&actual) && actual == mac->digest_size;
+			}
+			dssh_test_ossl_reset();
+			valid = valid && ret == DSSH_ERROR_INIT && output[0] == 0x5a
+			    && output[mac->digest_size + 1U] == 0x5a
+			    && memcmp(&output[1], expected, mac->digest_size) == 0;
+			mac->cleanup(ctx);
+		}
+		int configured = EVP_set_default_properties(NULL, "provider=deucessh_missing_provider");
+		dssh_mac_ctx *ctx = NULL;
+		int ret = configured == 1 ? mac->init(key, &ctx) : 0;
+		int restored = EVP_set_default_properties(NULL, "");
+		ERR_clear_error();
+		valid = valid && configured == 1 && restored == 1 && ret == DSSH_ERROR_INIT && ctx == NULL;
+		mac->cleanup(ctx);
+	}
+	dssh_test_reset_global_config();
+	ASSERT_TRUE(valid);
+	return TEST_PASS;
+}
+#endif
+
 /* ================================================================
  * Test table
  * ================================================================ */
 
 static struct dssh_test_entry tests[] = {
+	{ "mac/registration_contract",       test_mac_registration_contract },
+#ifdef DSSH_CRYPTO_OPENSSL
+	{ "mac/native_failures",             test_mac_native_failures },
+#endif
 	{ "mac/module_rfc4231_vectors",       test_mac_module_rfc4231_vectors },
 	/* Registration */
 	{ "mac/dssh_register_hmac_sha2_256",      test_register_hmac_sha2_256 },

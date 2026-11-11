@@ -250,6 +250,10 @@ static _Thread_local bool encrypt_length_override;
 static _Thread_local int encrypt_length_value;
 static _Thread_local bool encrypt_length_seen;
 static _Thread_local int encrypt_native_length;
+static _Thread_local bool mac_length_override;
+static _Thread_local size_t mac_length_value;
+static _Thread_local bool mac_length_seen;
+static _Thread_local size_t mac_native_length;
 static _Thread_local bool random_post_failure;
 static _Thread_local bool random_seen;
 static _Thread_local size_t random_length;
@@ -260,6 +264,23 @@ void
 dssh_test_ossl_random_post_failure(bool enabled)
 {
 	random_post_failure = enabled;
+}
+
+void
+dssh_test_ossl_mac_length(size_t value)
+{
+	mac_length_override = true;
+	mac_length_value = value;
+	mac_length_seen = false;
+	mac_native_length = 0;
+}
+
+bool
+dssh_test_ossl_mac_observed(size_t *actual_length)
+{
+	if (actual_length != NULL)
+		*actual_length = mac_native_length;
+	return mac_length_seen;
 }
 
 bool
@@ -403,6 +424,9 @@ dssh_test_ossl_reset(void)
 	encrypt_length_seen = false;
 	encrypt_native_length = 0;
 	random_post_failure = false;
+	mac_length_override = false;
+	mac_length_seen = false;
+	mac_native_length = 0;
 	random_seen = false;
 	random_length = 0;
 	random_strength = 0;
@@ -819,7 +843,13 @@ dssh_test_EVP_MAC_final(EVP_MAC_CTX *ctx, unsigned char *out,
 {
 	if (should_fail())
 		return 0;
-	return EVP_MAC_final(ctx, out, outl, outsize);
+	int ret = EVP_MAC_final(ctx, out, outl, outsize);
+	if (ret == 1 && mac_length_override && outl != NULL) {
+		mac_native_length = *outl;
+		mac_length_seen = true;
+		*outl = mac_length_value;
+	}
+	return ret;
 }
 
 int

@@ -238,11 +238,23 @@ enum tx_slot_refusal_mode {
 	TX_SLOT_SIZE_REFUSAL,
 };
 
+static dssh_log_action
+tx_slot_refusal_log(const struct dssh_log_record *record, void *opaque)
+{
+	atomic_int *error = opaque;
+	if (record->level == DSSH_LOG_ERROR
+	    && (record->error_code == DSSH_ERROR_REKEY_NEEDED || record->error_code == DSSH_ERROR_TOOLONG))
+		atomic_store(error, record->error_code);
+	return DSSH_LOG_LOCAL_ONLY;
+}
+
 static int
-tx_slot_refusal_run(struct conn_ctx *ctx, bool global, enum tx_slot_refusal_mode mode)
+tx_slot_refusal_run(struct conn_ctx *ctx, bool global, enum tx_slot_refusal_mode mode,
+    atomic_int *error)
 {
 	dssh_session sess = ctx->server;
 	ASSERT_OK(dssh_session_set_global_request_cb(sess, tx_slot_refusal_global, NULL));
+	ASSERT_OK(dssh_session_set_log_cb(sess, tx_slot_refusal_log, error));
 	ASSERT_TRUE(compression_fixture_selected(ctx->client, sess));
 	ASSERT_OK(dssh_session_start(sess));
 	ASSERT_OK(tx_acquire(sess, SSH_MSG_IGNORE));
@@ -281,16 +293,21 @@ tx_slot_refusal_run(struct conn_ctx *ctx, bool global, enum tx_slot_refusal_mode
 	}
 
 	bool stopped = valid && dssh_test_wait_bool(&sess->demux_running, false);
+	if (!stopped) {
+		session_set_terminate(sess);
+		mock_io_close_c2s(&ctx->io);
+	}
+	dssh_session_stop(sess);
 	bool preserved = atomic_load(&slot->ready);
 	bool emitted = sess->trans.tx_seq != seq;
-	printf("tx_slot_refusal global=%d mode=%d waited=%d stopped=%d preserved=%d emitted=%d\n",
-	    global, mode, valid, stopped, preserved, emitted);
-	if (!stopped)
-		session_set_terminate(sess);
+	int reported = atomic_load(error);
+	printf("tx_slot_refusal global=%d mode=%d waited=%d stopped=%d preserved=%d emitted=%d error=%d\n",
+	    global, mode, valid, stopped, preserved, emitted, reported);
 	ASSERT_TRUE(stopped);
 	ASSERT_TRUE(dssh_session_is_terminated(sess));
 	ASSERT_TRUE(preserved);
 	ASSERT_FALSE(emitted);
+	ASSERT_EQ(reported, mode == TX_SLOT_KEY_REFUSAL ? DSSH_ERROR_REKEY_NEEDED : DSSH_ERROR_TOOLONG);
 	return TEST_PASS;
 }
 
@@ -306,7 +323,9 @@ test_tx_slot_refusal(void)
 			return TEST_FAIL;
 		enum tx_slot_refusal_mode mode = i < 2 ? TX_SLOT_NO_REFUSAL
 		    : growth ? TX_SLOT_SIZE_REFUSAL : TX_SLOT_KEY_REFUSAL;
-		int ret = tx_slot_refusal_run(&ctx, i % 2 == 0, mode);
+		atomic_int error;
+		atomic_init(&error, 0);
+		int ret = tx_slot_refusal_run(&ctx, i % 2 == 0, mode, &error);
 		conn_cleanup(&ctx);
 		passed = ret == TEST_PASS && passed;
 	}

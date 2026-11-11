@@ -222,6 +222,9 @@ struct dssh_transport_state_s {
 
 				 /* Pointer-sized — round-robin index for fair channel slot drain */
 	size_t drain_next_ch;
+	/* Last pre-wire drain refusal published with engine release.
+	 * Protected by tx_queue_mtx. */
+	int tx_slot_refusal;
 
 	/* 1-byte */
 	bool        client;

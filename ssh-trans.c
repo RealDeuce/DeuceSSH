@@ -1734,11 +1734,15 @@ tx_unlock_with_slots(struct dssh_session_s *sess)
 			}
 			continue;
 		}
+		sess->trans.tx_slot_refusal = drain_ret;
 		tx_owned_session = NULL;
 		atomic_store_explicit(&sess->trans.tx_owner_active, false, memory_order_release);
-		ur = dssh_mtx_unlock(&sess->trans.tx_queue_mtx);
-		if (ur != thrd_success)
-			dssh_thrd_check_unlock(sess, ur);
+		/* The occupied predicate stayed true. Wake producers so they can
+		 * observe the refusal instead of waiting for an idle engine. */
+		int br = drain_ret < 0 ? cnd_broadcast(&sess->trans.tx_slot_cnd) : thrd_success;
+		dssh_mtx_unlock(&sess->trans.tx_queue_mtx);
+		if (br != thrd_success)
+			dssh_thrd_check(sess, br);
 		tx_wake_owners(sess);
 		return;
 	}
@@ -1885,6 +1889,13 @@ send_to_slot_inner(struct dssh_session_s *sess, struct dssh_tx_slot *slot,
 		if (tx_owned_session == sess) {
 			dssh_mtx_unlock(&sess->trans.tx_queue_mtx);
 			return DSSH_ERROR_INVALID;
+		}
+		if (sess->trans.tx_slot_refusal < 0
+		    && !atomic_load(&sess->trans.tx_owner_active)
+		    && !atomic_load(&sess->trans.rekey_in_progress)) {
+			int refusal = sess->trans.tx_slot_refusal;
+			dssh_mtx_unlock(&sess->trans.tx_queue_mtx);
+			return refusal;
 		}
 		if (cnd_wait(&sess->trans.tx_slot_cnd, &sess->trans.tx_queue_mtx) != thrd_success) {
 			dssh_mtx_unlock(&sess->trans.tx_queue_mtx);

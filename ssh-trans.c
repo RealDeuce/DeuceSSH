@@ -502,11 +502,17 @@ dssh_transport_handshake(struct dssh_session_s *sess)
 		return DSSH_ERROR_INVALID;
 	if (session_receive_api_conflict(sess))
 		return DSSH_ERROR_INVALID;
+	if (sess->terminate)
+		return DSSH_ERROR_TERMINATED;
+	if (sess->handshake_complete)
+		return DSSH_ERROR_INVALID;
 	struct dssh_session_scope scope;
 
 	session_scope_enter(&scope, sess);
 	int ret = transport_handshake_inner(sess);
 
+	if (ret == 0)
+		sess->handshake_complete = true;
 	session_scope_leave(&scope);
 	return ret;
 }

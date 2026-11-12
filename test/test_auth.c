@@ -20,12 +20,14 @@
 #include "deucessh.h"
 #include "deucessh-algorithms.h"
 #include "deucessh-auth.h"
+#include "deucessh-conn.h"
 #include "ssh-trans.h"
 #include "ssh-internal.h"
 #include "dssh_test_internal.h"
 #include "mock_io.h"
 #include "test_dhgex_provider.h"
 #include "dssh_test_alloc.h"
+#include "dssh_test_ossl.h"
 #include "test_comp.h"
 #include "compression_fixture.h"
 
@@ -58,6 +60,8 @@ struct auth_test_io_watch {
 #include "signature_copy_fixture.h"
 
 static struct auth_test_io_watch *auth_test_io_watch;
+static _Thread_local bool lifecycle_phase_deny_io;
+static _Thread_local unsigned lifecycle_phase_unexpected_io;
 
 static bool
 auth_test_bytes_zero(const uint8_t *bytes, size_t length)
@@ -73,6 +77,10 @@ static int
 mock_tx_dispatch(uint8_t *buf, size_t bufsz,
     dssh_session sess, void *cbdata)
 {
+	if (lifecycle_phase_deny_io) {
+		lifecycle_phase_unexpected_io++;
+		return DSSH_ERROR_INIT;
+	}
 	if (auth_test_io_watch != NULL && auth_test_io_watch->target == sess) {
 		struct auth_test_io_watch *watch = auth_test_io_watch;
 		if (watch->armed) {
@@ -96,6 +104,10 @@ static int
 mock_rx_dispatch(uint8_t *buf, size_t bufsz,
     dssh_session sess, void *cbdata)
 {
+	if (lifecycle_phase_deny_io) {
+		lifecycle_phase_unexpected_io++;
+		return DSSH_ERROR_INIT;
+	}
 	if (sess->trans.client)
 		return mock_rx_client(buf, bufsz, sess, cbdata);
 	else
@@ -106,6 +118,10 @@ static int
 mock_rxline_dispatch(uint8_t *buf, size_t bufsz,
     size_t *bytes_received, dssh_session sess, void *cbdata)
 {
+	if (lifecycle_phase_deny_io) {
+		lifecycle_phase_unexpected_io++;
+		return DSSH_ERROR_INIT;
+	}
 	if (sess->trans.client)
 		return mock_rxline_client(buf, bufsz, bytes_received, sess, cbdata);
 	else
@@ -12566,8 +12582,9 @@ test_auth_request_capacity(void)
 	ASSERT_NOT_NULL(sess);
 	size_t calls = 0;
 	ASSERT_OK(dssh_session_set_cbdata(sess, &calls, &calls, &calls, NULL));
-	/* Isolate request construction from the already-completed service
-	 * exchange; none of these oversized inputs should reach I/O. */
+	/* This unkeyed component fixture isolates request construction from
+	 * transport/service admission. Exercise the private constructors; public
+	 * admission is covered separately with real lifecycle exchanges. */
 	sess->auth_service_requested = true;
 	size_t input_len = sess->trans.packet_buf_sz;
 	char *input = malloc(input_len + 1);
@@ -12575,10 +12592,10 @@ test_auth_request_capacity(void)
 	memset(input, 'x', input_len);
 	input[input_len] = 0;
 	char methods[16];
-	ASSERT_EQ(dssh_auth_get_methods(sess, input, methods, sizeof(methods)), DSSH_ERROR_TOOLONG);
-	ASSERT_EQ(dssh_auth_password(sess, input, "password", NULL, NULL), DSSH_ERROR_TOOLONG);
-	ASSERT_EQ(dssh_auth_password(sess, "testuser", input, NULL, NULL), DSSH_ERROR_TOOLONG);
-	ASSERT_EQ(dssh_auth_keyboard_interactive(sess, input, kbi_cb_unreachable, NULL), DSSH_ERROR_TOOLONG);
+	ASSERT_EQ(get_methods_impl(sess, input, methods, sizeof(methods)), DSSH_ERROR_TOOLONG);
+	ASSERT_EQ(auth_password_impl(sess, input, "password", NULL, NULL), DSSH_ERROR_TOOLONG);
+	ASSERT_EQ(auth_password_impl(sess, "testuser", input, NULL, NULL), DSSH_ERROR_TOOLONG);
+	ASSERT_EQ(auth_kbi_impl(sess, input, kbi_cb_unreachable, NULL), DSSH_ERROR_TOOLONG);
 	ASSERT_EQ_U(calls, 0);
 	ASSERT_FALSE(dssh_session_is_terminated(sess));
 	ASSERT_FALSE(sess->trans.tx_owner_active);
@@ -12595,7 +12612,12 @@ test_auth_request_capacity(void)
 #include "kbi_result_cases.h"
 #include "signature_auth_result_cases.h"
 
+#include "lifecycle_phase_cases.h"
+
 static struct dssh_test_entry tests[] = {
+	{ "lifecycle/preflight", test_lifecycle_preflight },
+	{ "lifecycle/progression", test_lifecycle_progression },
+	{ "lifecycle/handshake_failure", test_lifecycle_handshake_failure },
 	{ "release/auth_setup_ownership", test_auth_setup_ownership },
 	{ "release/auth_nested_setup_ownership", test_auth_nested_setup_ownership },
 	{ "release/auth_fixture_builder", test_auth_fixture_builder },

@@ -1118,6 +1118,21 @@ auth_check_terminated(struct dssh_session_s *sess, int res)
 	return res;
 }
 
+/* The public receive operation owns the complete authentication exchange.
+ * A method-list response or partial success must leave authentication open.
+ * Private component entry points retain their independent wire-test scope. */
+static int
+auth_entry_check(struct dssh_session_s *sess, bool client)
+{
+	if (session_receive_api_conflict(sess))
+		return DSSH_ERROR_INVALID;
+	if (sess->terminate)
+		return DSSH_ERROR_TERMINATED;
+	if (sess->trans.client != client || !sess->handshake_complete || sess->auth_complete)
+		return DSSH_ERROR_INVALID;
+	return 0;
+}
+
 DSSH_PUBLIC int
 dssh_auth_server(struct dssh_session_s *sess, const struct dssh_auth_server_cbs *cbs, uint8_t *username_out,
     size_t *username_out_len)
@@ -1127,13 +1142,16 @@ dssh_auth_server(struct dssh_session_s *sess, const struct dssh_auth_server_cbs 
 	if ((cbs == NULL) || (sess == NULL) || (cbs->methods_str == NULL)
 	    || ((username_out == NULL) != (username_out_len == NULL)))
 		return DSSH_ERROR_INVALID;
-	if (session_receive_api_conflict(sess))
-		return DSSH_ERROR_INVALID;
+	int ret = auth_entry_check(sess, false);
+	if (ret < 0)
+		return ret;
 	struct dssh_session_scope scope;
 
 	session_scope_enter(&scope, sess);
-	int ret = auth_check_terminated(sess, auth_server_impl(sess, cbs, username_out, username_out_len));
+	ret = auth_check_terminated(sess, auth_server_impl(sess, cbs, username_out, username_out_len));
 
+	if (ret == 0)
+		sess->auth_complete = true;
 	session_scope_leave(&scope);
 	return ret;
 }
@@ -1353,13 +1371,16 @@ dssh_auth_get_methods(struct dssh_session_s *sess, const char *username, char *m
 		return DSSH_ERROR_INVALID;
 	if ((methods == NULL) || (username == NULL) || (sess == NULL))
 		return DSSH_ERROR_INIT;
-	if (session_receive_api_conflict(sess))
-		return DSSH_ERROR_INVALID;
+	int ret = auth_entry_check(sess, true);
+	if (ret < 0)
+		return ret;
 	struct dssh_session_scope scope;
 
 	session_scope_enter(&scope, sess);
-	int ret = auth_check_terminated(sess, get_methods_impl(sess, username, methods, methods_sz));
+	ret = auth_check_terminated(sess, get_methods_impl(sess, username, methods, methods_sz));
 
+	if (ret == DSSH_AUTH_NONE_ACCEPTED)
+		sess->auth_complete = true;
 	session_scope_leave(&scope);
 	return ret;
 }
@@ -1494,13 +1515,16 @@ dssh_auth_password(struct dssh_session_s *sess, const char *username, const char
 		return DSSH_ERROR_INVALID;
 	if ((password == NULL) || (username == NULL) || (sess == NULL))
 		return DSSH_ERROR_INVALID;
-	if (session_receive_api_conflict(sess))
-		return DSSH_ERROR_INVALID;
+	int ret = auth_entry_check(sess, true);
+	if (ret < 0)
+		return ret;
 	struct dssh_session_scope scope;
 
 	session_scope_enter(&scope, sess);
-	int ret = auth_check_terminated(sess, auth_password_impl(sess, username, password, passwd_change_cb, passwd_change_cbdata));
+	ret = auth_check_terminated(sess, auth_password_impl(sess, username, password, passwd_change_cb, passwd_change_cbdata));
 
+	if (ret == 0)
+		sess->auth_complete = true;
 	session_scope_leave(&scope);
 	return ret;
 }
@@ -1694,13 +1718,16 @@ dssh_auth_keyboard_interactive(struct dssh_session_s *sess, const char *username
 		return DSSH_ERROR_INVALID;
 	if ((prompt_cb == NULL) || (username == NULL) || (sess == NULL))
 		return DSSH_ERROR_INVALID;
-	if (session_receive_api_conflict(sess))
-		return DSSH_ERROR_INVALID;
+	int ret = auth_entry_check(sess, true);
+	if (ret < 0)
+		return ret;
 	struct dssh_session_scope scope;
 
 	session_scope_enter(&scope, sess);
-	int ret = auth_check_terminated(sess, auth_kbi_impl(sess, username, prompt_cb, cbdata));
+	ret = auth_check_terminated(sess, auth_kbi_impl(sess, username, prompt_cb, cbdata));
 
+	if (ret == 0)
+		sess->auth_complete = true;
 	session_scope_leave(&scope);
 	return ret;
 }
@@ -1875,13 +1902,16 @@ dssh_auth_publickey(struct dssh_session_s *sess, const char *username, const cha
 		return DSSH_ERROR_INVALID;
 	if ((algo_name == NULL) || (username == NULL) || (sess == NULL))
 		return DSSH_ERROR_INVALID;
-	if (session_receive_api_conflict(sess))
-		return DSSH_ERROR_INVALID;
+	int ret = auth_entry_check(sess, true);
+	if (ret < 0)
+		return ret;
 	struct dssh_session_scope scope;
 
 	session_scope_enter(&scope, sess);
-	int ret = auth_check_terminated(sess, auth_publickey_impl(sess, username, algo_name));
+	ret = auth_check_terminated(sess, auth_publickey_impl(sess, username, algo_name));
 
+	if (ret == 0)
+		sess->auth_complete = true;
 	session_scope_leave(&scope);
 	return ret;
 }

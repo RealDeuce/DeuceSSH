@@ -3329,6 +3329,10 @@ dssh_session_start(struct dssh_session_s *sess)
 		DSSH_LOGF(sess, DSSH_LOG_ERROR, DSSH_ERROR_INIT, "Session connection layer is already started");
 		return DSSH_ERROR_INIT;
 	}
+	if (sess->terminate)
+		return DSSH_ERROR_TERMINATED;
+	if (!sess->handshake_complete || !sess->auth_complete)
+		return DSSH_ERROR_INVALID;
 
 	if (mtx_init(&sess->channel_mtx, mtx_plain) != thrd_success) {
 		DSSH_LOGF(sess, DSSH_LOG_ERROR, DSSH_ERROR_INIT, "Failed to initialize channel mutex");

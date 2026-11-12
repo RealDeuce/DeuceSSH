@@ -531,6 +531,11 @@ struct dssh_session_s {
 	atomic_bool terminate_wake_started;
 	atomic_bool lifecycle_busy;
 	atomic_bool log_mirror_suppressed;
+	/* Synchronous pre-start operations are serialized by the application.
+	 * Publish only after their complete public operation succeeds. Session
+	 * identifiers and installed keys can also exist on a failed handshake. */
+	bool        handshake_complete;
+	bool        auth_complete;
 	bool        auth_service_requested;
 	/* Owned by the synchronous server authentication receive operation. */
 	bool        server_auth_active;

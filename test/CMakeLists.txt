@@ -1098,6 +1098,12 @@ foreach(part IN ITEMS expansion context_replacement auth_cleanup sensitive_failu
 endforeach()
 
 dssh_add_test(auth test_auth.c)
+foreach(part IN ITEMS preflight progression handshake_failure)
+	dssh_add_output_test(dssh_lifecycle_${part} dssh_test_auth
+		"1 tests: 1 passed, 0 failed, 0 skipped" --exact lifecycle/${part})
+	set_tests_properties(dssh_lifecycle_${part} PROPERTIES
+		TIMEOUT 120 ENVIRONMENT "${DSSH_TEST_KEY_ENV}")
+endforeach()
 dssh_add_output_test(dssh_auth_setup_ownership dssh_test_auth
 	"1 tests: 1 passed, 0 failed, 0 skipped" --exact release/auth_setup_ownership)
 set_tests_properties(dssh_auth_setup_ownership PROPERTIES TIMEOUT 120

@@ -8362,6 +8362,7 @@ test_compression_window_rekey(void)
 #include "accept_callback_cases.h"
 #include "channel_params_cases.h"
 #include "event_overflow_cases.h"
+#include "close_outcome_cases.h"
 
 static struct dssh_test_entry tests[] = {
 	{ "release/half_close_retry", test_half_close_retry },
@@ -8921,6 +8922,8 @@ DSSH_TEST_MAIN(tests)
 int
 main(int argc, char *argv[])
 {
+	if (argc == 2 && strcmp(argv[1], "--audit-close-outcomes") == 0)
+		return close_outcome_probe();
 	if (argc == 4 && strcmp(argv[1], "--channel-fatal") == 0)
 		return channel_worker_fatal_child(argv[2], argv[3]);
 	if (argc == 3 && strcmp(argv[1], "--join-fatal") == 0)

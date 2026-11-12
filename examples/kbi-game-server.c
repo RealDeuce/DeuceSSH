@@ -11,6 +11,9 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
+#include <stdarg.h>
+#include <stdatomic.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
@@ -23,10 +26,45 @@
 #include "deucessh-conn.h"
 #include "deucessh.h"
 #include "server-io.h"
+#include "server-output.h"
 
 static int          conn_fd = -1;
 static dssh_session sess;
 static struct example_socket_io connection_io = { .descriptor = -1 };
+static atomic_bool diagnostic_failed = ATOMIC_VAR_INIT(false);
+
+static bool
+log_failure(void)
+{
+	atomic_store(&diagnostic_failed, true);
+	if (sess != NULL)
+		dssh_session_terminate(sess);
+	return false;
+}
+
+static bool log_message(const char *, ...) DSSH_EXAMPLE_PRINTF_LIKE(1, 2);
+
+static bool
+log_message(const char *format, ...)
+{
+	va_list arguments;
+	va_start(arguments, format);
+	int written = vfprintf(stderr, format, arguments);
+	va_end(arguments);
+	if (written < 0 || fflush(stderr) != 0)
+		return log_failure();
+	return true;
+}
+
+static bool
+log_bytes(const char *prefix, const uint8_t *bytes, size_t length)
+{
+	if (fputs(prefix, stderr) == EOF || example_write_text(stderr, bytes, length) < 0
+	    || fputc('\n', stderr) == EOF || fflush(stderr) != 0)
+		return log_failure();
+	return true;
+}
+
 
 /* ================================================================
  * Terminate callback -- unblock I/O callbacks
@@ -65,12 +103,24 @@ rxline(uint8_t *buf, size_t bufsz, size_t *bytes_received, dssh_session s, void 
 /* ================================================================
  * Auth callbacks
  * ================================================================ */
-static void
-set_banner(const char *msg)
+static int
+publish_banner(const char *msg)
 {
-	fprintf(stderr, "  BANNER: %s", msg);
-	dssh_auth_set_banner(sess, msg, NULL);
+	int ret = dssh_auth_set_banner(sess, msg, NULL);
+	if (ret < 0)
+		return ret;
+	const uint8_t *bytes = (const uint8_t *)msg;
+	return log_bytes("  BANNER: ", bytes, strlen(msg)) ? 0 : DSSH_ERROR_INIT;
 }
+
+#define BANNER(message) do { \
+	if (publish_banner(message) < 0) \
+		return DSSH_AUTH_DISCONNECT; \
+} while (0)
+#define FORMAT(...) do { \
+	if (example_format(__VA_ARGS__) < 0) \
+		return DSSH_AUTH_DISCONNECT; \
+} while (0)
 
 /* ================================================================
  * KBI Adventure Game
@@ -190,18 +240,17 @@ auth_kbi(const uint8_t *username, size_t username_len, uint32_t num_responses, c
 	if (num_responses == 0 && responses == NULL) {
 		memset(&gs, 0, sizeof(gs));
 		gs.room     = ROOM_GATE;
-		size_t nlen = username_len < sizeof(gs.username) - 1 ? username_len : sizeof(gs.username) - 1;
-		memcpy(gs.username, username, nlen);
-		gs.username[nlen] = '\0';
+		if (example_display_text(gs.username, sizeof(gs.username), username, username_len) < 0)
+			return DSSH_AUTH_DISCONNECT;
 
-		snprintf(banner, sizeof(banner),
+		FORMAT(banner, sizeof(banner),
 		    "\r\n--- The Gate of Authentication ---\r\n"
 		    "\r\n"
 		    "Welcome, %s. To prove your worth, you must find\r\n"
 		    "the key that unlocks the gate.\r\n"
 		    "%s",
 		    gs.username, gate_desc);
-		set_banner(banner);
+		BANNER(banner);
 		gs.looked = true;
 		goto prompt;
 	}
@@ -226,18 +275,18 @@ auth_kbi(const uint8_t *username, size_t username_len, uint32_t num_responses, c
 
 	/* Universal commands */
 	if (cmd_eq(cmd, "quit") || cmd_eq(cmd, "exit")) {
-		set_banner("You walk away from the gate. Maybe next time.\r\n");
+		BANNER("You walk away from the gate. Maybe next time.\r\n");
 		return DSSH_AUTH_FAILURE;
 	}
 	if (cmd_eq(cmd, "help") || cmd_eq(cmd, "?")) {
-		set_banner(help_text);
+		BANNER(help_text);
 		goto prompt;
 	}
 	if (cmd_eq(cmd, "inventory") || cmd_eq(cmd, "inv") || cmd_eq(cmd, "i")) {
 		if (gs.has_key)
-			set_banner("You are carrying: a rusty iron key\r\n");
+			BANNER("You are carrying: a rusty iron key\r\n");
 		else
-			set_banner("You are carrying nothing.\r\n");
+			BANNER("You are carrying nothing.\r\n");
 		goto prompt;
 	}
 
@@ -245,12 +294,12 @@ auth_kbi(const uint8_t *username, size_t username_len, uint32_t num_responses, c
 	switch (gs.room) {
 		case ROOM_GATE:
 			if (cmd_eq(cmd, "look") || cmd_eq(cmd, "l")) {
-				set_banner(gate_desc);
+				BANNER(gate_desc);
 				gs.looked = true;
 				goto prompt;
 			}
 			if (looking_at(cmd, "gate") || looking_at(cmd, "door")) {
-				set_banner(
+				BANNER(
 				    "\r\nThe gate is wrought from black iron, "
 				    "twisted into thorny spirals.\r\n"
 				    "It's cold to the touch and far too heavy "
@@ -259,12 +308,12 @@ auth_kbi(const uint8_t *username, size_t username_len, uint32_t num_responses, c
 			}
 			if (looking_at(cmd, "padlock") || looking_at(cmd, "lock")) {
 				if (gs.has_key)
-					set_banner(
+					BANNER(
 					    "\r\nA heavy padlock. The keyhole looks "
 					    "like it might accept the key you're "
 					    "carrying.\r\n\r\n");
 				else
-					set_banner(
+					BANNER(
 					    "\r\nA heavy padlock, green with verdigris. "
 					    "The keyhole is shaped\r\n"
 					    "like an old-fashioned skeleton key. "
@@ -272,7 +321,7 @@ auth_kbi(const uint8_t *username, size_t username_len, uint32_t num_responses, c
 				goto prompt;
 			}
 			if (looking_at(cmd, "bars")) {
-				set_banner(
+				BANNER(
 				    "\r\nThrough the bars you can see a softly "
 				    "glowing terminal prompt.\r\n"
 				    "It blinks patiently. It has all the time "
@@ -280,7 +329,7 @@ auth_kbi(const uint8_t *username, size_t username_len, uint32_t num_responses, c
 				goto prompt;
 			}
 			if (looking_at(cmd, "path") || looking_at(cmd, "paths")) {
-				set_banner(
+				BANNER(
 				    "\r\nA cobblestone path branches north toward "
 				    "an overgrown garden,\r\n"
 				    "and west toward a crumbling stone "
@@ -288,14 +337,14 @@ auth_kbi(const uint8_t *username, size_t username_len, uint32_t num_responses, c
 				goto prompt;
 			}
 			if (looking_at(cmd, "tower")) {
-				set_banner(
+				BANNER(
 				    "\r\nThe tower rises to the west, its upper "
 				    "stones crumbling.\r\n"
 				    "Something dark moves on the parapet.\r\n\r\n");
 				goto prompt;
 			}
 			if (looking_at(cmd, "garden")) {
-				set_banner(
+				BANNER(
 				    "\r\nTo the north, vines and wildflowers spill "
 				    "over what was once\r\n"
 				    "a formal garden. You can just make out a "
@@ -305,31 +354,31 @@ auth_kbi(const uint8_t *username, size_t username_len, uint32_t num_responses, c
 			if (dir_match(cmd, "north", "n")) {
 				gs.room   = ROOM_GARDEN;
 				gs.looked = false;
-				set_banner(garden_desc);
+				BANNER(garden_desc);
 				gs.looked = true;
 				goto prompt;
 			}
 			if (dir_match(cmd, "west", "w")) {
 				gs.room   = ROOM_TOWER;
 				gs.looked = false;
-				set_banner(tower_desc);
+				BANNER(tower_desc);
 				gs.looked = true;
 				goto prompt;
 			}
 			if (dir_match(cmd, "east", "e") || dir_match(cmd, "south", "s")
 			    || dir_match(cmd, "up", "u") || dir_match(cmd, "down", "d")) {
-				set_banner("There is no path in that direction.\r\n");
+				BANNER("There is no path in that direction.\r\n");
 				goto prompt;
 			}
 			if (cmd_eq(cmd, "use key") || cmd_eq(cmd, "unlock gate") || cmd_eq(cmd, "unlock door")
 			    || cmd_eq(cmd, "open gate") || cmd_eq(cmd, "open door")) {
 				if (!gs.has_key) {
-					set_banner(
+					BANNER(
 					    "You rattle the padlock uselessly. "
 					    "You need a key.\r\n");
 					goto prompt;
 				}
-				snprintf(banner, sizeof(banner),
+				FORMAT(banner, sizeof(banner),
 				    "\r\nThe rusty key turns in the padlock with a "
 				    "satisfying click.\r\n"
 				    "The gate swings open with a groan.\r\n"
@@ -337,33 +386,33 @@ auth_kbi(const uint8_t *username, size_t username_len, uint32_t num_responses, c
 				    "Welcome, %s. You have proven yourself worthy.\r\n"
 				    "\r\n",
 				    gs.username);
-				set_banner(banner);
+				BANNER(banner);
 				return DSSH_AUTH_SUCCESS;
 			}
-			set_banner("You can't do that here.\r\n");
+			BANNER("You can't do that here.\r\n");
 			goto prompt;
 
 		case ROOM_GARDEN:
 			if (cmd_eq(cmd, "look") || cmd_eq(cmd, "l") || cmd_eq(cmd, "examine")) {
 				if (gs.riddle_solved && !gs.has_key)
-					set_banner(
+					BANNER(
 					    "\r\n"
 					    "The overgrown garden. The fountain's "
 					    "symbols glow faintly.\r\n"
 					    "A rusty key glints beneath a loose "
 					    "stone.\r\n\r\n");
 				else if (gs.has_key)
-					set_banner(
+					BANNER(
 					    "\r\n"
 					    "The overgrown garden. The fountain is "
 					    "quiet now.\r\n\r\n");
 				else
-					set_banner(garden_desc);
+					BANNER(garden_desc);
 				gs.looked = true;
 				goto prompt;
 			}
 			if (looking_at(cmd, "fountain")) {
-				set_banner(
+				BANNER(
 				    "\r\nThe fountain is carved from a single block "
 				    "of grey stone.\r\n"
 				    "It hasn't held water in decades, but the "
@@ -373,7 +422,7 @@ auth_kbi(const uint8_t *username, size_t username_len, uint32_t num_responses, c
 				goto prompt;
 			}
 			if (looking_at(cmd, "rim") || looking_at(cmd, "symbols") || looking_at(cmd, "carvings")) {
-				set_banner(
+				BANNER(
 				    "\r\nThe symbols look like an ancient script. "
 				    "They seem to form words,\r\n"
 				    "but you can't quite make them out from "
@@ -381,7 +430,7 @@ auth_kbi(const uint8_t *username, size_t username_len, uint32_t num_responses, c
 				goto prompt;
 			}
 			if (looking_at(cmd, "stones") || looking_at(cmd, "stepping stones")) {
-				set_banner(
+				BANNER(
 				    "\r\nMoss-covered stepping stones form a path "
 				    "south toward the gate.\r\n"
 				    "They're slippery but solid.\r\n\r\n");
@@ -389,16 +438,16 @@ auth_kbi(const uint8_t *username, size_t username_len, uint32_t num_responses, c
 			}
 			if (looking_at(cmd, "stone") || looking_at(cmd, "loose stone")) {
 				if (gs.riddle_solved && !gs.has_key)
-					set_banner(
+					BANNER(
 					    "\r\nA loose stone at the fountain's base "
 					    "has shifted, revealing\r\n"
 					    "a rusty iron key underneath.\r\n\r\n");
 				else if (gs.riddle_solved)
-					set_banner(
+					BANNER(
 					    "\r\nThe loose stone. The key is gone -- "
 					    "you have it.\r\n\r\n");
 				else
-					set_banner(
+					BANNER(
 					    "\r\nThe stones around the fountain's base "
 					    "are tightly fitted.\r\n"
 					    "Nothing seems loose.\r\n\r\n");
@@ -406,19 +455,19 @@ auth_kbi(const uint8_t *username, size_t username_len, uint32_t num_responses, c
 			}
 			if (looking_at(cmd, "key")) {
 				if (gs.riddle_solved && !gs.has_key)
-					set_banner(
+					BANNER(
 					    "\r\nA rusty iron key, half-buried under "
 					    "the loose stone.\r\n"
 					    "It looks like it would fit an old "
 					    "padlock.\r\n\r\n");
 				else if (gs.has_key)
-					set_banner("You already picked it up.\r\n");
+					BANNER("You already picked it up.\r\n");
 				else
-					set_banner("You don't see a key here.\r\n");
+					BANNER("You don't see a key here.\r\n");
 				goto prompt;
 			}
 			if (looking_at(cmd, "leaves") || looking_at(cmd, "basin")) {
-				set_banner(
+				BANNER(
 				    "\r\nDead leaves fill the dry basin. Nothing "
 				    "useful, just the slow\r\n"
 				    "decay of a forgotten place.\r\n\r\n");
@@ -426,7 +475,7 @@ auth_kbi(const uint8_t *username, size_t username_len, uint32_t num_responses, c
 			}
 			if (looking_at(cmd, "vines") || looking_at(cmd, "flowers")
 			    || looking_at(cmd, "wildflowers")) {
-				set_banner(
+				BANNER(
 				    "\r\nWild morning glories twist through the "
 				    "remains of a trellis.\r\n"
 				    "They're beautiful in a melancholy way.\r\n\r\n");
@@ -435,19 +484,19 @@ auth_kbi(const uint8_t *username, size_t username_len, uint32_t num_responses, c
 			if (dir_match(cmd, "south", "s")) {
 				gs.room   = ROOM_GATE;
 				gs.looked = false;
-				set_banner(gate_desc);
+				BANNER(gate_desc);
 				gs.looked = true;
 				goto prompt;
 			}
 			if (dir_match(cmd, "north", "n") || dir_match(cmd, "east", "e")
 			    || dir_match(cmd, "west", "w") || dir_match(cmd, "up", "u")
 			    || dir_match(cmd, "down", "d")) {
-				set_banner("There is no path in that direction.\r\n");
+				BANNER("There is no path in that direction.\r\n");
 				goto prompt;
 			}
 			if (cmd_eq(cmd, "read fountain") || cmd_eq(cmd, "read") || cmd_eq(cmd, "read rim")
 			    || cmd_eq(cmd, "read symbols")) {
-				set_banner(
+				BANNER(
 				    "\r\nCarved into the fountain's rim:\r\n\r\n"
 				    "  \"I have cities, but no houses.\r\n"
 				    "   I have mountains, but no trees.\r\n"
@@ -461,44 +510,44 @@ auth_kbi(const uint8_t *username, size_t username_len, uint32_t num_responses, c
 				const char *ans = cmd_arg(cmd, "answer");
 				if (strcasecmp(ans, "a map") == 0 || strcasecmp(ans, "map") == 0) {
 					gs.riddle_solved = true;
-					set_banner(
+					BANNER(
 					    "\r\nThe symbols on the fountain glow "
 					    "bright blue!\r\n"
 					    "A stone at the fountain's base shifts, "
 					    "revealing a rusty key.\r\n");
 					goto prompt;
 				}
-				set_banner(
+				BANNER(
 				    "The fountain remains silent. "
 				    "That is not the answer.\r\n");
 				goto prompt;
 			}
 			if (cmd_eq(cmd, "take key") || cmd_eq(cmd, "get key")) {
 				if (!gs.riddle_solved) {
-					set_banner("You don't see a key here.\r\n");
+					BANNER("You don't see a key here.\r\n");
 					goto prompt;
 				}
 				if (gs.has_key) {
-					set_banner("You already have the key.\r\n");
+					BANNER("You already have the key.\r\n");
 					goto prompt;
 				}
 				gs.has_key = true;
-				set_banner(
+				BANNER(
 				    "You pick up the rusty iron key. "
 				    "It's heavy and cold.\r\n");
 				goto prompt;
 			}
-			set_banner("You can't do that here.\r\n");
+			BANNER("You can't do that here.\r\n");
 			goto prompt;
 
 		case ROOM_TOWER:
 			if (cmd_eq(cmd, "look") || cmd_eq(cmd, "l")) {
-				set_banner(tower_desc);
+				BANNER(tower_desc);
 				gs.looked = true;
 				goto prompt;
 			}
 			if (looking_at(cmd, "tower") || looking_at(cmd, "walls")) {
-				set_banner(
+				BANNER(
 				    "\r\nThe tower is built from rough-hewn stone, "
 				    "crumbling at the edges.\r\n"
 				    "It must have been a watchtower once. Ivy "
@@ -506,7 +555,7 @@ auth_kbi(const uint8_t *username, size_t username_len, uint32_t num_responses, c
 				goto prompt;
 			}
 			if (looking_at(cmd, "steps") || looking_at(cmd, "stairs")) {
-				set_banner(
+				BANNER(
 				    "\r\nNarrow stone steps spiral upward into "
 				    "shadow, worn smooth\r\n"
 				    "by centuries of footsteps. They look "
@@ -514,7 +563,7 @@ auth_kbi(const uint8_t *username, size_t username_len, uint32_t num_responses, c
 				goto prompt;
 			}
 			if (looking_at(cmd, "ivy")) {
-				set_banner(
+				BANNER(
 				    "\r\nThick ivy clings to the stonework. "
 				    "Tiny spiders scurry away\r\n"
 				    "from your gaze.\r\n\r\n");
@@ -523,40 +572,40 @@ auth_kbi(const uint8_t *username, size_t username_len, uint32_t num_responses, c
 			if (dir_match(cmd, "east", "e")) {
 				gs.room   = ROOM_GATE;
 				gs.looked = false;
-				set_banner(gate_desc);
+				BANNER(gate_desc);
 				gs.looked = true;
 				goto prompt;
 			}
 			if (dir_match(cmd, "up", "u")) {
 				gs.room   = ROOM_PARAPET;
 				gs.looked = false;
-				set_banner(parapet_desc);
+				BANNER(parapet_desc);
 				gs.looked = true;
 				goto prompt;
 			}
 			if (dir_match(cmd, "north", "n") || dir_match(cmd, "south", "s")
 			    || dir_match(cmd, "west", "w") || dir_match(cmd, "down", "d")) {
-				set_banner("There is no path in that direction.\r\n");
+				BANNER("There is no path in that direction.\r\n");
 				goto prompt;
 			}
-			set_banner("You can't do that here.\r\n");
+			BANNER("You can't do that here.\r\n");
 			goto prompt;
 
 		case ROOM_PARAPET:
 			if (cmd_eq(cmd, "look") || cmd_eq(cmd, "l")) {
-				set_banner(parapet_desc);
+				BANNER(parapet_desc);
 				gs.looked = true;
 				goto prompt;
 			}
 			if (looking_at(cmd, "raven") || looking_at(cmd, "bird")) {
 				if (gs.talked_raven)
-					set_banner(
+					BANNER(
 					    "\r\nThe raven watches you with one "
 					    "beady eye. It's already said\r\n"
 					    "its piece and seems smugly satisfied "
 					    "about it.\r\n\r\n");
 				else
-					set_banner(
+					BANNER(
 					    "\r\nA large raven, jet black with an "
 					    "iridescent sheen. It cocks\r\n"
 					    "its head as if waiting for you to "
@@ -565,7 +614,7 @@ auth_kbi(const uint8_t *username, size_t username_len, uint32_t num_responses, c
 			}
 			if (looking_at(cmd, "battlement") || looking_at(cmd, "wall")
 			    || looking_at(cmd, "parapet")) {
-				set_banner(
+				BANNER(
 				    "\r\nThe battlement is crumbling badly. "
 				    "Several merlons have fallen\r\n"
 				    "away entirely, leaving gaps through which "
@@ -574,7 +623,7 @@ auth_kbi(const uint8_t *username, size_t username_len, uint32_t num_responses, c
 			}
 			if (looking_at(cmd, "view") || looking_at(cmd, "horizon")
 			    || looking_at(cmd, "landscape")) {
-				set_banner(
+				BANNER(
 				    "\r\nFrom up here you can see the garden to "
 				    "the north-east, the locked\r\n"
 				    "gate below to the east, and beyond it... "
@@ -583,7 +632,7 @@ auth_kbi(const uint8_t *username, size_t username_len, uint32_t num_responses, c
 				goto prompt;
 			}
 			if (looking_at(cmd, "stairs") || looking_at(cmd, "steps")) {
-				set_banner(
+				BANNER(
 				    "\r\nThe spiral stairs disappear into shadow "
 				    "below.\r\n\r\n");
 				goto prompt;
@@ -591,26 +640,26 @@ auth_kbi(const uint8_t *username, size_t username_len, uint32_t num_responses, c
 			if (dir_match(cmd, "down", "d")) {
 				gs.room   = ROOM_TOWER;
 				gs.looked = false;
-				set_banner(tower_desc);
+				BANNER(tower_desc);
 				gs.looked = true;
 				goto prompt;
 			}
 			if (dir_match(cmd, "north", "n") || dir_match(cmd, "south", "s")
 			    || dir_match(cmd, "east", "e") || dir_match(cmd, "west", "w")
 			    || dir_match(cmd, "up", "u")) {
-				set_banner("There is no path in that direction.\r\n");
+				BANNER("There is no path in that direction.\r\n");
 				goto prompt;
 			}
 			if (cmd_eq(cmd, "talk raven") || cmd_eq(cmd, "talk") || cmd_eq(cmd, "ask raven")) {
 				gs.talked_raven = true;
-				set_banner(
+				BANNER(
 				    "\r\nThe raven cocks its head and croaks:\r\n\r\n"
 				    "  \"Cartographers know the answer, traveler.\r\n"
 				    "   But you won't find it in any atlas.\"\r\n\r\n"
 				    "The raven ruffles its feathers smugly.\r\n");
 				goto prompt;
 			}
-			set_banner("You can't do that here.\r\n");
+			BANNER("You can't do that here.\r\n");
 			goto prompt;
 	}
 
@@ -655,22 +704,41 @@ static struct dssh_auth_server_cbs auth_cbs = {
     .keyboard_interactive_cb = auth_kbi,
 };
 
+#undef BANNER
+#undef FORMAT
+
 /* ================================================================
  * Channel accept callbacks (new dssh_chan_* API)
  * ================================================================ */
 static int
 accept_pty_cb(dssh_channel ch, const struct dssh_chan_params *p, void *cbdata)
 {
-	fprintf(stderr, "  PTY: %s %ux%u\n", p->term, p->cols, p->rows);
+	(void)ch;
+	(void)cbdata;
+	if (p == NULL)
+		return DSSH_ERROR_INVALID;
+	const uint8_t *term = (const uint8_t *)p->term;
+	size_t length = p->term == NULL ? 0 : strlen(p->term);
+	if (!log_bytes("  PTY: ", term, length)
+	    || !log_message("  SIZE: %" PRIu32 "x%" PRIu32 "\n", p->cols, p->rows))
+		return DSSH_ERROR_INIT;
 	return 0;
 }
 
 static int
 accept_env_cb(dssh_channel ch, const struct dssh_chan_params *p, void *cbdata)
 {
-	if (p->env_count > 0)
-		fprintf(stderr, "  ENV: %s=%s\n", p->env[p->env_count - 1].name, p->env[p->env_count - 1].value);
-	return 0;
+	(void)ch;
+	(void)cbdata;
+	if (p == NULL || (p->env_count > 0 && p->env == NULL))
+		return DSSH_ERROR_INVALID;
+	if (p->env_count == 0)
+		return 0;
+	const char *name = p->env[p->env_count - 1].name;
+	if (name == NULL)
+		return DSSH_ERROR_INVALID;
+	const uint8_t *bytes = (const uint8_t *)name;
+	return log_bytes("  ENV_NAME: ", bytes, strlen(name)) ? 0 : DSSH_ERROR_INIT;
 }
 
 static int
@@ -691,8 +759,8 @@ accept_exec_cb(dssh_channel ch, const struct dssh_chan_params *p, struct dssh_ch
 	(void)ch;
 	(void)result;
 	(void)cbdata;
-	fprintf(stderr, "  EXEC: %s\n", p->command ? p->command : "(null)");
-	return 0;
+	(void)p;
+	return log_message("  EXEC request\n") ? 0 : DSSH_ERROR_INIT;
 }
 
 static struct dssh_chan_accept_cbs accept_cbs = {
@@ -708,22 +776,28 @@ static struct dssh_chan_accept_cbs accept_cbs = {
 static void
 debug_cb(bool always_display, const uint8_t *message, size_t message_len, void *cbdata)
 {
-	fprintf(stderr, "  DEBUG(%s): %.*s\n", always_display ? "display" : "nodisplay", (int)message_len,
-	    message);
+	(void)cbdata;
+	if (!log_bytes(always_display ? "  DEBUG(display): " : "  DEBUG(nodisplay): ", message, message_len))
+		return;
 }
 
 static void
 unimplemented_cb(uint32_t rejected_seq, void *cbdata)
 {
-	fprintf(stderr, "  UNIMPLEMENTED: seq %u\n", rejected_seq);
+	(void)cbdata;
+	if (!log_message("  UNIMPLEMENTED: seq %" PRIu32 "\n", rejected_seq))
+		return;
 }
 
 static int
 global_request_cb(const uint8_t *name, size_t name_len, bool want_reply, const uint8_t *data, size_t data_len,
     void *cbdata)
 {
-	fprintf(stderr, "  GLOBAL_REQ: %.*s (want_reply=%d, data_len=%zu)\n", (int)name_len, name, want_reply,
-	    data_len);
+	(void)data;
+	(void)cbdata;
+	if (!log_message("  GLOBAL_REQ: want_reply=%d, data_len=%zu\n", want_reply, data_len)
+	    || !log_bytes("  REQUEST_NAME: ", name, name_len))
+		return -1;
 	return -1; /* reject all */
 }
 
@@ -733,6 +807,7 @@ global_request_cb(const uint8_t *name, size_t name_len, bool want_reply, const u
 static int
 handle_connection(void)
 {
+	atomic_store(&diagnostic_failed, false);
 	/* Readiness alone does not make a blocking transfer bounded. */
 	int flags = fcntl(conn_fd, F_GETFL);
 	if (flags < 0 || fcntl(conn_fd, F_SETFL, flags | O_NONBLOCK) != 0) {
@@ -777,7 +852,11 @@ handle_connection(void)
 
 	/* Auth */
 	fprintf(stderr, "Handling auth...\n");
-	set_banner("Welcome to the DeuceSSH test server, have fun!\r\n");
+	if (publish_banner("Welcome to the DeuceSSH test server, have fun!\r\n") < 0) {
+		dssh_session_cleanup(sess);
+		sess = NULL;
+		return 1;
+	}
 
 	uint8_t auth_user[256];
 	size_t  auth_user_len = sizeof(auth_user);
@@ -905,7 +984,7 @@ channel_done:
 		closed = 1;
 	}
 	conn_fd = -1;
-	if (closed != 0)
+	if (closed != 0 || atomic_load(&diagnostic_failed))
 		status = 1;
 	return status;
 }

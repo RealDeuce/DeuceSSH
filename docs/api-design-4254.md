@@ -105,6 +105,18 @@ observe cumulative received positions and run on the demux thread. Follow the
 public callback restrictions and pass application work to an appropriate worker.
 Callbacks and queued delivery are alternative consumers of each event.
 
+## BREAK actions
+
+BREAK uses `dssh_chan_break_cb`, with defaults set before start through
+`dssh_session_set_break_cb()` and per-channel replacement through
+`dssh_chan_set_break_cb()`. It is not a general event. The borrowed request
+contains raw duration, cumulative stream positions and normalized reply flag.
+Return whether a BREAK of any kind was performed; the requested wire reply
+follows that result. An absent handler performs no action and fails a requested
+reply. The library performs no device I/O or duration clamping. Follow the
+public callback and captured-code/data lifetime restrictions. The handler runs
+on the demux thread after setup; waiting inside it stalls session receive work.
+
 ## Zero-copy I/O
 
 `dssh_chan_zc_open()` supplies a receive callback rather than buffered stream
@@ -122,7 +134,7 @@ reservation is owned.
 
 The acceptor invokes PTY/environment and terminal callbacks on the thread
 calling `dssh_chan_accept()`, with borrowed accumulated parameters and handle.
-Getters and the documented event setters are available during setup. Do not
+Getters and the documented event/BREAK setters are available during setup. Do not
 retain those parameter views, hand the borrowed handle to another thread or
 perform same-session channel I/O/TX/nested accept there. A terminal callback
 fills `dssh_chan_accept_result` to select stream or zero-copy delivery.

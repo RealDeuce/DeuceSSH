@@ -338,6 +338,8 @@ struct dssh_channel_s {
 	void                  *zc_cbdata;
 	dssh_chan_event_cb     event_cb; /* optional event push callback */
 	void                  *event_cbdata;
+	dssh_chan_break_cb     break_cb;
+	void                  *break_cbdata;
 
 	/* C11 synchronization (platform-dependent size).
 	 * TX slot draining uses tx_mtx -> channel_mtx -> buf_mtx.
@@ -405,7 +407,7 @@ struct dssh_channel_s {
 
 	/* Pre-allocated TX slots for demux fire-and-forget responses */
 	struct dssh_tx_slot wa_slot;        /* CHANNEL_WINDOW_ADJUST (9 B) */
-	struct dssh_tx_slot chan_fail_slot; /* CHANNEL_FAILURE (8 B)       */
+	struct dssh_tx_slot chan_reply_slot; /* CHANNEL_SUCCESS/FAILURE (8 B) */
 
 					    /* Embedded structs (contain pointers, large) */
 	struct dssh_chan_params params; /* new API: getters after open/accept */
@@ -490,6 +492,8 @@ struct dssh_session_s {
 	void                  *hostkey_verify_cbdata;
 	dssh_chan_event_cb      default_event_cb;
 	void                   *default_event_cbdata;
+	dssh_chan_break_cb      default_break_cb;
+	void                   *default_break_cbdata;
 	size_t                  default_max_events;
 	struct dssh_channel_s **channels;
 	size_t                  channel_count;

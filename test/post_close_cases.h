@@ -145,8 +145,8 @@ post_close_enqueue_controls(dssh_channel ch, uint32_t bytes, bool defer)
 	uint8_t failure[5];
 	post_close_build_failure(failure, ch->remote_id);
 	int window_result = schedule_wa_slot(sess);
-	int failure_result = send_channel_failure(sess, ch, failure, sizeof(failure));
-	bool ready = atomic_load(&ch->wa_slot.ready) && atomic_load(&ch->chan_fail_slot.ready);
+	int failure_result = send_channel_reply(sess, ch, failure, sizeof(failure));
+	bool ready = atomic_load(&ch->wa_slot.ready) && atomic_load(&ch->chan_reply_slot.ready);
 	if (defer)
 		atomic_store(&sess->trans.rekey_in_progress, true);
 	tx_unlock_with_slots(sess);
@@ -174,7 +174,7 @@ post_close_queued_run(struct conn_ctx *ctx)
 	ASSERT_NOT_NULL(replacement);
 	ASSERT_TRUE(post_close_enqueue_controls(old, 2, false));
 	ASSERT_FALSE(atomic_load(&old->wa_slot.ready));
-	ASSERT_FALSE(atomic_load(&old->chan_fail_slot.ready));
+	ASSERT_FALSE(atomic_load(&old->chan_reply_slot.ready));
 	if (mtx_lock(&old->buf_mtx) != thrd_success)
 		abort();
 	uint32_t local_window = old->local_window;
@@ -188,7 +188,7 @@ post_close_queued_run(struct conn_ctx *ctx)
 
 	uint8_t failure[5];
 	post_close_build_failure(failure, remote);
-	ASSERT_OK(send_channel_failure(ctx->server, old, failure, sizeof(failure)));
+	ASSERT_OK(send_channel_reply(ctx->server, old, failure, sizeof(failure)));
 	ASSERT_TRUE(channel_id_wire_barrier(ctx->client));
 	ASSERT_OK(dssh_chan_close(old, -1));
 	ASSERT_OK(dssh_chan_send_break(replacement, 100));

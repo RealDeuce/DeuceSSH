@@ -30,6 +30,7 @@ close_termination_callback(dssh_session session, void *opaque)
 		valid = state->closed == DSSH_ERROR_INVALID && valid;
 	}
 	valid = dssh_session_set_log_level(session, DSSH_LOG_ERROR) == DSSH_ERROR_INVALID && valid;
+	valid = dssh_session_set_break_cb(session, NULL, NULL) == DSSH_ERROR_INVALID && valid;
 	if (state->nested != NULL) {
 		bool terminated = dssh_session_terminate(state->other);
 		valid = terminated && state->nested->valid && state->nested->calls == 1 && valid;

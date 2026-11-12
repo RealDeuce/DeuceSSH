@@ -923,7 +923,7 @@ alloc_channel_slots(struct dssh_session_s *sess, struct dssh_channel_s *ch)
 
 	ret = alloc_tx_slot(&ch->wa_slot, 9, bs, mac);
 	if (ret == 0)
-		ret = alloc_tx_slot(&ch->chan_fail_slot, 8, bs, mac);
+		ret = alloc_tx_slot(&ch->chan_reply_slot, 8, bs, mac);
 	if (acquired)
 		return tx_unlock_with_result(sess, ret);
 	return ret;
@@ -993,7 +993,7 @@ resize_channel_slots(struct dssh_session_s *sess)
 
 		alloc_ret = resize_tx_slot_live(sess, &ch->wa_slot, 9, bs, mac);
 		if (alloc_ret == 0)
-			alloc_ret = resize_tx_slot_live(sess, &ch->chan_fail_slot, 8, bs, mac);
+			alloc_ret = resize_tx_slot_live(sess, &ch->chan_reply_slot, 8, bs, mac);
 		if (ret == 0 && alloc_ret < 0)
 			ret = alloc_ret;
 	}
@@ -1518,7 +1518,7 @@ drain_tx_slots(struct dssh_session_s *sess)
 				for (size_t j = 0; j < n; j++) {
 					struct dssh_channel_s *candidate = sess->channels[idx];
 					if (atomic_load(&candidate->wa_slot.ready)
-					    || atomic_load(&candidate->chan_fail_slot.ready)) {
+					    || atomic_load(&candidate->chan_reply_slot.ready)) {
 						atomic_fetch_add_explicit(&candidate->tx_refs, 1, memory_order_acq_rel);
 						ch = candidate;
 						discard = candidate->protocol_id->close_ordered;
@@ -1533,7 +1533,7 @@ drain_tx_slots(struct dssh_session_s *sess)
 				break;
 			result = drain_one_wa_slot(sess, ch, &progress, discard);
 			if (result == 0)
-				result = drain_one_slot(sess, &ch->chan_fail_slot, &progress, discard);
+				result = drain_one_slot(sess, &ch->chan_reply_slot, &progress, discard);
 			atomic_fetch_sub_explicit(&ch->tx_refs, 1, memory_order_acq_rel);
 			if (result < 0)
 				break;
@@ -2003,10 +2003,10 @@ send_to_slot(struct dssh_session_s *sess, struct dssh_tx_slot *slot, const uint8
 }
 
 DSSH_PRIVATE int
-send_channel_failure(struct dssh_session_s *sess, struct dssh_channel_s *ch,
+send_channel_reply(struct dssh_session_s *sess, struct dssh_channel_s *ch,
     const uint8_t *payload, size_t payload_len)
 {
-	return send_to_slot_inner(sess, &ch->chan_fail_slot, payload, payload_len, ch);
+	return send_to_slot_inner(sess, &ch->chan_reply_slot, payload, payload_len, ch);
 }
 
 /*

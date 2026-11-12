@@ -1649,6 +1649,55 @@ dssh_chan_send_window_change(ch, cols, rows, wpx, hpx);
 dssh_chan_send_break(ch, 0);  /* RFC 4335 */
 ```
 
+### Receiving BREAK requests
+
+BREAK is an action request, separate from the event queue. Set a session default
+before `dssh_session_start()`, or replace a channel's handler using
+`dssh_chan_set_break_cb()`. Check every setter result. The session default is
+inherited by new stream, zero-copy and accepted channels.
+
+```c
+/* Application function: return true only if a BREAK of some kind occurred. */
+bool perform_break_on_device(uint32_t requested_ms, void *device);
+
+static bool handle_break(dssh_channel ch,
+    const struct dssh_chan_break_request *request, void *device)
+{
+    (void)ch;
+    return perform_break_on_device(request->length, device);
+}
+
+int configure_break(dssh_session sess, void *device)
+{
+    return dssh_session_set_break_cb(sess, handle_break, device);
+}
+```
+
+After channel setup, the handler runs on the demux thread without library
+mutexes held. The channel and request are borrowed for the invocation. It gets
+the exact uint32 duration, cumulative prior stdout/stderr positions (saturating
+at `SIZE_MAX`) and normalized `want_reply`. Return true if any BREAK was
+performed, even if a later part of the device operation failed; return false
+only if none was performed. Queueing work alone does not establish execution.
+A requested SUCCESS/FAILURE follows that return. With no handler, no action or
+event occurs, and a requested reply is FAILURE. Requests during setup retain
+the unperformed/rejection path. The sender uses `want_reply=false`; its success
+reports local transmission, not remote device execution.
+
+The library does no terminal/device I/O or duration clamping. The application
+owns authorization, serial/nonserial attention behavior and cascaded forwarding.
+RFC 4335 recommends the device default for zero, 500 ms if no default exists,
+and ordinarily 500–3000 ms for controllable durations. The application chooses
+its device policy.
+
+Follow event callback restrictions: no channel I/O, poll, TX, close, open or
+accept from this handler. Getters and callback/limit setters remain available.
+Session lifecycle requests retain deferred cleanup. Waiting for a worker/device
+here pauses receive progress for every channel in this session. Callback/data
+replacement affects future snapshots; keep an already captured pair alive until
+its invocation finishes. The examples have no device BREAK action and leave
+the handler unset.
+
 ### Windowing
 
 The library manages flow control automatically.  The max window size
@@ -1665,7 +1714,8 @@ demux thread also handles:
 
 - Incoming CHANNEL_OPEN — queued for `dssh_chan_accept()`
 - CHANNEL_EOF / CHANNEL_CLOSE — sets flags, wakes poll
-- CHANNEL_REQUEST "signal", "exit-status", "exit-signal", "window-change", "break" — queued as events
+- CHANNEL_REQUEST "signal", "exit-status", "exit-signal", "window-change" — delivered as events
+- CHANNEL_REQUEST "break" — invokes the synchronous action handler; requested replies reflect its result
 - Forbidden channel types (x11, forwarded-tcpip, direct-tcpip, session-from-server) — auto-rejected
 - Data after peer EOF/CLOSE — discarded
 - Rekeying, global requests, IGNORE/DEBUG/UNIMPLEMENTED — transparent
@@ -1691,7 +1741,7 @@ logging and termination callbacks still apply.
 
 ## Event Model
 
-Events (signal, window-change, break, EOF, close, exit-status,
+Events (signal, window-change, EOF, close, exit-status,
 exit-signal) are separate from data — the `signalfd()` model.
 Data always flows freely via `dssh_chan_read()`.  Events are
 queued and pulled independently.
@@ -1869,7 +1919,7 @@ my_shell_cb(dssh_channel ch,
 
 Setup callbacks run on the accept caller thread with no library mutex held.
 The channel and accumulated parameters are borrowed for that invocation;
-getters on the callback handle show those parameters. Event callback and limit
+getters on the callback handle show those parameters. Event/BREAK callback and limit
 setters are available. Same-session channel I/O, polling, TX reservations and
 nested open/accept are rejected. Independent sessions remain available.
 Do not hand the handle to another thread before accept returns successfully.
@@ -2211,3 +2261,15 @@ test/               Test suite (built with -DDEUCESSH_BUILD_TESTS=ON)
   mock_io.h/.c      Bidirectional mock I/O layer
   test_*.c          Test source files
 ```
+
+
+Optional independent BREAK interoperability checks use a separately built SSH
+client; it does not compile or link the C API. The audit helper
+`test/build_break_ssh_peer.py` builds `test/break_ssh_peer.go` from existing
+offline `golang.org/x/crypto` v0.58.0 and `golang.org/x/sys` v0.49.0 module
+sources with Go 1.26. Pass the resulting executable as
+`-DDEUCESSH_BREAK_SSH_PEER=/absolute/path/to/break-ssh-peer` to enable the two
+`dssh_break_independent_*` CTests. Library builds and the C test suites require
+no Go installation. These checks verify handler-derived acknowledgements,
+pinned host authentication, transfer, exit status and rekey against the foreign
+implementation; they do not operate a physical serial device.

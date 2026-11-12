@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,6 +23,30 @@ static const uint8_t digits[] = "0123456789abcdef";
 static const uint8_t error_text[] = "interop-stderr\n";
 static const uint8_t acknowledgement[] = "dssh-ack\n";
 static struct timespec started;
+
+struct break_observation {
+	atomic_uint count;
+	atomic_bool bad;
+};
+
+static bool
+perform_break(dssh_channel channel, const struct dssh_chan_break_request *request, void *opaque)
+{
+	struct break_observation *observation = opaque;
+	static const uint32_t durations[] = {0, 1, 499, 500, 3000, 3001, UINT32_MAX};
+	unsigned index = atomic_load(&observation->count);
+	if (index >= 14) {
+		atomic_store(&observation->bad, true);
+		return false;
+	}
+	if (request->length != durations[index / 2] || request->want_reply != (index % 2 == 1)
+	    || request->stdout_pos != 0 || request->stderr_pos != 0
+	    || dssh_chan_get_type(channel) != DSSH_CHAN_EXEC)
+		atomic_store(&observation->bad, true);
+	atomic_store(&observation->count, index + 1);
+	/* An explicit fixture action outcome, never a claim of hardware I/O. */
+	return request->length >= 500 && request->length <= 3000;
+}
 
 struct authorization {
 	uint8_t blob[8192];
@@ -399,6 +424,12 @@ main(int argc, char **argv)
 	if (argc != 6 || (strcmp(argv[1], "server") != 0 && strcmp(argv[1], "client") != 0))
 		return 2;
 	bool client = strcmp(argv[1], "client") == 0;
+	bool break_actions = getenv("DSSH_TEST_BREAK_ACTION") != NULL;
+	if (break_actions && client)
+		return 2;
+	struct break_observation break_observation;
+	atomic_init(&break_observation.count, 0);
+	atomic_init(&break_observation.bad, false);
 	bool language_fields = getenv("DSSH_TEST_LANGUAGE_FIELDS") != NULL;
 	const char *cipher = getenv("DSSH_TEST_ENC");
 	if (cipher == NULL)
@@ -476,6 +507,8 @@ main(int argc, char **argv)
 	unsigned language_checks = 0;
 	unsigned algorithm_checks = 0;
 	ret = dssh_session_set_timeout(session, 75000);
+	if (ret == 0 && break_actions)
+		ret = dssh_session_set_break_cb(session, perform_break, &break_observation);
 	if (ret == 0 && language_fields) {
 		const char *first[] = {"en-US", "fr"};
 		const char *second[] = {"x-interop"};
@@ -540,6 +573,14 @@ main(int argc, char **argv)
 			algorithm_checks++;
 	}
 	dssh_session_cleanup(session);
+	if (break_actions) {
+		unsigned calls = atomic_load(&break_observation.count);
+		bool valid = calls == 14 && !atomic_load(&break_observation.bad);
+		if (ret == 0 && !valid)
+			ret = DSSH_ERROR_INVALID;
+		if (fprintf(stderr, "DeuceSSH break actions: calls=%u valid=%u\n", calls, valid ? 1U : 0U) < 0)
+			ret = DSSH_ERROR_INIT;
+	}
 	if (ret == 0 && client && auth.host_checks < 2)
 		ret = DSSH_ERROR_INVALID;
 	fprintf(stderr, "DeuceSSH interop: role=%s kex=%s cipher=%s mac=%s stage=%s result=%d host-checks=%u signed-auth=%d channel-ack=%u language-checks=%u mac-s2c=%s algorithm-checks=%u\n",

@@ -291,7 +291,7 @@ queue_retry_mask(struct queue_retry_fixture *f)
 	return (atomic_load(&f->ctx.server->trans.global_reply_slot.ready) ? 1U : 0U)
 	    | (atomic_load(&f->ctx.server->trans.open_fail_slot.ready) ? 2U : 0U)
 	    | (atomic_load(&f->channel->wa_slot.ready) ? 4U : 0U)
-	    | (atomic_load(&f->channel->chan_fail_slot.ready) ? 8U : 0U);
+	    | (atomic_load(&f->channel->chan_reply_slot.ready) ? 8U : 0U);
 }
 
 static int
@@ -352,7 +352,7 @@ queue_retry_case(unsigned kind, bool gather, unsigned probe)
 		valid = dssh_test_wait_bool(&f.ctx.server->trans.global_reply_slot.ready, true)
 		    && dssh_test_wait_bool(&f.ctx.server->trans.open_fail_slot.ready, true);
 	if (valid)
-		valid = dssh_test_wait_bool(&f.channel->chan_fail_slot.ready, true);
+		valid = dssh_test_wait_bool(&f.channel->chan_reply_slot.ready, true);
 	uint8_t data[24];
 	if (valid && !queue_retry_merge_kind(kind) && kind != 12)
 		valid = dssh_test_wait_bool(&f.data_done, true);

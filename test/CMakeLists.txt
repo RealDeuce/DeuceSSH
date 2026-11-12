@@ -1295,6 +1295,23 @@ foreach(part IN ITEMS queued popped confirmed late_confirmation concurrent_accep
 	set_tests_properties(dssh_conn_peer_id_${part} PROPERTIES TIMEOUT 120
 		ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys)
 endforeach()
+foreach(part IN ITEMS break_handler_outcomes break_handler_lifetime break_handler_failures
+    break_handler_positions break_handler_queue break_handler_setup)
+	foreach(profile IN ITEMS default dh-gex group14 group16 sntrup mlkem rsa rsa512 growth)
+		set(extra "")
+		if(profile STREQUAL "growth")
+			set(extra "DSSH_TEST_COMPRESSION=test-growth")
+		elseif(profile MATCHES "^rsa")
+			set(extra "DSSH_TEST_KEY=${profile}")
+		elseif(NOT profile STREQUAL "default")
+			set(extra "DSSH_TEST_KEX=${profile}")
+		endif()
+		dssh_add_output_test(dssh_conn_${part}_${profile} dssh_test_conn
+			"1 tests: 1 passed, 0 failed, 0 skipped" --exact release/${part})
+		set_tests_properties(dssh_conn_${part}_${profile} PROPERTIES TIMEOUT 120
+			ENVIRONMENT "${DSSH_TEST_KEY_ENV};${extra}" FIXTURES_REQUIRED dssh_cached_keys)
+	endforeach()
+endforeach()
 foreach(part IN ITEMS disposal_values disposal_send disposal_retirement reservation termination_callback)
 	foreach(profile IN ITEMS default dh-gex group14 group16 sntrup mlkem rsa rsa512 growth)
 		set(extra "")
@@ -1969,3 +1986,24 @@ foreach(test_name IN LISTS dssh_registered_tests)
 			FIXTURES_REQUIRED dssh_cached_keys)
 	endif()
 endforeach()
+
+# Optional independent SSH implementation, built separately without compiling
+# the C API as another language. Normal library/tests need no Go dependency.
+set(DEUCESSH_BREAK_SSH_PEER "" CACHE FILEPATH "Prebuilt independent SSH peer for BREAK acknowledgement checks")
+if(DEUCESSH_BREAK_SSH_PEER AND Python3_Interpreter_FOUND
+    AND TARGET dssh_openssh_static AND TARGET dssh_openssh_shared)
+	if(NOT EXISTS "${DEUCESSH_BREAK_SSH_PEER}")
+		message(FATAL_ERROR "DEUCESSH_BREAK_SSH_PEER does not exist")
+	endif()
+	foreach(form IN ITEMS static shared)
+		set(name dssh_break_independent_${form})
+		add_test(NAME ${name} COMMAND ${Python3_EXECUTABLE}
+			${CMAKE_CURRENT_SOURCE_DIR}/break_ssh_interop.py
+			--peer $<TARGET_FILE:dssh_openssh_${form}>
+			--foreign "${DEUCESSH_BREAK_SSH_PEER}"
+			--evidence ${CMAKE_CURRENT_BINARY_DIR}/break-evidence/${name})
+		set_tests_properties(${name} PROPERTIES TIMEOUT 90 LABELS "interop;break"
+			PASS_REGULAR_EXPRESSION "independent_break status=PASSED cases=14"
+			FAIL_REGULAR_EXPRESSION "independent_break status=FAILED;AddressSanitizer;ThreadSanitizer;runtime error:")
+	endforeach()
+endif()

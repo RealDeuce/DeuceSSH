@@ -163,6 +163,9 @@ event_setup(struct event_fixture *fixture, struct event_capture *capture, bool z
 	return open_exec_channel(&fixture->ctx, &fixture->open) == 0;
 }
 
+/* Packet-builder selector for an action request, not a public event. */
+#define TEST_CHANNEL_BREAK_REQUEST (-1)
+
 static int
 event_packet(struct dssh_channel_s *ch, int type, uint8_t *buf, size_t cap, size_t *length)
 {
@@ -177,7 +180,7 @@ event_packet(struct dssh_channel_s *ch, int type, uint8_t *buf, size_t cap, size
 	if (type != DSSH_EVENT_EOF && type != DSSH_EVENT_CLOSE) {
 		const char *request = type == DSSH_EVENT_SIGNAL ? "signal"
 		    : type == DSSH_EVENT_WINDOW_CHANGE ? "window-change"
-		    : type == DSSH_EVENT_BREAK ? "break"
+		    : type == TEST_CHANNEL_BREAK_REQUEST ? "break"
 		    : type == DSSH_EVENT_EXIT_STATUS ? "exit-status" : "exit-signal";
 		size_t len = strlen(request);
 		uint32_t len_u32 = (uint32_t)len;
@@ -240,14 +243,14 @@ event_peer_case(bool zc)
 	struct event_fixture fixture = {0};
 	ASSERT_TRUE(event_setup(&fixture, &capture, zc));
 	static const int types[] = {DSSH_EVENT_SIGNAL, DSSH_EVENT_WINDOW_CHANGE,
-		DSSH_EVENT_BREAK, DSSH_EVENT_EXIT_STATUS, DSSH_EVENT_EXIT_SIGNAL,
+		DSSH_EVENT_EXIT_STATUS, DSSH_EVENT_EXIT_SIGNAL,
 		DSSH_EVENT_EOF, DSSH_EVENT_CLOSE};
 	uint8_t data[] = {1, 2, 3};
 	ASSERT_EQ(dssh_chan_write(fixture.open.client_ch, 0, data, 3), 3);
 	ASSERT_EQ(dssh_chan_write(fixture.open.client_ch, 1, data, 2), 2);
 	for (size_t i = 0; i < sizeof(types) / sizeof(types[0]); i++)
 		ASSERT_OK(event_send(&fixture, types[i], false));
-	bool delivered = dssh_test_wait_int(&capture.count, 7);
+	bool delivered = dssh_test_wait_int(&capture.count, 6);
 	conn_cleanup(&fixture.ctx);
 	ASSERT_TRUE(delivered);
 	ASSERT_FALSE(atomic_load(&capture.bad));
@@ -261,11 +264,10 @@ event_peer_case(bool zc)
 	ASSERT_EQ_U(capture.events[1].window_change.rows, 2);
 	ASSERT_EQ_U(capture.events[1].window_change.wpx, 3);
 	ASSERT_EQ_U(capture.events[1].window_change.hpx, 4);
-	ASSERT_EQ_U(capture.events[2].brk.length, UINT32_MAX);
-	ASSERT_EQ_U(capture.events[3].exit_status.exit_code, UINT32_MAX);
-	ASSERT_TRUE(dssh_test_bytes_equal(capture.events[4].exit_signal.signal_name, "TERM", 4));
-	ASSERT_TRUE(capture.events[4].exit_signal.core_dumped);
-	ASSERT_TRUE(dssh_test_bytes_equal(capture.events[4].exit_signal.error_message, "message", 7));
+	ASSERT_EQ_U(capture.events[2].exit_status.exit_code, UINT32_MAX);
+	ASSERT_TRUE(dssh_test_bytes_equal(capture.events[3].exit_signal.signal_name, "TERM", 4));
+	ASSERT_TRUE(capture.events[3].exit_signal.core_dumped);
+	ASSERT_TRUE(dssh_test_bytes_equal(capture.events[3].exit_signal.error_message, "message", 7));
 	return TEST_PASS;
 }
 
@@ -317,7 +319,7 @@ test_event_switch(void)
 	ASSERT_TRUE(event_setup(&fixture, NULL, false));
 	ASSERT_OK(event_send(&fixture, DSSH_EVENT_SIGNAL, true));
 	ASSERT_EQ(dssh_chan_poll(fixture.open.server_ch, DSSH_POLL_EVENT, 0), DSSH_POLL_EVENT);
-	ASSERT_OK(event_send(&fixture, DSSH_EVENT_BREAK, true));
+	ASSERT_OK(event_send(&fixture, DSSH_EVENT_WINDOW_CHANGE, true));
 	ASSERT_OK(dssh_chan_set_event_cb(fixture.open.server_ch, capture_event, &first));
 	ASSERT_OK(event_send(&fixture, DSSH_EVENT_EXIT_SIGNAL, true));
 	ASSERT_OK(dssh_chan_set_event_cb(fixture.open.server_ch, capture_other_event, &second));
@@ -331,7 +333,7 @@ test_event_switch(void)
 	valid = valid && dssh_test_bytes_equal(old.signal.name, "TERM", 4);
 	ASSERT_EQ(dssh_chan_poll(fixture.open.server_ch, DSSH_POLL_EVENT, 0), DSSH_POLL_EVENT);
 	ASSERT_OK(dssh_chan_read_event(fixture.open.server_ch, &old));
-	valid = valid && old.type == DSSH_EVENT_BREAK;
+	valid = valid && old.type == DSSH_EVENT_WINDOW_CHANGE;
 	ASSERT_EQ(dssh_chan_poll(fixture.open.server_ch, DSSH_POLL_EVENT, 0), DSSH_POLL_EVENT);
 	ASSERT_OK(dssh_chan_read_event(fixture.open.server_ch, &old));
 	valid = valid && old.type == DSSH_EVENT_EXIT_STATUS
@@ -371,14 +373,14 @@ test_event_replacement(void)
 	atomic_store(&first.release, true);
 	valid = valid && dssh_test_wait_int(&first.count, 1);
 	if (valid)
-		valid = event_send(&fixture, DSSH_EVENT_BREAK, false) == 0
+		valid = event_send(&fixture, DSSH_EVENT_WINDOW_CHANGE, false) == 0
 		    && dssh_test_wait_int(&second.count, 1);
 	conn_cleanup(&fixture.ctx);
 	ASSERT_TRUE(valid);
 	ASSERT_FALSE(atomic_load(&first.bad));
 	ASSERT_FALSE(atomic_load(&second.bad));
 	ASSERT_EQ(first.events[0].type, DSSH_EVENT_SIGNAL);
-	ASSERT_EQ(second.events[0].type, DSSH_EVENT_BREAK);
+	ASSERT_EQ(second.events[0].type, DSSH_EVENT_WINDOW_CHANGE);
 	return TEST_PASS;
 }
 
@@ -442,7 +444,7 @@ test_event_malformed(void)
 	event_capture_init(&capture, false);
 	struct event_fixture fixture = {0};
 	ASSERT_TRUE(event_setup(&fixture, &capture, false));
-	int types[] = {DSSH_EVENT_SIGNAL, DSSH_EVENT_WINDOW_CHANGE, DSSH_EVENT_BREAK,
+	int types[] = {DSSH_EVENT_SIGNAL, DSSH_EVENT_WINDOW_CHANGE, TEST_CHANNEL_BREAK_REQUEST,
 		DSSH_EVENT_EXIT_STATUS, DSSH_EVENT_EXIT_SIGNAL};
 	bool valid = true;
 	for (size_t i = 0; i < sizeof(types) / sizeof(types[0]); i++) {
@@ -667,11 +669,11 @@ test_event_self_disable(void)
 	ASSERT_OK(event_send(&fixture, DSSH_EVENT_SIGNAL, false));
 	bool valid = dssh_test_wait_int(&capture.count, 1) && !atomic_load(&capture.bad);
 	if (valid) {
-		valid = event_send(&fixture, DSSH_EVENT_BREAK, false) == 0
+		valid = event_send(&fixture, DSSH_EVENT_WINDOW_CHANGE, false) == 0
 		    && dssh_chan_poll(fixture.open.server_ch, DSSH_POLL_EVENT, 5000) == DSSH_POLL_EVENT;
 		struct dssh_chan_event event;
 		valid = valid && dssh_chan_read_event(fixture.open.server_ch, &event) == 0
-		    && event.type == DSSH_EVENT_BREAK && atomic_load(&capture.count) == 1;
+		    && event.type == DSSH_EVENT_WINDOW_CHANGE && atomic_load(&capture.count) == 1;
 	}
 	conn_cleanup(&fixture.ctx);
 	ASSERT_TRUE(valid);

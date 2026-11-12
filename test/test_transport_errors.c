@@ -267,7 +267,7 @@ channel_slot_fixture_setup(dssh_session sess, struct channel_slot_fixture *fixtu
 	}
 	if (alloc_channel_slots(sess, &fixture->channel) < 0) {
 		free_tx_slot(&fixture->channel.wa_slot);
-		free_tx_slot(&fixture->channel.chan_fail_slot);
+		free_tx_slot(&fixture->channel.chan_reply_slot);
 		cnd_destroy(&fixture->channel.poll_cnd);
 		mtx_destroy(&fixture->channel.cb_mtx);
 		mtx_destroy(&fixture->channel.buf_mtx);
@@ -302,7 +302,7 @@ channel_slot_fixture_cleanup(dssh_session sess, struct channel_slot_fixture *fix
 	sess->channel_capacity = 0;
 
 	free_tx_slot(&fixture->channel.wa_slot);
-	free_tx_slot(&fixture->channel.chan_fail_slot);
+	free_tx_slot(&fixture->channel.chan_reply_slot);
 	cnd_destroy(&fixture->channel.poll_cnd);
 	mtx_destroy(&fixture->channel.cb_mtx);
 	mtx_destroy(&fixture->channel.buf_mtx);

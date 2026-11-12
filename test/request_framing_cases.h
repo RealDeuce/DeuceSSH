@@ -285,7 +285,7 @@ request_event_length_case(bool zc)
 	struct event_fixture fixture = {0};
 	ASSERT_TRUE(event_setup(&fixture, &capture, zc));
 	ASSERT_OK(dssh_chan_set_event_cb(fixture.open.client_ch, capture_event, &capture));
-	int types[] = {DSSH_EVENT_SIGNAL, DSSH_EVENT_WINDOW_CHANGE, DSSH_EVENT_BREAK,
+	int types[] = {DSSH_EVENT_SIGNAL, DSSH_EVENT_WINDOW_CHANGE, TEST_CHANNEL_BREAK_REQUEST,
 	    DSSH_EVENT_EXIT_STATUS, DSSH_EVENT_EXIT_SIGNAL};
 	bool valid = true;
 	for (size_t i = 0; i < sizeof(types) / sizeof(types[0]); i++) {
@@ -312,7 +312,7 @@ request_event_length_case(bool zc)
 		int ret = dssh_test_demux_dispatch(target->sess, packet[0], packet, length);
 		valid = ret == 0 && valid;
 	}
-	valid = valid && atomic_load(&capture.count) == 5 && !atomic_load(&capture.bad)
+	valid = valid && atomic_load(&capture.count) == 4 && !atomic_load(&capture.bad)
 	    && !dssh_session_is_terminated(fixture.ctx.client) && !dssh_session_is_terminated(fixture.ctx.server);
 	conn_cleanup(&fixture.ctx);
 	ASSERT_TRUE(valid);

@@ -4806,13 +4806,13 @@ test_replenish_queued_accounting(void)
 
 	fail[fail_pos++] = SSH_MSG_CHANNEL_FAILURE;
 	DSSH_PUT_U32(oc.server_ch->remote_id, fail, &fail_pos);
-	ASSERT_OK(send_to_slot(ctx.server, &oc.server_ch->chan_fail_slot, fail, fail_pos));
+	ASSERT_OK(send_to_slot(ctx.server, &oc.server_ch->chan_reply_slot, fail, fail_pos));
 	mtx_lock(&oc.server_ch->buf_mtx);
 	uint32_t local = oc.server_ch->local_window;
 	uint32_t pending = oc.server_ch->window_adjust_pending;
 	uint32_t inflight = oc.server_ch->window_adjust_inflight;
 	bool wa_ready = atomic_load(&oc.server_ch->wa_slot.ready);
-	bool fail_ready = atomic_load(&oc.server_ch->chan_fail_slot.ready);
+	bool fail_ready = atomic_load(&oc.server_ch->chan_reply_slot.ready);
 	mtx_unlock(&oc.server_ch->buf_mtx);
 	ASSERT_EQ_U(local, 1);
 	ASSERT_EQ_U(pending, 31);
@@ -4839,7 +4839,7 @@ test_replenish_queued_accounting(void)
 	pending = oc.server_ch->window_adjust_pending;
 	inflight = oc.server_ch->window_adjust_inflight;
 	wa_ready = atomic_load(&oc.server_ch->wa_slot.ready);
-	fail_ready = atomic_load(&oc.server_ch->chan_fail_slot.ready);
+	fail_ready = atomic_load(&oc.server_ch->chan_reply_slot.ready);
 	mtx_unlock(&oc.server_ch->buf_mtx);
 	ASSERT_EQ_U(local, 32);
 	ASSERT_EQ_U(pending, 0);
@@ -8367,8 +8367,15 @@ test_compression_window_rekey(void)
 #include "termination_callback_cases.h"
 #include "channel_control_cases.h"
 #include "incoming_control_cases.h"
+#include "break_handler_cases.h"
 
 static struct dssh_test_entry tests[] = {
+	{ "release/break_handler_outcomes", test_break_handler_outcomes },
+	{ "release/break_handler_lifetime", test_break_handler_lifetime },
+	{ "release/break_handler_failures", test_break_handler_failures },
+	{ "release/break_handler_positions", test_break_handler_positions },
+	{ "release/break_handler_queue", test_break_handler_queue },
+	{ "release/break_handler_setup", test_break_handler_setup },
 	{ "release/close_disposal_values", test_close_disposal_values },
 	{ "release/close_disposal_send", test_close_disposal_send },
 	{ "release/close_disposal_retirement", test_close_disposal_retirement },

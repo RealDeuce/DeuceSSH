@@ -143,8 +143,6 @@ incoming_control_event(const struct dssh_chan_event *event, const struct incomin
 	if (test->type == DSSH_EVENT_WINDOW_CHANGE)
 		return event->window_change.cols == test->values[0] && event->window_change.rows == test->values[1]
 		    && event->window_change.wpx == test->values[2] && event->window_change.hpx == test->values[3];
-	if (test->type == DSSH_EVENT_BREAK)
-		return event->brk.length == test->values[0];
 	return test->type == DSSH_EVENT_EXIT_STATUS && event->exit_status.exit_code == test->values[0];
 }
 
@@ -194,12 +192,36 @@ incoming_control_packet(dssh_channel channel, const struct incoming_control_case
 	return true;
 }
 
+struct incoming_break_capture {
+	struct dssh_chan_break_request requests[EVENT_CAPTURE_CAP];
+	atomic_uint count;
+};
+
+static bool
+incoming_break_perform(dssh_channel channel, const struct dssh_chan_break_request *request, void *opaque)
+{
+	(void)channel;
+	struct incoming_break_capture *capture = opaque;
+	unsigned index = atomic_load(&capture->count);
+	if (index >= EVENT_CAPTURE_CAP)
+		return false;
+	capture->requests[index] = *request;
+	atomic_store(&capture->count, index + 1);
+	/* This fixture reports an application action outcome; no physical
+	 * serial device or terminal operation is claimed. */
+	return true;
+}
+
 static int
 incoming_control_run(struct conn_ctx *ctx, unsigned role, unsigned gather, unsigned delivery)
 {
 	/* delivery 0: stream callback; 1: ZC callback; 2: stream poll. */
 	struct event_capture capture = {0};
 	event_capture_init(&capture, true);
+	struct incoming_break_capture actions = {0};
+	atomic_init(&actions.count, 0);
+	if (dssh_session_set_break_cb(ctx->server, incoming_break_perform, &actions) != 0)
+		return TEST_FAIL;
 	const char *expected_mac = test_using_hmac256() ? "hmac-sha2-256" : "hmac-sha2-512";
 	for (unsigned direction = 0; direction < 2; direction++) {
 		enum dssh_direction selected = direction == 0 ? DSSH_CLIENT_TO_SERVER : DSSH_SERVER_TO_CLIENT;
@@ -242,13 +264,13 @@ incoming_control_run(struct conn_ctx *ctx, unsigned role, unsigned gather, unsig
 		{.name = "nul", .type = DSSH_EVENT_SIGNAL, .signal = {nul_signal, sizeof(nul_signal)}},
 		{.name = "high", .type = DSSH_EVENT_SIGNAL, .signal = {high_signal, sizeof(high_signal)}},
 		{.name = "unknown", .type = DSSH_EVENT_SIGNAL, .signal = VIEW("UNKNOWN")},
-		{.name = "break0", .type = DSSH_EVENT_BREAK, .values = {0}},
-		{.name = "break1", .type = DSSH_EVENT_BREAK, .values = {1}},
-		{.name = "break499", .type = DSSH_EVENT_BREAK, .values = {499}},
-		{.name = "break500", .type = DSSH_EVENT_BREAK, .values = {500}},
-		{.name = "break3000", .type = DSSH_EVENT_BREAK, .values = {3000}},
-		{.name = "break3001", .type = DSSH_EVENT_BREAK, .values = {3001}},
-		{.name = "breakmax", .type = DSSH_EVENT_BREAK, .values = {UINT32_MAX}},
+		{.name = "break0", .type = TEST_CHANNEL_BREAK_REQUEST, .values = {0}},
+		{.name = "break1", .type = TEST_CHANNEL_BREAK_REQUEST, .values = {1}},
+		{.name = "break499", .type = TEST_CHANNEL_BREAK_REQUEST, .values = {499}},
+		{.name = "break500", .type = TEST_CHANNEL_BREAK_REQUEST, .values = {500}},
+		{.name = "break3000", .type = TEST_CHANNEL_BREAK_REQUEST, .values = {3000}},
+		{.name = "break3001", .type = TEST_CHANNEL_BREAK_REQUEST, .values = {3001}},
+		{.name = "breakmax", .type = TEST_CHANNEL_BREAK_REQUEST, .values = {UINT32_MAX}},
 		{.name = "window0", .type = DSSH_EVENT_WINDOW_CHANGE, .values = {0}},
 		{.name = "windowmax", .type = DSSH_EVENT_WINDOW_CHANGE,
 		    .values = {UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX}},
@@ -266,7 +288,7 @@ incoming_control_run(struct conn_ctx *ctx, unsigned role, unsigned gather, unsig
 	};
 #undef VIEW
 	static const uint8_t flags[] = {0, 1, 0xff};
-	unsigned observations = 0;
+	unsigned observations = 0, event_observations = 0, break_observations = 0;
 	uint_least32_t remote_window = atomic_load(&channel->remote_window);
 	for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
 		for (size_t j = 0; j < sizeof(flags) / sizeof(flags[0]); j++) {
@@ -279,7 +301,29 @@ incoming_control_run(struct conn_ctx *ctx, unsigned role, unsigned gather, unsig
 			if (!incoming_control_barrier(ctx->client, &success, &failure))
 				return TEST_FAIL;
 			bool delivered;
-			if (delivery == 2) {
+			if (cases[i].type == TEST_CHANNEL_BREAK_REQUEST) {
+				unsigned count = atomic_load(&actions.count);
+				delivered = count == break_observations + 1 && count <= EVENT_CAPTURE_CAP;
+				if (delivered) {
+					const struct dssh_chan_break_request *request = &actions.requests[break_observations];
+					delivered = request->length == cases[i].values[0]
+					    && request->stdout_pos == 0 && request->stderr_pos == 0
+					    && request->want_reply == (flags[j] != 0);
+				}
+				if (delivery == 2)
+					delivered = dssh_chan_poll(channel, DSSH_POLL_EVENT, 0) == 0 && delivered;
+				else {
+					int events = atomic_load(&capture.count);
+					if (events < 0)
+						delivered = false;
+					else {
+						unsigned event_count = (unsigned)events;
+						delivered = event_count == event_observations && delivered;
+					}
+				}
+				break_observations++;
+			}
+			else if (delivery == 2) {
 				struct dssh_chan_event event;
 				delivered = dssh_chan_poll(channel, DSSH_POLL_EVENT, 0) == DSSH_POLL_EVENT
 				    && dssh_chan_read_event(channel, &event) == 0
@@ -288,15 +332,20 @@ incoming_control_run(struct conn_ctx *ctx, unsigned role, unsigned gather, unsig
 			}
 			else {
 				int count = atomic_load(&capture.count);
-				delivered = observations < EVENT_CAPTURE_CAP && count > 0
+				delivered = event_observations < EVENT_CAPTURE_CAP && count > 0
 				    && count <= EVENT_CAPTURE_CAP && !atomic_load(&capture.bad)
-				    && incoming_control_event(&capture.events[observations], &cases[i]);
+				    && incoming_control_event(&capture.events[event_observations], &cases[i]);
 				if (delivered) {
 					unsigned count_u = (unsigned)count;
-					delivered = count_u == observations + 1;
+					delivered = count_u == event_observations + 1;
 				}
 			}
-			bool valid = delivered && success == 0 && failure == (flags[j] != 0 ? 1U : 0U)
+			bool action = cases[i].type == TEST_CHANNEL_BREAK_REQUEST;
+			if (!action)
+				event_observations++;
+			unsigned expected_success = action && flags[j] != 0 ? 1U : 0U;
+			unsigned expected_failure = !action && flags[j] != 0 ? 1U : 0U;
+			bool valid = delivered && success == expected_success && failure == expected_failure
 			    && !dssh_session_is_terminated(ctx->server) && !dssh_session_is_terminated(ctx->client)
 			    && atomic_load(&channel->remote_window) == remote_window;
 			unsigned flag = flags[j];

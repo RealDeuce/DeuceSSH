@@ -137,11 +137,10 @@ DSSH_PUBLIC int  dssh_chan_params_add_env(struct dssh_chan_params *p, const char
 /* Event types */
 #define DSSH_EVENT_SIGNAL        1
 #define DSSH_EVENT_WINDOW_CHANGE 2
-#define DSSH_EVENT_BREAK         3
-#define DSSH_EVENT_EOF           4
-#define DSSH_EVENT_CLOSE         5
-#define DSSH_EVENT_EXIT_STATUS   6
-#define DSSH_EVENT_EXIT_SIGNAL   7
+#define DSSH_EVENT_EOF           3
+#define DSSH_EVENT_CLOSE         4
+#define DSSH_EVENT_EXIT_STATUS   5
+#define DSSH_EVENT_EXIT_SIGNAL   6
 
 /* Event struct — returned by dssh_chan_read_event().
  * Text fields are borrowed byte views of the complete accepted wire fields,
@@ -168,10 +167,6 @@ struct dssh_chan_event {
 		} window_change;
 
 		struct {
-			uint32_t length;
-		} brk;
-
-		struct {
 			uint32_t exit_code;
 		} exit_status;
 
@@ -183,6 +178,26 @@ struct dssh_chan_event {
 		} exit_signal;
 	};
 };
+
+/* BREAK action request. All fields are borrowed for the callback. Duration
+ * is the exact peer uint32 value; positions count prior received stream bytes,
+ * saturating at SIZE_MAX. want_reply is the peer flag, normalized to bool. */
+struct dssh_chan_break_request {
+	size_t stdout_pos, stderr_pos;
+	uint32_t length;
+	bool want_reply;
+};
+
+/* After channel setup, runs on the demux thread with no library mutex held.
+ * Return true iff a
+ * BREAK of any kind was performed; false iff none was performed. Reply, when
+ * requested, follows return. No handler means no action and a failure reply.
+ * This replaces BREAK event delivery; no general event is published.
+ * Keep the borrowed channel/request only for this invocation. Follow event
+ * callback restrictions: no channel I/O/poll/TX/close/open/accept. Waiting here
+ * pauses receive progress for every channel in this session. */
+typedef bool (*dssh_chan_break_cb)(dssh_channel ch,
+    const struct dssh_chan_break_request *request, void *cbdata);
 
 /* ZC data callback — fires on demux thread for each inbound
  * CHANNEL_DATA / EXTENDED_DATA.  Returns bytes consumed for
@@ -341,6 +356,15 @@ DSSH_PUBLIC int dssh_chan_set_event_cb(dssh_channel ch, dssh_chan_event_cb cb, v
  * after start.  Copied to each new channel at open/accept time. */
 DSSH_PUBLIC int dssh_session_set_event_cb(dssh_session sess, dssh_chan_event_cb cb, void *cbdata);
 
+/* BREAK handler replacement uses the same captured callback/data lifetime
+ * rules as event callback replacement. A captured invocation may finish after
+ * replacement returns; keep its code/data alive until it finishes. */
+DSSH_PUBLIC int dssh_chan_set_break_cb(dssh_channel ch, dssh_chan_break_cb cb, void *cbdata);
+
+/* Set before session start; returns DSSH_ERROR_TOOLATE afterwards.
+ * Copied to newly opened/accepted channels. */
+DSSH_PUBLIC int dssh_session_set_break_cb(dssh_session sess, dssh_chan_break_cb cb, void *cbdata);
+
 /* ---- Event queue limits ---- */
 
 /* Set the maximum number of queued events per channel (default 64).
@@ -362,7 +386,7 @@ DSSH_PUBLIC int dssh_chan_set_max_events(dssh_channel ch, size_t max_events);
  * with no library mutex held. ch and params are borrowed for the invocation;
  * do not pass the handle to other threads or retain parameter views beyond it.
  * Getters on ch reflect the current accumulated params during the callback.
- * Event-callback and event-limit setters are permitted. Same-session channel
+ * Event/BREAK callback and event-limit setters are permitted. Same-session channel
  * I/O, poll/read_event, TX/reservation and nested open/accept are rejected;
  * work on independent sessions is unaffected. Session termination/lifecycle
  * requests retain their documented deferred-cleanup behavior.

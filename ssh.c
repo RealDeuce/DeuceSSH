@@ -45,6 +45,7 @@ session_scope_enter(struct dssh_session_scope *scope, struct dssh_session_s *ses
 {
 	scope->sess = sess;
 	scope->previous = active_session_scope;
+	scope->termination_callback = false;
 	active_session_scope = scope;
 }
 
@@ -59,6 +60,16 @@ session_scope_active(struct dssh_session_s *sess)
 {
 	for (struct dssh_session_scope *scope = active_session_scope; scope != NULL; scope = scope->previous) {
 		if (scope->sess == sess)
+			return true;
+	}
+	return false;
+}
+
+DSSH_PRIVATE bool
+session_termination_callback_active(struct dssh_session_s *sess)
+{
+	for (struct dssh_session_scope *scope = active_session_scope; scope != NULL; scope = scope->previous) {
+		if (scope->sess == sess && scope->termination_callback)
 			return true;
 	}
 	return false;
@@ -388,6 +399,7 @@ session_notify_terminated(struct dssh_session_s *sess)
 	if (tcb) {
 		struct dssh_session_scope scope;
 		session_scope_enter(&scope, sess);
+		scope.termination_callback = true;
 		tcb(sess, sess->terminate_cbdata);
 		session_scope_leave(&scope);
 	}

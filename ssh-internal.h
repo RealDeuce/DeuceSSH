@@ -170,10 +170,12 @@ DSSH_PRIVATE void dssh_log_termination(struct dssh_session_s *sess, int cause);
 struct dssh_session_scope {
 	struct dssh_session_s *sess;
 	struct dssh_session_scope *previous;
+	bool termination_callback;
 };
 DSSH_PRIVATE void session_scope_enter(struct dssh_session_scope *scope, struct dssh_session_s *sess);
 DSSH_PRIVATE void session_scope_leave(struct dssh_session_scope *scope);
 DSSH_PRIVATE bool session_scope_active(struct dssh_session_s *sess);
+DSSH_PRIVATE bool session_termination_callback_active(struct dssh_session_s *sess);
 DSSH_PRIVATE bool session_receive_api_conflict(struct dssh_session_s *sess);
 DSSH_PRIVATE bool session_lifecycle_begin(struct dssh_session_s *sess);
 DSSH_PRIVATE void session_stop_inner(struct dssh_session_s *sess);

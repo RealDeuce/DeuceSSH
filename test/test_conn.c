@@ -8364,6 +8364,7 @@ test_compression_window_rekey(void)
 #include "event_overflow_cases.h"
 #include "close_outcome_cases.h"
 #include "close_reservation_cases.h"
+#include "termination_callback_cases.h"
 #include "channel_control_cases.h"
 
 static struct dssh_test_entry tests[] = {
@@ -8371,6 +8372,7 @@ static struct dssh_test_entry tests[] = {
 	{ "release/close_disposal_send", test_close_disposal_send },
 	{ "release/close_disposal_retirement", test_close_disposal_retirement },
 	{ "release/close_reservation", test_close_reservation },
+	{ "release/close_termination_callback", test_close_termination_callback },
 	{ "release/control_wire", test_channel_control_wire },
 	{ "release/control_after_eof", test_channel_control_after_eof },
 	{ "release/control_refusal", test_channel_control_refusal },

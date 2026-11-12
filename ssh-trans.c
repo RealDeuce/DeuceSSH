@@ -90,8 +90,8 @@ mac_s2c_module(struct dssh_session_s *sess)
 DSSH_PRIVATE bool
 dssh_io_callback_active(struct dssh_session_s *sess)
 {
-	(void)sess;
-	return io_callback_session != NULL || dssh_result_callback_active();
+	return io_callback_session != NULL || dssh_result_callback_active()
+	    || session_termination_callback_active(sess);
 }
 
 static int

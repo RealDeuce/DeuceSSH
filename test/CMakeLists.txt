@@ -1295,7 +1295,7 @@ foreach(part IN ITEMS queued popped confirmed late_confirmation concurrent_accep
 	set_tests_properties(dssh_conn_peer_id_${part} PROPERTIES TIMEOUT 120
 		ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys)
 endforeach()
-foreach(part IN ITEMS disposal_values disposal_send disposal_retirement reservation)
+foreach(part IN ITEMS disposal_values disposal_send disposal_retirement reservation termination_callback)
 	foreach(profile IN ITEMS default dh-gex group14 group16 sntrup mlkem rsa rsa512 growth)
 		set(extra "")
 		if(profile STREQUAL "growth")

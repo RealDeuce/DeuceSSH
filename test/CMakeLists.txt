@@ -1295,7 +1295,7 @@ foreach(part IN ITEMS queued popped confirmed late_confirmation concurrent_accep
 	set_tests_properties(dssh_conn_peer_id_${part} PROPERTIES TIMEOUT 120
 		ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys)
 endforeach()
-foreach(part IN ITEMS terminal_mode_validation terminal_mode_roundtrip terminal_mode_wire break_handler_outcomes break_handler_lifetime break_handler_failures
+foreach(part IN ITEMS notification_reply_flags notification_flag_failures terminal_mode_validation terminal_mode_roundtrip terminal_mode_wire break_handler_outcomes break_handler_lifetime break_handler_failures
     break_handler_positions break_handler_queue break_handler_setup)
 	foreach(profile IN ITEMS default dh-gex group14 group16 sntrup mlkem rsa rsa512 growth)
 		set(extra "")
@@ -2003,6 +2003,15 @@ if(DEUCESSH_BREAK_SSH_PEER AND Python3_Interpreter_FOUND
 			--foreign "${DEUCESSH_BREAK_SSH_PEER}"
 			--evidence ${CMAKE_CURRENT_BINARY_DIR}/break-evidence/${name})
 		set_tests_properties(${name} PROPERTIES TIMEOUT 90 LABELS "interop;break"
+			PASS_REGULAR_EXPRESSION "independent_break status=PASSED cases=14"
+			FAIL_REGULAR_EXPRESSION "independent_break status=FAILED;AddressSanitizer;ThreadSanitizer;runtime error:")
+		set(notification_name dssh_notification_flags_independent_${form})
+		add_test(NAME ${notification_name} COMMAND ${Python3_EXECUTABLE}
+			${CMAKE_CURRENT_SOURCE_DIR}/break_ssh_interop.py
+			--peer $<TARGET_FILE:dssh_openssh_${form}>
+			--foreign "${DEUCESSH_BREAK_SSH_PEER}" --notification-flags
+			--evidence ${CMAKE_CURRENT_BINARY_DIR}/break-evidence/${notification_name})
+		set_tests_properties(${notification_name} PROPERTIES TIMEOUT 90 LABELS "interop;notifications"
 			PASS_REGULAR_EXPRESSION "independent_break status=PASSED cases=14"
 			FAIL_REGULAR_EXPRESSION "independent_break status=FAILED;AddressSanitizer;ThreadSanitizer;runtime error:")
 		foreach(mode IN ITEMS none 0 1)

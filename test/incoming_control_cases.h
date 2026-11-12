@@ -300,57 +300,75 @@ incoming_control_run(struct conn_ctx *ctx, unsigned role, unsigned gather, unsig
 			unsigned success = 0, failure = 0;
 			if (!incoming_control_barrier(ctx->client, &success, &failure))
 				return TEST_FAIL;
-			bool delivered;
+			bool verified, observed = false;
 			if (cases[i].type == TEST_CHANNEL_BREAK_REQUEST) {
 				unsigned count = atomic_load(&actions.count);
-				delivered = count == break_observations + 1 && count <= EVENT_CAPTURE_CAP;
-				if (delivered) {
+				observed = count == break_observations + 1;
+				verified = observed && count <= EVENT_CAPTURE_CAP;
+				if (verified) {
 					const struct dssh_chan_break_request *request = &actions.requests[break_observations];
-					delivered = request->length == cases[i].values[0]
+					verified = request->length == cases[i].values[0]
 					    && request->stdout_pos == 0 && request->stderr_pos == 0
 					    && request->want_reply == (flags[j] != 0);
 				}
 				if (delivery == 2)
-					delivered = dssh_chan_poll(channel, DSSH_POLL_EVENT, 0) == 0 && delivered;
+					verified = dssh_chan_poll(channel, DSSH_POLL_EVENT, 0) == 0 && verified;
 				else {
 					int events = atomic_load(&capture.count);
 					if (events < 0)
-						delivered = false;
+						verified = false;
 					else {
 						unsigned event_count = (unsigned)events;
-						delivered = event_count == event_observations && delivered;
+						verified = event_count == event_observations && verified;
 					}
 				}
 				break_observations++;
 			}
+			else if (flags[j] != 0) {
+				if (delivery == 2) {
+					int ready = dssh_chan_poll(channel, DSSH_POLL_EVENT, 0);
+					observed = ready == DSSH_POLL_EVENT;
+					verified = ready == 0;
+				}
+				else {
+					int count = atomic_load(&capture.count);
+					verified = count >= 0 && !atomic_load(&capture.bad);
+					if (count >= 0) {
+						unsigned received = (unsigned)count;
+						observed = received > event_observations;
+						verified = verified && received == event_observations;
+					}
+				}
+			}
 			else if (delivery == 2) {
 				struct dssh_chan_event event;
-				delivered = dssh_chan_poll(channel, DSSH_POLL_EVENT, 0) == DSSH_POLL_EVENT
-				    && dssh_chan_read_event(channel, &event) == 0
+				observed = dssh_chan_poll(channel, DSSH_POLL_EVENT, 0) == DSSH_POLL_EVENT;
+				verified = observed && dssh_chan_read_event(channel, &event) == 0
 				    && incoming_control_event(&event, &cases[i])
 				    && dssh_chan_poll(channel, DSSH_POLL_EVENT, 0) == 0;
 			}
 			else {
 				int count = atomic_load(&capture.count);
-				delivered = event_observations < EVENT_CAPTURE_CAP && count > 0
+				verified = event_observations < EVENT_CAPTURE_CAP && count > 0
 				    && count <= EVENT_CAPTURE_CAP && !atomic_load(&capture.bad)
 				    && incoming_control_event(&capture.events[event_observations], &cases[i]);
-				if (delivered) {
+				if (verified) {
 					unsigned count_u = (unsigned)count;
-					delivered = count_u == event_observations + 1;
+					observed = count_u > event_observations;
+					verified = count_u == event_observations + 1;
 				}
 			}
 			bool action = cases[i].type == TEST_CHANNEL_BREAK_REQUEST;
-			if (!action)
+			if (!action && flags[j] == 0)
 				event_observations++;
 			unsigned expected_success = action && flags[j] != 0 ? 1U : 0U;
 			unsigned expected_failure = !action && flags[j] != 0 ? 1U : 0U;
-			bool valid = delivered && success == expected_success && failure == expected_failure
+			bool valid = verified && success == expected_success && failure == expected_failure
 			    && !dssh_session_is_terminated(ctx->server) && !dssh_session_is_terminated(ctx->client)
 			    && atomic_load(&channel->remote_window) == remote_window;
 			unsigned flag = flags[j];
 			printf("incoming_control role=%u gather=%u delivery=%u name=%s flag=%u delivered=%u success=%u failure=%u structural_valid=%u policy_accepted=0\n",
-			    role, gather, delivery, cases[i].name, flag, delivered ? 1U : 0U,
+			    role, gather, delivery, cases[i].name, flag, observed ? 1U : 0U,
 			    success, failure, valid ? 1U : 0U);
 			if (!valid)
 				return TEST_FAIL;

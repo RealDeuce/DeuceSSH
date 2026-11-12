@@ -2280,26 +2280,29 @@ parse_channel_request(const uint8_t *payload, size_t payload_len, const uint8_t 
 	return 0;
 }
 
-/* Validate every mandatory field before publishing an application event.
+/* Validate mandatory fields and notification reply flags before publication.
  * Unsupported request types remain the generic request path's responsibility. */
 static bool
 event_request_valid(const uint8_t *type, uint32_t type_len,
-    const uint8_t *data, size_t length)
+    const uint8_t *data, size_t length, bool want_reply)
 {
-	if ((type_len == DSSH_STRLEN(str_exit_status)
-	        && memcmp(type, str_exit_status, DSSH_STRLEN(str_exit_status)) == 0)
-	    || (type_len == DSSH_STRLEN(str_break)
-	        && memcmp(type, str_break, DSSH_STRLEN(str_break)) == 0))
+	if (type_len == DSSH_STRLEN(str_break)
+	    && memcmp(type, str_break, DSSH_STRLEN(str_break)) == 0)
 		return length == 4;
+	if (type_len == DSSH_STRLEN(str_exit_status)
+	    && memcmp(type, str_exit_status, DSSH_STRLEN(str_exit_status)) == 0)
+		return !want_reply && length == 4;
 	if (type_len == DSSH_STRLEN(str_window_change)
 	    && memcmp(type, str_window_change, DSSH_STRLEN(str_window_change)) == 0)
-		return length == 16;
+		return !want_reply && length == 16;
 	bool exit_signal = type_len == DSSH_STRLEN(str_exit_signal)
 	    && memcmp(type, str_exit_signal, DSSH_STRLEN(str_exit_signal)) == 0;
 	bool signal = type_len == DSSH_STRLEN(str_signal)
 	    && memcmp(type, str_signal, DSSH_STRLEN(str_signal)) == 0;
 	if (!exit_signal && !signal)
 		return true;
+	if (want_reply)
+		return false;
 	size_t pos = 0;
 	unsigned fields = exit_signal ? 3U : 1U;
 	for (unsigned field = 0; field < fields; field++) {
@@ -2433,7 +2436,7 @@ handle_channel_request(struct dssh_session_s *sess, struct dssh_channel_s *ch, c
 	}
 
 	if (ch->chan_type == DSSH_CHAN_SESSION
-	    && !event_request_valid(rtype, rtype_len, rdata, rdata_len)) {
+	    && !event_request_valid(rtype, rtype_len, rdata, rdata_len, want_reply)) {
 		if (want_reply)
 			return channel_request_reply(sess, ch, false);
 		if (release_channel_locked(sess, ch) < 0)

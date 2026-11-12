@@ -48,6 +48,47 @@ perform_break(dssh_channel channel, const struct dssh_chan_break_request *reques
 	return request->length >= 500 && request->length <= 3000;
 }
 
+struct notification_observation {
+	atomic_uint count;
+	atomic_bool bad;
+};
+
+static bool
+notification_bytes(struct dssh_bytes view, const char *text, size_t length)
+{
+	return view.len == length && (length == 0
+	    || (view.data != NULL && memcmp(view.data, text, length) == 0));
+}
+
+static void
+observe_notification(dssh_channel channel, const struct dssh_chan_event *event, void *opaque)
+{
+	(void)channel;
+	if (event->type == DSSH_EVENT_EOF || event->type == DSSH_EVENT_CLOSE)
+		return;
+	struct notification_observation *observation = opaque;
+	unsigned index = atomic_load(&observation->count);
+	if (index >= 8) {
+		atomic_store(&observation->bad, true);
+		return;
+	}
+	bool valid = index == 0 && event->type == DSSH_EVENT_SIGNAL
+	    && notification_bytes(event->signal.name, "TERM", 4);
+	if (index == 1)
+		valid = event->type == DSSH_EVENT_WINDOW_CHANGE && event->window_change.cols == 87
+		    && event->window_change.rows == 29 && event->window_change.wpx == 696 && event->window_change.hpx == 232;
+	else if (index == 2)
+		valid = event->type == DSSH_EVENT_EXIT_STATUS && event->exit_status.exit_code == UINT32_C(0x10203040);
+	else if (index == 3)
+		valid = event->type == DSSH_EVENT_EXIT_SIGNAL && event->exit_signal.core_dumped
+		    && notification_bytes(event->exit_signal.signal_name, "TERM", 4)
+		    && notification_bytes(event->exit_signal.error_message, "notification text", 17)
+		    && notification_bytes(event->exit_signal.language, "en", 2);
+	if (!valid || event->stdout_pos != 0 || event->stderr_pos != 0)
+		atomic_store(&observation->bad, true);
+	atomic_store(&observation->count, index + 1);
+}
+
 struct authorization {
 	uint8_t blob[8192];
 	size_t length;
@@ -480,6 +521,12 @@ main(int argc, char **argv)
 	if (argc != 6 || (strcmp(argv[1], "server") != 0 && strcmp(argv[1], "client") != 0))
 		return 2;
 	bool client = strcmp(argv[1], "client") == 0;
+	bool notification_flags = getenv("DSSH_TEST_NOTIFICATION_FLAGS") != NULL;
+	if (notification_flags && client)
+		return 2;
+	struct notification_observation notifications;
+	atomic_init(&notifications.count, 0);
+	atomic_init(&notifications.bad, false);
 	bool break_actions = getenv("DSSH_TEST_BREAK_ACTION") != NULL;
 	if (break_actions && client)
 		return 2;
@@ -565,6 +612,8 @@ main(int argc, char **argv)
 	ret = dssh_session_set_timeout(session, 75000);
 	if (ret == 0 && break_actions)
 		ret = dssh_session_set_break_cb(session, perform_break, &break_observation);
+	if (ret == 0 && notification_flags)
+		ret = dssh_session_set_event_cb(session, observe_notification, &notifications);
 	if (ret == 0 && language_fields) {
 		const char *first[] = {"en-US", "fr"};
 		const char *second[] = {"x-interop"};
@@ -629,6 +678,14 @@ main(int argc, char **argv)
 			algorithm_checks++;
 	}
 	dssh_session_cleanup(session);
+	if (notification_flags) {
+		unsigned calls = atomic_load(&notifications.count);
+		bool valid = calls == 4 && !atomic_load(&notifications.bad);
+		if (ret == 0 && !valid)
+			ret = DSSH_ERROR_INVALID;
+		if (fprintf(stderr, "DeuceSSH notifications: calls=%u valid=%u\n", calls, valid ? 1U : 0U) < 0)
+			ret = DSSH_ERROR_INIT;
+	}
 	if (break_actions) {
 		unsigned calls = atomic_load(&break_observation.count);
 		bool valid = calls == 14 && !atomic_load(&break_observation.bad);

@@ -56,6 +56,8 @@ def run(args):
                        DSSH_TEST_MAC_S2C="hmac-sha2-256", GOMAXPROCS="4")
             if args.terminal_mode is not None:
                 env["DSSH_TEST_TERMINAL_MODE"] = args.terminal_mode
+            if args.notification_flags:
+                env["DSSH_TEST_NOTIFICATION_FLAGS"] = "1"
             left, right = socket.socketpair()
             native_log = directory / f"native-{attempt}.log"
             foreign_log = directory / f"foreign-{attempt}.log"
@@ -118,6 +120,14 @@ def run(args):
                 if expected_mode not in text or observed.get("terminal_mode") != args.terminal_mode:
                     raise RuntimeError("independent IUTF8 callback/getter oracle mismatch")
                 result["terminal_mode"] = args.terminal_mode
+            if args.notification_flags:
+                expected_notifications = [dict(name=name, reply=reply, accepted=False)
+                                          for name in ["signal", "window-change", "exit-status", "exit-signal"]
+                                          for reply in [True, False]]
+                if "DeuceSSH notifications: calls=4 valid=1\n" not in text \
+                        or observed.get("notifications") != expected_notifications:
+                    raise RuntimeError("independent notification flag/delivery oracle mismatch")
+                result["notification_flags"] = True
             expected = [dict(duration=duration, reply=reply,
                              accepted=reply and 500 <= duration <= 3000)
                         for duration in [0, 1, 499, 500, 3000, 3001, 4294967295]
@@ -145,4 +155,5 @@ if __name__ == "__main__":
     parser.add_argument("--evidence", required=True)
     parser.add_argument("--keygen", default="/usr/bin/ssh-keygen")
     parser.add_argument("--terminal-mode", choices=["none", "0", "1"])
+    parser.add_argument("--notification-flags", action="store_true")
     sys.exit(run(parser.parse_args()))

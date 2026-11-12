@@ -154,6 +154,32 @@ func run() error {
 	if err = session.Start("dssh-interop"); err != nil {
 		return err
 	}
+	notificationResults := make([]map[string]interface{}, 0, 8)
+	if os.Getenv("DSSH_TEST_NOTIFICATION_FLAGS") != "" {
+		requests := []struct {
+			name string
+			payload []byte
+		}{
+			{"signal", ssh.Marshal(struct{ Signal string }{"TERM"})},
+			{"window-change", ssh.Marshal(struct{ Columns, Rows, Width, Height uint32 }{87, 29, 696, 232})},
+			{"exit-status", ssh.Marshal(struct{ Status uint32 }{0x10203040})},
+			{"exit-signal", ssh.Marshal(struct {
+				Signal string
+				Core bool
+				Error, Language string
+			}{"TERM", true, "notification text", "en"})},
+		}
+		for _, request := range requests {
+			for _, reply := range []bool{true, false} {
+				accepted, requestError := session.SendRequest(request.name, reply, request.payload)
+				if requestError != nil || accepted {
+					return fmt.Errorf("notification %s reply=%t accepted=%t error=%v", request.name, reply, accepted, requestError)
+				}
+				notificationResults = append(notificationResults, map[string]interface{}{
+					"name": request.name, "reply": reply, "accepted": accepted})
+			}
+		}
+	}
 	results := make([]map[string]interface{}, 0, 14)
 	for _, duration := range []uint32{0, 1, 499, 500, 3000, 3001, ^uint32(0)} {
 		for _, reply := range []bool{false, true} {
@@ -194,7 +220,8 @@ func run() error {
 		return fmt.Errorf("transfer/stderr/rekey verification failed")
 	}
 	return json.NewEncoder(os.Stdout).Encode(map[string]interface{}{
-		"implementation": "golang.org/x/crypto/ssh", "cases": results, "terminal_mode": terminalMode, "stdout_bytes": output.position,
+		"implementation": "golang.org/x/crypto/ssh", "cases": results, "terminal_mode": terminalMode,
+		"notifications": notificationResults, "stdout_bytes": output.position,
 		"remote_exit_status": exit.ExitStatus(), "host_checks": hostChecks.Load(), "valid": true,
 	})
 }

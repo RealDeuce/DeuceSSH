@@ -8369,8 +8369,11 @@ test_compression_window_rekey(void)
 #include "incoming_control_cases.h"
 #include "break_handler_cases.h"
 #include "terminal_mode_cases.h"
+#include "notification_flag_cases.h"
 
 static struct dssh_test_entry tests[] = {
+	{ "release/notification_reply_flags", test_notification_reply_flags },
+	{ "release/notification_flag_failures", test_notification_flag_failures },
 	{ "release/terminal_mode_validation", test_terminal_mode_validation },
 	{ "release/terminal_mode_roundtrip", test_terminal_mode_roundtrip },
 	{ "release/terminal_mode_wire", test_terminal_mode_wire },

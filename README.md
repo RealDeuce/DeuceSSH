@@ -1763,6 +1763,10 @@ logging and termination callbacks still apply.
 
 ## Event Model
 
+RFC 4254 notifications (`signal`, `window-change`, `exit-status`, `exit-signal`)
+use `want_reply=false`. A reply-requested version is declined with CHANNEL_FAILURE
+before event delivery. BREAK uses its dedicated synchronous action/reply contract.
+
 Events (signal, window-change, EOF, close, exit-status,
 exit-signal) are separate from data — the `signalfd()` model.
 Data always flows freely via `dssh_chan_read()`.  Events are
@@ -2297,3 +2301,7 @@ pinned host authentication, transfer, exit status and rekey against the foreign
 implementation; they do not operate a physical serial device. The optional
 `dssh_terminal_mode_independent_*` checks additionally verify absent, disabled
 and enabled IUTF8 through PTY callbacks and retained getters.
+
+The optional `dssh_notification_flags_independent_*` checks verify notification
+reply flags, callback fields and delivery against the same independent peer,
+while retaining its transfer/status/rekey and BREAK checks.

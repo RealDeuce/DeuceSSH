@@ -84,7 +84,7 @@ foreach(kind IN ITEMS static shared)
 					target_include_directories(${client_target} BEFORE PRIVATE ${DSSH_THREADS_SHIM_INCLUDE})
 				endif()
 				dssh_add_output_test(dssh_example_client_${kind} ${client_target}
-					"14 tests: 14 passed, 0 failed, 0 skipped")
+					"20 tests: 20 passed, 0 failed, 0 skipped")
 				set_tests_properties(dssh_example_client_${kind} PROPERTIES TIMEOUT 60)
 				add_executable(dssh_client_driver_${kind} client_example_driver.c)
 				set_property(TARGET dssh_client_driver_${kind} PROPERTY C_STANDARD 17)

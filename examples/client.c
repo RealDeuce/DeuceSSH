@@ -1,6 +1,6 @@
 /*
  * Example SSH client using the high-level DeuceSSH API.
- * Usage: client hostkey-sha256 username password [host] [port] [command]
+ * Usage: client hostkey-sha256 username password-fd [host] [port] [command]
  * If command is given, runs exec mode (no pty).
  * If omitted, opens an interactive shell with pty.
  */
@@ -12,6 +12,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdatomic.h>
 #include <netdb.h>
@@ -31,6 +32,117 @@
 static int          sock = -1;
 static dssh_session sess;
 static atomic_bool input_stop = ATOMIC_VAR_INIT(false);
+
+/* One application-owned allocation, retained through synchronous authentication.
+ * Two extra input bytes allow a maximum-length body followed by CRLF. */
+#define PASSWORD_LIMIT 16384
+struct password_input {
+	char *text;
+	size_t capacity;
+};
+
+static void
+password_clear(struct password_input *input)
+{
+	if (input->text != NULL) {
+		dssh_cleanse(input->text, input->capacity);
+		free(input->text);
+	}
+	input->text = NULL;
+	input->capacity = 0;
+}
+
+static int
+parse_password_descriptor(const char *text, int *descriptor)
+{
+	if (text == NULL || *text == 0)
+		return -1;
+	uintmax_t value = 0;
+	for (const char *p = text; *p != 0; p++) {
+		if (*p < '0' || *p > '9')
+			return -1;
+		unsigned int digit = (unsigned int)(*p - '0');
+		if (value > (INT_MAX - digit) / 10)
+			return -1;
+		value = value * 10 + digit;
+	}
+	if (value < 3)
+		return -1;
+	int result = (int)value;
+	*descriptor = result;
+	return 0;
+}
+
+/* Consume exactly one line (or EOF) and retire our descriptor before DNS.
+ * Do not change descriptor flags: the parent may share its open file description. */
+static int
+password_read(int descriptor, struct password_input *input)
+{
+	int result = -1;
+	size_t used = 0;
+	input->capacity = PASSWORD_LIMIT + 3;
+	input->text = malloc(input->capacity);
+	if (input->text == NULL)
+		goto done;
+	for (;;) {
+		size_t count = input->capacity - 1 - used;
+		if (count > 4096)
+			count = 4096;
+		ssize_t n = read(descriptor, &input->text[used], count);
+		if (n > 0) {
+			if (n > 4096)
+				goto done;
+			size_t advanced = (size_t)n;
+			if (advanced > count)
+				goto done;
+			size_t end = used + advanced;
+			for (size_t i = used; i < end; i++) {
+				if (input->text[i] == '\n') {
+					size_t length = i;
+					if (length > 0 && input->text[length - 1] == '\r')
+						length--;
+					if (length > PASSWORD_LIMIT)
+						goto done;
+					input->text[length] = 0;
+					result = 0;
+					goto done;
+				}
+				if (input->text[i] == 0)
+					goto done;
+			}
+			used = end;
+			if (used > PASSWORD_LIMIT
+			    && !(used == PASSWORD_LIMIT + 1 && input->text[PASSWORD_LIMIT] == '\r'))
+				goto done;
+		}
+		else if (n == 0) {
+			if (used > PASSWORD_LIMIT)
+				goto done;
+			input->text[used] = 0;
+			result = 0;
+			goto done;
+		}
+		else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+			struct pollfd fd = { .fd = descriptor, .events = POLLIN };
+			int ready;
+			do {
+				ready = poll(&fd, 1, -1);
+			} while (ready < 0 && errno == EINTR);
+			if (ready <= 0 || (fd.revents & (POLLERR | POLLNVAL)) != 0
+			    || (fd.revents & (POLLIN | POLLHUP)) == 0)
+				goto done;
+		}
+		else if (errno != EINTR)
+			goto done;
+	}
+done:
+	/* Do not retry close after EINTR: descriptor ownership is then ambiguous. */
+	if (close(descriptor) != 0)
+		result = -1;
+	if (result != 0)
+		password_clear(input);
+	return result;
+}
 
 /* ================================================================
  * Keyboard-interactive callback: answer every prompt with password
@@ -502,19 +614,19 @@ main(int argc, char **argv)
 {
 	const char *program = argc > 0 && argv != NULL && argv[0] != NULL ? argv[0] : "client";
 	if (argc < 4 || argc > 7 || argv == NULL) {
-		fprintf(stderr, "Usage: %s hostkey-sha256 username password [host] [port] [command]\n", program);
+		fprintf(stderr, "Usage: %s hostkey-sha256 username password-fd [host] [port] [command]\n", program);
 		return 1;
 	}
 	char *expected_hostkey = argv[1];
 	const char *username = argv[2];
-	const char *password = argv[3];
+	int password_descriptor;
 	const char *host = argc > 4 ? argv[4] : "localhost";
 	const char *command = argc > 6 ? argv[6] : NULL;
 	uint16_t port = 22;
 	if (!valid_fingerprint(expected_hostkey) || username == NULL || *username == 0
-	    || password == NULL || host == NULL || *host == 0
+	    || parse_password_descriptor(argv[3], &password_descriptor) != 0 || host == NULL || *host == 0
 	    || (argc > 5 && parse_port(argv[5], &port) != 0)) {
-		fputs("Invalid fingerprint, username, host or port.\n", stderr);
+		fputs("Invalid fingerprint, username, password descriptor, host or port.\n", stderr);
 		return 1;
 	}
 	char port_str[16];
@@ -528,11 +640,16 @@ main(int argc, char **argv)
 	}
 
 	int status = 1;
+	struct password_input password = {0};
 	atomic_store_explicit(&input_stop, false, memory_order_release);
 	dssh_channel channel = NULL;
 	struct dssh_chan_params params;
 	bool have_params = false, have_writer = false;
 	thrd_t writer;
+	if (password_read(password_descriptor, &password) != 0) {
+		fputs("Password input failed.\n", stderr);
+		goto done;
+	}
 	sock = connect_host(host, port_str);
 	if (sock < 0)
 		goto done;
@@ -590,9 +707,9 @@ main(int argc, char **argv)
 			goto done;
 		ret = DSSH_ERROR_REJECTED;
 		if (offered_method(methods, "password"))
-			ret = dssh_auth_password(sess, username, password, NULL, NULL);
+			ret = dssh_auth_password(sess, username, password.text, NULL, NULL);
 		if (ret != 0 && offered_method(methods, "keyboard-interactive")) {
-			struct kbi_state state = { .password = password };
+			struct kbi_state state = { .password = password.text };
 			ret = dssh_auth_keyboard_interactive(sess, username, kbi_prompt, &state);
 			kbi_release(&state);
 			free(state.answer);
@@ -603,6 +720,7 @@ main(int argc, char **argv)
 			goto done;
 		}
 	}
+	password_clear(&password);
 	if (fputs("Authenticated.\n", stderr) == EOF)
 		goto done;
 	ret = dssh_session_start(sess);
@@ -704,6 +822,7 @@ main(int argc, char **argv)
 	}
 
 done:
+	password_clear(&password);
 	if (have_params)
 		dssh_chan_params_free(&params);
 	if (have_writer) {

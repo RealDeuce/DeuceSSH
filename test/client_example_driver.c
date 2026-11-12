@@ -20,6 +20,11 @@ static const char *fault;
 static atomic_uint hits = ATOMIC_VAR_INIT(0);
 static unsigned sessions, cleanups, builders, frees, channels, closes, workers, joins, sockets, retirements;
 static bool invalid;
+static int credential_fd = -1;
+static unsigned credential_closes, secret_allocations, secret_frees;
+static void *secret;
+static void *app_malloc(size_t);
+static void app_free(void *);
 static bool fail(const char *name);
 static int report(int status);
 static int app_socket(int, int, int);
@@ -47,6 +52,8 @@ static int app_join(thrd_t, int *);
 static int app_chan_poll(dssh_channel, int, int);
 
 #define main client_example_main
+#define malloc app_malloc
+#define free app_free
 #define socket app_socket
 #define close app_close
 #define write app_write
@@ -95,6 +102,37 @@ static int app_chan_poll(dssh_channel, int, int);
 #undef close
 #undef socket
 #undef main
+#undef free
+#undef malloc
+
+static void *
+app_malloc(size_t size)
+{
+	void *result = malloc(size);
+	if (size == PASSWORD_LIMIT + 3) {
+		if (secret != NULL || secret_allocations != 0)
+			invalid = true;
+		secret = result;
+		if (result != NULL)
+			secret_allocations++;
+	}
+	return result;
+}
+
+static void
+app_free(void *value)
+{
+	if (value != NULL && value == secret) {
+		const unsigned char *bytes = value;
+		for (size_t i = 0; i < PASSWORD_LIMIT + 3; i++) {
+			if (bytes[i] != 0)
+				invalid = true;
+		}
+		secret_frees++;
+		secret = NULL;
+	}
+	free(value);
+}
 
 static bool
 fail(const char *name)
@@ -110,7 +148,11 @@ report(int status)
 {
 	unsigned count = atomic_load_explicit(&hits, memory_order_relaxed);
 	bool valid = !invalid && count == 1 && sessions == cleanups && builders == frees
-	    && channels == closes && workers == joins && sockets == retirements;
+	    && channels == closes && workers == joins && sockets == retirements
+	    && credential_closes == 1 && secret_allocations == 1 && secret_frees == 1 && secret == NULL;
+	if (fprintf(stderr, "example_credential closed=%u allocated=%u cleared=%u valid=%u\n",
+	    credential_closes, secret_allocations, secret_frees, valid ? 1U : 0U) < 0)
+		valid = false;
 	if (fprintf(stderr, "example_ownership fault=%s hits=%u status=%d sessions=%u/%u builders=%u/%u channels=%u/%u workers=%u/%u sockets=%u/%u valid=%u\n",
 	    fault, count, status, sessions, cleanups, builders, frees, channels, closes,
 	    workers, joins, sockets, retirements, valid ? 1U : 0U) < 0)
@@ -121,6 +163,8 @@ report(int status)
 static int
 app_socket(int domain, int type, int protocol)
 {
+	if (credential_closes != 1)
+		invalid = true;
 	int fd = socket(domain, type, protocol);
 	if (fd >= 0)
 		sockets++;
@@ -131,8 +175,12 @@ static int
 app_close(int fd)
 {
 	int ret = close(fd);
-	if (ret == 0)
-		retirements++;
+	if (ret == 0) {
+		if (fd == credential_fd && credential_closes == 0)
+			credential_closes++;
+		else
+			retirements++;
+	}
 	else
 		invalid = true;
 	return ret;
@@ -151,7 +199,7 @@ app_write(int fd, const void *bytes, size_t size)
 static ssize_t
 app_read(int fd, void *bytes, size_t size)
 {
-	if (fail("stdin")) {
+	if (fd == STDIN_FILENO && fail("stdin")) {
 		errno = EIO;
 		return -1;
 	}
@@ -190,7 +238,15 @@ CHECKED(app_verify_cb, "verify_cb", (dssh_session s, dssh_hostkey_verify_cb cb, 
 CHECKED(app_registration, "registration", (void), dssh_register_none_comp())
 CHECKED(app_handshake, "handshake", (dssh_session s), dssh_transport_handshake(s))
 CHECKED(app_methods, "auth_query", (dssh_session s, const char *user, char *list, size_t size), dssh_auth_get_methods(s, user, list, size))
-CHECKED(app_start, "start", (dssh_session s), dssh_session_start(s))
+static int
+app_start(dssh_session s)
+{
+	if (secret != NULL || secret_frees != 1)
+		invalid = true;
+	if (fail("start"))
+		return DSSH_ERROR_ALLOC;
+	return dssh_session_start(s);
+}
 CHECKED(app_command, "command", (struct dssh_chan_params *p, const char *text), dssh_chan_params_set_command(p, text))
 CHECKED(app_pty, "pty", (struct dssh_chan_params *p, bool enable), dssh_chan_params_set_pty(p, enable))
 CHECKED(app_term, "term", (struct dssh_chan_params *p, const char *text), dssh_chan_params_set_term(p, text))
@@ -266,7 +322,8 @@ app_join(thrd_t thread, int *result)
 		 * ownership failure. No worker is stranded by this test adapter. */
 		bool valid = ret == thrd_success && workers == 1 && joins == 1
 		    && sessions == 1 && cleanups == 0 && channels == 1 && closes == 0
-		    && builders == frees && !invalid;
+		    && builders == frees && !invalid && credential_closes == 1
+		    && secret_allocations == 1 && secret_frees == 1 && secret == NULL;
 		if (fprintf(stderr, "example_join_failure joined=%u owned=%u\n",
 		    valid ? 1U : 0U, valid ? 1U : 0U) < 0 || fflush(stderr) != 0)
 			_Exit(2);
@@ -286,9 +343,11 @@ app_chan_poll(dssh_channel ch, int flags, int timeout)
 int
 main(int argc, char **argv)
 {
-	if (argc < 3)
+	if (argc < 5)
 		return 2;
 	fault = argv[1];
+	if (parse_password_descriptor(argv[4], &credential_fd) != 0)
+		return 2;
 	struct rlimit limit = {0, 0};
 	if (setrlimit(RLIMIT_CORE, &limit) != 0)
 		return 2;

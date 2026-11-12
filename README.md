@@ -383,8 +383,22 @@ configuration before connecting. The POSIX client example takes it as its first
 argument:
 
 ```sh
-client 'SHA256:<trusted fingerprint>' username password [host] [port] [command]
+client 'SHA256:<trusted fingerprint>' username password-fd [host] [port] [command]
 ```
+
+Supply a dedicated readable descriptor numbered at least 3, for example:
+
+```sh
+client 'SHA256:<trusted fingerprint>' alice 3 example.net 22 'uname -a' 3<password-file
+```
+
+The example reads one password line before resolving the host, then closes its
+descriptor. LF ends the line and an immediately preceding CR is removed; EOF
+also ends input. Empty passwords are allowed. Embedded NUL bytes and passwords
+longer than 16 KiB are rejected without truncation. Other bytes are preserved.
+The application clears and frees its password storage after authentication or
+an error. Stdin remains available for channel input. The parent supplies and
+owns its credential source; there is no password argument or fallback source.
 
 If the callback is not set on a client session,
 `dssh_transport_handshake()` returns `DSSH_ERROR_INIT`.  Server

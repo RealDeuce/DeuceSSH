@@ -128,11 +128,23 @@ def run(args):
                 client_command.append(args.client_fault)
             elif not args.direct:
                 client_command.append("--run-client")
-            client_command.extend([expected_pin, "audit", password, args.host, port])
-            if args.mode == "exec":
-                client_command.append("rejected-command" if args.reject_command else "dssh-example")
-            client = subprocess.Popen(client_command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                      stderr=subprocess.PIPE, start_new_session=True)
+            password_read, password_write = os.pipe()
+            try:
+                credential = (password + "\n").encode()
+                # This fixture's short credential fits in an empty native pipe.
+                if os.write(password_write, credential) != len(credential):
+                    raise RuntimeError("credential pipe write was incomplete")
+                os.close(password_write)
+                password_write = -1
+                client_command.extend([expected_pin, "audit", str(password_read), args.host, port])
+                if args.mode == "exec":
+                    client_command.append("rejected-command" if args.reject_command else "dssh-example")
+                client = subprocess.Popen(client_command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                          stderr=subprocess.PIPE, pass_fds=(password_read,), start_new_session=True)
+            finally:
+                os.close(password_read)
+                if password_write != -1:
+                    os.close(password_write)
             connected = None
             until = time.monotonic() + 15
             while connected is None:
@@ -167,6 +179,14 @@ def run(args):
         expected_exit = -signal.SIGABRT if args.client_fault == "join" else (1 if negative else 0)
         if match is None or server_exit != 0 or client_exit != expected_exit:
             raise RuntimeError("native process completion disagrees")
+        original_stderr = stderr
+        if not args.direct:
+            credential_report = b"example_credential closed=1 allocated=1 cleared=1 valid=1\n"
+            if args.client_fault != "join" and credential_report not in stderr:
+                raise RuntimeError("credential retirement/clearing observation missing")
+            # Keep caller diagnostics separate from the exact remote stderr check.
+            stderr = stderr.replace(credential_report, b"")
+            result["credential_ownership"] = "descriptor retired before DNS; owned allocation cleared and freed"
         values = list(map(int, match.groups()[:9]))
         if foreign.count("Received SSH_MSG_NEWKEYS") != values[0]:
             raise RuntimeError("independent NEWKEYS count disagrees")
@@ -231,7 +251,7 @@ def run(args):
                       independent_newkeys=values[0], authenticated=values[1], input_bytes=values[5],
                       password_calls=values[6], kbi_calls=values[7], libssh_version=match[10],
                       stdout_bytes=len(stdout), stdout_sha256=hashlib.sha256(stdout).hexdigest(),
-                      raw_stderr_bytes=len(stderr), raw_stderr_sha256=hashlib.sha256(stderr).hexdigest(),
+                      raw_stderr_bytes=len(original_stderr), raw_stderr_sha256=hashlib.sha256(original_stderr).hexdigest(),
                       remote_stderr_bytes=0 if negative else len(ERROR),
                       remote_stderr_sha256=None if negative else hashlib.sha256(ERROR).hexdigest())
         (evidence / "client.log").write_bytes(diagnostic)

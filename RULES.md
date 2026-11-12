@@ -20,6 +20,11 @@ Internal code calls the inner function directly, skipping the outer validation.
 
 Code must use only C17 standard functions and must not rely on any platform-specific APIs.
 
+The private `timespec_get` compatibility shim may use POSIX
+`clock_gettime(CLOCK_REALTIME)` when the build's feature namespace does not
+provide `timespec_get` / `TIME_UTC`. Core code continues to use the C11 interface;
+the shim does not expose platform APIs in public headers.
+
 Code must be correct on any conforming platform, from 16-bit to 64-bit. `size_t`, `int`, and enum
 widths vary across platforms; code must handle all valid widths.
 

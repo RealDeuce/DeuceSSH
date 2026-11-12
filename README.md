@@ -35,8 +35,10 @@ DeuceSSH when changing Botan versions; the source-build minimum remains 3.13.0.
 
 CMake selects C17 when supported. On macOS x86 only, a compiler without
 C17 mode may use C11 instead. Library targets, tests, and capability probes
-use the same dialect. Runtime requirements, including `timespec_get()` and
-atomics, are unchanged; selecting C11 does not supply missing SDK functions.
+use the same dialect. When `timespec_get()` / `TIME_UTC` are unavailable in the
+build's feature namespace, a private POSIX shim uses
+`clock_gettime(CLOCK_REALTIME)` instead (including on macOS 10.14). Atomics
+remain required; selecting C11 does not supply missing SDK functions.
 
 ```sh
 cmake -S . -B build

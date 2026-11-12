@@ -127,24 +127,49 @@ function(dssh_find_math_link_library)
 endfunction()
 dssh_find_math_link_library()
 
-# Compiler language-mode support does not establish that the SDK/libc
-# ships the C11 functions <time.h> promises. Without this probe an
-# older macOS SDK (pre-10.15 lacks timespec_get / TIME_UTC) gets all
-# the way to "implicit declaration of function 'timespec_get'" at
-# real-target compile time while configure thinks everything's fine.
-# Fail configure up front so consumers' own build-time probes can
-# observe the failure and react.
-check_c_source_compiles("
-	#include <time.h>
-	int main(void) {
-		struct timespec ts;
-		return timespec_get(&ts, TIME_UTC) == TIME_UTC ? 0 : 1;
-	}
-" HAVE_TIMESPEC_GET)
-if(NOT HAVE_TIMESPEC_GET)
-	message(FATAL_ERROR
-	    "DeuceSSH requires C11's timespec_get / TIME_UTC in <time.h>.  "
-	    "This SDK/libc predates them — upgrade the platform toolchain.")
+# Match the POSIX namespace used by library sources and tests. Older Apple
+# headers hide timespec_get / TIME_UTC in this namespace even in C11 mode.
+# The new cache key intentionally discards the old, unrestricted probe result.
+function(dssh_find_timespec_get)
+	cmake_push_check_state()
+	set(CMAKE_TRY_COMPILE_TARGET_TYPE EXECUTABLE)
+	if(NOT WIN32)
+		list(APPEND CMAKE_REQUIRED_DEFINITIONS -D_POSIX_C_SOURCE=200809L)
+	endif()
+	check_c_source_compiles("
+		#include <time.h>
+		int main(void) {
+			struct timespec ts;
+			int (*get_time)(struct timespec *, int) = timespec_get;
+			return get_time(&ts, TIME_UTC) == TIME_UTC ? 0 : 1;
+		}
+	" DSSH_HAVE_TIMESPEC_GET)
+	if(NOT DSSH_HAVE_TIMESPEC_GET AND UNIX)
+		check_c_source_compiles("
+			#include <time.h>
+			int main(void) {
+				struct timespec ts;
+				int (*get_time)(clockid_t, struct timespec *) = clock_gettime;
+				return get_time(CLOCK_REALTIME, &ts);
+			}
+		" DSSH_HAVE_CLOCK_GETTIME)
+	endif()
+	cmake_pop_check_state()
+endfunction()
+dssh_find_timespec_get()
+
+set(DSSH_TIME_SHIM_SOURCES "")
+set(DSSH_TIME_SHIM_DEFINITIONS "")
+if(NOT DSSH_HAVE_TIMESPEC_GET)
+	if(UNIX AND DSSH_HAVE_CLOCK_GETTIME)
+		set(DSSH_TIME_SHIM_SOURCES posix/timespec.c)
+		set(DSSH_TIME_SHIM_DEFINITIONS DSSH_TIMESPEC_GET_SHIM)
+		message(STATUS "Using POSIX timespec_get compatibility shim")
+	else()
+		message(FATAL_ERROR
+			"DeuceSSH requires timespec_get / TIME_UTC in <time.h>, "
+			"or POSIX clock_gettime(CLOCK_REALTIME) for its compatibility shim.")
+	endif()
 endif()
 
 # C11 threads: glibc (2.28+), recent macOS SDKs, and FreeBSD 12+ have
@@ -201,7 +226,7 @@ else()
 	# Strict C modes do not implicitly expose strdup() or the POSIX APIs used
 	# by the file writer and the pthread-backed C11 threads shim.
 	set_source_files_properties(ssh-auth.c ssh-conn.c
-		key_algo/private-key-file-posix.c posix/threads.c
+		key_algo/private-key-file-posix.c posix/threads.c posix/timespec.c
 		PROPERTIES COMPILE_DEFINITIONS _POSIX_C_SOURCE=200809L)
 	# NetBSD declares fchmod() in its XSI namespace, not its POSIX namespace.
 	set_property(SOURCE key_algo/private-key-file-posix.c APPEND PROPERTY
@@ -299,6 +324,7 @@ set(DEUCESSH_SOURCES
 	kex/sntrup761_optblocker.c
 	${DSSH_ALG_SOURCES}
 	${DSSH_THREADS_SHIM_SOURCES}
+	${DSSH_TIME_SHIM_SOURCES}
 	enc/none.c
 	mac/none.c
 	comp/none.c
@@ -492,6 +518,7 @@ if(DEUCESSH_BUILD_STATIC)
 			${DSSH_PRIVATE_KEY_FILE_LIB} ${DSSH_PC_CXX_RUNTIME_LIBRARIES} ${DSSH_MATH_LINK_LIB})
 	target_compile_definitions(deucessh_static
 		PRIVATE DSSH_VERSION_STRING="${PROJECT_VERSION}"
+		${DSSH_TIME_SHIM_DEFINITIONS}
 		$<$<CONFIG:Release>:NDEBUG>)
 	target_compile_options(deucessh_static PRIVATE ${DEUCESSH_COMPILE_OPTIONS})
 	if(BOTAN3_VENDORED_BUILD_TARGET)
@@ -531,6 +558,7 @@ if(DEUCESSH_BUILD_SHARED)
 	target_compile_definitions(deucessh_shared
 		PRIVATE
 			DSSH_SHARED
+			${DSSH_TIME_SHIM_DEFINITIONS}
 			DSSH_VERSION_STRING="${PROJECT_VERSION}"
 			$<$<CONFIG:Release>:NDEBUG>)
 	target_compile_options(deucessh_shared PRIVATE

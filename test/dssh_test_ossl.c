@@ -36,6 +36,7 @@
 #endif
 
 #include "dssh_test_ossl.h"
+#include "../ssh-timespec.h"
 
 static _Thread_local bool sntrup_clear_watched;
 static _Thread_local size_t sntrup_clear_size;

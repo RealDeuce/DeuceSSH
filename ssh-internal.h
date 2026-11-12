@@ -9,7 +9,7 @@
 #include <stdlib.h>
 #include <threads.h>
 #include "ssh-time.h"
-#include <time.h>        /* timespec_get / TIME_UTC — dssh_deadline_from_ms */
+#include "ssh-timespec.h" /* timespec_get / TIME_UTC — dssh_deadline_from_ms */
 
 #include "deucessh-conn.h"
 #include "ssh-trans.h"
@@ -203,6 +203,7 @@ void dssh_test_free(void *ptr);
 
 /* Clock controls use their own thread-local state. */
 int dssh_test_timespec_get(struct timespec *ts, int base);
+ #undef timespec_get
  #define timespec_get(t, b) dssh_test_timespec_get(t, b)
 
 /* C11 threads */

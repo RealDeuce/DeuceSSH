@@ -155,6 +155,7 @@ target_compile_definitions(deucessh_test_lib PRIVATE DSSH_TESTING
 	$<$<COMPILE_LANGUAGE:C>:_POSIX_C_SOURCE=200809L>
 	$<$<STREQUAL:${DEUCESSH_CRYPTO_BACKEND},OpenSSL>:DSSH_CRYPTO_OPENSSL>
 	$<$<STREQUAL:${DEUCESSH_CRYPTO_BACKEND},Botan>:DSSH_CRYPTO_BOTAN>)
+target_compile_definitions(deucessh_test_lib PUBLIC ${DSSH_TIME_SHIM_DEFINITIONS})
 target_include_directories(deucessh_test_lib
 	PUBLIC ${PROJECT_SOURCE_DIR}
 	PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -189,6 +190,7 @@ target_include_directories(dssh_test_allocator PUBLIC
 	${CMAKE_CURRENT_SOURCE_DIR})
 # Crypto + C11 threads failure injection library
 add_library(dssh_test_ossl STATIC dssh_test_ossl.c)
+target_compile_definitions(dssh_test_ossl PRIVATE ${DSSH_TIME_SHIM_DEFINITIONS})
 if(UNIX)
 	target_compile_definitions(dssh_test_ossl PRIVATE _POSIX_C_SOURCE=200809L)
 endif()

@@ -15,6 +15,7 @@
 
 #include "deucessh.h"
 #include "deucessh-result.h"
+#include "../ssh-timespec.h"
 
 static inline bool
 dssh_test_bytes_equal(struct dssh_bytes bytes, const void *data, size_t len)

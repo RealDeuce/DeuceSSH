@@ -24,6 +24,7 @@
 #include "ssh-trans.h"
 #include "ssh-internal.h"
 #include "dssh_test_internal.h"
+#include "auth_discovery_fixture.h"
 #include "mock_io.h"
 #include "test_dhgex_provider.h"
 #include "dssh_test_alloc.h"
@@ -397,9 +398,9 @@ struct auth_client_arg {
 	dssh_auth_kbi_prompt_cb kbi_cb;
 	void *kbi_cbdata;
 	int result;
-	int methods_result;
+	int begin_result;
 	char methods[256];
-	bool do_get_methods;
+	bool do_begin;
 	bool do_password;
 	bool do_kbi;
 	bool do_publickey;
@@ -420,11 +421,15 @@ auth_client_thread(void *arg)
 	struct auth_client_arg *a = arg;
 	dssh_session sess = a->ctx->client;
 
-	if (a->do_get_methods) {
-		a->methods_result = dssh_auth_get_methods(sess,
+	if (a->do_begin) {
+		a->begin_result = test_auth_discover(sess,
 		    a->username, a->methods, sizeof(a->methods));
-		if (a->methods_result < 0) {
-			a->result = a->methods_result;
+		if (a->begin_result < 0) {
+			a->result = a->begin_result;
+			return 0;
+		}
+		if (a->begin_result == DSSH_AUTH_SUCCESS) {
+			a->result = DSSH_AUTH_SUCCESS;
 			return 0;
 		}
 	}
@@ -551,7 +556,7 @@ test_auth_password_success(void)
 	ca.ctx = &ctx;
 	ca.username = "testuser";
 	ca.password = "secret123";
-	ca.do_get_methods = true;
+	ca.do_begin = true;
 	ca.do_password = true;
 
 	struct auth_server_arg sa = {0};
@@ -596,7 +601,7 @@ test_auth_password_failure(void)
 	ca.ctx = &ctx;
 	ca.username = "testuser";
 	ca.password = "wrong";
-	ca.do_get_methods = true;
+	ca.do_begin = true;
 	ca.do_password = true;
 
 	struct auth_server_arg sa = {0};
@@ -616,7 +621,7 @@ test_auth_password_failure(void)
 	mock_io_close_s2c(&ctx.io);
 	thrd_join(st, NULL);
 
-	ASSERT_TRUE(ca.result < 0);
+	ASSERT_EQ(ca.result, DSSH_AUTH_CONTINUE);
 	ASSERT_TRUE(cbdata.password_called);
 
 	handshake_cleanup(&ctx);
@@ -641,7 +646,7 @@ test_auth_password_wrong_user(void)
 	ca.ctx = &ctx;
 	ca.username = "wronguser";
 	ca.password = "secret";
-	ca.do_get_methods = true;
+	ca.do_begin = true;
 	ca.do_password = true;
 
 	struct auth_server_arg sa = {0};
@@ -660,7 +665,7 @@ test_auth_password_wrong_user(void)
 	mock_io_close_s2c(&ctx.io);
 	thrd_join(st, NULL);
 
-	ASSERT_TRUE(ca.result < 0);
+	ASSERT_EQ(ca.result, DSSH_AUTH_CONTINUE);
 	ASSERT_TRUE(cbdata.password_called);
 
 	mock_io_close_c2s(&ctx.io);
@@ -686,7 +691,7 @@ test_auth_password_partial(void)
 	ca.ctx = &ctx;
 	ca.username = "testuser";
 	ca.password = "secret";
-	ca.do_get_methods = true;
+	ca.do_begin = true;
 	ca.do_password = true;
 
 	struct auth_server_arg sa = {0};
@@ -707,7 +712,7 @@ test_auth_password_partial(void)
 
 	/* PARTIAL means auth failure response with partial_success=true.
 	 * The client receives USERAUTH_FAILURE so returns error. */
-	ASSERT_TRUE(ca.result < 0);
+	ASSERT_EQ(ca.result, DSSH_AUTH_PARTIAL);
 	ASSERT_TRUE(cbdata.password_called);
 
 	mock_io_close_c2s(&ctx.io);
@@ -735,7 +740,7 @@ test_auth_password_empty(void)
 	ca.ctx = &ctx;
 	ca.username = "testuser";
 	ca.password = "";
-	ca.do_get_methods = true;
+	ca.do_begin = true;
 	ca.do_password = true;
 
 	struct auth_server_arg sa = {0};
@@ -784,7 +789,7 @@ test_auth_password_long(void)
 	ca.ctx = &ctx;
 	ca.username = "testuser";
 	ca.password = longpass;
-	ca.do_get_methods = true;
+	ca.do_begin = true;
 	ca.do_password = true;
 
 	struct auth_server_arg sa = {0};
@@ -1180,7 +1185,7 @@ test_auth_server_publickey_accept(void)
 	ca.ctx = &ctx;
 	ca.username = "testuser";
 	ca.algo_name = test_key_algo_name();
-	ca.do_get_methods = true;
+	ca.do_begin = true;
 	ca.do_publickey = true;
 
 	thrd_t ct, st;
@@ -1223,7 +1228,7 @@ test_auth_server_publickey_reject(void)
 	ca.ctx = &ctx;
 	ca.username = "testuser";
 	ca.algo_name = test_key_algo_name();
-	ca.do_get_methods = true;
+	ca.do_begin = true;
 	ca.do_publickey = true;
 
 	thrd_t ct, st;
@@ -1236,7 +1241,7 @@ test_auth_server_publickey_reject(void)
 	mock_io_close_s2c(&ctx.io);
 	thrd_join(st, NULL);
 
-	ASSERT_TRUE(ca.result < 0);
+	ASSERT_EQ(ca.result, DSSH_AUTH_CONTINUE);
 	ASSERT_TRUE(cbdata.publickey_called);
 
 	mock_io_close_c2s(&ctx.io);
@@ -1342,7 +1347,7 @@ test_auth_server_username_captured(void)
 	ca.ctx = &ctx;
 	ca.username = "captured_user";
 	ca.password = "pass";
-	ca.do_get_methods = true;
+	ca.do_begin = true;
 	ca.do_password = true;
 
 	thrd_t ct, st;
@@ -1390,7 +1395,7 @@ test_auth_roundtrip_password(void)
 	ca.ctx = &ctx;
 	ca.username = "alice";
 	ca.password = "p@ssw0rd";
-	ca.do_get_methods = true;
+	ca.do_begin = true;
 	ca.do_password = true;
 
 	struct auth_server_arg sa = {0};
@@ -1438,7 +1443,7 @@ test_auth_roundtrip_password_reject(void)
 	ca.ctx = &ctx;
 	ca.username = "alice";
 	ca.password = "incorrect";
-	ca.do_get_methods = true;
+	ca.do_begin = true;
 	ca.do_password = true;
 
 	struct auth_server_arg sa = {0};
@@ -1458,7 +1463,7 @@ test_auth_roundtrip_password_reject(void)
 	mock_io_close_s2c(&ctx.io);
 	thrd_join(st, NULL);
 
-	ASSERT_TRUE(ca.result < 0);
+	ASSERT_EQ(ca.result, DSSH_AUTH_CONTINUE);
 	ASSERT_TRUE(cbdata.password_called);
 
 	mock_io_close_c2s(&ctx.io);
@@ -1485,7 +1490,7 @@ test_auth_roundtrip_publickey(void)
 	ca.ctx = &ctx;
 	ca.username = "bob";
 	ca.algo_name = test_key_algo_name();
-	ca.do_get_methods = true;
+	ca.do_begin = true;
 	ca.do_publickey = true;
 
 	struct auth_server_arg sa = {0};
@@ -1530,7 +1535,7 @@ test_auth_roundtrip_get_methods(void)
 	ca.ctx = &ctx;
 	ca.username = "testuser";
 	ca.password = "pass";
-	ca.do_get_methods = true;
+	ca.do_begin = true;
 	ca.do_password = true;
 
 	struct auth_server_arg sa = {0};
@@ -1554,7 +1559,7 @@ test_auth_roundtrip_get_methods(void)
 	ASSERT_EQ(sa.result, 0);
 
 	/* Verify the client got the methods list from the none probe */
-	ASSERT_EQ(ca.methods_result, 1);
+	ASSERT_EQ(ca.begin_result, DSSH_AUTH_CONTINUE);
 	ASSERT_STR_EQ(ca.methods, "publickey,password");
 
 	handshake_cleanup(&ctx);
@@ -1744,7 +1749,7 @@ test_auth_roundtrip_kbi(void)
 	struct auth_client_arg ca = {0};
 	ca.ctx = &ctx;
 	ca.username = "testuser";
-	ca.do_get_methods = true;
+	ca.do_begin = true;
 	ca.do_kbi = true;
 	ca.kbi_cb = test_kbi_prompt_cb;
 	ca.kbi_cbdata = &kbi_data;
@@ -1801,18 +1806,24 @@ test_auth_roundtrip_multiple_attempts(void)
 	/* Client side: manually do get_methods, then two password attempts */
 	dssh_session client = ctx.client;
 	char methods[256];
-	int mres = dssh_auth_get_methods(client, "testuser", methods, sizeof(methods));
-	ASSERT_EQ(mres, DSSH_AUTH_METHODS_AVAILABLE);
+	int mres = test_auth_discover(client, "testuser", methods, sizeof(methods));
 
 	/* First attempt with wrong password */
-	int res = dssh_auth_password(client, "testuser", "wrong", NULL, NULL);
-	ASSERT_TRUE(res < 0);
+	int first_result = DSSH_ERROR_INVALID;
+	int res = DSSH_ERROR_INVALID;
+	if (mres == DSSH_AUTH_CONTINUE)
+		first_result = dssh_auth_password(client, "testuser", "wrong", NULL, NULL);
 
 	/* Second attempt with correct password */
-	res = dssh_auth_password(client, "testuser", "correct", NULL, NULL);
+	if (first_result == DSSH_AUTH_CONTINUE)
+		res = dssh_auth_password(client, "testuser", "correct", NULL, NULL);
+	mock_io_close_c2s(&ctx.io);
+	mock_io_close_s2c(&ctx.io);
+	if (thrd_join(st, NULL) != thrd_success)
+		abort();
+	ASSERT_EQ(mres, DSSH_AUTH_CONTINUE);
+	ASSERT_EQ(first_result, DSSH_AUTH_CONTINUE);
 	ASSERT_EQ(res, 0);
-
-	thrd_join(st, NULL);
 	ASSERT_EQ(sa.result, 0);
 
 	handshake_cleanup(&ctx);
@@ -3020,7 +3031,7 @@ test_kbi_failure_response(void)
 	mock_io_close_s2c(&ctx.io);
 	thrd_join(st, NULL);
 
-	ASSERT_EQ(res, DSSH_ERROR_AUTH_REJECTED);
+	ASSERT_EQ(res, DSSH_AUTH_CONTINUE);
 
 	handshake_cleanup(&ctx);
 	return TEST_PASS;
@@ -3075,7 +3086,7 @@ test_kbi_unexpected_message(void)
 	mock_io_close_s2c(&ctx.io);
 	thrd_join(st, NULL);
 
-	ASSERT_EQ(res, DSSH_ERROR_AUTH_REJECTED);
+	ASSERT_EQ(res, DSSH_AUTH_CONTINUE);
 
 	handshake_cleanup(&ctx);
 	return TEST_PASS;
@@ -4570,11 +4581,11 @@ test_get_methods_none_accepted(void)
 	 * Server accepts it -> sends USERAUTH_SUCCESS.
 	 * get_methods should return NONE_ACCEPTED with empty methods string. */
 	char methods[256] = "unchanged";
-	int res = dssh_auth_get_methods(ctx.client, "testuser",
+	int res = test_auth_discover(ctx.client, "testuser",
 	    methods, sizeof(methods));
 
 	thrd_join(st, NULL);
-	ASSERT_EQ(res, DSSH_AUTH_NONE_ACCEPTED);
+	ASSERT_EQ(res, DSSH_AUTH_SUCCESS);
 	ASSERT_EQ(methods[0], '\0');
 	ASSERT_EQ(sa.result, 0);
 
@@ -4651,7 +4662,7 @@ test_get_methods_failure_truncated(void)
 	ASSERT_THRD_CREATE(&st, crafted_response_server_thread, &cr);
 
 	char methods[256];
-	int res = dssh_auth_get_methods(ctx.client, "user", methods, sizeof(methods));
+	int res = test_auth_discover(ctx.client, "user", methods, sizeof(methods));
 	thrd_join(st, NULL);
 	ASSERT_TRUE(res < 0);
 
@@ -4678,7 +4689,7 @@ test_get_methods_failure_methods_len_exceeds(void)
 	ASSERT_THRD_CREATE(&st, crafted_response_server_thread, &cr);
 
 	char methods[256];
-	int res = dssh_auth_get_methods(ctx.client, "user", methods, sizeof(methods));
+	int res = test_auth_discover(ctx.client, "user", methods, sizeof(methods));
 	thrd_join(st, NULL);
 	ASSERT_TRUE(res < 0);
 
@@ -4707,7 +4718,7 @@ test_get_methods_failure_control_char(void)
 	ASSERT_THRD_CREATE(&st, crafted_response_server_thread, &cr);
 
 	char methods[256];
-	int res = dssh_auth_get_methods(ctx.client, "user", methods, sizeof(methods));
+	int res = test_auth_discover(ctx.client, "user", methods, sizeof(methods));
 	thrd_join(st, NULL);
 	ASSERT_TRUE(res < 0);
 
@@ -4731,7 +4742,7 @@ test_get_methods_unexpected_msg(void)
 	ASSERT_THRD_CREATE(&st, crafted_response_server_thread, &cr);
 
 	char methods[256];
-	int res = dssh_auth_get_methods(ctx.client, "user", methods, sizeof(methods));
+	int res = test_auth_discover(ctx.client, "user", methods, sizeof(methods));
 	thrd_join(st, NULL);
 	ASSERT_TRUE(res < 0);
 
@@ -4969,7 +4980,7 @@ test_service_accept_unexpected(void)
 		thrd_t st;
 		ASSERT_THRD_CREATE(&st, service_bogus_server_thread, &cr);
 		char methods[256];
-		int res = dssh_auth_get_methods(ctx.client, "user", methods, sizeof(methods));
+		int res = test_auth_discover(ctx.client, "user", methods, sizeof(methods));
 		thrd_join(st, NULL);
 		bool accepted = ctx.client->auth_service_requested;
 		handshake_cleanup(&ctx);
@@ -5942,7 +5953,7 @@ test_get_methods_zero_buffer(void)
 	 * Server accepts none -> USERAUTH_SUCCESS -> line 567 False.
 	 * The methods buffer is not written to. */
 	char methods[1] = { 'X' };
-	int res = dssh_auth_get_methods(ctx.client, "user", methods, 0);
+	int res = test_auth_discover(ctx.client, "user", methods, 0);
 
 	thrd_join(st, NULL);
 	ASSERT_EQ(res, 0);
@@ -5981,7 +5992,7 @@ test_get_methods_del_char(void)
 	ASSERT_THRD_CREATE(&st, crafted_response_server_thread, &cr);
 
 	char methods[256];
-	int res = dssh_auth_get_methods(ctx.client, "user", methods, sizeof(methods));
+	int res = test_auth_discover(ctx.client, "user", methods, sizeof(methods));
 	thrd_join(st, NULL);
 	ASSERT_TRUE(res < 0);
 
@@ -6348,7 +6359,7 @@ test_client_service_request_send_fail(void)
 	mock_io_close_c2s(&ctx.io);
 
 	char methods[256];
-	int res = dssh_auth_get_methods(ctx.client, "user",
+	int res = test_auth_discover(ctx.client, "user",
 	    methods, sizeof(methods));
 	ASSERT_TRUE(res < 0);
 
@@ -6361,10 +6372,10 @@ test_client_service_request_send_fail(void)
  * Client get_methods send fail after service is requested.
  * Complete SERVICE_REQUEST/ACCEPT, then close c2s so the
  * USERAUTH_REQUEST (none) send fails.
- * Exercises line 556 (send_packet error in get_methods_impl).
+ * Exercises send_packet error propagation in auth_begin_impl.
  */
 static int
-test_client_get_methods_send_fail(void)
+test_client_auth_begin_send_fail(void)
 {
 	struct handshake_ctx ctx;
 	if (handshake_setup(&ctx) < 0) {
@@ -6387,16 +6398,16 @@ test_client_get_methods_send_fail(void)
 	/* First call to get_methods succeeds (sends SERVICE_REQUEST,
 	 * gets ACCEPT, sends none request, gets FAILURE). */
 	char methods[256];
-	int res = dssh_auth_get_methods(ctx.client, "user",
+	int res = test_auth_discover(ctx.client, "user",
 	    methods, sizeof(methods));
-	ASSERT_EQ(res, 1);
+	ASSERT_EQ(res, DSSH_AUTH_CONTINUE);
 
 	/* Now close c2s so the NEXT get_methods send fails.
 	 * auth_service_requested is already true, so it skips SERVICE_REQUEST
 	 * and goes straight to sending the none USERAUTH_REQUEST. */
 	mock_io_close_c2s(&ctx.io);
 
-	res = dssh_auth_get_methods(ctx.client, "user",
+	res = test_auth_discover(ctx.client, "user",
 	    methods, sizeof(methods));
 	ASSERT_TRUE(res < 0);
 
@@ -6563,9 +6574,9 @@ test_client_kbi_send_fail(void)
 
 	/* First get_methods to set auth_service_requested */
 	char methods[256];
-	int mres = dssh_auth_get_methods(ctx.client, "user",
+	int mres = test_auth_discover(ctx.client, "user",
 	    methods, sizeof(methods));
-	ASSERT_EQ(mres, DSSH_AUTH_METHODS_AVAILABLE);
+	ASSERT_EQ(mres, DSSH_AUTH_CONTINUE);
 
 	/* Close c2s so KBI send fails */
 	mock_io_close_c2s(&ctx.io);
@@ -6788,9 +6799,9 @@ test_client_publickey_send_fail(void)
 	ASSERT_TRUE(thrd_create(&st, auth_server_thread, &sa) == thrd_success);
 
 	char methods[256];
-	int mres = dssh_auth_get_methods(ctx.client, "user",
+	int mres = test_auth_discover(ctx.client, "user",
 	    methods, sizeof(methods));
-	ASSERT_EQ(mres, DSSH_AUTH_METHODS_AVAILABLE);
+	ASSERT_EQ(mres, DSSH_AUTH_CONTINUE);
 
 	/* Close c2s so the publickey send fails */
 	mock_io_close_c2s(&ctx.io);
@@ -6874,9 +6885,9 @@ test_client_publickey_recv_fail(void)
 
 	/* get_methods first */
 	char methods[256];
-	int mres = dssh_auth_get_methods(ctx.client, "user",
+	int mres = test_auth_discover(ctx.client, "user",
 	    methods, sizeof(methods));
-	ASSERT_EQ(mres, DSSH_AUTH_METHODS_AVAILABLE);
+	ASSERT_EQ(mres, DSSH_AUTH_CONTINUE);
 
 	int res = dssh_auth_publickey(ctx.client, "user",
 	    test_key_algo_name());
@@ -6982,9 +6993,9 @@ test_client_publickey_banner(void)
 
 	/* get_methods first */
 	char methods[256];
-	int mres = dssh_auth_get_methods(ctx.client, "user",
+	int mres = test_auth_discover(ctx.client, "user",
 	    methods, sizeof(methods));
-	ASSERT_EQ(mres, DSSH_AUTH_METHODS_AVAILABLE);
+	ASSERT_EQ(mres, DSSH_AUTH_CONTINUE);
 
 	int res = dssh_auth_publickey(ctx.client, "user",
 	    test_key_algo_name());
@@ -7109,16 +7120,18 @@ test_get_methods_small_buffer(void)
 	thrd_t st;
 	ASSERT_TRUE(thrd_create(&st, auth_server_thread, &sa) == thrd_success);
 
-	/* Call with a 1-byte buffer: methods_sz=1, copylen = min(18, 0) = 0 */
+	/* Begin publishes the complete list; a short getter output is unchanged. */
 	char methods[1] = { 'X' };
-	int res = dssh_auth_get_methods(ctx.client, "user", methods, 1);
+	int res = dssh_auth_begin(ctx.client, "user");
+	int64_t copied = dssh_auth_get_methods(ctx.client, methods, sizeof(methods));
 
 	mock_io_close_c2s(&ctx.io);
 	mock_io_close_s2c(&ctx.io);
 	thrd_join(st, NULL);
 
-	ASSERT_EQ(res, 1);
-	ASSERT_EQ(methods[0], '\0'); /* NUL terminated with 0 bytes copied */
+	ASSERT_EQ(res, DSSH_AUTH_CONTINUE);
+	ASSERT_EQ(copied, DSSH_ERROR_TOOLONG);
+	ASSERT_EQ(methods[0], 'X');
 
 	handshake_cleanup(&ctx);
 	return TEST_PASS;
@@ -7698,9 +7711,9 @@ test_server_send_fail_pk_success(void)
 
 	/* Client: get_methods first */
 	char methods[256];
-	int mres = dssh_auth_get_methods(ctx.client, "user",
+	int mres = test_auth_discover(ctx.client, "user",
 	    methods, sizeof(methods));
-	ASSERT_EQ(mres, DSSH_AUTH_METHODS_AVAILABLE);
+	ASSERT_EQ(mres, DSSH_AUTH_CONTINUE);
 
 	/* Client: publickey auth -- server will close pipe before responding */
 	int res = dssh_auth_publickey(ctx.client, "user",
@@ -9084,13 +9097,13 @@ test_dclient_wrong_svc_reply(void)
 	}
 
 	char methods[256];
-	int res = get_methods_impl(ctx.client, "user", methods, sizeof(methods));
+	int res = test_auth_discover_component(ctx.client, "user", methods, sizeof(methods));
 
 	mock_io_close_c2s(&ctx.io);
 	int joined = thrd_join(st, NULL);
 	ASSERT_EQ(joined, thrd_success);
 	ASSERT_OK(sa.result);
-	ASSERT_EQ(res, DSSH_AUTH_METHODS_AVAILABLE);
+	ASSERT_EQ(res, DSSH_AUTH_CONTINUE);
 	ASSERT_EQ(strcmp(methods, "password"), 0);
 	ASSERT_TRUE(ctx.client->auth_service_requested);
 	ASSERT_FALSE(dssh_session_is_terminated(ctx.client));
@@ -9127,7 +9140,7 @@ test_dclient_get_methods_del(void)
 	}
 
 	char methods[256];
-	int res = get_methods_impl(ctx.client, "user", methods, sizeof(methods));
+	int res = test_auth_discover_component(ctx.client, "user", methods, sizeof(methods));
 
 	mock_io_close_c2s(&ctx.io);
 	mock_io_close_s2c(&ctx.io);
@@ -9641,7 +9654,7 @@ test_dclient_get_methods_trunc_payload(void)
 	}
 
 	char methods[128];
-	int res = get_methods_impl(ctx.client, "user", methods,
+	int res = test_auth_discover_component(ctx.client, "user", methods,
 	    sizeof(methods));
 
 	mock_io_close_c2s(&ctx.io);
@@ -9678,7 +9691,7 @@ test_dclient_get_methods_ctrl_char(void)
 	}
 
 	char methods[128];
-	int res = get_methods_impl(ctx.client, "user", methods,
+	int res = test_auth_discover_component(ctx.client, "user", methods,
 	    sizeof(methods));
 
 	mock_io_close_c2s(&ctx.io);
@@ -9746,7 +9759,7 @@ test_dclient_get_methods_unexpected_msg(void)
 	}
 
 	char methods[128];
-	int res = get_methods_impl(ctx.client, "user", methods,
+	int res = test_auth_discover_component(ctx.client, "user", methods,
 	    sizeof(methods));
 
 	mock_io_close_c2s(&ctx.io);
@@ -9795,7 +9808,7 @@ test_dclient_changereq_prompt_overflow(void)
  *
  * Server sends two consecutive SSH_MSG_USERAUTH_BANNER messages before
  * the USERAUTH_FAILURE response.  RFC 4252 s5.4 permits multiple banners.
- * The client's get_methods_impl must drain all banners (while loop, not if).
+ * The client's auth_begin_impl must drain all banners (while loop, not if).
  * ================================================================ */
 
 static int banner_count;
@@ -9922,14 +9935,14 @@ test_dclient_get_methods_multi_banner(void)
 	}
 
 	char methods[256];
-	int res = get_methods_impl(ctx.client, "user", methods,
+	int res = test_auth_discover_component(ctx.client, "user", methods,
 	    sizeof(methods));
 
 	mock_io_close_c2s(&ctx.io);
 	mock_io_close_s2c(&ctx.io);
 	thrd_join(st, NULL);
 	ASSERT_EQ(sa.result, 0);
-	ASSERT_EQ(res, DSSH_AUTH_METHODS_AVAILABLE);
+	ASSERT_EQ(res, DSSH_AUTH_CONTINUE);
 	ASSERT_EQ(banner_count, 2);
 	ASSERT_STR_EQ(methods, "password");
 
@@ -10013,7 +10026,7 @@ test_auth_server_kbi_roundtrip(void)
 	struct auth_client_arg ca = {0};
 	ca.ctx = &ctx;
 	ca.username = "testuser";
-	ca.do_get_methods = true;
+	ca.do_begin = true;
 	ca.do_kbi = true;
 	ca.kbi_cb = test_kbi_prompt_cb;
 	ca.kbi_cbdata = &kbi_cdata;
@@ -10064,7 +10077,7 @@ test_auth_server_kbi_failure(void)
 	struct auth_client_arg ca = {0};
 	ca.ctx = &ctx;
 	ca.username = "testuser";
-	ca.do_get_methods = true;
+	ca.do_begin = true;
 	ca.do_kbi = true;
 	ca.kbi_cb = test_kbi_prompt_cb;
 	ca.kbi_cbdata = &kbi_cdata;
@@ -10078,7 +10091,7 @@ test_auth_server_kbi_failure(void)
 	mock_io_close_s2c(&ctx.io);
 	thrd_join(st, NULL);
 
-	ASSERT_TRUE(ca.result < 0);
+	ASSERT_EQ(ca.result, DSSH_AUTH_CONTINUE);
 	/* Server may return 0 (client retried) or TERMINATED (client disconnected) */
 	ASSERT_TRUE(sa.result == 0 || sa.result == DSSH_ERROR_TERMINATED);
 	ASSERT_TRUE(kbi_sdata.called);
@@ -10221,7 +10234,7 @@ test_auth_server_kbi_multi_round(void)
 	struct auth_client_arg ca = {0};
 	ca.ctx = &ctx;
 	ca.username = "testuser";
-	ca.do_get_methods = true;
+	ca.do_begin = true;
 	ca.do_kbi = true;
 	ca.kbi_cb = test_kbi_multi_prompt_cb;
 	ca.kbi_cbdata = &kbi_cdata;
@@ -10296,7 +10309,7 @@ test_auth_server_banner(void)
 	ca.ctx = &ctx;
 	ca.username = "testuser";
 	ca.password = "pass";
-	ca.do_get_methods = true;
+	ca.do_begin = true;
 	ca.do_password = true;
 
 	thrd_t ct, st;
@@ -10345,49 +10358,48 @@ kbi_bad_client_thread(void *arg)
 {
 	struct handshake_ctx *ctx = arg;
 	dssh_session client = ctx->client;
-
-	/* SERVICE_REQUEST -> SERVICE_ACCEPT */
-	int res = dssh_auth_get_methods(client, "testuser", NULL, 0);
-	if (res < 0)
+	int ret = dssh_auth_begin(client, "u");
+	if (ret != DSSH_AUTH_CONTINUE) {
+		ctx->client_result = DSSH_ERROR_INVALID;
+		mock_io_close_c2s_write(&ctx->io);
 		return 0;
-
-	/* Send KBI USERAUTH_REQUEST */
-	static const char svc[] = "ssh-connection";
-	static const char method[] = "keyboard-interactive";
-	size_t ulen = 8; /* "testuser" */
+	}
 	uint8_t msg[128];
-	size_t pos = 0;
-
-	msg[pos++] = SSH_MSG_USERAUTH_REQUEST;
-	dssh_serialize_uint32((uint32_t)ulen, msg, sizeof(msg), &pos);
-	memcpy(&msg[pos], "testuser", ulen);
-	pos += ulen;
-	dssh_serialize_uint32(sizeof(svc) - 1, msg, sizeof(msg), &pos);
-	memcpy(&msg[pos], svc, sizeof(svc) - 1);
-	pos += sizeof(svc) - 1;
-	dssh_serialize_uint32(sizeof(method) - 1, msg, sizeof(msg), &pos);
-	memcpy(&msg[pos], method, sizeof(method) - 1);
-	pos += sizeof(method) - 1;
-	dssh_serialize_uint32(0, msg, sizeof(msg), &pos); /* language */
-	dssh_serialize_uint32(0, msg, sizeof(msg), &pos); /* submethods */
-
-	send_packet(client, msg, pos, NULL);
-
-	/* Receive INFO_REQUEST (60) -- discard it */
-	uint8_t  rx_type;
-	uint8_t *rx_payload;
-	size_t   rx_len;
-	recv_packet(client, &rx_type, &rx_payload, &rx_len);
-
-	/* Send garbage USERAUTH_REQUEST instead of INFO_RESPONSE */
-	uint8_t bad[1];
-	bad[0] = SSH_MSG_USERAUTH_REQUEST;
-	send_packet(client, bad, 1, NULL);
-
-	/* Should get FAILURE back */
-	recv_packet(client, &rx_type, &rx_payload, &rx_len);
-
+	const uint8_t extra[8] = {0};
+	size_t length = build_auth_request("keyboard-interactive",
+	    DSSH_STRLEN("keyboard-interactive"), extra, sizeof(extra), msg, sizeof(msg));
+	ret = length == 0 ? DSSH_ERROR_INVALID : send_packet(client, msg, length, NULL);
+	uint8_t type;
+	uint8_t *payload;
+	size_t received;
+	if (ret == 0) {
+		ret = recv_packet(client, &type, &payload, &received);
+		if (ret == 0 && (type != SSH_MSG_USERAUTH_INFO_REQUEST || received < 17))
+			ret = DSSH_ERROR_PARSE;
+	}
+	if (ret == 0) {
+		/* A malformed replacement request is a parse error, not a
+		 * response-count mismatch that receives USERAUTH_FAILURE. */
+		uint8_t bad = SSH_MSG_USERAUTH_REQUEST;
+		ret = send_packet(client, &bad, 1, NULL);
+		if (ret == 0)
+			ret = recv_packet(client, &type, &payload, &received) < 0 ? 0 : DSSH_ERROR_INVALID;
+	}
+	ctx->client_result = ret;
+	mock_io_close_c2s_write(&ctx->io);
 	return 0;
+}
+
+static int
+kbi_bad_server_thread(void *opaque)
+{
+	struct auth_server_arg *server = opaque;
+	int ret = auth_server_thread(server);
+	/* The fixture owns the transport and wakes its peer on an auth error;
+	 * no reply is promised for a malformed replacement request. */
+	if (server->result < 0)
+		mock_io_close_s2c_write(&server->ctx->io);
+	return ret;
 }
 
 static int
@@ -10411,16 +10423,24 @@ test_auth_server_kbi_bad_response(void)
 	sa.cbs.cbdata = &kbi_sdata;
 
 	thrd_t ct, st;
-	ASSERT_TRUE(thrd_create(&st, auth_server_thread, &sa) == thrd_success);
-	ASSERT_TRUE(thrd_create(&ct, kbi_bad_client_thread, &ctx) == thrd_success);
-
-	thrd_join(ct, NULL);
+	if (thrd_create(&st, kbi_bad_server_thread, &sa) != thrd_success) {
+		handshake_cleanup(&ctx);
+		return TEST_FAIL;
+	}
+	if (thrd_create(&ct, kbi_bad_client_thread, &ctx) != thrd_success) {
+		mock_io_close_c2s(&ctx.io);
+		mock_io_close_s2c(&ctx.io);
+		if (thrd_join(st, NULL) != thrd_success)
+			abort();
+		handshake_cleanup(&ctx);
+		return TEST_FAIL;
+	}
+	if (thrd_join(ct, NULL) != thrd_success || thrd_join(st, NULL) != thrd_success)
+		abort();
 	mock_io_close_c2s(&ctx.io);
 	mock_io_close_s2c(&ctx.io);
-	thrd_join(st, NULL);
-
-	/* Server should have survived (FAILURE sent, then TERMINATED on disconnect) */
-	ASSERT_TRUE(sa.result == 0 || sa.result == DSSH_ERROR_TERMINATED);
+	ASSERT_EQ(ctx.client_result, 0);
+	ASSERT_EQ(sa.result, DSSH_ERROR_PARSE);
 
 	handshake_cleanup(&ctx);
 	return TEST_PASS;
@@ -10435,7 +10455,7 @@ kbi_truncated_response_thread(void *arg)
 	struct handshake_ctx *ctx = arg;
 	dssh_session client = ctx->client;
 
-	int res = dssh_auth_get_methods(client, "testuser", NULL, 0);
+	int res = test_auth_discover(client, "testuser", NULL, 0);
 	if (res < 0)
 		return 0;
 
@@ -10520,7 +10540,7 @@ kbi_trunc_lang_thread(void *arg)
 	struct handshake_ctx *ctx = arg;
 	dssh_session client = ctx->client;
 
-	int res = dssh_auth_get_methods(client, "testuser", NULL, 0);
+	int res = test_auth_discover(client, "testuser", NULL, 0);
 	if (res < 0)
 		return 0;
 
@@ -10609,7 +10629,7 @@ test_auth_server_kbi_no_callback(void)
 	struct auth_client_arg ca = {0};
 	ca.ctx = &ctx;
 	ca.username = "testuser";
-	ca.do_get_methods = true;
+	ca.do_begin = true;
 	ca.do_kbi = true;
 	ca.kbi_cb = test_kbi_prompt_cb;
 	ca.kbi_cbdata = &kbi_cdata;
@@ -10623,7 +10643,7 @@ test_auth_server_kbi_no_callback(void)
 	mock_io_close_s2c(&ctx.io);
 	thrd_join(st, NULL);
 
-	ASSERT_TRUE(ca.result < 0);
+	ASSERT_EQ(ca.result, DSSH_AUTH_CONTINUE);
 
 	handshake_cleanup(&ctx);
 	return TEST_PASS;
@@ -10685,7 +10705,7 @@ test_auth_server_kbi_with_banner(void)
 	struct auth_client_arg ca = {0};
 	ca.ctx = &ctx;
 	ca.username = "testuser";
-	ca.do_get_methods = true;
+	ca.do_begin = true;
 	ca.do_kbi = true;
 	ca.kbi_cb = test_kbi_prompt_cb;
 	ca.kbi_cbdata = &kbi_cdata;
@@ -10733,17 +10753,15 @@ static int
 test_auth_get_methods_null(void)
 {
 	char methods[64];
-
-	ASSERT_EQ(dssh_auth_get_methods(NULL, NULL, NULL, sizeof(methods)),
-	    DSSH_ERROR_INIT);                 /* methods == NULL */
-	ASSERT_EQ(dssh_auth_get_methods(NULL, NULL, methods, sizeof(methods)),
-	    DSSH_ERROR_INIT);                 /* username == NULL */
-	ASSERT_EQ(dssh_auth_get_methods(NULL, "user", methods, sizeof(methods)),
-	    DSSH_ERROR_INIT);                 /* sess == NULL */
+	ASSERT_EQ(dssh_auth_begin(NULL, NULL), DSSH_ERROR_INVALID);
+	ASSERT_EQ(dssh_auth_begin(NULL, "user"), DSSH_ERROR_INVALID);
+	ASSERT_EQ(dssh_auth_get_methods(NULL, NULL, 0), DSSH_ERROR_INVALID);
+	ASSERT_EQ(dssh_auth_get_methods(NULL, methods, sizeof(methods)), DSSH_ERROR_INVALID);
 	return TEST_PASS;
 }
 
-/* if (password == NULL || username == NULL || sess == NULL) */
+/* Password action argument validation. */
+
 static int
 test_auth_password_null(void)
 {
@@ -11004,7 +11022,7 @@ test_auth_server_pk_verify_disconnect(void)
 	ca.ctx = &ctx;
 	ca.username = "testuser";
 	ca.algo_name = test_key_algo_name();
-	ca.do_get_methods = true;
+	ca.do_begin = true;
 	ca.do_publickey = true;
 
 	thrd_t ct, st;
@@ -11094,7 +11112,7 @@ test_auth_server_kbi_disconnect(void)
 	struct auth_client_arg ca = {0};
 	ca.ctx = &ctx;
 	ca.username = "testuser";
-	ca.do_get_methods = true;
+	ca.do_begin = true;
 	ca.do_kbi = true;
 	ca.kbi_cb = test_kbi_prompt_cb;
 	ca.kbi_cbdata = &kbi_cdata;
@@ -11997,7 +12015,7 @@ kbi_trunc_lang_hdr_thread(void *arg)
 	struct handshake_ctx *ctx = arg;
 	dssh_session client = ctx->client;
 
-	int res = dssh_auth_get_methods(client, "testuser", NULL, 0);
+	int res = test_auth_discover(client, "testuser", NULL, 0);
 	if (res < 0)
 		return 0;
 
@@ -12072,7 +12090,7 @@ kbi_trunc_submethods_thread(void *arg)
 	struct handshake_ctx *ctx = arg;
 	dssh_session client = ctx->client;
 
-	int res = dssh_auth_get_methods(client, "testuser", NULL, 0);
+	int res = test_auth_discover(client, "testuser", NULL, 0);
 	if (res < 0)
 		return 0;
 
@@ -12325,7 +12343,7 @@ kbi_trunc_resp_body_thread(void *arg)
 	struct handshake_ctx *ctx = arg;
 	dssh_session client = ctx->client;
 
-	int res = dssh_auth_get_methods(client, "testuser", NULL, 0);
+	int res = test_auth_discover(client, "testuser", NULL, 0);
 	if (res < 0)
 		return 0;
 
@@ -12421,7 +12439,7 @@ kbi_excess_responses_thread(void *arg)
 	struct handshake_ctx *ctx = response_case->ctx;
 	dssh_session client = ctx->client;
 
-	int res = dssh_auth_get_methods(client, "testuser", NULL, 0);
+	int res = test_auth_discover(client, "testuser", NULL, 0);
 	if (res < 0)
 		return 0;
 
@@ -12592,7 +12610,7 @@ test_auth_request_capacity(void)
 	memset(input, 'x', input_len);
 	input[input_len] = 0;
 	char methods[16];
-	ASSERT_EQ(get_methods_impl(sess, input, methods, sizeof(methods)), DSSH_ERROR_TOOLONG);
+	ASSERT_EQ(test_auth_discover_component(sess, input, methods, sizeof(methods)), DSSH_ERROR_TOOLONG);
 	ASSERT_EQ(auth_password_impl(sess, input, "password", NULL, NULL), DSSH_ERROR_TOOLONG);
 	ASSERT_EQ(auth_password_impl(sess, "testuser", input, NULL, NULL), DSSH_ERROR_TOOLONG);
 	ASSERT_EQ(auth_kbi_impl(sess, input, kbi_cb_unreachable, NULL), DSSH_ERROR_TOOLONG);
@@ -12614,8 +12632,11 @@ test_auth_request_capacity(void)
 
 #include "lifecycle_phase_cases.h"
 #include "kbi_prompt_count_cases.h"
+#include "auth_continuation_cases.h"
 
 static struct dssh_test_entry tests[] = {
+	{ "auth/continuation/snapshots", test_auth_continuation_snapshots },
+	{ "auth/continuation/storage", test_auth_continuation_storage },
 	{ "auth/kbi/prompt_counts", test_kbi_prompt_counts },
 	{ "lifecycle/preflight", test_lifecycle_preflight },
 	{ "lifecycle/progression", test_lifecycle_progression },
@@ -12792,7 +12813,7 @@ static struct dssh_test_entry tests[] = {
 
 	/* Group C: client-side failure tests */
 	{ "auth/client/svc_req_send_fail",       test_client_service_request_send_fail },
-	{ "auth/client/get_methods_send_fail",   test_client_get_methods_send_fail },
+	{ "auth/client/begin_send_fail",   test_client_auth_begin_send_fail },
 	{ "auth/client/pw_changereq_cb_error",   test_password_changereq_cb_error },
 	{ "auth/client/pw_changereq_send_fail",  test_password_changereq_send_fail },
 	{ "auth/client/kbi_send_fail",           test_client_kbi_send_fail },

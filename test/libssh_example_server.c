@@ -65,14 +65,18 @@ log_message(int priority, const char *function, const char *message, void *data)
 static int
 password_auth(ssh_session session, const char *user, const char *password, void *data)
 {
-	(void)session;
 	(void)data;
 	if (state.password_calls == 10)
 		return SSH_AUTH_DENIED;
 	state.password_calls++;
-	if (strcmp(state.auth, "password") != 0 || user == NULL || password == NULL
+	if ((strcmp(state.auth, "password") != 0 && strcmp(state.auth, "partial") != 0)
+	    || user == NULL || password == NULL
 	    || strcmp(user, "audit") != 0 || strcmp(password, "example-password") != 0)
 		return SSH_AUTH_DENIED;
+	if (strcmp(state.auth, "partial") == 0) {
+		ssh_set_auth_methods(session, SSH_AUTH_METHOD_INTERACTIVE);
+		return SSH_AUTH_PARTIAL;
+	}
 	state.authenticated = true;
 	return SSH_AUTH_SUCCESS;
 }
@@ -304,7 +308,8 @@ main(int argc, char **argv)
 		return valid ? 0 : 1;
 	}
 	if (argc != 7 || (strcmp(argv[3], "rsa-sha2-256") != 0 && strcmp(argv[3], "ssh-ed25519") != 0)
-	    || (strcmp(argv[4], "password") != 0 && strcmp(argv[4], "kbi") != 0 && strcmp(argv[4], "fallback") != 0)
+	    || (strcmp(argv[4], "password") != 0 && strcmp(argv[4], "kbi") != 0
+	        && strcmp(argv[4], "fallback") != 0 && strcmp(argv[4], "partial") != 0)
 	    || (strcmp(argv[5], "exec") != 0 && strcmp(argv[5], "shell") != 0 && strcmp(argv[5], "shell-idle") != 0)
 	    || (strcmp(argv[6], "positive") != 0 && strcmp(argv[6], "negative") != 0)) {
 		ssh_finalize();
@@ -380,7 +385,8 @@ main(int argc, char **argv)
 	handed_off = true;
 	if (ssh_bind_accept_fd(bind, state.session, fd) != SSH_OK)
 		goto done;
-	int methods = strcmp(state.auth, "password") == 0 ? SSH_AUTH_METHOD_PASSWORD : SSH_AUTH_METHOD_INTERACTIVE;
+	int methods = strcmp(state.auth, "password") == 0 || strcmp(state.auth, "partial") == 0
+	    ? SSH_AUTH_METHOD_PASSWORD : SSH_AUTH_METHOD_INTERACTIVE;
 	if (strcmp(state.auth, "fallback") == 0)
 		methods |= SSH_AUTH_METHOD_PASSWORD;
 	ssh_set_auth_methods(state.session, methods);

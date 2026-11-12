@@ -237,7 +237,12 @@ def run(args):
                 raise RuntimeError("keyboard-interactive path disagrees")
             if args.auth == "fallback" and (values[6] != 1 or values[7] != 2):
                 raise RuntimeError("fallback path disagrees")
+            if args.auth == "partial" and (values[6] != 1 or values[7] != 2):
+                raise RuntimeError("partial-success path disagrees")
             prefix, separator, payload = stderr.partition(b"Authenticated.\n")
+            if args.auth == "partial" and (b"Auth methods: password\n" not in prefix
+                                           or b"Auth methods: keyboard-interactive\n" not in prefix):
+                raise RuntimeError("continuation list was not refreshed after partial success")
             if not separator or fingerprint_pattern.sub(b"", payload) != ERROR:
                 raise RuntimeError("extended output is incomplete or contains unexpected diagnostics")
             diagnostic = prefix + separator + b"[remote stderr payload verified and omitted]\n"
@@ -306,7 +311,7 @@ def main():
     parser.add_argument("--server", required=True)
     parser.add_argument("--key", required=True)
     parser.add_argument("--algorithm", required=True, choices=["rsa-sha2-256", "ssh-ed25519"])
-    parser.add_argument("--auth", choices=["password", "kbi", "fallback"], default="password")
+    parser.add_argument("--auth", choices=["password", "kbi", "fallback", "partial"], default="password")
     parser.add_argument("--mode", choices=["exec", "shell", "shell-idle"], default="exec")
     parser.add_argument("--host", choices=["127.0.0.1", "localhost"], default="127.0.0.1")
     parser.add_argument("--negative-pin", action="store_true")

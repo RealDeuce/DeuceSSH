@@ -121,7 +121,7 @@ auth_methods_valid(const uint8_t *methods, size_t length)
 
 static int
 parse_auth_failure(const uint8_t *payload, size_t payload_len,
-    const uint8_t **methods, size_t *methods_len)
+    const uint8_t **methods, size_t *methods_len, bool *partial)
 {
 	size_t pos = 1;
 	const uint8_t *names;
@@ -129,20 +129,62 @@ parse_auth_failure(const uint8_t *payload, size_t payload_len,
 	if (!auth_read_string(payload, payload_len, &pos, &names, &length)
 	    || payload_len - pos != 1 || !auth_methods_valid(names, length))
 		return DSSH_ERROR_PARSE;
-	/* Every nonzero partial-success byte represents TRUE (RFC 4251 s5).
-	 * Its public observability remains a separate API design question. */
+	/* Every nonzero partial-success byte represents TRUE (RFC 4251 s5). */
 	*methods = names;
 	*methods_len = length;
+	*partial = payload[pos] != 0;
+	return 0;
+}
+
+/* Publish only complete replies; allocation failure preserves the prior
+ * snapshot. Empty lists need no allocation, including initial success. */
+static int
+auth_publish_methods(struct dssh_session_s *sess, const uint8_t *methods, size_t length)
+{
+	if (length > sess->trans.packet_buf_sz || length == SIZE_MAX)
+		return DSSH_ERROR_TOOLONG;
+	if (length > 0 && length >= sess->auth_methods_capacity) {
+		size_t needed = length + 1;
+		char *storage = realloc(sess->auth_methods, needed);
+		if (storage == NULL)
+			return DSSH_ERROR_ALLOC;
+		sess->auth_methods = storage;
+		sess->auth_methods_capacity = needed;
+	}
+	if (length > 0)
+		memcpy(sess->auth_methods, methods, length);
+	if (sess->auth_methods != NULL)
+		sess->auth_methods[length] = 0;
+	sess->auth_methods_len = length;
+	sess->auth_methods_available = true;
 	return 0;
 }
 
 static int
-auth_failure_result(const uint8_t *payload, size_t payload_len)
+auth_success_result(struct dssh_session_s *sess, size_t payload_len)
+{
+	if (payload_len != 1)
+		return DSSH_ERROR_PARSE;
+	return auth_publish_methods(sess, NULL, 0);
+}
+
+static int
+auth_failure_result(struct dssh_session_s *sess, const uint8_t *payload, size_t payload_len)
 {
 	const uint8_t *methods;
 	size_t methods_len;
-	int ret = parse_auth_failure(payload, payload_len, &methods, &methods_len);
-	return ret < 0 ? ret : DSSH_ERROR_AUTH_REJECTED;
+	bool partial;
+	int ret = parse_auth_failure(payload, payload_len, &methods, &methods_len, &partial);
+	if (ret < 0)
+		return ret;
+	ret = auth_publish_methods(sess, methods, methods_len);
+	if (ret < 0) {
+		/* The server has completed an action, potentially accepting a factor
+		 * or changing a password. Do not continue after losing its result. */
+		session_set_terminate(sess);
+		return ret;
+	}
+	return partial ? DSSH_AUTH_PARTIAL : DSSH_AUTH_CONTINUE;
 }
 
 static int
@@ -1097,8 +1139,8 @@ auth_server_impl(struct dssh_session_s *sess, const struct dssh_auth_server_cbs 
  * flag was set (by send_packet/recv_packet on a fatal I/O or crypto
  * error), the connection is dead and callers need to know.
  *
- * Auth rejection (server sent USERAUTH_FAILURE) does NOT set
- * terminate, so those errors pass through unchanged.
+ * Complete USERAUTH_FAILURE replies produce positive PARTIAL/CONTINUE
+ * outcomes and do not terminate the session.
  */
 static inline int
 auth_check_terminated(struct dssh_session_s *sess, int res)
@@ -1109,8 +1151,10 @@ auth_check_terminated(struct dssh_session_s *sess, int res)
 		dssh_log_termination(sess, res);
 		return DSSH_ERROR_TERMINATED;
 	}
-	if (res == DSSH_ERROR_AUTH_REJECTED)
-		DSSH_LOGF(sess, DSSH_LOG_WARNING, res, "Authentication rejected by peer");
+	if (res == DSSH_AUTH_PARTIAL)
+		DSSH_LOGF(sess, DSSH_LOG_DEBUG, DSSH_ERROR_NONE, "Authentication factor accepted; more authentication required");
+	else if (res == DSSH_AUTH_CONTINUE)
+		DSSH_LOGF(sess, DSSH_LOG_DEBUG, DSSH_ERROR_NONE, "Authentication requires another method");
 	else if (res < 0)
 		DSSH_LOGF(sess, DSSH_LOG_ERROR, res, "Authentication operation failed: %s", dssh_strerror(res));
 	else if (res == 0)
@@ -1292,7 +1336,7 @@ build_userauth_request(uint8_t *buf, const char *username, size_t ulen, const ch
 }
 
 DSSH_TESTABLE int
-get_methods_impl(struct dssh_session_s *sess, const char *username, char *methods, size_t methods_sz)
+auth_begin_impl(struct dssh_session_s *sess, const char *username)
 {
 	int res = ensure_auth_service(sess);
 
@@ -1337,52 +1381,64 @@ get_methods_impl(struct dssh_session_s *sess, const char *username, char *method
 			return res;
 	}
 
-	if (msg_type == SSH_MSG_USERAUTH_SUCCESS) {
-		if (payload_len != 1)
-			return DSSH_ERROR_PARSE;
-		if ((methods != NULL) && (methods_sz > 0))
-			methods[0] = 0;
-		return DSSH_AUTH_NONE_ACCEPTED;
-	}
-
-	if (msg_type == SSH_MSG_USERAUTH_FAILURE) {
-		const uint8_t *names;
-		size_t mlen;
-		res = parse_auth_failure(payload, payload_len, &names, &mlen);
-		if (res < 0)
-			return res;
-
-		if ((methods != NULL) && (methods_sz > 0)) {
-			size_t copylen = mlen < methods_sz - 1 ? mlen : methods_sz - 1;
-
-			memcpy(methods, names, copylen);
-			methods[copylen] = 0;
-		}
-		return DSSH_AUTH_METHODS_AVAILABLE;
-	}
+	if (msg_type == SSH_MSG_USERAUTH_SUCCESS)
+		return auth_success_result(sess, payload_len);
+	if (msg_type == SSH_MSG_USERAUTH_FAILURE)
+		return auth_failure_result(sess, payload, payload_len);
 
 	return DSSH_ERROR_PARSE;
 }
 
 DSSH_PUBLIC int
-dssh_auth_get_methods(struct dssh_session_s *sess, const char *username, char *methods, size_t methods_sz)
+dssh_auth_begin(struct dssh_session_s *sess, const char *username)
 {
 	if (sess != NULL && (dssh_io_callback_active(sess) || dssh_setup_callback_active(sess)))
 		return DSSH_ERROR_INVALID;
-	if ((methods == NULL) || (username == NULL) || (sess == NULL))
-		return DSSH_ERROR_INIT;
+	if (username == NULL || sess == NULL)
+		return DSSH_ERROR_INVALID;
 	int ret = auth_entry_check(sess, true);
 	if (ret < 0)
 		return ret;
 	struct dssh_session_scope scope;
 
 	session_scope_enter(&scope, sess);
-	ret = auth_check_terminated(sess, get_methods_impl(sess, username, methods, methods_sz));
+	ret = auth_check_terminated(sess, auth_begin_impl(sess, username));
 
-	if (ret == DSSH_AUTH_NONE_ACCEPTED)
+	if (ret == DSSH_AUTH_SUCCESS)
 		sess->auth_complete = true;
 	session_scope_leave(&scope);
 	return ret;
+}
+
+DSSH_TESTABLE int64_t
+auth_get_methods_inner(struct dssh_session_s *sess, char *methods, size_t methods_sz)
+{
+	if (!sess->auth_methods_available)
+		return DSSH_ERROR_INIT;
+	/* Publication bounds the snapshot by the session packet limit and
+	 * reserves its terminating byte before changing any visible state. */
+	size_t needed = sess->auth_methods_len + 1;
+#if SIZE_MAX > INT64_MAX
+	if (needed > INT64_MAX)
+		return DSSH_ERROR_INVALID;
+#endif
+	int64_t result = (int64_t)needed;
+	if (methods == NULL || methods_sz == 0)
+		return result;
+	if (methods_sz < needed)
+		return DSSH_ERROR_TOOLONG;
+	if (sess->auth_methods_len > 0)
+		memcpy(methods, sess->auth_methods, sess->auth_methods_len);
+	methods[sess->auth_methods_len] = 0;
+	return result;
+}
+
+DSSH_PUBLIC int64_t
+dssh_auth_get_methods(struct dssh_session_s *sess, char *methods, size_t methods_sz)
+{
+	if (sess == NULL || dssh_io_callback_active(sess) || !sess->trans.client)
+		return DSSH_ERROR_INVALID;
+	return auth_get_methods_inner(sess, methods, methods_sz);
 }
 
 /*
@@ -1469,10 +1525,10 @@ auth_password_impl(struct dssh_session_s *sess, const char *username, const char
 		}
 
 		if (msg_type == SSH_MSG_USERAUTH_SUCCESS)
-			return payload_len == 1 ? 0 : DSSH_ERROR_PARSE;
+			return auth_success_result(sess, payload_len);
 
 		if (msg_type == SSH_MSG_USERAUTH_FAILURE)
-			return auth_failure_result(payload, payload_len);
+			return auth_failure_result(sess, payload, payload_len);
 
 		if (msg_type == SSH_MSG_USERAUTH_PASSWD_CHANGEREQ) {
 			size_t pos = 1;
@@ -1581,10 +1637,10 @@ auth_kbi_run(struct dssh_session_s *sess, const char *username, dssh_auth_kbi_pr
 		}
 
 		if (msg_type == SSH_MSG_USERAUTH_SUCCESS)
-			return payload_len == 1 ? 0 : DSSH_ERROR_PARSE;
+			return auth_success_result(sess, payload_len);
 
 		if (msg_type == SSH_MSG_USERAUTH_FAILURE)
-			return auth_failure_result(payload, payload_len);
+			return auth_failure_result(sess, payload, payload_len);
 
 		if (msg_type == SSH_MSG_USERAUTH_INFO_REQUEST) {
 			size_t rpos = 1;
@@ -1888,9 +1944,9 @@ auth_publickey_impl(struct dssh_session_s *sess, const char *username, const cha
 			continue;
 		}
 		if (msg_type == SSH_MSG_USERAUTH_SUCCESS)
-			return payload_len == 1 ? 0 : DSSH_ERROR_PARSE;
+			return auth_success_result(sess, payload_len);
 		if (msg_type == SSH_MSG_USERAUTH_FAILURE)
-			return auth_failure_result(payload, payload_len);
+			return auth_failure_result(sess, payload, payload_len);
 		res = send_unimplemented(sess, sess->trans.last_rx_seq);
 		if (res < 0)
 			return res;

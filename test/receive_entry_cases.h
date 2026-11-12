@@ -52,7 +52,7 @@ receive_entry_check(dssh_session sess, unsigned kind, bool scoped)
 			ret = dssh_transport_handshake(sess);
 			break;
 		case 1:
-			ret = dssh_auth_get_methods(sess, "u", methods, sizeof(methods));
+			ret = test_auth_discover(sess, "u", methods, sizeof(methods));
 			break;
 		case 2:
 			ret = dssh_auth_password(sess, "u", "p", NULL, NULL);
@@ -288,8 +288,8 @@ receive_entry_authenticate(struct receive_entry_auth *p)
 	bool started = watched && thrd_create(&server, receive_entry_auth_server, p) == thrd_success;
 	char methods[9];
 	memset(methods, 0x5a, sizeof(methods));
-	int ret = started ? dssh_auth_get_methods(p->pair->client, "u", methods, sizeof(methods)) : DSSH_ERROR_INIT;
-	if (ret != DSSH_AUTH_NONE_ACCEPTED) {
+	int ret = started ? test_auth_discover(p->pair->client, "u", methods, sizeof(methods)) : DSSH_ERROR_INIT;
+	if (ret != DSSH_AUTH_SUCCESS) {
 		mock_io_close_c2s(&p->pair->io);
 		mock_io_close_s2c(&p->pair->io);
 	}
@@ -298,7 +298,7 @@ receive_entry_authenticate(struct receive_entry_auth *p)
 	atomic_store(&watch.finished, true);
 	if (watched && thrd_join(watchdog, NULL) != thrd_success)
 		abort();
-	valid = valid && started && ret == DSSH_AUTH_NONE_ACCEPTED && methods[0] == 0
+	valid = valid && started && ret == DSSH_AUTH_SUCCESS && methods[0] == 0
 	    && p->server_result == 0 && p->banner_result == 0 && p->banner_calls == 1 && p->banner_valid
 	    && p->username_len == 1 && p->username[0] == 'u' && !atomic_load(&watch.timed_out)
 	    && !session_scope_active(p->pair->client) && !session_scope_active(p->pair->server);

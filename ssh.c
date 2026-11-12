@@ -155,8 +155,6 @@ dssh_strerror(int error_code)
 			return "No more items are available";
 		case DSSH_ERROR_REKEY_NEEDED:
 			return "Key exchange is required before continuing";
-		case DSSH_ERROR_AUTH_REJECTED:
-			return "Authentication rejected";
 		case DSSH_ERROR_REJECTED:
 			return "Channel operation rejected";
 		case DSSH_ERROR_TIMEOUT:

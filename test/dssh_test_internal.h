@@ -247,8 +247,8 @@ int64_t parse_userauth_prefix(const uint8_t *payload, size_t payload_len,
 int auth_server_impl(dssh_session sess,
     const struct dssh_auth_server_cbs *cbs,
     uint8_t *username_out, size_t *username_out_len);
-int get_methods_impl(dssh_session sess,
-    const char *username, char *methods, size_t methods_sz);
+int auth_begin_impl(dssh_session sess, const char *username);
+int64_t auth_get_methods_inner(dssh_session sess, char *methods, size_t capacity);
 int auth_password_impl(dssh_session sess,
     const char *username, const char *password,
     dssh_auth_passwd_change_cb passwd_change_cb, void *cbdata);

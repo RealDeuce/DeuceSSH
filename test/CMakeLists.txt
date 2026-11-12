@@ -61,6 +61,26 @@ foreach(kind IN ITEMS static shared)
 			configured)
 		set_tests_properties(dssh_session_init_${kind}_default dssh_session_init_${kind}_configured
 			PROPERTIES TIMEOUT 60)
+		if(UNIX)
+			set(auth_target dssh_auth_actions_${kind})
+			add_executable(${auth_target} test_auth_actions.c mock_io.c)
+			foreach(shim IN LISTS DSSH_THREADS_SHIM_SOURCES)
+				target_sources(${auth_target} PRIVATE "${PROJECT_SOURCE_DIR}/${shim}")
+			endforeach()
+			set_property(TARGET ${auth_target} PROPERTY C_STANDARD ${DEUCESSH_C_STANDARD})
+			set_property(TARGET ${auth_target} PROPERTY C_STANDARD_REQUIRED ON)
+			target_compile_definitions(${auth_target} PRIVATE _DEFAULT_SOURCE)
+			target_compile_options(${auth_target} PRIVATE ${DEUCESSH_COMPILE_OPTIONS})
+			target_link_libraries(${auth_target} PRIVATE deucessh_${kind} ${THREADS_LINK_LIB})
+			if(DSSH_THREADS_SHIM_INCLUDE)
+				target_include_directories(${auth_target} BEFORE PRIVATE ${DSSH_THREADS_SHIM_INCLUDE})
+			endif()
+			foreach(mode IN ITEMS begin direct)
+				dssh_add_output_test(dssh_auth_actions_${kind}_${mode} ${auth_target}
+					"valid=1" ${mode})
+				set_tests_properties(dssh_auth_actions_${kind}_${mode} PROPERTIES TIMEOUT 60)
+			endforeach()
+		endif()
 		set(release_target dssh_test_release_entry_${kind})
 		add_executable(${release_target} test_release_entry.c)
 		set_property(TARGET ${release_target} PROPERTY C_STANDARD ${DEUCESSH_C_STANDARD})
@@ -1140,6 +1160,8 @@ add_test(NAME dssh_auth_request_capacity
 target_link_libraries(dssh_test_auth PRIVATE dssh_mock_io dssh_mock_comp)
 target_sources(dssh_test_auth PRIVATE password_result_provider.c kbi_result_provider.c signature_result_provider.c)
 set(AUTH_TESTS
+	auth/continuation/snapshots
+	auth/continuation/storage
 	auth/kbi/prompt_counts
 	callbacks/banner_transaction callbacks/output_pairs callbacks/password_lifetime callbacks/password_result callbacks/signature_result callbacks/kbi_client_result callbacks/kbi_server_result
 	callbacks/kbi_lifetime callbacks/client_cleanup callbacks/results callbacks/reply_failures
@@ -1235,7 +1257,7 @@ set(AUTH_TESTS
 	auth/client/pk_no_key auth/client/pk_pubkey_fail
 	auth/client/pk_sign_fail auth/client/pk_send_fail
 	auth/client/pk_recv_fail auth/client/pk_banner
-	auth/client/get_methods_send_fail
+	auth/client/begin_send_fail
 	auth/client/kbi_send_fail auth/client/kbi_recv_fail
 	direct/wrong_first_msg direct/short_svc_request
 	direct/svc_slen_overflow direct/bad_prefix_in_loop
@@ -1866,7 +1888,7 @@ if(DEUCESSH_TEST_OPENSSH)
 		endfunction()
 		foreach(form IN ITEMS static shared)
 			foreach(algorithm IN ITEMS rsa-sha2-256 ssh-ed25519)
-				foreach(auth IN ITEMS password kbi fallback)
+				foreach(auth IN ITEMS password kbi fallback partial)
 					foreach(mode IN ITEMS exec shell)
 						dssh_client_peer_case(dssh_client_peer_${form}_${algorithm}_${auth}_${mode}
 							dssh_test_example_client_${form} ${algorithm} ${auth} ${mode})

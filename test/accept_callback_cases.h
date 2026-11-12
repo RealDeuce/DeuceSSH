@@ -111,7 +111,7 @@ accept_callback_request(dssh_channel ch, const struct dssh_chan_params *params, 
 	    && dssh_session_start(f->ctx.server) == DSSH_ERROR_INVALID
 	    && dssh_transport_handshake(f->ctx.server) == DSSH_ERROR_INVALID
 	    && dssh_transport_disconnect(f->ctx.server, SSH_DISCONNECT_BY_APPLICATION, "setup") == DSSH_ERROR_INVALID
-	    && dssh_auth_get_methods(f->ctx.server, "u", methods, sizeof(methods)) == DSSH_ERROR_INVALID
+	    && test_auth_discover(f->ctx.server, "u", methods, sizeof(methods)) == DSSH_ERROR_INVALID
 	    && memcmp(methods, "sentinel", sizeof(methods)) == 0
 	    && dssh_auth_password(f->ctx.server, "u", "p", NULL, NULL) == DSSH_ERROR_INVALID
 	    && dssh_auth_keyboard_interactive(f->ctx.server, "u", NULL, NULL) == DSSH_ERROR_INVALID

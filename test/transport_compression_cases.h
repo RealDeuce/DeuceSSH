@@ -1085,7 +1085,7 @@ test_compression_auth_cleanup(void)
 			}
 			compression_tx_observer = NULL;
 			compression_auth_active = NULL;
-			int expected = accept != 0 ? 0 : DSSH_ERROR_AUTH_REJECTED;
+			int expected = accept != 0 ? 0 : DSSH_AUTH_CONTINUE;
 			/* RFC 4252 password request prefix for the exact username/method. */
 			size_t request_len = 45 + sizeof(compression_auth_secret) - 1;
 			bool valid = created == thrd_success && result == expected && probe.calls == 1

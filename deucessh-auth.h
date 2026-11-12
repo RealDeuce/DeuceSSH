@@ -74,19 +74,38 @@ typedef int (*dssh_auth_kbi_prompt_cb)(const uint8_t *name, size_t name_len, con
 
 /* dssh_auth_banner_cb is defined in deucessh.h */
 
-#define DSSH_AUTH_NONE_ACCEPTED     0 /* No auth required (rare) */
-#define DSSH_AUTH_METHODS_AVAILABLE 1 /* Auth required; methods populated */
+/* Client authentication continuation; server callback outcomes are unchanged.
+ * Values 2 and 3 are the server-only password-change/KBI-prompt outcomes. */
+#define DSSH_AUTH_CONTINUE 4
 
 /*
- * Query available authentication methods by sending a "none"
- * auth request.  Sends SSH_MSG_SERVICE_REQUEST automatically
- * if not already sent.  On return:
- *   DSSH_AUTH_NONE_ACCEPTED   = no auth required (methods empty)
- *   DSSH_AUTH_METHODS_AVAILABLE = auth required; methods is a
- *       comma-separated list (e.g., "publickey,password")
- *   <0 = error
+ * Common client authentication outcomes for begin/password/publickey/KBI:
+ *   DSSH_AUTH_SUCCESS   authentication complete
+ *   DSSH_AUTH_PARTIAL   factor accepted; more authentication is required
+ *   DSSH_AUTH_CONTINUE  incomplete; no factor accepted by this action
+ *   negative DSSH_ERROR_* operation error
+ * Each complete FAILURE publishes its current continuation list; SUCCESS
+ * publishes an empty list and completes authentication. Intermediate messages
+ * and malformed/local/transport errors do not replace the previous snapshot.
+ * Credential methods do not implicitly perform begin. Requesting the user
+ * authentication service automatically remains separate from discovery.
  */
-DSSH_PUBLIC int dssh_auth_get_methods(dssh_session sess, const char *username, char *methods, size_t methods_sz);
+
+/* Start authentication without credentials. May complete authentication or
+ * discover the methods needed to continue. Returns the common client outcomes
+ * above, without attempting another method. Optional; applications may instead
+ * start directly with password/publickey/KBI. */
+DSSH_PUBLIC int dssh_auth_begin(dssh_session sess, const char *username);
+
+/* Read the methods from the last complete authentication response. Pure
+ * getter: no I/O and no change to authentication state. Returns required bytes
+ * including NUL; NULL methods or zero methods_sz queries size. A short buffer
+ * returns DSSH_ERROR_TOOLONG without modifying it. Before any completed reply,
+ * returns DSSH_ERROR_INIT without starting discovery. An empty list needs one
+ * byte and does not itself imply completed authentication; use the action's
+ * outcome. The snapshot belongs to the last completed exchange, not a failed
+ * subsequent action. Normal callback/pre-start serialization rules apply. */
+DSSH_PUBLIC int64_t dssh_auth_get_methods(dssh_session sess, char *methods, size_t methods_sz);
 
 /*
  * Password change callback (RFC 4252 s8).
@@ -115,8 +134,8 @@ typedef int (*dssh_auth_passwd_change_cb)(const uint8_t *prompt, size_t prompt_l
  * change, the callback is invoked to get the new password.
  * If passwd_change_cb is NULL and the server requests a change,
  * authentication fails with DSSH_ERROR_INIT (missing prerequisite).
- * Returns 0 on success, DSSH_ERROR_AUTH_REJECTED if the server
- * rejected credentials, or another negative error code on failure.
+ * Uses the common client authentication outcomes above. A refused credential
+ * attempt returns DSSH_AUTH_CONTINUE; operation errors are negative.
  */
 DSSH_PUBLIC int dssh_auth_password(dssh_session sess, const char *username, const char *password,
     dssh_auth_passwd_change_cb passwd_change_cb, void *passwd_change_cbdata);
@@ -125,7 +144,8 @@ DSSH_PUBLIC int dssh_auth_password(dssh_session sess, const char *username, cons
  * Authenticate via keyboard-interactive (RFC 4256).
  * For each INFO_REQUEST, the prompt_cb is called with the server's
  * name, instruction, and prompts.  The callback provides responses.
- * Returns 0 on success, negative on failure or rejection.
+ * Uses the common client authentication outcomes above. A refused credential
+ * attempt returns DSSH_AUTH_CONTINUE; operation errors are negative.
  */
 DSSH_PUBLIC int dssh_auth_keyboard_interactive(dssh_session sess, const char *username,
     dssh_auth_kbi_prompt_cb prompt_cb, void *cbdata);
@@ -290,7 +310,8 @@ DSSH_PUBLIC int dssh_auth_set_banner(dssh_session sess, const char *message, con
  * dssh_rsa_sha2_256_load_key_file(), etc., on the registered algorithm entry.
  * The algo_name must match a registered key algorithm that has a key
  * loaded (e.g., "ssh-ed25519", "rsa-sha2-256").
- * Returns 0 on success, negative on failure or rejection.
+ * Uses the common client authentication outcomes above. A refused credential
+ * attempt returns DSSH_AUTH_CONTINUE; operation errors are negative.
  */
 DSSH_PUBLIC int dssh_auth_publickey(dssh_session sess, const char *username, const char *algo_name);
 

@@ -538,6 +538,12 @@ struct dssh_session_s {
 	bool        handshake_complete;
 	bool        auth_complete;
 	bool        auth_service_requested;
+	/* Client reply snapshots are mutable only during application-serialized
+	 * pre-start authentication, and immutable after successful startup. */
+	char       *auth_methods;
+	size_t      auth_methods_len;
+	size_t      auth_methods_capacity;
+	bool        auth_methods_available;
 	/* Owned by the synchronous server authentication receive operation. */
 	bool        server_auth_active;
 };

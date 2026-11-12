@@ -127,7 +127,7 @@ auth_frame_client(unsigned method, const uint8_t *packet, size_t length, struct 
 	char methods[128] = "unchanged";
 	if (ret == 0) {
 		if (method == 0)
-			ret = get_methods_impl(ctx.client, "user", methods, sizeof(methods));
+			ret = test_auth_discover_component(ctx.client, "user", methods, sizeof(methods));
 		else if (method == 1)
 			ret = auth_password_impl(ctx.client, "user", "password",
 			    probe->callback_enabled ? auth_frame_change : NULL, probe);
@@ -187,7 +187,7 @@ test_auth_frame_results(void)
 				if (variant == 14)
 					packet[length++] = 0;
 				if (variant == 4 || variant == 5 || variant == 15)
-					expected = method == 0 ? DSSH_AUTH_METHODS_AVAILABLE : DSSH_ERROR_AUTH_REJECTED;
+					expected = variant == 5 ? DSSH_AUTH_PARTIAL : DSSH_AUTH_CONTINUE;
 			}
 			struct auth_frame_probe probe = { .valid_inputs = true };
 			ASSERT_EQ(auth_frame_client(method, packet, length, &probe), expected);

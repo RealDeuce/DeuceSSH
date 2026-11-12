@@ -268,9 +268,7 @@ main(int argc, char **argv)
 		}
 
 		/* Try auth query — exercises encrypted transport */
-		char methods[256];
-
-		res = dssh_auth_get_methods(sess, "test", methods, sizeof(methods));
+		res = dssh_auth_begin(sess, "test");
 		if (res < 0) {
 			printf("FAIL (auth query: %d)\n", res);
 			dssh_session_cleanup(sess);

@@ -39,7 +39,7 @@ responsibility to not include `"none"` in this string.
 ### 4-2
 > However, it [the "none" method] **MAY** be sent by the client.
 
-**CONFORMS** — `dssh_auth_get_methods()` sends a "none" auth
+**CONFORMS** — `dssh_auth_begin()` sends a "none" auth
 request to query available methods.
 
 ### 4-3
@@ -85,7 +85,7 @@ delegated to the application callback.
 > [byte SSH_MSG_USERAUTH_REQUEST, string user name, string service name,
 > string method name, ...]
 
-**CONFORMS** — `dssh_auth_get_methods()`, `dssh_auth_password()`,
+**CONFORMS** — `dssh_auth_begin()`, `dssh_auth_password()`,
 and `dssh_auth_keyboard_interactive()` all build messages with
 this exact format: msg type (50), username string, service name
 (`"ssh-connection"`), method name, then method-specific fields.

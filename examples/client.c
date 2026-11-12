@@ -13,6 +13,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <inttypes.h>
 #include <signal.h>
 #include <stdatomic.h>
 #include <netdb.h>
@@ -641,6 +642,8 @@ main(int argc, char **argv)
 
 	int status = 1;
 	struct password_input password = {0};
+	char *methods = NULL;
+	size_t methods_capacity = 0;
 	atomic_store_explicit(&input_stop, false, memory_order_release);
 	dssh_channel channel = NULL;
 	struct dssh_chan_params params;
@@ -696,29 +699,50 @@ main(int argc, char **argv)
 			goto done;
 	}
 
-	char methods[256];
-	ret = dssh_auth_get_methods(sess, username, methods, sizeof(methods));
-	if (ret != DSSH_AUTH_NONE_ACCEPTED && ret != DSSH_AUTH_METHODS_AVAILABLE) {
-		fprintf(stderr, "auth method query failed: %d\n", ret);
-		goto done;
-	}
-	if (ret == DSSH_AUTH_METHODS_AVAILABLE) {
+	ret = dssh_auth_begin(sess, username);
+	bool tried_password = false, tried_kbi = false;
+	while (ret == DSSH_AUTH_PARTIAL || ret == DSSH_AUTH_CONTINUE) {
+		int64_t needed = dssh_auth_get_methods(sess, NULL, 0);
+		if (needed < 1) {
+			fprintf(stderr, "auth methods unavailable: %" PRId64 "\n", needed);
+			goto done;
+		}
+#if SIZE_MAX < INT64_MAX
+		if (needed > SIZE_MAX)
+			goto done;
+#endif
+		size_t size = (size_t)needed;
+		if (size > methods_capacity) {
+			char *replacement = realloc(methods, size);
+			if (replacement == NULL)
+				goto done;
+			methods = replacement;
+			methods_capacity = size;
+		}
+		if (dssh_auth_get_methods(sess, methods, methods_capacity) != needed)
+			goto done;
 		if (fprintf(stderr, "Auth methods: %s\n", methods) < 0)
 			goto done;
-		ret = DSSH_ERROR_REJECTED;
-		if (offered_method(methods, "password"))
+		if (!tried_password && offered_method(methods, "password")) {
+			tried_password = true;
 			ret = dssh_auth_password(sess, username, password.text, NULL, NULL);
-		if (ret != 0 && offered_method(methods, "keyboard-interactive")) {
+		}
+		else if (!tried_kbi && offered_method(methods, "keyboard-interactive")) {
+			tried_kbi = true;
 			struct kbi_state state = { .password = password.text };
 			ret = dssh_auth_keyboard_interactive(sess, username, kbi_prompt, &state);
 			kbi_release(&state);
 			free(state.answer);
 			free(state.responses);
 		}
-		if (ret != 0) {
-			fprintf(stderr, "authentication failed: %d\n", ret);
+		else {
+			fputs("No untried supported authentication method.\n", stderr);
 			goto done;
 		}
+	}
+	if (ret != DSSH_AUTH_SUCCESS) {
+		fprintf(stderr, "authentication failed: %d\n", ret);
+		goto done;
 	}
 	password_clear(&password);
 	if (fputs("Authenticated.\n", stderr) == EOF)
@@ -822,6 +846,7 @@ main(int argc, char **argv)
 	}
 
 done:
+	free(methods);
 	password_clear(&password);
 	if (have_params)
 		dssh_chan_params_free(&params);

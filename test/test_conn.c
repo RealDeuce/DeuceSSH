@@ -23,6 +23,7 @@
 #include "ssh-trans.h"
 #include "ssh-internal.h"
 #include "dssh_test_internal.h"
+#include "auth_discovery_fixture.h"
 #include "dssh_test_alloc.h"
 #include "dssh_test_ossl.h"
 #include "mock_io.h"

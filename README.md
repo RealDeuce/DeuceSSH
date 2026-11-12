@@ -115,15 +115,11 @@ int main(void)
     /* 4. Handshake */
     dssh_transport_handshake(sess);
 
-    /* 5. Authenticate */
-    char methods[256];
-    int r = dssh_auth_get_methods(sess, "user", methods, sizeof(methods));
-    if (r > 0) {
-        if (strstr(methods, "password"))
-            dssh_auth_password(sess, "user", "pass", NULL, NULL);
-        else if (strstr(methods, "keyboard-interactive"))
-            dssh_auth_keyboard_interactive(sess, "user",
-                my_kbi_prompt, my_context);
+    /* 5. Try the application's chosen method directly. */
+    int r = dssh_auth_password(sess, "user", "pass", NULL, NULL);
+    if (r != DSSH_AUTH_SUCCESS) {
+        dssh_session_cleanup(sess);
+        return 1;
     }
 
     /* 6. Start the demux thread */
@@ -486,6 +482,36 @@ Do not `realloc()` password buffers — the old allocation won't be
 scrubbed.
 
 ## Authentication — Client Side
+
+`dssh_auth_begin(sess, username)` optionally starts authentication without
+credentials. It may authenticate immediately or discover the methods needed
+to continue. An application that already knows its desired method can call
+password, public-key or keyboard-interactive directly; those calls never
+implicitly perform discovery.
+
+All four actions return the same outcomes:
+
+| Outcome | Meaning |
+| --- | --- |
+| `DSSH_AUTH_SUCCESS` | Authentication is complete; the connection can start. |
+| `DSSH_AUTH_PARTIAL` | This factor succeeded; another authentication is needed. |
+| `DSSH_AUTH_CONTINUE` | Authentication is incomplete; this action accepted no factor. |
+| Negative `DSSH_ERROR_*` | An operation error. |
+
+After PARTIAL or CONTINUE, read the current list with
+`dssh_auth_get_methods(sess, methods, methods_sz)` and choose the next method.
+The getter performs no I/O and cannot authenticate. It reports the last complete
+reply from any method, not just the initial discovery response. Banners and
+interactive challenges leave that snapshot unchanged; SUCCESS publishes an empty
+list. Failed operations preserve the prior completed snapshot.
+
+Pass NULL output or zero capacity to query the required bytes including NUL.
+A short buffer returns TOOLONG unchanged; an empty list needs one byte and does
+not itself mean authentication succeeded. Before any completed reply the getter
+returns INIT. Reuse a caller-owned buffer, growing it only when the required size
+increases. The [client example](examples/client.c) implements this flow, refreshes
+the list after each action and attempts each supported credential method once.
+
 
 ### Password
 
@@ -2178,7 +2204,6 @@ and never returned to the caller.
 | `DSSH_ERROR_TOOLONG` | -8 | Data exceeds buffer or protocol limit |
 | `DSSH_ERROR_NOMORE` | -10 | No more items in name-list |
 | `DSSH_ERROR_REKEY_NEEDED` | -11 | Must rekey before sending more packets |
-| `DSSH_ERROR_AUTH_REJECTED` | -12 | Authentication rejected by peer |
 | `DSSH_ERROR_REJECTED` | -13 | Channel open or request rejected |
 | `DSSH_ERROR_TIMEOUT` | -14 | Operation timed out |
 

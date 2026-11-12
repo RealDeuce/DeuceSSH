@@ -28,6 +28,7 @@
 #include "ssh-trans.h"
 #include "ssh-internal.h"
 #include "dssh_test_internal.h"
+#include "auth_discovery_fixture.h"
 #include "mock_io.h"
 #include "test_dhgex_provider.h"
 #include "test_comp.h"
@@ -8864,7 +8865,7 @@ test_auth_control_reply_errors(void)
 		}
 		else if (mode == 2) {
 			char methods[32];
-			ret = get_methods_impl(receiver, "user", methods, sizeof(methods));
+			ret = test_auth_discover_component(receiver, "user", methods, sizeof(methods));
 		}
 		else if (mode == 3)
 			ret = auth_password_impl(receiver, "user", "password", NULL, NULL);
@@ -9138,7 +9139,7 @@ test_auth_client_unknown_messages(void)
 		int ret;
 		char methods[64];
 		if (method == 0)
-			ret = get_methods_impl(ctx.client, "user", methods, sizeof(methods));
+			ret = test_auth_discover_component(ctx.client, "user", methods, sizeof(methods));
 		else if (method == 1)
 			ret = auth_password_impl(ctx.client, "user", "password", NULL, NULL);
 		else if (method == 2)

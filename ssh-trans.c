@@ -4473,6 +4473,7 @@ dssh_session_cleanup(struct dssh_session_s *sess)
 	transport_cleanup(sess);
 	free(sess->pending_banner);
 	free(sess->pending_banner_lang);
+	free(sess->auth_methods);
 	free(sess->kex_filter);
 	free(sess->key_algo_filter);
 	free(sess->enc_filter);

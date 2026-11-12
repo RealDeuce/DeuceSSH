@@ -37,7 +37,7 @@ static int app_terminate_cb(dssh_session, dssh_terminate_cb, void *);
 static int app_verify_cb(dssh_session, dssh_hostkey_verify_cb, void *);
 static int app_registration(void);
 static int app_handshake(dssh_session);
-static int app_methods(dssh_session, const char *, char *, size_t);
+static int app_auth_begin(dssh_session, const char *);
 static int app_start(dssh_session);
 static int app_params_init(struct dssh_chan_params *, enum dssh_chan_type);
 static void app_params_free(struct dssh_chan_params *);
@@ -64,7 +64,7 @@ static int app_chan_poll(dssh_channel, int, int);
 #define dssh_session_set_hostkey_verify_cb app_verify_cb
 #define dssh_register_none_comp app_registration
 #define dssh_transport_handshake app_handshake
-#define dssh_auth_get_methods app_methods
+#define dssh_auth_begin app_auth_begin
 #define dssh_session_start app_start
 #define dssh_chan_params_init app_params_init
 #define dssh_chan_params_free app_params_free
@@ -90,7 +90,7 @@ static int app_chan_poll(dssh_channel, int, int);
 #undef dssh_chan_params_free
 #undef dssh_chan_params_init
 #undef dssh_session_start
-#undef dssh_auth_get_methods
+#undef dssh_auth_begin
 #undef dssh_transport_handshake
 #undef dssh_register_none_comp
 #undef dssh_session_set_hostkey_verify_cb
@@ -237,7 +237,7 @@ CHECKED(app_terminate_cb, "terminate_cb", (dssh_session s, dssh_terminate_cb cb,
 CHECKED(app_verify_cb, "verify_cb", (dssh_session s, dssh_hostkey_verify_cb cb, void *data), dssh_session_set_hostkey_verify_cb(s, cb, data))
 CHECKED(app_registration, "registration", (void), dssh_register_none_comp())
 CHECKED(app_handshake, "handshake", (dssh_session s), dssh_transport_handshake(s))
-CHECKED(app_methods, "auth_query", (dssh_session s, const char *user, char *list, size_t size), dssh_auth_get_methods(s, user, list, size))
+CHECKED(app_auth_begin, "auth_query", (dssh_session s, const char *user), dssh_auth_begin(s, user))
 static int
 app_start(dssh_session s)
 {

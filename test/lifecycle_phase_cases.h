@@ -31,7 +31,7 @@ lifecycle_phase_call(dssh_session sess, unsigned operation)
 	case 0:
 		return dssh_session_start(sess);
 	case 1:
-		return dssh_auth_get_methods(sess, "user", methods, sizeof(methods));
+		return test_auth_discover(sess, "user", methods, sizeof(methods));
 	case 2:
 		return dssh_auth_password(sess, "user", "password", NULL, NULL);
 	case 3:
@@ -204,17 +204,17 @@ test_lifecycle_progression(void)
 			return TEST_FAIL;
 		}
 		char methods[128];
-		int ret = dssh_auth_get_methods(ctx.client, "user", methods, sizeof(methods));
-		valid &= ret == (mode == 0 ? DSSH_AUTH_NONE_ACCEPTED : DSSH_AUTH_METHODS_AVAILABLE);
+		int ret = test_auth_discover(ctx.client, "user", methods, sizeof(methods));
+		valid &= ret == (mode == 0 ? DSSH_AUTH_SUCCESS : DSSH_AUTH_CONTINUE);
 		valid &= ctx.client->auth_complete == (mode == 0);
-		if (ret == DSSH_AUTH_METHODS_AVAILABLE) {
+		if (ret == DSSH_AUTH_CONTINUE) {
 			valid &= lifecycle_phase_reject(ctx.client, 0);
 			if (mode == 1) {
 				/* Both partial success and ordinary rejection preserve the
 				 * authentication receive phase for the next valid attempt. */
 				for (unsigned attempt = 0; attempt < 3; attempt++) {
 					ret = dssh_auth_password(ctx.client, "user", "password", NULL, NULL);
-					valid &= ret == (attempt < 2 ? DSSH_ERROR_AUTH_REJECTED : 0);
+					valid &= ret == (attempt == 0 ? DSSH_AUTH_PARTIAL : attempt == 1 ? DSSH_AUTH_CONTINUE : 0);
 					if (attempt < 2) {
 						valid &= !ctx.client->auth_complete;
 						valid &= lifecycle_phase_reject(ctx.client, 0);

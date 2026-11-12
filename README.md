@@ -154,9 +154,11 @@ int main(void)
         }
     }
 
-    /* 9. Clean up */
-    dssh_chan_close(ch, 0);
+    /* 9. Clean up; an ordinary close consumes ch even on error. */
+    int closed = dssh_chan_close(ch, -1);
+    ch = NULL;
     dssh_session_cleanup(sess);
+    return closed == 0 ? 0 : 1;
 }
 ```
 
@@ -273,9 +275,11 @@ int main(void)
         }
     }
 
-    /* 8. Clean up */
-    dssh_chan_close(ch, 0);
+    /* 8. Clean up; this server selects exit status zero. */
+    int closed = dssh_chan_close(ch, 0);
+    ch = NULL;
     dssh_session_cleanup(sess);
+    return closed == 0 ? 0 : 1;
 }
 ```
 
@@ -1614,15 +1618,28 @@ const struct dssh_chan_params *dssh_chan_get_pty(ch);  /* PTY params (or NULL) *
 /* Half-close: send EOF, keep reading */
 dssh_chan_shutwr(ch);
 
-/* Close with exit status (sends exit-status + EOF + CLOSE) */
+/* Server close with exit status (exit-status + EOF + CLOSE) */
 dssh_chan_close(ch, 0);
 
-/* Close without exit status (exit_code < 0: no exit-status sent) */
+/* Close without exit status (negative or above UINT32_MAX omits it) */
 dssh_chan_close(ch, -1);
 ```
 
-`dssh_chan_close()` frees the channel handle — do not use it
-after close.
+An ordinary `dssh_chan_close()` consumes the channel handle on every return;
+do not retry or reuse it after an error. Packet sends are best effort: zero
+reports local disposal, including when sending fails or the session was already
+terminated. A failed detach returns `DSSH_ERROR_TERMINATED`; the terminated
+session owns any deferred storage until cleanup.
+
+On a server, `exit_code` in `[0, UINT32_MAX]` selects the status packet. All other
+`int64_t` values omit status and still close the channel. A client does not send
+exit-status. No status argument produces an invalid-argument error.
+
+Calls forbidden by callback or TX-reservation context return
+`DSSH_ERROR_INVALID` without consuming the handle. Finish or cancel the caller's
+same-session zero-copy reservation before closing a channel. The existing
+server setup callback exception records cancellation and defers retirement
+until that callback returns. Stop other application use before ordinary close.
 
 ### Control messages
 

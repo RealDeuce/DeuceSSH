@@ -1,5 +1,19 @@
-/* Audit characterization, not acceptance of a new close result contract.
- * The dedicated CLI reports current public outcomes before API selection. */
+/* Selected B close contract. The historical characterization now supplies
+ * strict wire, disposal and ownership regressions for the sole v1.0 policy. */
+struct close_outcome_lifetime {
+	const void *handle;
+	unsigned frees;
+};
+
+static void
+close_outcome_observe_free(const void *pointer, void *opaque)
+{
+	struct close_outcome_lifetime *watch = opaque;
+	if (pointer != NULL && pointer == watch->handle) {
+		watch->handle = NULL;
+		watch->frees++;
+	}
+}
 struct close_outcome_accept {
 	dssh_session session;
 	dssh_channel channel;
@@ -49,13 +63,23 @@ close_outcome_open(struct conn_ctx *ctx)
 	return valid && job.callbacks == 1 ? job.channel : NULL;
 }
 
+static int
+close_outcome_invalid_tx(dssh_session session)
+{
+	(void)session;
+	return DSSH_ERROR_INVALID;
+}
+
 static _Thread_local unsigned close_outcome_packets, close_outcome_fail_after;
+static _Thread_local dssh_session close_outcome_publication_session;
 
 static int
 close_outcome_after_tx(dssh_session session)
 {
-	(void)session;
 	close_outcome_packets++;
+	if (close_outcome_publication_session == session
+	    && close_outcome_packets == (session->trans.client ? 2U : 3U))
+		dssh_test_mtx_reject_once(&session->channel_mtx);
 	if (close_outcome_fail_after != 0 && close_outcome_packets == close_outcome_fail_after)
 		setup_tx_test_hook = half_close_fail_tx;
 	else
@@ -104,11 +128,13 @@ close_outcome_drain(dssh_session peer, struct close_outcome_wire *wire)
 static const char *const close_outcome_names[] = {
 	"zero", "max_u32", "omit", "min_i64", "over_u32", "max_i64",
 	"status_io", "eof_io", "close_io", "terminated", "peer_closed",
-	"status_capacity", "terminal_capacity", "hard_counter", "detach_acquisition"
+	"status_capacity", "terminal_capacity", "hard_counter", "detach_acquisition",
+	"local_closed", "close_publication", "send_invalid"
 };
 
 static int
-close_outcome_run(struct conn_ctx *ctx, unsigned kind, unsigned role, unsigned gather)
+close_outcome_run(struct conn_ctx *ctx, unsigned kind, unsigned role, unsigned gather,
+    struct close_outcome_lifetime *watch)
 {
 	if (dssh_session_start(ctx->server) != 0)
 		return TEST_FAIL;
@@ -136,7 +162,7 @@ close_outcome_run(struct conn_ctx *ctx, unsigned kind, unsigned role, unsigned g
 
 	if (kind == 10 && post_close_receive_close(ctx, ch) != TEST_PASS)
 		return TEST_FAIL;
-	if (kind == 14) {
+	if (kind == 14 || kind == 15) {
 		/* With local CLOSE already committed, the next close(-1) has exactly
 		 * two ordinary BUF acquisitions before its registry detach. */
 		if (conn_close(ctx->server, ch) != 0
@@ -144,10 +170,14 @@ close_outcome_run(struct conn_ctx *ctx, unsigned kind, unsigned role, unsigned g
 			return TEST_FAIL;
 	}
 	close_outcome_packets = 0;
-	close_outcome_fail_after = kind == 7 ? 1 : kind == 8 ? 2 : 0;
+	close_outcome_fail_after = kind == 7 && role == 0 ? 1
+	    : kind == 8 ? (role == 0 ? 2 : 1) : 0;
+	close_outcome_publication_session = kind == 16 ? ctx->server : NULL;
 	window_tx_return_test_hook = close_outcome_after_tx;
-	if (kind == 6)
+	if (kind == 6 || (kind == 7 && role != 0))
 		setup_tx_test_hook = half_close_fail_tx;
+	if (kind == 17)
+		setup_tx_test_hook = close_outcome_invalid_tx;
 	if (kind == 9)
 		dssh_session_terminate(ctx->server);
 	if (kind == 11 || kind == 12) {
@@ -165,12 +195,15 @@ close_outcome_run(struct conn_ctx *ctx, unsigned kind, unsigned role, unsigned g
 	if (kind == 14)
 		dssh_test_thrd_fail_after(2);
 
+	watch->handle = ch;
 	int result = dssh_chan_close(ch, exit_code);
 	/* ch is never inspected or used again. On detach failure the registry
 	 * still owns its storage; session cleanup, not this probe, retires it. */
 	setup_tx_test_hook = NULL;
 	window_tx_return_test_hook = NULL;
+	close_outcome_publication_session = NULL;
 	int thread_calls = kind == 14 ? dssh_test_thrd_count() : 0;
+	unsigned unowned_unlocks = dssh_test_mtx_rejected_unlocks();
 	dssh_test_thrd_reset();
 	bool terminated = dssh_session_is_terminated(ctx->server);
 	size_t registered = 0;
@@ -189,17 +222,48 @@ close_outcome_run(struct conn_ctx *ctx, unsigned kind, unsigned role, unsigned g
 		mock_io_close_s2c_write(&ctx->io);
 	struct close_outcome_wire wire = {0};
 	bool valid = close_outcome_drain(ctx->client, &wire);
+	bool expect_status = role == 0 && (kind == 0 || kind == 1 || kind == 7
+	    || kind == 8 || kind == 10 || kind == 16);
+	bool expect_eof = kind <= 5 || kind == 8 || kind == 10 || kind == 11 || kind == 16;
+	bool expect_close = kind <= 5 || kind == 10 || kind == 11 || kind == 16;
+	bool expect_terminated = (kind >= 6 && kind <= 9) || kind == 12 || kind == 13
+	    || kind == 14 || kind == 16 || kind == 17;
+	uint32_t expected_code = kind == 0 ? 0 : kind == 1 ? UINT32_MAX : 42;
+	unsigned expected_retired = kind == 10 || kind == 14 ? 0 : 1;
+	unsigned expected_registered = kind == 14 ? 1 : 0;
+	unsigned expected_frees = kind == 14 ? 0 : 1;
+	valid = valid && result == (kind == 14 ? DSSH_ERROR_TERMINATED : 0)
+	    && registered == expected_registered && retired == expected_retired
+	    && terminated == expect_terminated && wire.status == (expect_status ? 1U : 0U)
+	    && wire.eof == (expect_eof ? 1U : 0U) && wire.close == (expect_close ? 1U : 0U)
+	    && (!expect_status || wire.exit_code == expected_code) && watch->frees == expected_frees
+	    && close_outcome_packets == wire.status + wire.eof + wire.close
+	    && unowned_unlocks == 0 && !atomic_load(&ctx->server->trans.tx_owner_active);
+	if (kind == 14)
+		valid = valid && thread_calls >= 3;
 	intmax_t input_wide = exit_code;
 	uintmax_t code_wide = wire.exit_code;
-	printf("close_outcome name=%s role=%u gather=%u input=%jd result=%d registered=%zu retired=%zu terminated=%u callbacks=%u status=%u code=%ju eof=%u close=%u end=%d thread_calls=%d observed=%u\n",
+	printf("close_outcome name=%s role=%u gather=%u input=%jd result=%d registered=%zu retired=%zu terminated=%u callbacks=%u status=%u code=%ju eof=%u close=%u end=%d thread_calls=%d immediate_frees=%u valid=%u\n",
 	    close_outcome_names[kind], role, gather, input_wide, result, registered,
 	    retired, terminated ? 1U : 0U, close_outcome_packets, wire.status,
-	    code_wide, wire.eof, wire.close, wire.end, thread_calls, valid ? 1U : 0U);
+	    code_wide, wire.eof, wire.close, wire.end, thread_calls, watch->frees, valid ? 1U : 0U);
 	return valid ? TEST_PASS : TEST_FAIL;
 }
 
+static bool
+close_disposal_selected(unsigned kind, int part)
+{
+	if (part < 0)
+		return true;
+	if (part == 0)
+		return kind <= 5;
+	if (part == 1)
+		return (kind >= 6 && kind <= 9) || (kind >= 11 && kind <= 13) || kind == 16 || kind == 17;
+	return kind == 10 || kind == 14 || kind == 15;
+}
+
 static int
-close_outcome_probe(void)
+close_disposal_profiles(int part)
 {
 	if (signal(SIGPIPE, SIG_IGN) == SIG_ERR)
 		return 2;
@@ -209,7 +273,9 @@ close_outcome_probe(void)
 	for (unsigned role = 0; role < 2; role++) {
 		for (unsigned gather = 0; gather < 2; gather++) {
 			for (unsigned kind = 0; kind < sizeof(close_outcome_names) / sizeof(close_outcome_names[0]); kind++) {
-				if ((kind == 11 || kind == 12) && !capacity_cases)
+				if (!close_disposal_selected(kind, part)
+				    || ((kind == 11 || kind == 12) && !capacity_cases)
+				    || (kind == 6 && role != 0))
 					continue;
 				struct conn_ctx ctx;
 				window_test_gather = gather != 0;
@@ -226,14 +292,46 @@ close_outcome_probe(void)
 					ctx.client = ctx.server;
 					ctx.server = swap;
 				}
-				int ret = close_outcome_run(&ctx, kind, role, gather);
+				struct close_outcome_lifetime watch = {0};
+				dssh_test_alloc_observe_frees(close_outcome_observe_free, &watch);
+				int ret = close_outcome_run(&ctx, kind, role, gather, &watch);
 				conn_cleanup(&ctx);
+				dssh_test_alloc_observe_frees(NULL, NULL);
 				cases++;
-				if (ret != TEST_PASS)
+				if (ret != TEST_PASS || watch.frees != 1 || watch.handle != NULL)
 					failed++;
+				printf("close_disposal_retired name=%s role=%u gather=%u frees=%u valid=%u\n",
+				    close_outcome_names[kind], role, gather, watch.frees,
+				    watch.frees == 1 && watch.handle == NULL ? 1U : 0U);
 			}
 		}
 	}
-	printf("close_outcome_probe cases=%u observation_failures=%u\n", cases, failed);
-	return failed == 0 && cases == (capacity_cases ? 60U : 52U) ? 0 : 1;
+	unsigned expected = part == 0 ? 24 : part == 1 ? (capacity_cases ? 34 : 26)
+	    : part == 2 ? 12 : capacity_cases ? 70 : 62;
+	printf("close_disposal part=%d cases=%u failures=%u\n", part, cases, failed);
+	return failed == 0 && cases == expected ? 0 : 1;
+}
+
+static int
+close_outcome_probe(void)
+{
+	return close_disposal_profiles(-1);
+}
+
+static int
+test_close_disposal_values(void)
+{
+	return close_disposal_profiles(0) == 0 ? TEST_PASS : TEST_FAIL;
+}
+
+static int
+test_close_disposal_send(void)
+{
+	return close_disposal_profiles(1) == 0 ? TEST_PASS : TEST_FAIL;
+}
+
+static int
+test_close_disposal_retirement(void)
+{
+	return close_disposal_profiles(2) == 0 ? TEST_PASS : TEST_FAIL;
 }

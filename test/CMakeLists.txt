@@ -1295,6 +1295,22 @@ foreach(part IN ITEMS queued popped confirmed late_confirmation concurrent_accep
 	set_tests_properties(dssh_conn_peer_id_${part} PROPERTIES TIMEOUT 120
 		ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys)
 endforeach()
+foreach(part IN ITEMS disposal_values disposal_send disposal_retirement reservation)
+	foreach(profile IN ITEMS default dh-gex group14 group16 sntrup mlkem rsa rsa512 growth)
+		set(extra "")
+		if(profile STREQUAL "growth")
+			set(extra "DSSH_TEST_COMPRESSION=test-growth")
+		elseif(profile MATCHES "^rsa")
+			set(extra "DSSH_TEST_KEY=${profile}")
+		elseif(NOT profile STREQUAL "default")
+			set(extra "DSSH_TEST_KEX=${profile}")
+		endif()
+		dssh_add_output_test(dssh_conn_close_${part}_${profile} dssh_test_conn
+			"1 tests: 1 passed, 0 failed, 0 skipped" --exact release/close_${part})
+		set_tests_properties(dssh_conn_close_${part}_${profile} PROPERTIES TIMEOUT 120
+			ENVIRONMENT "${DSSH_TEST_KEY_ENV};${extra}" FIXTURES_REQUIRED dssh_cached_keys)
+	endforeach()
+endforeach()
 foreach(part IN ITEMS wire after_eof refusal failure)
 	set(control_profiles default dh-gex group14 group16 sntrup mlkem rsa rsa512)
 	if(NOT part STREQUAL "refusal")

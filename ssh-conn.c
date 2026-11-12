@@ -4611,6 +4611,17 @@ dssh_chan_shutwr(struct dssh_channel_s *ch)
 	return send_eof(ch->sess, ch);
 }
 
+/* Status/EOF are best effort during disposal. Their helpers already apply
+ * transport failure policy. Retain recoverable pre-wire refusal and the
+ * channel-local already-closed result without terminating a healthy session. */
+static void
+close_optional_packet_result(struct dssh_session_s *sess, int result)
+{
+	if (result < 0 && result != DSSH_ERROR_TOOLONG && result != DSSH_ERROR_REKEY_NEEDED
+	    && result != DSSH_ERROR_TERMINATED)
+		session_set_terminate(sess);
+}
+
 DSSH_PUBLIC int
 dssh_chan_close(struct dssh_channel_s *ch, int64_t exit_code)
 {
@@ -4620,6 +4631,9 @@ dssh_chan_close(struct dssh_channel_s *ch, int64_t exit_code)
 		return DSSH_ERROR_INVALID;
 	if (in_zc_rx)
 		return DSSH_ERROR_INVALID;
+	struct dssh_session_s *sess = ch->sess;
+	if (tx_owner_is_current(sess))
+		return DSSH_ERROR_INVALID;
 	struct setup_callback_scope *scope = setup_scope_for_channel(ch);
 	if (scope != NULL) {
 		scope->cancelled = true;
@@ -4627,13 +4641,17 @@ dssh_chan_close(struct dssh_channel_s *ch, int64_t exit_code)
 	}
 	if (channel_io_forbidden(ch))
 		return DSSH_ERROR_INVALID;
-	struct dssh_session_s *sess = ch->sess;
-	if (exit_code >= 0 && exit_code <= UINT32_MAX) {
+	int ret;
+	if (!sess->trans.client && exit_code >= 0 && exit_code <= UINT32_MAX) {
 		uint32_t ec = (uint32_t)exit_code;
-		dssh_conn_send_exit_status(sess, ch, ec);
+		ret = dssh_conn_send_exit_status(sess, ch, ec);
+		close_optional_packet_result(sess, ret);
 	}
-	send_eof(sess, ch);
-	conn_close(sess, ch);
+	ret = send_eof(sess, ch);
+	close_optional_packet_result(sess, ret);
+	ret = conn_close(sess, ch);
+	if (ret < 0)
+		session_set_terminate(sess);
 	if (detach_channel(sess, ch) < 0)
 		return DSSH_ERROR_TERMINATED;
 	params_free(&ch->params);

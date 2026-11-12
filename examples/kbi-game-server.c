@@ -933,10 +933,16 @@ handle_connection(void)
 	/* Clean shutdown */
 	alarm(0);
 	fprintf(stderr, "Channel closed.\n");
-	dssh_chan_close(ch, 0);
+	int closed = dssh_chan_close(ch, 0);
+	ch = NULL;
 	dssh_session_cleanup(sess);
-	close(conn_fd);
-	return 0;
+	sess = NULL;
+	if (close(conn_fd) != 0) {
+		perror("close");
+		closed = 1;
+	}
+	conn_fd = -1;
+	return closed == 0 ? 0 : 1;
 }
 
 /* ================================================================

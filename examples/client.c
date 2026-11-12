@@ -837,7 +837,8 @@ done:
 	}
 	if (channel != NULL) {
 		int result = dssh_chan_close(channel, -1);
-		if (result != 0 && result != DSSH_ERROR_TERMINATED)
+		channel = NULL;
+		if (result != 0)
 			status = 1;
 	}
 	if (sess != NULL) {

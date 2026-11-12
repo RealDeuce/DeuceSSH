@@ -13,9 +13,10 @@ extern "C" {
 /* Opaque channel handle.  Created by open/accept, freed by close.
 *
 * Lifetime rules:
-*   - After dssh_chan_close(ch),
-*     the handle MUST NOT be used again. Setup callback cancellation defers
-*     physical retirement until the callback returns (see below).
+*   - After an ordinary dssh_chan_close call, the handle MUST NOT be used
+*     again, regardless of its return value or exit_code. Calls forbidden by
+*     callback/TX context do not change ownership. Setup callback cancellation
+*     defers physical retirement until the callback returns (see below).
 *   - After dssh_session_stop() successfully joins the worker, all channel
 *     handles are freed (see the shutdown conditions below).
 *   - Passing a previously-closed handle is undefined behavior. */
@@ -278,10 +279,22 @@ DSSH_PUBLIC int dssh_chan_read_event(dssh_channel ch, struct dssh_chan_event *ev
 /* Half-close: send EOF, keep reading. */
 DSSH_PUBLIC int dssh_chan_shutwr(dssh_channel ch);
 
-/* Close: send exit-status (if exit_code >= 0) + EOF + CLOSE.
- * Frees the channel handle. In a server setup callback this records setup
- * cancellation, with physical retirement deferred until the callback returns;
- * see the accept callback contract below. */
+/* Close and consume the channel handle. On a server, exit_code in
+ * [0, UINT32_MAX] selects an exit-status packet. Every other int64_t value
+ * means omit status and still close; a client does not send exit-status.
+ * No exit_code value returns DSSH_ERROR_INVALID or prevents channel disposal.
+ * NULL/forbidden callback or TX-reservation contexts return DSSH_ERROR_INVALID.
+ * Finish or cancel the caller's same-session TX reservation before closing.
+ * An ordinary close consumes ch on every return; do not retry or reuse it.
+ * A previously committed local CLOSE emits no further channel packets.
+ * Otherwise attempt the selected exit-status, EOF and CLOSE in that order.
+ * Detachment failure returns DSSH_ERROR_TERMINATED: the terminated session
+ * retains the storage until cleanup; the application must not retry ch.
+ * Packet sends are best effort: return 0 for completed local retirement,
+ * including packet-send failure. Normal session-termination policy still applies.
+ * Zero does not acknowledge packet delivery, peer receipt or remote completion.
+ * In a server setup callback this records cancellation and returns 0;
+ * physical retirement is deferred until the callback returns. See below. */
 DSSH_PUBLIC int dssh_chan_close(dssh_channel ch, int64_t exit_code);
 
 /* Control: signal, window-change, break (RFC 4335). */

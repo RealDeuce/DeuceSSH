@@ -10,6 +10,7 @@
 #include <netinet/in.h>
 
 #include <errno.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
@@ -21,9 +22,11 @@
 #include "deucessh-auth.h"
 #include "deucessh-conn.h"
 #include "deucessh.h"
+#include "server-io.h"
 
 static int          conn_fd = -1;
 static dssh_session sess;
+static struct example_socket_io connection_io = { .descriptor = -1 };
 
 /* ================================================================
  * Terminate callback -- unblock I/O callbacks
@@ -41,70 +44,22 @@ on_terminate(dssh_session s, void *cbdata)
 static int
 tx(uint8_t *buf, size_t bufsz, dssh_session s, void *cbdata)
 {
-	size_t sent = 0;
-
-	while (sent < bufsz && !dssh_session_is_terminated(s)) {
-		ssize_t n = send(conn_fd, &buf[sent], bufsz - sent, 0);
-
-		if (n > 0)
-			sent += n;
-		else if ((n < 0) && (errno != EAGAIN) && (errno != EINTR))
-			return DSSH_ERROR_INIT;
-	}
-	return 0;
+	(void)cbdata;
+	return example_socket_transfer(&connection_io, buf, bufsz, s, true);
 }
 
 static int
 rx(uint8_t *buf, size_t bufsz, dssh_session s, void *cbdata)
 {
-	size_t got = 0;
-
-	while (got < bufsz && !dssh_session_is_terminated(s)) {
-		struct pollfd fd = {.fd = conn_fd, .events = POLLIN};
-		int           pr = poll(&fd, 1, 5000);
-
-		if (pr < 0)
-			return DSSH_ERROR_INIT;
-		if (pr == 0)
-			continue;
-		if (fd.revents & (POLLHUP | POLLERR) && !(fd.revents & POLLIN))
-			return DSSH_ERROR_INIT;
-
-		ssize_t n = recv(conn_fd, &buf[got], bufsz - got, 0);
-
-		if (n > 0)
-			got += n;
-		else if (n == 0)
-			return DSSH_ERROR_INIT;
-		else if ((errno != EAGAIN) && (errno != EINTR))
-			return DSSH_ERROR_INIT;
-	}
-	return 0;
+	(void)cbdata;
+	return example_socket_transfer(&connection_io, buf, bufsz, s, false);
 }
 
 static int
 rxline(uint8_t *buf, size_t bufsz, size_t *bytes_received, dssh_session s, void *cbdata)
 {
-	size_t pos    = 0;
-	bool   lastcr = false;
-
-	while (!dssh_session_is_terminated(s)) {
-		int res = rx(&buf[pos], 1, s, cbdata);
-
-		if (res < 0)
-			return res;
-		if (buf[pos] == '\r')
-			lastcr = true;
-		if ((buf[pos] == '\n') && lastcr) {
-			*bytes_received = pos + 1;
-			return 0;
-		}
-		if (pos + 1 < bufsz)
-			pos++;
-		else
-			return DSSH_ERROR_TOOLONG;
-	}
-	return DSSH_ERROR_TERMINATED;
+	(void)cbdata;
+	return example_socket_line(&connection_io, buf, bufsz, bytes_received, s);
 }
 
 /* ================================================================
@@ -227,8 +182,9 @@ auth_kbi(const uint8_t *username, size_t username_len, uint32_t num_responses, c
 	static struct game_state gs;
 	char                     banner[1024];
 
-	/* Reset session timeout on each KBI interaction */
-	alarm(60);
+	/* Reset the application deadline on each KBI interaction. */
+	if (example_socket_reset(&connection_io) != 0)
+		return DSSH_AUTH_DISCONNECT;
 
 	/* First call -- initialize game */
 	if (num_responses == 0 && responses == NULL) {
@@ -747,17 +703,6 @@ static struct dssh_chan_accept_cbs accept_cbs = {
 };
 
 /* ================================================================
- * Session timeout handler
- * ================================================================ */
-static void
-timeout_handler(int sig)
-{
-	(void)sig;
-	if (sess != NULL)
-		dssh_session_terminate(sess);
-}
-
-/* ================================================================
  * Debug and global request callbacks
  * ================================================================ */
 static void
@@ -788,9 +733,18 @@ global_request_cb(const uint8_t *name, size_t name_len, bool want_reply, const u
 static int
 handle_connection(void)
 {
-	/* 60-second session timeout */
-	signal(SIGALRM, timeout_handler);
-	alarm(60);
+	/* Readiness alone does not make a blocking transfer bounded. */
+	int flags = fcntl(conn_fd, F_GETFL);
+	if (flags < 0 || fcntl(conn_fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+		perror("fcntl");
+		return 1;
+	}
+	/* The deadline is immutable after authentication/connection startup. */
+	connection_io = (struct example_socket_io){ .descriptor = conn_fd };
+	if (example_socket_reset(&connection_io) != 0) {
+		fputs("clock initialization failed\n", stderr);
+		return 1;
+	}
 
 	/* Initialize session */
 	sess = dssh_session_init(false, 0);
@@ -859,16 +813,24 @@ handle_connection(void)
 	    : ctype == DSSH_CHAN_SHELL ? "shell"
 				       : "subsystem");
 
+	int status = 0;
+#define WRITE(stream, bytes, length) do { \
+	if (example_channel_write(ch, stream, bytes, length) < 0) { \
+		status = 1; \
+		goto channel_done; \
+	} \
+} while (0)
+
 	if (ctype == DSSH_CHAN_EXEC) {
 		/* Execute command -- respond and close */
 		const char *cmd = dssh_chan_get_command(ch);
 
 		if (cmd != NULL && strcmp(cmd, "ping") == 0) {
-			dssh_chan_write(ch, 0, (const uint8_t *)"pong\n", 5);
-			dssh_chan_write(ch, 1, (const uint8_t *)"gnop\n", 5);
+			WRITE(0, (const uint8_t *)"pong\n", 5);
+			WRITE(1, (const uint8_t *)"gnop\n", 5);
 		}
 		else {
-			dssh_chan_write(ch, 0, (const uint8_t *)"unknown command\n", 16);
+			WRITE(0, (const uint8_t *)"unknown command\n", 16);
 		}
 	}
 	else {
@@ -876,7 +838,7 @@ handle_connection(void)
 		uint8_t buf[4096];
 		size_t  line_len = 0;
 
-		dssh_chan_write(ch, 0, (const uint8_t *)"> ", 2);
+		WRITE(0, (const uint8_t *)"> ", 2);
 
 		for (;;) {
 			int ev = dssh_chan_poll(ch, DSSH_POLL_READ, -1);
@@ -892,9 +854,9 @@ handle_connection(void)
 			/* Echo input back, translating \r to \r\n */
 			for (ssize_t ei = 0; ei < n; ei++) {
 				if (buf[line_len + ei] == '\r')
-					dssh_chan_write(ch, 0, (const uint8_t *)"\r\n", 2);
+					WRITE(0, (const uint8_t *)"\r\n", 2);
 				else
-					dssh_chan_write(ch, 0, &buf[line_len + ei], 1);
+					WRITE(0, &buf[line_len + ei], 1);
 			}
 
 			line_len += n;
@@ -909,29 +871,30 @@ handle_connection(void)
 			buf[line_len] = '\0';
 
 			if (strcmp((char *)buf, "ping") == 0) {
-				dssh_chan_write(ch, 0, (const uint8_t *)"pong\r\n", 6);
+				WRITE(0, (const uint8_t *)"pong\r\n", 6);
 			}
 			else if (strcmp((char *)buf, "quit") == 0 || strcmp((char *)buf, "exit") == 0) {
-				dssh_chan_write(ch, 0, (const uint8_t *)"bye\r\n", 5);
+				WRITE(0, (const uint8_t *)"bye\r\n", 5);
 				break;
 			}
 			else if (strcmp((char *)buf, "diediedie") == 0) {
-				dssh_chan_write(ch, 0, (const uint8_t *)"dying...\r\n", 10);
+				WRITE(0, (const uint8_t *)"dying...\r\n", 10);
 				kill(getppid(), SIGTERM);
 				break;
 			}
 			else if (line_len > 0) {
 				static const char help[] = "commands: ping, quit, exit\r\n";
-				dssh_chan_write(ch, 0, (const uint8_t *)help, sizeof(help) - 1);
+				WRITE(0, (const uint8_t *)help, sizeof(help) - 1);
 			}
 
 			line_len = 0;
-			dssh_chan_write(ch, 0, (const uint8_t *)"> ", 2);
+			WRITE(0, (const uint8_t *)"> ", 2);
 		}
 	}
 
+#undef WRITE
+channel_done:
 	/* Clean shutdown */
-	alarm(0);
 	fprintf(stderr, "Channel closed.\n");
 	int closed = dssh_chan_close(ch, 0);
 	ch = NULL;
@@ -942,7 +905,9 @@ handle_connection(void)
 		closed = 1;
 	}
 	conn_fd = -1;
-	return closed == 0 ? 0 : 1;
+	if (closed != 0)
+		status = 1;
+	return status;
 }
 
 /* ================================================================
@@ -952,13 +917,20 @@ static void
 sigchld_handler(int sig)
 {
 	(void)sig;
+	int saved_errno = errno;
 	while (waitpid(-1, NULL, WNOHANG) > 0)
 		;
+	errno = saved_errno;
 }
 
 int
 main(int argc, char **argv)
 {
+	/* Socket write failures are reported through the callbacks. */
+	if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
+		perror("signal");
+		return 1;
+	}
 	int port = 2222;
 
 	if (argc > 1)

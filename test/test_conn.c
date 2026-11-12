@@ -8366,6 +8366,7 @@ test_compression_window_rekey(void)
 #include "close_reservation_cases.h"
 #include "termination_callback_cases.h"
 #include "channel_control_cases.h"
+#include "incoming_control_cases.h"
 
 static struct dssh_test_entry tests[] = {
 	{ "release/close_disposal_values", test_close_disposal_values },
@@ -8934,6 +8935,8 @@ DSSH_TEST_MAIN(tests)
 int
 main(int argc, char *argv[])
 {
+	if (argc == 2 && strcmp(argv[1], "--audit-incoming-controls") == 0)
+		return incoming_control_probe();
 	if (argc == 2 && strcmp(argv[1], "--audit-close-outcomes") == 0)
 		return close_outcome_probe();
 	if (argc == 4 && strcmp(argv[1], "--channel-fatal") == 0)

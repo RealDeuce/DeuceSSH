@@ -1,6 +1,6 @@
 /*
  * Example SSH client using the high-level DeuceSSH API.
- * Usage: client username password [host] [port] [command]
+ * Usage: client hostkey-sha256 username password [host] [port] [command]
  * If command is given, runs exec mode (no pty).
  * If omitted, opens an interactive shell with pty.
  */
@@ -11,6 +11,9 @@
 #include <netinet/in.h>
 
 #include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <stdatomic.h>
 #include <netdb.h>
 #include <poll.h>
 #include <stdio.h>
@@ -22,10 +25,12 @@
 #include "deucessh-algorithms.h"
 #include "deucessh-auth.h"
 #include "deucessh-conn.h"
+#include "deucessh-crypto.h"
 #include "deucessh.h"
 
 static int          sock = -1;
 static dssh_session sess;
+static atomic_bool input_stop = ATOMIC_VAR_INIT(false);
 
 /* ================================================================
  * Keyboard-interactive callback: answer every prompt with password
@@ -62,7 +67,7 @@ kbi_prompt(const uint8_t *name, size_t name_len, const uint8_t *instruction, siz
 	(void)prompt_lens;
 	(void)echo;
 	struct kbi_state *state = cbdata;
-	if (state == NULL || state->password == NULL || state->leased)
+	if (state == NULL || state->password == NULL || state->leased || out == NULL)
 		return DSSH_ERROR_INVALID;
 	state->leased = true;
 	out->lease.release = kbi_release;
@@ -103,38 +108,41 @@ kbi_prompt(const uint8_t *name, size_t name_len, const uint8_t *instruction, siz
 	return 0;
 }
 
-/* ================================================================
- * Host key verification callback -- print fingerprint, accept all
- * ================================================================ */
+/* The expected SHA-256 fingerprint has one canonical textual form. */
+static bool
+valid_fingerprint(const char *text)
+{
+	static const char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+	static const char final_chars[] = "AEIMQUYcgkosw048";
+	if (text == NULL || strlen(text) != 50 || memcmp(text, "SHA256:", 7) != 0)
+		return false;
+	for (size_t i = 7; i < 50; i++) {
+		if (strchr(alphabet, text[i]) == NULL)
+			return false;
+	}
+	return strchr(final_chars, text[49]) != NULL;
+}
+
+/* The pin comes from trusted application configuration and remains valid until
+ * cleanup. Check it on every initial/rekey host-key callback. */
 static dssh_hostkey_decision
 verify_hostkey(const char *algo_name, unsigned int key_bits, const uint8_t *sha256_hash,
     const uint8_t *key_blob, size_t key_blob_len, void *cbdata)
 {
-	(void)key_blob;
-	(void)key_blob_len;
-	(void)cbdata;
-
-	/* Base64-encode the SHA-256 fingerprint for display */
-	static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-	char              fp[45]; /* ceil(32/3)*4 + 1 */
-	size_t            o = 0;
-
-	for (int i = 0; i < 32; i += 3) {
-		uint32_t v = (uint32_t)sha256_hash[i] << 16;
-
-		if (i + 1 < 32)
-			v |= (uint32_t)sha256_hash[i + 1] << 8;
-		if (i + 2 < 32)
-			v |= sha256_hash[i + 2];
-		fp[o++] = b64[(v >> 18) & 0x3F];
-		fp[o++] = b64[(v >> 12) & 0x3F];
-		fp[o++] = (i + 1 < 32) ? b64[(v >> 6) & 0x3F] : '=';
-		fp[o++] = (i + 2 < 32) ? b64[v & 0x3F] : '=';
-	}
-	fp[o] = '\0';
-
-	fprintf(stderr, "Host key: %s %u SHA256:%s\n", algo_name, key_bits, fp);
-	return DSSH_HOSTKEY_ACCEPT;
+	const char *expected = cbdata;
+	if (!valid_fingerprint(expected) || algo_name == NULL || sha256_hash == NULL
+	    || key_blob == NULL || key_blob_len == 0)
+		return DSSH_HOSTKEY_REJECT;
+	char encoded[45];
+	int written = dssh_base64_encode(sha256_hash, 32, encoded, sizeof(encoded));
+	if (written != 44 || encoded[43] != '=')
+		return DSSH_HOSTKEY_REJECT;
+	char fingerprint[51] = "SHA256:";
+	memcpy(&fingerprint[7], encoded, 43);
+	fingerprint[50] = 0;
+	if (fprintf(stderr, "Host key: %s %u %s\n", algo_name, key_bits, fingerprint) < 0)
+		return DSSH_HOSTKEY_REJECT;
+	return strcmp(expected, fingerprint) == 0 ? DSSH_HOSTKEY_ACCEPT : DSSH_HOSTKEY_REJECT;
 }
 
 /* ================================================================
@@ -143,114 +151,181 @@ verify_hostkey(const char *algo_name, unsigned int key_bits, const uint8_t *sha2
 static void
 on_terminate(dssh_session s, void *cbdata)
 {
-	if (sock != -1)
-		shutdown(sock, SHUT_RDWR);
+	(void)s;
+	(void)cbdata;
+	if (sock != -1) {
+		int ret;
+		do {
+			ret = shutdown(sock, SHUT_RDWR);
+		} while (ret < 0 && errno == EINTR);
+		if (ret < 0 && errno != ENOTCONN)
+			perror("shutdown");
+	}
 }
 
 /* ================================================================
  * I/O callbacks for the transport layer
  * ================================================================ */
+/* Socket requests stay small enough for every POSIX ssize_t. The callbacks
+ * consume the original spans directly, retaining offsets after interruptions. */
 static int
 tx(uint8_t *buf, size_t bufsz, dssh_session s, void *cbdata)
 {
-	size_t sent_total = 0;
-
-	while (sent_total < bufsz && !dssh_session_is_terminated(s)) {
-		struct pollfd fd = {
-		    .fd      = sock,
-		    .events  = POLLOUT,
-		    .revents = 0,
-		};
-		int pr = poll(&fd, 1, 5000);
-
-		if (pr < 0)
-			return DSSH_ERROR_INIT;
-		if (pr == 0)
-			continue;
-		if (fd.revents & (POLLHUP | POLLERR))
-			return DSSH_ERROR_INIT;
-
-		ssize_t n = send(sock, &buf[sent_total], bufsz - sent_total, 0);
-
-		if (n > 0) {
-			sent_total += n;
-		}
-		else if (n == 0)
-			return DSSH_ERROR_INIT;
-		else if (n < 0) {
-			if ((errno == EAGAIN) || (errno == EINTR))
+	(void)cbdata;
+	if (s == NULL || (bufsz > 0 && buf == NULL))
+		return DSSH_ERROR_INVALID;
+	size_t offset = 0;
+	while (offset < bufsz && !dssh_session_is_terminated(s)) {
+		struct pollfd fd = { .fd = sock, .events = POLLOUT };
+		int ready = poll(&fd, 1, 1000);
+		if (ready < 0) {
+			if (errno == EINTR)
 				continue;
 			return DSSH_ERROR_INIT;
 		}
+		if (ready == 0)
+			continue;
+		if ((fd.revents & (POLLHUP | POLLERR | POLLNVAL)) != 0)
+			return DSSH_ERROR_INIT;
+		if ((fd.revents & POLLOUT) == 0)
+			continue;
+		size_t count = bufsz - offset;
+		if (count > 4096)
+			count = 4096;
+		ssize_t n = send(sock, &buf[offset], count, 0);
+		if (n > 0) {
+			if (n > 4096)
+				return DSSH_ERROR_INVALID;
+			size_t advanced = (size_t)n;
+			if (advanced > count)
+				return DSSH_ERROR_INVALID;
+			offset += advanced;
+		}
+		else if (n == 0)
+			return DSSH_ERROR_INIT;
+		else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+			return DSSH_ERROR_INIT;
 	}
-	return sent_total == bufsz ? 0 : DSSH_ERROR_TERMINATED;
+	return offset == bufsz ? 0 : DSSH_ERROR_TERMINATED;
 }
 
 static int
 rx(uint8_t *buf, size_t bufsz, dssh_session s, void *cbdata)
 {
-	size_t rxlen = 0;
-
-	while (rxlen < bufsz && !dssh_session_is_terminated(s)) {
-		struct pollfd fd = {
-		    .fd      = sock,
-		    .events  = POLLIN,
-		    .revents = 0,
-		};
-		int pr = poll(&fd, 1, 5000);
-
-		if (pr < 0)
-			return DSSH_ERROR_INIT;
-		if (pr == 0)
-			continue;
-		if (fd.revents & (POLLHUP | POLLERR) && !(fd.revents & POLLIN))
-			return DSSH_ERROR_INIT;
-
-		ssize_t n = recv(sock, &buf[rxlen], bufsz - rxlen, 0);
-
-		if (n > 0) {
-			rxlen += n;
-		}
-		else if (n == 0) {
-			return DSSH_ERROR_INIT;
-		}
-		else {
-			if ((errno == EAGAIN) || (errno == EINTR))
+	(void)cbdata;
+	if (s == NULL || (bufsz > 0 && buf == NULL))
+		return DSSH_ERROR_INVALID;
+	size_t offset = 0;
+	while (offset < bufsz && !dssh_session_is_terminated(s)) {
+		struct pollfd fd = { .fd = sock, .events = POLLIN };
+		int ready = poll(&fd, 1, 1000);
+		if (ready < 0) {
+			if (errno == EINTR)
 				continue;
 			return DSSH_ERROR_INIT;
 		}
+		if (ready == 0)
+			continue;
+		if ((fd.revents & POLLNVAL) != 0)
+			return DSSH_ERROR_INIT;
+		if ((fd.revents & POLLIN) == 0) {
+			if ((fd.revents & (POLLHUP | POLLERR)) != 0)
+				return DSSH_ERROR_INIT;
+			continue;
+		}
+		size_t count = bufsz - offset;
+		if (count > 4096)
+			count = 4096;
+		ssize_t n = recv(sock, &buf[offset], count, 0);
+		if (n > 0) {
+			if (n > 4096)
+				return DSSH_ERROR_INVALID;
+			size_t advanced = (size_t)n;
+			if (advanced > count)
+				return DSSH_ERROR_INVALID;
+			offset += advanced;
+		}
+		else if (n == 0)
+			return DSSH_ERROR_INIT;
+		else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+			return DSSH_ERROR_INIT;
 	}
-	return rxlen == bufsz ? 0 : DSSH_ERROR_TERMINATED;
+	return offset == bufsz ? 0 : DSSH_ERROR_TERMINATED;
 }
 
 static int
 rxline(uint8_t *buf, size_t bufsz, size_t *bytes_received, dssh_session s, void *cbdata)
 {
-	size_t pos    = 0;
-	bool   lastcr = false;
-
-	while (!dssh_session_is_terminated(s)) {
-		int res = rx(&buf[pos], 1, s, cbdata);
-
-		if (res < 0)
-			return res;
-		if ((buf[pos] == '\n') && lastcr) {
+	if (buf == NULL || bufsz == 0 || bytes_received == NULL || s == NULL)
+		return DSSH_ERROR_INVALID;
+	*bytes_received = 0;
+	size_t pos = 0;
+	bool lastcr = false;
+	while (pos < bufsz && !dssh_session_is_terminated(s)) {
+		int ret = rx(&buf[pos], 1, s, cbdata);
+		if (ret < 0)
+			return ret;
+		if (buf[pos] == '\n' && lastcr) {
 			*bytes_received = pos + 1;
 			return 0;
 		}
 		lastcr = buf[pos] == '\r';
-		if (pos + 1 < bufsz)
-			pos++;
-		else
-			return DSSH_ERROR_TOOLONG;
+		pos++;
 	}
-	return DSSH_ERROR_TERMINATED;
+	return dssh_session_is_terminated(s) ? DSSH_ERROR_TERMINATED : DSSH_ERROR_TOOLONG;
 }
 
 static int
 extra_line(uint8_t *buf, size_t bufsz, void *cbdata)
 {
-	fprintf(stdout, "Server: %.*s\n", (int)bufsz, buf);
+	(void)cbdata;
+	if (bufsz > 0 && buf == NULL)
+		return DSSH_ERROR_INVALID;
+	if (fputs("Server: ", stderr) == EOF)
+		return DSSH_ERROR_INIT;
+	for (size_t i = 0; i < bufsz; i++) {
+		unsigned int byte = buf[i];
+		if (byte >= 0x20 && byte <= 0x7e) {
+			if (fputc(buf[i], stderr) == EOF)
+				return DSSH_ERROR_INIT;
+		}
+		else if (fprintf(stderr, "\\x%02x", byte) < 0)
+			return DSSH_ERROR_INIT;
+	}
+	return fputc('\n', stderr) == EOF ? DSSH_ERROR_INIT : 0;
+}
+
+static int
+write_output(int fd, const uint8_t *buf, size_t length)
+{
+	size_t offset = 0;
+	while (offset < length) {
+		size_t count = length - offset;
+		if (count > 4096)
+			count = 4096;
+		ssize_t n = write(fd, &buf[offset], count);
+		if (n > 0) {
+			if (n > 4096)
+				return -1;
+			size_t advanced = (size_t)n;
+			if (advanced > count)
+				return -1;
+			offset += advanced;
+			continue;
+		}
+		if (n == 0)
+			return -1;
+		if (errno == EINTR)
+			continue;
+		if (errno != EAGAIN && errno != EWOULDBLOCK)
+			return -1;
+		struct pollfd item = { .fd = fd, .events = POLLOUT };
+		int ready = poll(&item, 1, 1000);
+		if (ready < 0 && errno != EINTR)
+			return -1;
+		if (ready > 0 && (item.revents & (POLLHUP | POLLERR | POLLNVAL)) != 0)
+			return -1;
+	}
 	return 0;
 }
 
@@ -261,48 +336,162 @@ static int
 stdin_thread(void *arg)
 {
 	dssh_channel ch = arg;
-	uint8_t      buf[4096];
-
-	for (;;) {
-		/* Wait for stdin data */
-		struct pollfd fds[1] = {
-		    {.fd = STDIN_FILENO, .events = POLLIN},
-		};
-		int pr = poll(fds, 1, 1000);
-
-		if (dssh_session_is_terminated(sess))
-			break;
-		if (pr <= 0)
-			continue;
-
-		ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));
-
-		if (n <= 0)
-			break;
-
-		/* Wait for channel write space, then send the entire input. */
-		size_t len = (size_t)n;
-		size_t offset = 0;
-		while (offset < len) {
-			int ev = dssh_chan_poll(ch, DSSH_POLL_WRITE, 1000);
-
-			if ((ev < 0) || dssh_session_is_terminated(sess))
-				goto done;
-			if (!(ev & DSSH_POLL_WRITE))
+	uint8_t buf[4096];
+	while (!atomic_load_explicit(&input_stop, memory_order_acquire) && !dssh_session_is_terminated(sess)) {
+		struct pollfd fd = { .fd = STDIN_FILENO, .events = POLLIN };
+		int ready = poll(&fd, 1, 1000);
+		if (atomic_load_explicit(&input_stop, memory_order_acquire) || dssh_session_is_terminated(sess))
+			return 0;
+		if (ready < 0) {
+			if (errno == EINTR)
 				continue;
-
-			int64_t w = dssh_chan_write(ch, 0, &buf[offset], len - offset);
-
-			if (w <= 0)
-				goto done;
-			if (w > len - offset)
-				goto done;
-			size_t written = (size_t)w;
-			offset += written;
+			goto failed;
+		}
+		if (ready == 0)
+			continue;
+		if ((fd.revents & (POLLERR | POLLNVAL)) != 0)
+			goto failed;
+		if ((fd.revents & (POLLIN | POLLHUP)) == 0)
+			continue;
+		ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));
+		if (n < 0) {
+			if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+				continue;
+			goto failed;
+		}
+		if (n == 0) {
+			int ret = dssh_chan_shutwr(ch);
+			if (ret == 0 || ret == DSSH_ERROR_TERMINATED)
+				return 0;
+			goto failed;
+		}
+		if (n > 4096)
+			goto failed;
+		size_t length = (size_t)n;
+		size_t offset = 0;
+		while (offset < length) {
+			int events = dssh_chan_poll(ch, DSSH_POLL_WRITE, 1000);
+			if (atomic_load_explicit(&input_stop, memory_order_acquire) || dssh_session_is_terminated(sess))
+				return 0;
+			if (events < 0)
+				goto failed;
+			if ((events & DSSH_POLL_WRITE) == 0)
+				continue;
+			int64_t written = dssh_chan_write(ch, 0, &buf[offset], length - offset);
+			if (written == DSSH_ERROR_TERMINATED)
+				return 0;
+			if (written <= 0 || written > 4096)
+				goto failed;
+			size_t count = (size_t)written;
+			if (count > length - offset)
+				goto failed;
+			offset += count;
 		}
 	}
-done:
 	return 0;
+failed:
+	dssh_session_terminate(sess);
+	return 1;
+}
+
+static int
+parse_port(const char *text, uint16_t *port)
+{
+	if (text == NULL || *text == 0 || port == NULL)
+		return -1;
+	uint32_t value = 0;
+	for (const char *p = text; *p != 0; p++) {
+		if (*p < '0' || *p > '9')
+			return -1;
+		uint32_t digit = (uint32_t)(*p - '0');
+		if (value > (UINT16_MAX - digit) / 10)
+			return -1;
+		value = value * 10 + digit;
+	}
+	if (value == 0)
+		return -1;
+	*port = (uint16_t)value;
+	return 0;
+}
+
+/* Every candidate stays owned here until it is closed or returned. */
+static int
+connect_host(const char *host, const char *port)
+{
+	struct addrinfo hints = { .ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM };
+	struct addrinfo *addresses = NULL;
+	int ret = getaddrinfo(host, port, &hints, &addresses);
+	if (ret != 0) {
+		fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(ret));
+		return -1;
+	}
+	int connected = -1;
+	int last_error = EHOSTUNREACH;
+	for (struct addrinfo *address = addresses; address != NULL; address = address->ai_next) {
+		int candidate = socket(address->ai_family, address->ai_socktype, address->ai_protocol);
+		if (candidate < 0) {
+			last_error = errno;
+			continue;
+		}
+		if (connect(candidate, address->ai_addr, address->ai_addrlen) == 0) {
+			int flags = fcntl(candidate, F_GETFL);
+			int descriptor_flags = fcntl(candidate, F_GETFD);
+			if (flags >= 0 && descriptor_flags >= 0
+			    && fcntl(candidate, F_SETFL, flags | O_NONBLOCK) == 0
+			    && fcntl(candidate, F_SETFD, descriptor_flags | FD_CLOEXEC) == 0) {
+				connected = candidate;
+				break;
+			}
+		}
+		last_error = errno;
+		if (close(candidate) != 0) {
+			last_error = errno;
+			break;
+		}
+	}
+	freeaddrinfo(addresses);
+	if (connected < 0) {
+		errno = last_error;
+		perror("connect");
+	}
+	return connected;
+}
+
+static int
+register_algorithms(void)
+{
+	int (*const registrations[])(void) = {
+		dssh_register_mlkem768x25519_sha256,
+		dssh_register_sntrup761x25519_sha512,
+		dssh_register_curve25519_sha256,
+		dssh_register_dh_gex_sha256,
+		dssh_register_dh_group16_sha512,
+		dssh_register_dh_group14_sha256,
+		dssh_register_rsa_sha2_256,
+		dssh_register_ssh_ed25519,
+		dssh_register_aes256_ctr,
+		dssh_register_hmac_sha2_256,
+		dssh_register_none_comp,
+	};
+	int ret = dssh_transport_set_callbacks(tx, rx, rxline, extra_line);
+	for (size_t i = 0; ret == 0 && i < sizeof(registrations) / sizeof(registrations[0]); i++)
+		ret = registrations[i]();
+	return ret;
+}
+
+static bool
+offered_method(const char *list, const char *wanted)
+{
+	size_t wanted_length = strlen(wanted);
+	for (const char *name = list; *name != 0;) {
+		size_t length = strcspn(name, ",");
+		if (length == wanted_length && memcmp(name, wanted, length) == 0)
+			return true;
+		name += length;
+		if (*name == ',')
+			name++;
+	}
+	return false;
 }
 
 /* ================================================================
@@ -311,235 +500,238 @@ done:
 int
 main(int argc, char **argv)
 {
-	const char *host     = "127.0.0.1";
-	int         port     = 22;
-	const char *username = NULL;
-	const char *password = NULL;
-	const char *command  = NULL;
-
-	/* client user pass [host] [port] [command] */
-	if (argc > 1)
-		username = argv[1];
-	if (argc > 2)
-		password = argv[2];
-	if (argc > 3)
-		host = argv[3];
-	if (argc > 4)
-		port = atoi(argv[4]);
-	if (argc > 5)
-		command = argv[5];
-
-	if ((username == NULL) || (password == NULL)) {
-		fprintf(stderr, "Usage: %s username password [host] [port] [command]\n", argv[0]);
+	const char *program = argc > 0 && argv != NULL && argv[0] != NULL ? argv[0] : "client";
+	if (argc < 4 || argc > 7 || argv == NULL) {
+		fprintf(stderr, "Usage: %s hostkey-sha256 username password [host] [port] [command]\n", program);
 		return 1;
 	}
-
-	/* Connect */
+	char *expected_hostkey = argv[1];
+	const char *username = argv[2];
+	const char *password = argv[3];
+	const char *host = argc > 4 ? argv[4] : "localhost";
+	const char *command = argc > 6 ? argv[6] : NULL;
+	uint16_t port = 22;
+	if (!valid_fingerprint(expected_hostkey) || username == NULL || *username == 0
+	    || password == NULL || host == NULL || *host == 0
+	    || (argc > 5 && parse_port(argv[5], &port) != 0)) {
+		fputs("Invalid fingerprint, username, host or port.\n", stderr);
+		return 1;
+	}
 	char port_str[16];
-
-	snprintf(port_str, sizeof(port_str), "%d", port);
-
-	struct addrinfo hints = {
-	    .ai_family   = AF_UNSPEC,
-	    .ai_socktype = SOCK_STREAM,
-	};
-	struct addrinfo *ai;
-	int              gai = getaddrinfo(host, port_str, &hints, &ai);
-
-	if (gai != 0) {
-		fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(gai));
+	unsigned int port_number = port;
+	int printed = snprintf(port_str, sizeof(port_str), "%u", port_number);
+	if (printed < 0 || printed >= 16)
+		return 1;
+	if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
+		perror("signal");
 		return 1;
 	}
-	sock = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-	if (sock == -1) {
-		perror("socket");
-		freeaddrinfo(ai);
-		return 1;
-	}
-	if (connect(sock, ai->ai_addr, ai->ai_addrlen) == -1) {
-		perror("connect");
-		freeaddrinfo(ai);
-		return 1;
-	}
-	freeaddrinfo(ai);
-	fprintf(stderr, "Connected to %s:%d\n", host, port);
 
-	/* Register algorithms */
-	if (dssh_transport_set_callbacks(tx, rx, rxline, extra_line) != 0)
-		return 1;
-	if (dssh_register_mlkem768x25519_sha256() != 0)
-		return 1;
-	if (dssh_register_sntrup761x25519_sha512() != 0)
-		return 1;
-	if (dssh_register_curve25519_sha256() != 0)
-		return 1;
-	if (dssh_register_dh_gex_sha256() != 0)
-		return 1;
-	if (dssh_register_dh_group16_sha512() != 0)
-		return 1;
-	if (dssh_register_dh_group14_sha256() != 0)
-		return 1;
-	if (dssh_register_rsa_sha2_256() != 0)
-		return 1;
-	if (dssh_register_ssh_ed25519() != 0)
-		return 1;
-	if (dssh_register_aes256_ctr() != 0)
-		return 1;
-	if (dssh_register_hmac_sha2_256() != 0)
-		return 1;
-	if (dssh_register_none_comp() != 0)
-		return 1;
-
-	/* Initialize session */
+	int status = 1;
+	atomic_store_explicit(&input_stop, false, memory_order_release);
+	dssh_channel channel = NULL;
+	struct dssh_chan_params params;
+	bool have_params = false, have_writer = false;
+	thrd_t writer;
+	sock = connect_host(host, port_str);
+	if (sock < 0)
+		goto done;
+	if (fprintf(stderr, "Connected to %s:%u\n", host, port_number) < 0)
+		goto done;
+	int ret = register_algorithms();
+	if (ret != 0) {
+		fprintf(stderr, "algorithm setup failed: %d\n", ret);
+		goto done;
+	}
 	sess = dssh_session_init(true, 0);
 	if (sess == NULL) {
-		fprintf(stderr, "session_init failed\n");
-		return 1;
+		fputs("session_init failed\n", stderr);
+		goto done;
 	}
-	dssh_session_set_terminate_cb(sess, on_terminate, NULL);
-	dssh_session_set_hostkey_verify_cb(sess, verify_hostkey, NULL);
-
-	/* Handshake */
-	fprintf(stderr, "Handshake...\n");
-
-	int res = dssh_transport_handshake(sess);
-
-	if (res < 0) {
-		fprintf(stderr, "handshake failed: %d\n", res);
-		return 1;
+	ret = dssh_session_set_terminate_cb(sess, on_terminate, NULL);
+	if (ret == 0)
+		ret = dssh_session_set_hostkey_verify_cb(sess, verify_hostkey, expected_hostkey);
+	if (ret != 0) {
+		fprintf(stderr, "callback setup failed: %d\n", ret);
+		goto done;
 	}
-	fprintf(stderr, "Remote: %s\n", dssh_transport_get_remote_version(sess));
-	fprintf(stderr, "KEX: %s, Host key: %s\n", dssh_transport_get_kex_name(sess),
-	    dssh_transport_get_hostkey_name(sess));
+	if (fputs("Handshake...\n", stderr) == EOF)
+		goto done;
+	ret = dssh_transport_handshake(sess);
+	if (ret != 0) {
+		fprintf(stderr, "handshake failed: %d\n", ret);
+		goto done;
+	}
+	const char *remote = dssh_transport_get_remote_version(sess);
+	const char *kex = dssh_transport_get_kex_name(sess);
+	const char *key = dssh_transport_get_hostkey_name(sess);
+	if (remote == NULL || kex == NULL || key == NULL
+	    || fprintf(stderr, "Remote: %s\nKEX: %s, Host key: %s\n", remote, kex, key) < 0)
+		goto done;
 	const enum dssh_direction directions[] = {DSSH_CLIENT_TO_SERVER, DSSH_SERVER_TO_CLIENT};
 	const char *labels[] = {"Client to server", "Server to client"};
 	for (size_t i = 0; i < 2; i++) {
-		fprintf(stderr, "%s: Enc: %s, MAC: %s, Compression: %s\n", labels[i],
-		    dssh_transport_get_enc_name(sess, directions[i]),
-		    dssh_transport_get_mac_name(sess, directions[i]),
-		    dssh_transport_get_comp_name(sess, directions[i]));
+		const char *enc = dssh_transport_get_enc_name(sess, directions[i]);
+		const char *mac = dssh_transport_get_mac_name(sess, directions[i]);
+		const char *comp = dssh_transport_get_comp_name(sess, directions[i]);
+		if (enc == NULL || mac == NULL || comp == NULL
+		    || fprintf(stderr, "%s: Enc: %s, MAC: %s, Compression: %s\n", labels[i], enc, mac, comp) < 0)
+			goto done;
 	}
 
-	/* Authenticate */
 	char methods[256];
-
-	res = dssh_auth_get_methods(sess, username, methods, sizeof(methods));
-	if (res < 0) {
-		fprintf(stderr, "auth method query failed: %d\n", res);
-		return 1;
+	ret = dssh_auth_get_methods(sess, username, methods, sizeof(methods));
+	if (ret != DSSH_AUTH_NONE_ACCEPTED && ret != DSSH_AUTH_METHODS_AVAILABLE) {
+		fprintf(stderr, "auth method query failed: %d\n", ret);
+		goto done;
 	}
-	if (res == DSSH_AUTH_NONE_ACCEPTED) {
-		fprintf(stderr, "No authentication required.\n");
-	}
-	else {
-		fprintf(stderr, "Auth methods: %s\n", methods);
-		res = -1;
-		if (strstr(methods, "password"))
-			res = dssh_auth_password(sess, username, password, NULL, NULL);
-		if ((res < 0) && strstr(methods, "keyboard-interactive")) {
+	if (ret == DSSH_AUTH_METHODS_AVAILABLE) {
+		if (fprintf(stderr, "Auth methods: %s\n", methods) < 0)
+			goto done;
+		ret = DSSH_ERROR_REJECTED;
+		if (offered_method(methods, "password"))
+			ret = dssh_auth_password(sess, username, password, NULL, NULL);
+		if (ret != 0 && offered_method(methods, "keyboard-interactive")) {
 			struct kbi_state state = { .password = password };
-			res = dssh_auth_keyboard_interactive(sess, username, kbi_prompt, &state);
+			ret = dssh_auth_keyboard_interactive(sess, username, kbi_prompt, &state);
 			kbi_release(&state);
 			free(state.answer);
 			free(state.responses);
 		}
-		if (res < 0) {
-			fprintf(stderr, "authentication failed: %d\n", res);
-			return 1;
+		if (ret != 0) {
+			fprintf(stderr, "authentication failed: %d\n", ret);
+			goto done;
 		}
-		fprintf(stderr, "Authenticated.\n");
 	}
-
-	/* Start the demux thread */
-	res = dssh_session_start(sess);
-	if (res < 0) {
-		fprintf(stderr, "session_start failed: %d\n", res);
-		return 1;
+	if (fputs("Authenticated.\n", stderr) == EOF)
+		goto done;
+	ret = dssh_session_start(sess);
+	if (ret != 0) {
+		fprintf(stderr, "session_start failed: %d\n", ret);
+		goto done;
 	}
-
-	/* Open channel */
-	struct dssh_chan_params cp;
-
+	ret = dssh_chan_params_init(&params, command != NULL ? DSSH_CHAN_EXEC : DSSH_CHAN_SHELL);
+	if (ret != 0)
+		goto done;
+	have_params = true;
 	if (command != NULL) {
-		fprintf(stderr, "Executing: %s\n", command);
-		dssh_chan_params_init(&cp, DSSH_CHAN_EXEC);
-		dssh_chan_params_set_command(&cp, command);
-		dssh_chan_params_set_pty(&cp, false);
+		ret = dssh_chan_params_set_command(&params, command);
+		if (ret == 0)
+			ret = dssh_chan_params_set_pty(&params, false);
 	}
 	else {
-		fprintf(stderr, "Opening shell...\n");
-		dssh_chan_params_init(&cp, DSSH_CHAN_SHELL);
-		dssh_chan_params_set_term(&cp, "xterm-256color");
-		dssh_chan_params_set_size(&cp, 80, 24, 0, 0);
+		ret = dssh_chan_params_set_term(&params, "xterm-256color");
+		if (ret == 0)
+			ret = dssh_chan_params_set_size(&params, 80, 24, 0, 0);
+	}
+	if (ret != 0) {
+		fprintf(stderr, "channel parameters failed: %d\n", ret);
+		goto done;
+	}
+	channel = dssh_chan_open(sess, &params);
+	dssh_chan_params_free(&params);
+	have_params = false;
+	if (channel == NULL) {
+		fputs("channel open failed\n", stderr);
+		goto done;
+	}
+	if (command != NULL) {
+		/* Exec mode has no stdin worker, so publish its empty input now. */
+		if (dssh_chan_shutwr(channel) != 0)
+			goto done;
+	}
+	else {
+		if (thrd_create(&writer, stdin_thread, channel) != thrd_success) {
+			fputs("stdin worker creation failed\n", stderr);
+			goto done;
+		}
+		have_writer = true;
 	}
 
-	dssh_channel ch = dssh_chan_open(sess, &cp);
-
-	dssh_chan_params_free(&cp);
-	if (ch == NULL) {
-		fprintf(stderr, "channel open failed\n");
-		return 1;
-	}
-
-	/* Interactive mode: spawn a stdin writer thread */
-	thrd_t writer;
-	bool   have_writer = false;
-
-	if (command == NULL) {
-		if (thrd_create(&writer, stdin_thread, ch) == thrd_success)
-			have_writer = true;
-	}
-
-	/* Read stdout/stderr/events via poll */
 	uint8_t buf[4096];
-	int     poll_events = DSSH_POLL_READ | DSSH_POLL_READEXT | DSSH_POLL_EVENT;
-
+	int requested = DSSH_POLL_READ | DSSH_POLL_READEXT | DSSH_POLL_EVENT;
+	bool closed = false;
 	for (;;) {
-		int ev = dssh_chan_poll(ch, poll_events, -1);
-
-		if (ev <= 0)
-			break;
-
-		if (ev & DSSH_POLL_EVENT) {
-			struct dssh_chan_event event;
-
-			if (dssh_chan_read_event(ch, &event) == 0) {
-				if (event.type == DSSH_EVENT_SIGNAL) {
-					fputs("[signal bytes:", stderr);
-					for (size_t i = 0; i < event.signal.name.len; i++) {
-						unsigned int byte = event.signal.name.data[i];
-						fprintf(stderr, " %02x", byte);
-					}
-					fputs("]\n", stderr);
-				}
+		if ((requested & (DSSH_POLL_READ | DSSH_POLL_READEXT)) == 0) {
+			if (closed) {
+				status = 0;
+				break;
 			}
+			if (dssh_session_is_terminated(sess))
+				goto done;
+		}
+		int events = dssh_chan_poll(channel, requested, 1000);
+		if (events < 0)
+			goto done;
+		if (events == 0) {
+			if (dssh_session_is_terminated(sess))
+				goto done;
 			continue;
 		}
-		if (ev & DSSH_POLL_READ) {
-			ssize_t n = dssh_chan_read(ch, 0, buf, sizeof(buf));
-
-			if (n <= 0)
-				break;
-			write(STDOUT_FILENO, buf, n);
+		if ((events & DSSH_POLL_EVENT) != 0) {
+			struct dssh_chan_event event;
+			if (dssh_chan_read_event(channel, &event) != 0)
+				goto done;
+			if (event.type == DSSH_EVENT_CLOSE)
+				closed = true;
+			if (event.type == DSSH_EVENT_SIGNAL) {
+				if (fputs("[signal bytes:", stderr) == EOF)
+					goto done;
+				for (size_t i = 0; i < event.signal.name.len; i++) {
+					unsigned int byte = event.signal.name.data[i];
+					if (fprintf(stderr, " %02x", byte) < 0)
+						goto done;
+				}
+				if (fputs("]\n", stderr) == EOF)
+					goto done;
+			}
 		}
-		if (ev & DSSH_POLL_READEXT) {
-			ssize_t n = dssh_chan_read(ch, 1, buf, sizeof(buf));
-
-			if (n > 0)
-				write(STDERR_FILENO, buf, n);
+		for (int stream = 0; stream < 2; stream++) {
+			int flag = stream == 0 ? DSSH_POLL_READ : DSSH_POLL_READEXT;
+			if ((events & flag) == 0)
+				continue;
+			int64_t n = dssh_chan_read(channel, stream, buf, sizeof(buf));
+			if (n < 0 || n > 4096)
+				goto done;
+			if (n == 0) {
+				requested &= ~flag;
+				continue;
+			}
+			size_t count = (size_t)n;
+			if (write_output(stream == 0 ? STDOUT_FILENO : STDERR_FILENO, buf, count) != 0)
+				goto done;
 		}
 	}
 
-	/* Clean up */
+done:
+	if (have_params)
+		dssh_chan_params_free(&params);
 	if (have_writer) {
-		dssh_session_terminate(sess);
-
-		int wr;
-
-		thrd_join(writer, &wr);
+		atomic_store_explicit(&input_stop, true, memory_order_release);
+		if (status != 0)
+			dssh_session_terminate(sess);
+		int result;
+		if (thrd_join(writer, &result) != thrd_success)
+			abort();
+		if (result != 0)
+			status = 1;
 	}
-	dssh_chan_close(ch, 0);
-	dssh_session_cleanup(sess);
-	close(sock);
-	return 0;
+	if (channel != NULL) {
+		int result = dssh_chan_close(channel, -1);
+		if (result != 0 && result != DSSH_ERROR_TERMINATED)
+			status = 1;
+	}
+	if (sess != NULL) {
+		dssh_session_cleanup(sess);
+		sess = NULL;
+	}
+	if (sock != -1) {
+		int descriptor = sock;
+		sock = -1;
+		if (close(descriptor) != 0) {
+			perror("close");
+			status = 1;
+		}
+	}
+	return status;
 }

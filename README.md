@@ -338,26 +338,52 @@ Client sessions **must** set a host key verification callback before
 server's host key information:
 
 ```c
+#include <string.h>
+#include "deucessh.h"
+#include "deucessh-crypto.h"
+
 static dssh_hostkey_decision
 my_hostkey_verify(const char *algo_name, unsigned int key_bits,
     const uint8_t *sha256_hash, const uint8_t *key_blob,
     size_t key_blob_len, void *cbdata)
 {
-    /* algo_name:    "ssh-ed25519", "rsa-sha2-256", etc. */
-    /* key_bits:     256 (Ed25519), 2048/4096 (RSA), etc. */
-    /* sha256_hash:  32-byte SHA-256 fingerprint of key_blob */
-    /* key_blob/len: raw SSH wire-format public key blob */
-
-    /* Example: reject weak RSA keys */
-    if (key_bits > 0 && key_bits < 2048)
+    const char *expected = (const char *)cbdata; /* trusted SHA256: fingerprint */
+    if (expected == NULL || strlen(expected) != 50 || algo_name == NULL
+        || sha256_hash == NULL || key_blob == NULL || key_blob_len == 0)
         return DSSH_HOSTKEY_REJECT;
 
-    /* ... compare sha256_hash against known_hosts ... */
+    /* Sizes are algorithm-specific: 256 for Ed25519, modulus bits for RSA. */
+    bool rsa = strcmp(algo_name, "rsa-sha2-256") == 0
+        || strcmp(algo_name, "rsa-sha2-512") == 0;
+    if (rsa && key_bits < 2048)
+        return DSSH_HOSTKEY_REJECT;
 
-    return DSSH_HOSTKEY_ACCEPT;
+    char encoded[45];
+    int written = dssh_base64_encode(sha256_hash, 32, encoded, sizeof(encoded));
+    if (written != 44 || encoded[43] != '=')
+        return DSSH_HOSTKEY_REJECT;
+    char fingerprint[51] = "SHA256:";
+    memcpy(&fingerprint[7], encoded, 43);
+    fingerprint[50] = 0;
+    return strcmp(expected, fingerprint) == 0
+        ? DSSH_HOSTKEY_ACCEPT : DSSH_HOSTKEY_REJECT;
 }
 
-dssh_session_set_hostkey_verify_cb(sess, my_hostkey_verify, NULL);
+/* expected_hostkey is a validated pin from trusted configuration.
+ * Keep its storage alive until session cleanup and check the setter result. */
+int ret = dssh_session_set_hostkey_verify_cb(sess, my_hostkey_verify, expected_hostkey);
+if (ret != 0) {
+    /* Handle setup failure before starting the handshake. */
+}
+```
+
+The callback checks the key again during rekey. The expected fingerprint is
+`SHA256:` followed by 43 unpadded base64 characters. Obtain it through trusted
+configuration before connecting. The POSIX client example takes it as its first
+argument:
+
+```sh
+client 'SHA256:<trusted fingerprint>' username password [host] [port] [command]
 ```
 
 If the callback is not set on a client session,

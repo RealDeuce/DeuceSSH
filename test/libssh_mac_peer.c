@@ -292,6 +292,8 @@ server_run(struct peer *peer, ssh_bind bind, int fd)
 			break;
 		}
 		ret = ssh_event_dopoll(event, 100);
+		if (ret == SSH_AGAIN)
+			ret = SSH_OK;
 	}
 	if (ret == SSH_OK && (!peer->signed_auth || peer->channel == NULL))
 		ret = SSH_ERROR;
@@ -316,6 +318,8 @@ server_run(struct peer *peer, ssh_bind bind, int fd)
 			break;
 		}
 		ret = ssh_event_dopoll(event, 100);
+		if (ret == SSH_AGAIN)
+			ret = SSH_OK;
 	}
 	if (added && ssh_event_remove_session(event, peer->session) != SSH_OK)
 		ret = SSH_ERROR;

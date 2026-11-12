@@ -2063,6 +2063,8 @@ send_packet(struct dssh_session_s *sess, const uint8_t *payload, size_t payload_
  * caller serializes the payload directly.  *max_len is the maximum
  * payload the caller may write.  Caller MUST call send_commit(),
  * send_commit_sensitive(), or send_cancel() to release the reservation.
+ * A sender publishing packet-dependent state may instead use send_commit_held()
+ * and finish with tx_unlock_with_result() after that publication.
  *
  * Returns NULL on error (timeout, terminate); *err_out is set.
  */
@@ -2105,9 +2107,9 @@ send_begin(struct dssh_session_s *sess, uint8_t msg_type, size_t *max_len, int *
 	return &sess->trans.tx_packet[9];
 }
 
-/* Finalize and send the payload already at tx_packet[9].  When
- * sensitive is true, scrub the payload before invoking a termination
- * callback or releasing packet-engine ownership. */
+/* Finalize and send the payload already at tx_packet[9], retaining the
+ * packet engine for caller state publication. When sensitive is true, scrub
+ * the payload before invoking a termination callback. */
 static int
 send_commit_inner(struct dssh_session_s *sess, size_t payload_len, uint32_t *seq_out,
     bool sensitive, bool required)
@@ -2141,7 +2143,15 @@ done:
 	}
 	if (ret < 0 && (required || (ret != DSSH_ERROR_TOOLONG && ret != DSSH_ERROR_REKEY_NEEDED)))
 		session_set_terminate(sess);
-	return tx_unlock_with_result(sess, ret);
+	return ret;
+}
+
+/* Retain the engine until the caller has published its packet-dependent
+ * state. The caller must finish with tx_unlock_with_result(). */
+DSSH_PRIVATE int
+send_commit_held(struct dssh_session_s *sess, size_t payload_len)
+{
+	return send_commit_inner(sess, payload_len, NULL, false, false);
 }
 
 /*
@@ -2151,7 +2161,8 @@ done:
 DSSH_PRIVATE int
 send_commit(struct dssh_session_s *sess, size_t payload_len, uint32_t *seq_out)
 {
-	return send_commit_inner(sess, payload_len, seq_out, false, false);
+	int ret = send_commit_inner(sess, payload_len, seq_out, false, false);
+	return tx_unlock_with_result(sess, ret);
 }
 
 /* A protocol ownership transition already orders this packet ahead of later
@@ -2159,7 +2170,8 @@ send_commit(struct dssh_session_s *sess, size_t payload_len, uint32_t *seq_out)
 DSSH_PRIVATE int
 send_commit_required(struct dssh_session_s *sess, size_t payload_len)
 {
-	return send_commit_inner(sess, payload_len, NULL, false, true);
+	int ret = send_commit_inner(sess, payload_len, NULL, false, true);
+	return tx_unlock_with_result(sess, ret);
 }
 
 /*
@@ -2169,7 +2181,8 @@ send_commit_required(struct dssh_session_s *sess, size_t payload_len)
 DSSH_PRIVATE int
 send_commit_sensitive(struct dssh_session_s *sess, size_t payload_len, uint32_t *seq_out)
 {
-	return send_commit_inner(sess, payload_len, seq_out, true, false);
+	int ret = send_commit_inner(sess, payload_len, seq_out, true, false);
+	return tx_unlock_with_result(sess, ret);
 }
 
 /*

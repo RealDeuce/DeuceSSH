@@ -285,6 +285,8 @@ DSSH_PRIVATE int      send_packet(struct dssh_session_s *sess, const uint8_t *pa
 	 uint32_t *seq_out);
 DSSH_PRIVATE uint8_t *send_begin(struct dssh_session_s *sess, uint8_t msg_type, size_t *max_len, int *err_out);
 DSSH_PRIVATE int      send_commit(struct dssh_session_s *sess, size_t payload_len, uint32_t *seq_out);
+/* Retains packet ownership; finish with tx_unlock_with_result after publication. */
+DSSH_PRIVATE int      send_commit_held(struct dssh_session_s *sess, size_t payload_len);
 DSSH_PRIVATE int      send_commit_required(struct dssh_session_s *sess, size_t payload_len);
 DSSH_PRIVATE int      send_commit_sensitive(struct dssh_session_s *sess, size_t payload_len, uint32_t *seq_out);
 DSSH_PRIVATE void     send_cancel(struct dssh_session_s *sess);

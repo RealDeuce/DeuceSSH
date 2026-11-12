@@ -1516,14 +1516,20 @@ send_eof(struct dssh_session_s *sess, struct dssh_channel_s *ch)
 		send_cancel(sess);
 		return 0;
 	}
-	ch->eof_sent = true;
 	uint32_t remote = ch->remote_id;
 	dssh_mtx_unlock(&ch->buf_mtx);
 
 	size_t pos = 0;
 	packet[pos++] = SSH_MSG_CHANNEL_EOF;
 	DSSH_PUT_U32(remote, packet, &pos);
-	return send_commit(sess, pos, NULL);
+	ret = send_commit_held(sess, pos);
+	if (ret == 0) {
+		if (dssh_thrd_check(sess, mtx_lock(&ch->buf_mtx)) != thrd_success)
+			return tx_unlock_with_result(sess, DSSH_ERROR_TERMINATED);
+		ch->eof_sent = true;
+		dssh_mtx_unlock(&ch->buf_mtx);
+	}
+	return tx_unlock_with_result(sess, ret);
 }
 
 DSSH_TESTABLE int

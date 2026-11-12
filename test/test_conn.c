@@ -8350,6 +8350,7 @@ test_compression_window_rekey(void)
 #include "channel_id_cases.h"
 #include "peer_channel_id_cases.h"
 #include "post_close_cases.h"
+#include "half_close_cases.h"
 #include "setup_mailbox_cases.h"
 #include "accept_failure_cases.h"
 #include "request_framing_cases.h"
@@ -8363,6 +8364,10 @@ test_compression_window_rekey(void)
 #include "event_overflow_cases.h"
 
 static struct dssh_test_entry tests[] = {
+	{ "release/half_close_retry", test_half_close_retry },
+	{ "release/half_close_concurrent", test_half_close_concurrent },
+	{ "release/half_close_failure", test_half_close_failure },
+	{ "release/half_close_publication", test_half_close_publication },
 	{ "release/tx_slot_admission", test_tx_slot_admission },
 	{ "release/tx_slot_resize", test_tx_slot_resize },
 	{ "release/tx_slot_refusal", test_tx_slot_refusal },

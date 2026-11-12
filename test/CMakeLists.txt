@@ -1295,6 +1295,24 @@ foreach(part IN ITEMS queued popped confirmed late_confirmation concurrent_accep
 	set_tests_properties(dssh_conn_peer_id_${part} PROPERTIES TIMEOUT 120
 		ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys)
 endforeach()
+foreach(part IN ITEMS retry concurrent failure publication)
+	dssh_add_output_test(dssh_conn_half_close_${part} dssh_test_conn
+		"1 tests: 1 passed, 0 failed, 0 skipped" --exact release/half_close_${part})
+	set_tests_properties(dssh_conn_half_close_${part} PROPERTIES TIMEOUT 120
+		ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys)
+	foreach(profile IN ITEMS dh-gex group14 group16 sntrup mlkem growth rsa rsa512)
+		set(extra "DSSH_TEST_KEX=${profile}")
+		if(profile STREQUAL "growth")
+			set(extra "DSSH_TEST_COMPRESSION=test-growth")
+		elseif(profile MATCHES "^rsa")
+			set(extra "DSSH_TEST_KEY=${profile}")
+		endif()
+		dssh_add_output_test(dssh_conn_half_close_${part}_${profile} dssh_test_conn
+			"1 tests: 1 passed, 0 failed, 0 skipped" --exact release/half_close_${part})
+		set_tests_properties(dssh_conn_half_close_${part}_${profile} PROPERTIES TIMEOUT 120
+			ENVIRONMENT "${DSSH_TEST_KEY_ENV};${extra}" FIXTURES_REQUIRED dssh_cached_keys)
+	endforeach()
+endforeach()
 foreach(part IN ITEMS direct queued buffered)
 	dssh_add_output_test(dssh_conn_post_close_${part} dssh_test_conn
 		"1 tests: 1 passed, 0 failed, 0 skipped" --exact release/post_close_${part})

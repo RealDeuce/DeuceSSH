@@ -12613,8 +12613,10 @@ test_auth_request_capacity(void)
 #include "signature_auth_result_cases.h"
 
 #include "lifecycle_phase_cases.h"
+#include "kbi_prompt_count_cases.h"
 
 static struct dssh_test_entry tests[] = {
+	{ "auth/kbi/prompt_counts", test_kbi_prompt_counts },
 	{ "lifecycle/preflight", test_lifecycle_preflight },
 	{ "lifecycle/progression", test_lifecycle_progression },
 	{ "lifecycle/handshake_failure", test_lifecycle_handshake_failure },

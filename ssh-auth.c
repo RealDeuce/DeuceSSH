@@ -1603,11 +1603,13 @@ auth_kbi_run(struct dssh_session_s *sess, const char *username, dssh_auth_kbi_pr
 
 			rpos += 4;
 
-			if (num_prompts > 256 || num_prompts > (payload_len - rpos) / 6)
+			if (num_prompts > (payload_len - rpos) / 6)
 				return DSSH_ERROR_PARSE;
 
 			struct dssh_auth_responses responses = {0};
-			size_t prompt_count = (size_t)num_prompts; /* bounded by 256 */
+			/* The complete minimum prompt encoding bounds the count by
+			 * SIZE_MAX / 6 before narrowing or allocating callback views. */
+			size_t prompt_count = (size_t)num_prompts;
 			res = auth_kbi_views_reserve(views, prompt_count, true);
 			if (res < 0)
 				return res;

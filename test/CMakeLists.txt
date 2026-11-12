@@ -21,6 +21,17 @@ add_test(NAME dssh_c_standard COMMAND "${CMAKE_COMMAND}"
 	"-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/c-standard-tests"
 	-P "${CMAKE_CURRENT_SOURCE_DIR}/c_standard.cmake")
 
+if(UNIX)
+	add_executable(dssh_test_timespec_shim test_timespec.c)
+	set_property(TARGET dssh_test_timespec_shim PROPERTY C_STANDARD ${DEUCESSH_C_STANDARD})
+	set_property(TARGET dssh_test_timespec_shim PROPERTY C_STANDARD_REQUIRED ON)
+	target_compile_definitions(dssh_test_timespec_shim PRIVATE
+		_POSIX_C_SOURCE=200809L DSSH_TIMESPEC_GET_SHIM)
+	target_compile_options(dssh_test_timespec_shim PRIVATE ${DEUCESSH_COMPILE_OPTIONS})
+	dssh_add_output_test(dssh_timespec_shim dssh_test_timespec_shim
+		"timespec_shim cases=6 calls=4 valid=1")
+endif()
+
 # Cached key files for test runs — avoids repeated RSA keygen.
 # These are stored in the build directory and reused across runs.
 set(DSSH_TEST_KEY_ENV
@@ -1100,6 +1111,10 @@ foreach(part IN ITEMS expansion context_replacement auth_cleanup sensitive_failu
 endforeach()
 
 dssh_add_test(auth test_auth.c)
+dssh_add_output_test(dssh_kbi_prompt_counts dssh_test_auth
+	"1 tests: 1 passed, 0 failed, 0 skipped" --exact auth/kbi/prompt_counts)
+set_tests_properties(dssh_kbi_prompt_counts PROPERTIES
+	TIMEOUT 120 ENVIRONMENT "${DSSH_TEST_KEY_ENV}")
 foreach(part IN ITEMS preflight progression handshake_failure)
 	dssh_add_output_test(dssh_lifecycle_${part} dssh_test_auth
 		"1 tests: 1 passed, 0 failed, 0 skipped" --exact lifecycle/${part})
@@ -1125,6 +1140,7 @@ add_test(NAME dssh_auth_request_capacity
 target_link_libraries(dssh_test_auth PRIVATE dssh_mock_io dssh_mock_comp)
 target_sources(dssh_test_auth PRIVATE password_result_provider.c kbi_result_provider.c signature_result_provider.c)
 set(AUTH_TESTS
+	auth/kbi/prompt_counts
 	callbacks/banner_transaction callbacks/output_pairs callbacks/password_lifetime callbacks/password_result callbacks/signature_result callbacks/kbi_client_result callbacks/kbi_server_result
 	callbacks/kbi_lifetime callbacks/client_cleanup callbacks/results callbacks/reply_failures
 	framing/client_results framing/client_text framing/client_kbi framing/server_requests

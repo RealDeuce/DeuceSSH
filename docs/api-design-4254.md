@@ -84,6 +84,15 @@ Shell channels use `DSSH_CHAN_SHELL`; configure PTY, terminal size/modes and
 environment through the builder before open. Subsystems use
 `DSSH_CHAN_SUBSYSTEM` and `dssh_chan_params_set_subsystem()`.
 
+Terminal modes use `dssh_chan_params_set_mode()` with nonzero byte opcodes.
+The encoder supplies TTY_OP_END itself and puts future opcodes after known
+ones. Repeated setters update the existing entry without allocating storage.
+For RFC 8160 IUTF8, use opcode 42 with value 0 or 1 when the application knows
+its terminal state. The generic builder preserves raw uint32 values; device
+policy, terminal configuration and ignoring unsupported modes belong to the
+application. PTY callbacks/getters expose the accepted values; channel bytes
+remain binary data regardless of those values.
+
 ## Stream I/O and events
 
 Use `dssh_chan_poll()` for readiness and `dssh_chan_read()` /

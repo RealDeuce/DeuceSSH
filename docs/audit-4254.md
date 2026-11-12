@@ -394,9 +394,12 @@ tcpip-forward.
 
 ## Section 8: Encoding of Terminal Modes
 
-**N/A** — Terminal mode encoding/decoding is an application-level
-concern.  The library could provide helpers but this is not a protocol
-conformance issue.
+The historical N/A classification is withdrawn: the current library encodes
+and parses terminal modes through its parameter builder and PTY requests.
+Application-selected terminal values and device configuration remain application
+responsibilities. See the [current section 8 trace](release-1.0-evidence/rfc4254-ledger.md)
+and [terminal-mode review](release-1.0-evidence/terminal-mode-review.md); the
+historical totals below are not release acceptance.
 
 ---
 

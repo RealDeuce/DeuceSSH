@@ -1463,8 +1463,30 @@ Environment requests use `want_reply=false`. Channel opening does not wait for
 environment acknowledgments or report whether the peer accepted a variable;
 local allocation and send errors still fail the open.
 
-`set_mode()` accumulates opcode/value pairs.  Encoding at open time
-emits opcodes 1–159 first, then 160+, then TTY_OP_END (RFC 4254 s8).
+`set_mode()` accumulates opcode/value pairs; replacing an existing opcode
+reuses its storage. Opcode zero is TTY_OP_END, supplied by the encoder rather
+than stored as a mode/value pair. Invalid mode metadata is rejected before
+channel allocation or publication. Encoding emits opcodes 1–159 first, then
+160–255, then TTY_OP_END (RFC 4254 s8). A receiver stops at END or a future
+opcode (160–255); bytes after that stopping point are uninterpreted.
+
+RFC 8160 assigns opcode 42 to IUTF8: value 0 disables it and value 1 enables
+it. An application that knows its terminal's state should supply it before
+opening a PTY. For example:
+
+```c
+int configure_terminal_utf8(struct dssh_chan_params *params, bool enabled)
+{
+    return dssh_chan_params_set_mode(params, 42, enabled ? 1 : 0);
+}
+```
+
+Check that return value before opening the channel. The generic mode builder
+preserves uint32 values; it does not enforce device-specific mode policy.
+The library does not inspect or configure a local terminal, choose IUTF8 by
+default, or decode channel bytes as text. A server may ignore unsupported modes;
+its application interprets the accepted PTY parameters. The client example
+leaves terminal modes unspecified because it does not query terminal state.
 
 ## Channel Lifecycle
 
@@ -2272,4 +2294,6 @@ sources with Go 1.26. Pass the resulting executable as
 `dssh_break_independent_*` CTests. Library builds and the C test suites require
 no Go installation. These checks verify handler-derived acknowledgements,
 pinned host authentication, transfer, exit status and rekey against the foreign
-implementation; they do not operate a physical serial device.
+implementation; they do not operate a physical serial device. The optional
+`dssh_terminal_mode_independent_*` checks additionally verify absent, disabled
+and enabled IUTF8 through PTY callbacks and retained getters.

@@ -135,6 +135,22 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	terminalMode := os.Getenv("DSSH_TEST_TERMINAL_MODE")
+	if terminalMode != "" {
+		modes := ssh.TerminalModes{ssh.ECHO: 0}
+		switch terminalMode {
+		case "none":
+		case "0":
+			modes[42] = 0
+		case "1":
+			modes[42] = 1
+		default:
+			return fmt.Errorf("invalid terminal-mode fixture")
+		}
+		if err = session.RequestPty("dssh_iutf8", 29, 87, modes); err != nil {
+			return err
+		}
+	}
 	if err = session.Start("dssh-interop"); err != nil {
 		return err
 	}
@@ -178,7 +194,7 @@ func run() error {
 		return fmt.Errorf("transfer/stderr/rekey verification failed")
 	}
 	return json.NewEncoder(os.Stdout).Encode(map[string]interface{}{
-		"implementation": "golang.org/x/crypto/ssh", "cases": results, "stdout_bytes": output.position,
+		"implementation": "golang.org/x/crypto/ssh", "cases": results, "terminal_mode": terminalMode, "stdout_bytes": output.position,
 		"remote_exit_status": exit.ExitStatus(), "host_checks": hostChecks.Load(), "valid": true,
 	})
 }

@@ -1295,7 +1295,7 @@ foreach(part IN ITEMS queued popped confirmed late_confirmation concurrent_accep
 	set_tests_properties(dssh_conn_peer_id_${part} PROPERTIES TIMEOUT 120
 		ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys)
 endforeach()
-foreach(part IN ITEMS break_handler_outcomes break_handler_lifetime break_handler_failures
+foreach(part IN ITEMS terminal_mode_validation terminal_mode_roundtrip terminal_mode_wire break_handler_outcomes break_handler_lifetime break_handler_failures
     break_handler_positions break_handler_queue break_handler_setup)
 	foreach(profile IN ITEMS default dh-gex group14 group16 sntrup mlkem rsa rsa512 growth)
 		set(extra "")
@@ -2005,5 +2005,16 @@ if(DEUCESSH_BREAK_SSH_PEER AND Python3_Interpreter_FOUND
 		set_tests_properties(${name} PROPERTIES TIMEOUT 90 LABELS "interop;break"
 			PASS_REGULAR_EXPRESSION "independent_break status=PASSED cases=14"
 			FAIL_REGULAR_EXPRESSION "independent_break status=FAILED;AddressSanitizer;ThreadSanitizer;runtime error:")
+		foreach(mode IN ITEMS none 0 1)
+			set(mode_name dssh_terminal_mode_independent_${form}_${mode})
+			add_test(NAME ${mode_name} COMMAND ${Python3_EXECUTABLE}
+				${CMAKE_CURRENT_SOURCE_DIR}/break_ssh_interop.py
+				--peer $<TARGET_FILE:dssh_openssh_${form}>
+				--foreign "${DEUCESSH_BREAK_SSH_PEER}" --terminal-mode ${mode}
+				--evidence ${CMAKE_CURRENT_BINARY_DIR}/break-evidence/${mode_name})
+			set_tests_properties(${mode_name} PROPERTIES TIMEOUT 90 LABELS "interop;terminal-modes"
+				PASS_REGULAR_EXPRESSION "independent_break status=PASSED cases=14"
+				FAIL_REGULAR_EXPRESSION "independent_break status=FAILED;AddressSanitizer;ThreadSanitizer;runtime error:")
+		endforeach()
 	endforeach()
 endif()

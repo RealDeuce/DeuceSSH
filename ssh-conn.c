@@ -714,13 +714,19 @@ dssh_chan_params_set_size(struct dssh_chan_params *p, uint32_t cols, uint32_t ro
 static int
 params_set_mode(struct dssh_chan_params *p, uint8_t opcode, uint32_t value)
 {
-	if (p->mode_count > p->mode_capacity || (p->mode_capacity != 0 && p->modes == NULL))
+	if (opcode == 0 || p->mode_count > p->mode_capacity
+	    || (p->mode_capacity != 0 && p->modes == NULL))
 		return DSSH_ERROR_INVALID;
+	size_t match = p->mode_count;
 	for (size_t i = 0; i < p->mode_count; i++) {
-		if (p->modes[i].opcode == opcode) {
-			p->modes[i].value = value;
-			return 0;
-		}
+		if (p->modes[i].opcode == 0)
+			return DSSH_ERROR_INVALID;
+		if (p->modes[i].opcode == opcode && match == p->mode_count)
+			match = i;
+	}
+	if (match < p->mode_count) {
+		p->modes[match].value = value;
+		return 0;
 	}
 	if (p->mode_count >= p->mode_capacity) {
 		if (p->mode_capacity > SIZE_MAX / 2)
@@ -860,6 +866,10 @@ params_validate(const struct dssh_chan_params *p)
 		if (p->env[i].name == NULL || p->env[i].value == NULL)
 			return DSSH_ERROR_INVALID;
 	}
+	for (size_t i = 0; i < p->mode_count; i++) {
+		if (p->modes[i].opcode == 0)
+			return DSSH_ERROR_INVALID;
+	}
 	return 0;
 }
 
@@ -987,12 +997,17 @@ parse_pty_req_data(const uint8_t *data, size_t data_len, struct pty_req *pty)
 		return DSSH_ERROR_PARSE;
 	tlen = DSSH_GET_U32(&data[pos]);
 	pos += 4;
-	if (!dssh_buffer_has(data_len, pos, tlen)
-	    || !dssh_buffer_has(data_len, pos + tlen, 16))
+#if SIZE_MAX < UINT32_MAX
+	if (tlen > SIZE_MAX)
+		return DSSH_ERROR_PARSE;
+#endif
+	size_t term_len = (size_t)tlen;
+	if (!dssh_buffer_has(data_len, pos, term_len)
+	    || !dssh_buffer_has(data_len, pos + term_len, 16))
 		return DSSH_ERROR_PARSE;
 	pty->term = (const char *)&data[pos];
-	pty->term_len = tlen;
-	pos += tlen;
+	pty->term_len = term_len;
+	pos += term_len;
 	pty->cols = DSSH_GET_U32(&data[pos]);
 	pty->rows = DSSH_GET_U32(&data[pos + 4]);
 	pty->wpx  = DSSH_GET_U32(&data[pos + 8]);

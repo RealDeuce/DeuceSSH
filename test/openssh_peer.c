@@ -167,6 +167,45 @@ accept_command(dssh_channel channel, const struct dssh_chan_params *params,
 	return params->command != NULL && strcmp(params->command, "dssh-interop") == 0 ? 0 : -1;
 }
 
+struct terminal_mode_observation {
+	const char *state;
+	unsigned callbacks;
+	bool valid;
+};
+
+static bool
+check_terminal_modes(const struct dssh_chan_params *params, const char *state)
+{
+	if (params == NULL || params->term == NULL || strcmp(params->term, "dssh_iutf8") != 0
+	    || params->cols != 87 || params->rows != 29 || params->wpx != 696 || params->hpx != 232)
+		return false;
+	bool absent = strcmp(state, "none") == 0;
+	if (params->mode_count != (absent ? 1U : 2U) || params->modes == NULL)
+		return false;
+	bool echo = false, utf8 = false;
+	for (size_t i = 0; i < params->mode_count; i++) {
+		if (params->modes[i].opcode == 53 && params->modes[i].value == 0 && !echo)
+			echo = true;
+		else if (params->modes[i].opcode == 42 && !absent && !utf8
+		    && params->modes[i].value == (strcmp(state, "1") == 0 ? 1U : 0U))
+			utf8 = true;
+		else
+			return false;
+	}
+	return echo && (absent || utf8);
+}
+
+static int
+observe_terminal_modes(dssh_channel channel, const struct dssh_chan_params *params, void *opaque)
+{
+	struct terminal_mode_observation *observation = opaque;
+	observation->callbacks++;
+	observation->valid = observation->valid && observation->callbacks == 1
+	    && dssh_chan_get_pty(channel) == params && dssh_chan_has_pty(channel)
+	    && check_terminal_modes(params, observation->state);
+	return observation->valid ? 0 : DSSH_ERROR_REJECTED;
+}
+
 static int
 write_all(dssh_channel channel, int stream, const uint8_t *data, size_t length)
 {
@@ -237,11 +276,28 @@ receive_pattern(dssh_channel channel)
 static int
 server_channel(dssh_session session, bool *acknowledged, bool bidirectional)
 {
-	struct dssh_chan_accept_cbs callbacks = { .exec = accept_command };
+	struct terminal_mode_observation modes = {.state = getenv("DSSH_TEST_TERMINAL_MODE"), .valid = true};
+	struct dssh_chan_accept_cbs callbacks = {.exec = accept_command};
+	if (modes.state != NULL) {
+		if (strcmp(modes.state, "none") != 0 && strcmp(modes.state, "0") != 0 && strcmp(modes.state, "1") != 0)
+			return DSSH_ERROR_INVALID;
+		callbacks.pty_req = observe_terminal_modes;
+		callbacks.cbdata = &modes;
+	}
 	dssh_channel channel = dssh_chan_accept(session, &callbacks, 10000);
 	if (channel == NULL)
 		return DSSH_ERROR_INIT;
-	int ret = bidirectional ? receive_pattern(channel) : 0;
+	int ret = 0;
+	if (modes.state != NULL) {
+		bool valid = modes.valid && modes.callbacks == 1 && check_terminal_modes(dssh_chan_get_pty(channel), modes.state);
+		if (fprintf(stderr, "DeuceSSH terminal mode: state=%s callback=%u retained=%u valid=%u\n",
+		    modes.state, modes.callbacks, valid ? 1U : 0U, valid ? 1U : 0U) < 0)
+			ret = DSSH_ERROR_INIT;
+		else if (!valid)
+			ret = DSSH_ERROR_INVALID;
+	}
+	if (ret == 0 && bidirectional)
+		ret = receive_pattern(channel);
 	if (ret == 0)
 		ret = send_pattern(channel);
 	/* OpenSSH sends this application acknowledgement only after its reader has

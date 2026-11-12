@@ -8368,8 +8368,12 @@ test_compression_window_rekey(void)
 #include "channel_control_cases.h"
 #include "incoming_control_cases.h"
 #include "break_handler_cases.h"
+#include "terminal_mode_cases.h"
 
 static struct dssh_test_entry tests[] = {
+	{ "release/terminal_mode_validation", test_terminal_mode_validation },
+	{ "release/terminal_mode_roundtrip", test_terminal_mode_roundtrip },
+	{ "release/terminal_mode_wire", test_terminal_mode_wire },
 	{ "release/break_handler_outcomes", test_break_handler_outcomes },
 	{ "release/break_handler_lifetime", test_break_handler_lifetime },
 	{ "release/break_handler_failures", test_break_handler_failures },

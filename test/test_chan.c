@@ -1552,6 +1552,20 @@ test_accept_pty_validation(void)
 		size_t len = 25 + n;
 		ASSERT_EQ(accept_parse_pty(packet, len, &p), DSSH_ERROR_PARSE);
 	}
+	static const uint32_t large_terms[] = {UINT32_C(65536), UINT32_C(65537), UINT32_MAX};
+	for (size_t i = 0; i < sizeof(large_terms) / sizeof(large_terms[0]); i++) {
+		memcpy(packet, valid, sizeof(valid));
+		size_t offset = 0;
+		DSSH_PUT_U32(large_terms[i], packet, &offset);
+		dssh_test_alloc_fail_after(0);
+		int result = accept_parse_pty(packet, sizeof(valid), &p);
+		int attempts = dssh_test_alloc_count();
+		dssh_test_alloc_reset();
+		ASSERT_EQ(result, DSSH_ERROR_PARSE);
+		ASSERT_EQ(attempts, 0);
+		ASSERT_STR_EQ(p.term, "dumb");
+		ASSERT_EQ_U(p.mode_count, 1);
+	}
 	for (int n = 0; n < 2; n++) {
 		dssh_test_alloc_fail_after(n);
 		int ret = accept_parse_pty(valid, sizeof(valid), &p);
@@ -1632,6 +1646,36 @@ static int test_params_mode_dedup(void)
 	ASSERT_EQ_U(p.modes[1].value, 200);
 
 	dssh_chan_params_free(&p);
+	return TEST_PASS;
+}
+
+static int
+test_params_mode_domain(void)
+{
+	struct dssh_chan_params params;
+	ASSERT_OK(dssh_chan_params_init(&params, DSSH_CHAN_SHELL));
+	for (uint16_t code = 1; code <= UINT8_MAX; code++) {
+		uint8_t opcode = (uint8_t)code;
+		ASSERT_OK(dssh_chan_params_set_mode(&params, opcode, UINT32_MAX));
+	}
+	ASSERT_EQ_U(params.mode_count, UINT8_MAX);
+	struct dssh_chan_mode_entry *storage = params.modes;
+	size_t capacity = params.mode_capacity;
+	dssh_test_alloc_fail_after(0);
+	bool valid = true;
+	for (uint16_t code = 1; code <= UINT8_MAX; code++) {
+		uint8_t opcode = (uint8_t)code;
+		int result = dssh_chan_params_set_mode(&params, opcode, code);
+		valid = result == 0 && params.modes[code - 1].opcode == opcode
+		    && params.modes[code - 1].value == code && valid;
+	}
+	int result = dssh_chan_params_set_mode(&params, 0, UINT32_MAX);
+	valid = valid && result == DSSH_ERROR_INVALID && dssh_test_alloc_count() == 0
+	    && params.modes == storage && params.mode_capacity == capacity && params.mode_count == UINT8_MAX;
+	dssh_test_alloc_reset();
+	dssh_chan_params_free(&params);
+	ASSERT_TRUE(valid);
+	printf("terminal_mode_domain opcodes=255 updates=255 allocations=0 valid=1\n");
 	return TEST_PASS;
 }
 
@@ -1887,6 +1931,7 @@ static struct dssh_test_entry tests[] = {
 	{ "accept_string_validation",       test_accept_string_validation },
 	{ "accept_pty_validation",          test_accept_pty_validation },
 	{ "params_set_mode",                test_params_set_mode },
+	{ "params_mode_domain",             test_params_mode_domain },
 	{ "params_mode_dedup",              test_params_mode_dedup },
 	{ "params_free_null",               test_params_free_null },
 	{ "params_init_null",               test_params_init_null },

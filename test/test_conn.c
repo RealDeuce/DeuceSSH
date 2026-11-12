@@ -8363,8 +8363,13 @@ test_compression_window_rekey(void)
 #include "channel_params_cases.h"
 #include "event_overflow_cases.h"
 #include "close_outcome_cases.h"
+#include "channel_control_cases.h"
 
 static struct dssh_test_entry tests[] = {
+	{ "release/control_wire", test_channel_control_wire },
+	{ "release/control_after_eof", test_channel_control_after_eof },
+	{ "release/control_refusal", test_channel_control_refusal },
+	{ "release/control_failure", test_channel_control_failure },
 	{ "release/half_close_retry", test_half_close_retry },
 	{ "release/half_close_concurrent", test_half_close_concurrent },
 	{ "release/half_close_failure", test_half_close_failure },

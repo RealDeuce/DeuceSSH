@@ -28,6 +28,7 @@
 #include "server-io.h"
 #include "server-output.h"
 #include "server-shell.h"
+#include "server-port.h"
 
 static int          conn_fd = -1;
 static dssh_session sess;
@@ -1128,32 +1129,47 @@ connection_done:
 /* ================================================================
  * Main
  * ================================================================ */
+static volatile sig_atomic_t reap_failed;
+
 static void
 sigchld_handler(int sig)
 {
 	(void)sig;
 	int saved_errno = errno;
-	while (waitpid(-1, NULL, WNOHANG) > 0)
-		;
+	for (;;) {
+		pid_t child = waitpid(-1, NULL, WNOHANG);
+		if (child > 0)
+			continue;
+		if (child < 0 && errno == EINTR)
+			continue;
+		if (child < 0 && errno != ECHILD)
+			reap_failed = 1;
+		break;
+	}
 	errno = saved_errno;
 }
 
 int
 main(int argc, char **argv)
 {
-	/* Socket write failures are reported through the callbacks. */
-	if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
-		perror("signal");
+	int status = 1;
+	int listen_fd = -1;
+	uint16_t port = 2222;
+	reap_failed = 0;
+	atomic_store(&diagnostic_failed, false);
+	if (argc > 2 || (argc == 2 && !example_parse_port(argv[1], &port))) {
+		(void)log_message("expected zero or one decimal port argument (0..65535)\n");
 		return 1;
 	}
-	int port = 2222;
-
-	if (argc > 1)
-		port = atoi(argv[1]);
-
+	/* Socket write failures are reported through the callbacks. */
+	if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
+		(void)log_message("SIGPIPE setup failed\n");
+		return 1;
+	}
 	/* Set version */
-	dssh_transport_set_version("Mozilla/5.0",
-	    "(Windows NT 12.0; Win32; x32) AppleWebKit/540.70 (KHTML, like Gecko) Chrome/153.0.6626.357 Safari/540.70");
+	if (dssh_transport_set_version("Mozilla/5.0",
+	    "(Windows NT 12.0; Win32; x32) AppleWebKit/540.70 (KHTML, like Gecko) Chrome/153.0.6626.357 Safari/540.70") != 0)
+		return 1;
 
 	/* Register algorithms */
 	if (dssh_transport_set_callbacks(tx, rx, rxline, NULL) != 0)
@@ -1184,27 +1200,36 @@ main(int argc, char **argv)
 	/* Generate host keys once (shared across all forks) */
 	int res = dssh_ed25519_generate_key();
 
-	if (res < 0) {
-		fprintf(stderr, "ed25519 key gen failed: %d\n", res);
+	if (res != 0) {
+		(void)log_message("ed25519 key gen failed: %d\n", res);
 		return 1;
 	}
 	res = dssh_rsa_sha2_256_generate_key(4096);
-	if (res < 0) {
-		fprintf(stderr, "rsa key gen failed: %d\n", res);
+	if (res != 0) {
+		(void)log_message("rsa key gen failed: %d\n", res);
 		return 1;
 	}
 
 	/* Listen */
-	int listen_fd = socket(PF_INET, SOCK_STREAM, 0);
+	listen_fd = socket(PF_INET, SOCK_STREAM, 0);
 
 	if (listen_fd == -1) {
-		perror("socket");
+		(void)log_message("socket creation failed\n");
 		return 1;
 	}
 
+	/* Bound observation of a reaper error even between its flag check and wait. */
+	int flags = fcntl(listen_fd, F_GETFL);
+	if (flags < 0 || fcntl(listen_fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+		(void)log_message("listener configuration failed\n");
+		goto listener_done;
+	}
 	int opt = 1;
 
-	setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+	if (setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) != 0) {
+		(void)log_message("socket option failed\n");
+		goto listener_done;
+	}
 
 	struct sockaddr_in sa = {
 	    .sin_family = AF_INET,
@@ -1213,44 +1238,92 @@ main(int argc, char **argv)
 	};
 
 	if (bind(listen_fd, (struct sockaddr *)&sa, sizeof(sa)) == -1) {
-		perror("bind");
-		return 1;
+		(void)log_message("bind failed\n");
+		goto listener_done;
 	}
 	if (listen(listen_fd, 5) == -1) {
-		perror("listen");
-		return 1;
+		(void)log_message("listen failed\n");
+		goto listener_done;
 	}
 
-	signal(SIGCHLD, sigchld_handler);
-	fprintf(stderr, "Listening on port %d...\n", port);
+	/* Interrupt accept so a reaper failure reaches the ordinary owner path. */
+	struct sigaction action = { .sa_handler = sigchld_handler };
+	if (sigemptyset(&action.sa_mask) != 0 || sigaction(SIGCHLD, &action, NULL) != 0) {
+		(void)log_message("SIGCHLD setup failed\n");
+		goto listener_done;
+	}
+	unsigned displayed_port = port;
+	if (!log_message("Listening on port %u...\n", displayed_port))
+		goto listener_done;
 
-	/* Accept loop */
+	/* Accept loop: this process owns both descriptors until a successful fork. */
 	for (;;) {
-		conn_fd = accept(listen_fd, NULL, NULL);
-		if (conn_fd == -1) {
-			if (errno == EINTR)
-				continue;
-			perror("accept");
+		if (reap_failed) {
+			(void)log_message("child reaping failed\n");
 			break;
 		}
-		fprintf(stderr, "Connection accepted.\n");
-
-		pid_t pid = fork();
-
-		if (pid < 0) {
-			perror("fork");
-			close(conn_fd);
-			continue;
+		struct pollfd incoming = { .fd = listen_fd, .events = POLLIN };
+		int ready = poll(&incoming, 1, 1000);
+		if (ready < 0) {
+			if (errno == EINTR)
+				continue;
+			(void)log_message("listener wait failed\n");
+			break;
 		}
+		if (ready == 0)
+			continue;
+		if (ready != 1 || (incoming.revents & (POLLNVAL | POLLERR | POLLHUP)) != 0) {
+			(void)log_message("listener readiness failed\n");
+			break;
+		}
+		if ((incoming.revents & POLLIN) == 0)
+			continue;
+		conn_fd = accept(listen_fd, NULL, NULL);
+		if (conn_fd == -1) {
+			if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+				continue;
+			(void)log_message("accept failed\n");
+			break;
+		}
+		if (reap_failed || !log_message("Connection accepted.\n"))
+			break;
+		if (fflush(NULL) != 0) {
+			(void)log_message("pre-fork flush failed\n");
+			break;
+		}
+		pid_t pid = fork();
 		if (pid == 0) {
-			/* Child -- handle connection */
-			close(listen_fd);
+			/* The child must retire its listener before handling the connection. */
+			if (close(listen_fd) != 0) {
+				(void)log_message("child listener close failed\n");
+				if (close(conn_fd) != 0)
+					(void)log_message("child connection close failed\n");
+				conn_fd = -1;
+				_exit(1);
+			}
 			_exit(handle_connection());
 		}
-		/* Parent -- close child's fd, loop */
-		close(conn_fd);
+		bool fork_failed = pid < 0;
+		if (fork_failed && !log_message("fork failed\n"))
+			break;
+		int closed = close(conn_fd);
+		conn_fd = -1;
+		if (closed != 0) {
+			(void)log_message("parent connection close failed\n");
+			break;
+		}
+		/* A transient fork refusal leaves the listener usable after release. */
 	}
-
-	close(listen_fd);
-	return 0;
+listener_done:
+	if (conn_fd >= 0) {
+		if (close(conn_fd) != 0)
+			(void)log_message("connection close failed\n");
+		conn_fd = -1;
+	}
+	if (listen_fd >= 0) {
+		if (close(listen_fd) != 0)
+			(void)log_message("listener close failed\n");
+		listen_fd = -1;
+	}
+	return status;
 }

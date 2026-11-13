@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -36,11 +37,14 @@ enum exchange_case {
 	EXEC_NATIVE, EXEC_CAPPED, SHELL_LINES, SHELL_CRLF, SHELL_LF,
 	SHELL_PARTIAL, SHELL_LONG, SHELL_BINARY, SHELL_READ_ERROR,
 	SHELL_POLL_ERROR, SHELL_NOMORE, SHELL_POLL_ZERO, SHELL_BAD_EXTENT,
+	SHELL_PARENT, SHELL_PARENT_ERROR,
 	EXCHANGE_CASES,
 };
 static enum exchange_case exchange;
 static bool server_process;
-static unsigned application_reads, application_polls;
+static unsigned application_reads, application_polls, application_signals;
+static bool signal_arguments_valid;
+static int observed_kill(pid_t, int);
 static int64_t observed_channel_read(dssh_channel, int, uint8_t *, size_t);
 static int observed_channel_poll(dssh_channel, int, int);
 static ssize_t observed_send(int, const void *, size_t, int);
@@ -57,6 +61,7 @@ static int64_t observed_channel_write(dssh_channel, int, const uint8_t *, size_t
 #define dssh_chan_write observed_channel_write
 #define dssh_chan_read observed_channel_read
 #define dssh_chan_poll observed_channel_poll
+#define kill observed_kill
 #include "../examples/server-io.h"
 #include "../examples/server-shell.h"
 /* Other example paths retain their independent review. These diagnostics are
@@ -78,6 +83,7 @@ static int64_t observed_channel_write(dssh_channel, int, const uint8_t *, size_t
 #undef dssh_chan_write
 #undef dssh_chan_read
 #undef dssh_chan_poll
+#undef kill
 #undef recv
 #undef send
 #undef main
@@ -235,6 +241,18 @@ observed_channel_poll(dssh_channel channel, int events, int timeout)
 			return 0;
 	}
 	return dssh_chan_poll(channel, events, timeout);
+}
+
+static int
+observed_kill(pid_t target, int number)
+{
+	application_signals++;
+	signal_arguments_valid &= server_process && target == getppid() && number == SIGTERM;
+	if (exchange == SHELL_PARENT_ERROR) {
+		errno = EACCES;
+		return -1;
+	}
+	return 0;
 }
 
 static bool
@@ -413,9 +431,10 @@ game_roundtrip(enum exchange_case which)
 	exchange = which;
 	bool capped = which == EXEC_CAPPED;
 	bool shell = which >= SHELL_LINES;
-	bool failure = which == SHELL_READ_ERROR || which == SHELL_POLL_ERROR || which == SHELL_BAD_EXTENT;
+	bool failure = which == SHELL_READ_ERROR || which == SHELL_POLL_ERROR || which == SHELL_BAD_EXTENT || which == SHELL_PARENT_ERROR;
 	cap_channel_writes = capped;
-	application_reads = application_polls = 0;
+	application_reads = application_polls = application_signals = 0;
+	signal_arguments_valid = true;
 	application_writes = 0;
 	send_calls = recv_calls = poll_calls = clock_calls = 0;
 	pid_t child = fork();
@@ -430,9 +449,11 @@ game_roundtrip(enum exchange_case which)
 		conn_fd = descriptors[1];
 		server_process = true;
 		int status = handle_connection();
-		bool complete = status == (failure ? 1 : 0) && (!capped || application_writes >= 7);
-		if (fprintf(stderr, "server_io_application example=%s profile=%d writes=%u status=%d complete=%d\n",
-		    EXAMPLE_NAME, which, application_writes, status, complete) < 0)
+		bool parent_command = which == SHELL_PARENT || which == SHELL_PARENT_ERROR;
+		bool complete = status == (failure ? 1 : 0) && (!capped || application_writes >= 7)
+		    && signal_arguments_valid && application_signals == (parent_command ? 1u : 0u);
+		if (fprintf(stderr, "server_io_application example=%s profile=%d writes=%u status=%d signals=%u signal_args=%d complete=%d\n",
+		    EXAMPLE_NAME, which, application_writes, status, application_signals, signal_arguments_valid, complete) < 0)
 			complete = false;
 		_exit(complete ? 0 : 1);
 	}
@@ -512,9 +533,15 @@ game_roundtrip(enum exchange_case which)
 			answer_length = 8194 + sizeof(ending) - 1;
 			answer = expected;
 		}
-		if (failure) {
+		if (failure && which != SHELL_PARENT_ERROR) {
 			answer = (const uint8_t *)"> ";
 			answer_length = 2;
+		}
+		if (which == SHELL_PARENT || which == SHELL_PARENT_ERROR) {
+			bytes = (const uint8_t *)"diediedie\r";
+			length = 10;
+			answer = (const uint8_t *)"> diediedie\r\ndying...\r\n";
+			answer_length = 23;
 		}
 		valid = example_channel_write(channel, 0, bytes, length) == 0
 		    && dssh_chan_shutwr(channel) == 0;

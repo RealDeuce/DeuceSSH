@@ -713,6 +713,14 @@ endif()
 # Algorithm validation tests — reference helpers are backend-conditional
 dssh_add_test(signature_storage test_signature_storage.c)
 add_test(NAME dssh_unit_signature_storage COMMAND dssh_test_signature_storage)
+if(UNIX AND NOT APPLE)
+	dssh_add_test(signature_storage_gaps test_signature_storage_gaps.c)
+	target_link_options(dssh_test_signature_storage_gaps PRIVATE
+		-Wl,--wrap=dssh_test_malloc,--wrap=dssh_test_free)
+	dssh_add_output_test(dssh_signature_storage_gaps dssh_test_signature_storage_gaps
+		"4 tests: 4 passed, 0 failed, 0 skipped")
+	set_tests_properties(dssh_signature_storage_gaps PROPERTIES TIMEOUT 60)
+endif()
 
 dssh_add_test(kex_workspace test_kex_workspace.c)
 add_test(NAME dssh_unit_kex_workspace COMMAND dssh_test_kex_workspace)

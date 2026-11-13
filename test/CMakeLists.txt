@@ -884,6 +884,16 @@ add_test(NAME dssh_unit_kex_workspace COMMAND dssh_test_kex_workspace)
 dssh_add_test(curve_storage test_curve_storage.c)
 add_test(NAME dssh_unit_curve_storage COMMAND dssh_test_curve_storage)
 
+dssh_add_test(x25519 test_x25519.c)
+if(DEUCESSH_CRYPTO_BACKEND STREQUAL "Botan")
+	target_sources(dssh_test_x25519 PRIVATE x25519_fixture_botan.cpp)
+	set_target_properties(dssh_test_x25519 PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+endif()
+dssh_add_output_test(dssh_x25519_native dssh_test_x25519
+	"5 tests: 5 passed, 0 failed, 0 skipped")
+set_tests_properties(dssh_x25519_native PROPERTIES
+	FAIL_REGULAR_EXPRESSION "AddressSanitizer;ThreadSanitizer;UndefinedBehaviorSanitizer;runtime error:")
+
 dssh_add_test(hybrid_storage test_hybrid_storage.c)
 foreach(method IN ITEMS sntrup mlkem)
 	add_test(NAME dssh_unit_hybrid_storage_${method} COMMAND dssh_test_hybrid_storage)

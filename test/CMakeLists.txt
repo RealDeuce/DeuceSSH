@@ -690,6 +690,24 @@ if(DEUCESSH_CRYPTO_BACKEND STREQUAL "Botan")
 	set_property(TARGET dssh_test_crypto_botan_faults PROPERTY CXX_STANDARD 20)
 	set_property(TARGET dssh_test_crypto_botan_faults PROPERTY CXX_STANDARD_REQUIRED ON)
 	add_test(NAME dssh_unit_crypto_botan_faults COMMAND dssh_test_crypto_botan_faults)
+	dssh_add_test(base64_botan_faults test_base64_botan_faults.cpp)
+	set_target_properties(dssh_test_base64_botan_faults PROPERTIES
+		CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+	dssh_add_output_test(dssh_base64_native_faults dssh_test_base64_botan_faults
+		"base64_native cases=31 failures=0")
+	foreach(kind IN ITEMS static shared)
+		if(TARGET deucessh_${kind})
+			set(base64_target dssh_base64_storage_${kind})
+			add_executable(${base64_target} test_base64_storage.cpp)
+			set_property(TARGET ${base64_target} PROPERTY CXX_STANDARD 20)
+			set_property(TARGET ${base64_target} PROPERTY CXX_STANDARD_REQUIRED ON)
+			target_compile_options(${base64_target} PRIVATE ${DEUCESSH_COMPILE_OPTIONS})
+			target_link_libraries(${base64_target} PRIVATE deucessh_${kind})
+			dssh_add_output_test(${base64_target} ${base64_target}
+				"base64_storage cases=3744 vectors=96 offsets=13 failures=0 allocation_calls=0 escapes=0")
+			set_tests_properties(${base64_target} PROPERTIES TIMEOUT 60)
+		endif()
+	endforeach()
 endif()
 
 # Algorithm validation tests — reference helpers are backend-conditional

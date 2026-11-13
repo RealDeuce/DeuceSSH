@@ -20,6 +20,7 @@
 #include "deucessh-crypto.h"
 #include "deucessh.h"
 #ifdef DSSH_TESTING
+ #include "test/dssh_test_botan_base64.h"
  #include "test/dssh_test_botan_hash.h"
 #endif
 
@@ -200,23 +201,48 @@ dssh_base64_encode(const uint8_t *in, size_t len, char *out, size_t outlen)
 	if (outlen < needed + 1)
 		return DSSH_ERROR_TOOLONG;
 
-	std::string encoded;
-
+	/* Preserve overlap without allocating: place the input in the output,
+	 * then expand complete Base64 quanta backwards. Each write starts at
+	 * or after the remaining input prefix. The native encoder sees only
+	 * disjoint buffers and retains its native byte conversion. */
+	std::memmove(out, in, len);
+	uint8_t block[3 * 64];
+	size_t remaining = len;
+	size_t position = needed;
+	int status = 0;
 	try {
-		encoded = Botan::base64_encode(in, len);
+		while (remaining > 0) {
+			size_t chunk = remaining % sizeof(block);
+			if (chunk == 0)
+				chunk = sizeof(block);
+			remaining -= chunk;
+			std::memcpy(block, out + remaining, chunk);
+			/* All later chunks are multiples of three. Only this
+			 * first (last-in-input) chunk can require padding. */
+			size_t extent = 4 * ((chunk + 2) / 3);
+			position -= extent;
+			size_t consumed = 0;
+			size_t count =
+#ifdef DSSH_TESTING
+			    dssh_test_botan_base64_encode(out + position, block,
+#else
+			    Botan::base64_encode(out + position, block,
+#endif
+			    chunk, consumed, true);
+			if (count != extent || consumed != chunk) {
+				status = DSSH_ERROR_INIT;
+				break;
+			}
+		}
 	}
 	catch (...) {
-		return DSSH_ERROR_INIT;
+		status = DSSH_ERROR_INIT;
 	}
+	Botan::secure_scrub_memory(block, sizeof(block));
+	if (status < 0)
+		return status;
 
-	size_t count = encoded.size();
-
-	if (count > INT_MAX)
-		return DSSH_ERROR_TOOLONG;
-	if (!dssh_buffer_has(outlen, count, 1))
-		return DSSH_ERROR_TOOLONG;
-
-	memcpy(out, encoded.c_str(), count + 1);
-	int result = static_cast<int>(count);
+	out[needed] = '\0';
+	int result = static_cast<int>(needed);
 	return result;
 }

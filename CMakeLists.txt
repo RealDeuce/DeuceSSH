@@ -100,11 +100,24 @@ endif()
 include(CheckCSourceCompiles)
 include(CMakePushCheckState)
 
+# Use only inside a function, so the try-compile type is local to that probe.
+# Resetting check state unsets variables, which can expose cached values again;
+# explicitly empty bindings also exclude cached inputs from a parent project.
+macro(dssh_push_platform_check_state)
+	cmake_push_check_state(RESET)
+	foreach(dssh_check_input IN ITEMS CMAKE_EXTRA_INCLUDE_FILES
+		CMAKE_REQUIRED_FLAGS CMAKE_REQUIRED_DEFINITIONS CMAKE_REQUIRED_INCLUDES
+		CMAKE_REQUIRED_LINK_OPTIONS CMAKE_REQUIRED_LINK_DIRECTORIES
+		CMAKE_REQUIRED_LIBRARIES CMAKE_REQUIRED_QUIET)
+		set(${dssh_check_input} "")
+	endforeach()
+	set(CMAKE_TRY_COMPILE_TARGET_TYPE EXECUTABLE)
+endmacro()
+
 # The deadline helpers classify long double values. Some C runtimes
 # implement isfinite for that type in a separate math library.
 function(dssh_find_math_link_library)
-	cmake_push_check_state(RESET)
-	set(CMAKE_TRY_COMPILE_TARGET_TYPE EXECUTABLE)
+	dssh_push_platform_check_state()
 	set(probe [[
 		#include <math.h>
 		int main(void) {
@@ -131,8 +144,7 @@ dssh_find_math_link_library()
 # headers hide timespec_get / TIME_UTC in this namespace even in C11 mode.
 # The new cache key intentionally discards the old, unrestricted probe result.
 function(dssh_find_timespec_get)
-	cmake_push_check_state()
-	set(CMAKE_TRY_COMPILE_TARGET_TYPE EXECUTABLE)
+	dssh_push_platform_check_state()
 	if(NOT WIN32)
 		list(APPEND CMAKE_REQUIRED_DEFINITIONS -D_POSIX_C_SOURCE=200809L)
 	endif()
@@ -177,13 +189,22 @@ endif()
 # macOS and NetBSD have pthread but no <threads.h>; MinGW-w64 has
 # neither.  Probe libc first, then libstdthreads, then fall back to a
 # platform shim.
-check_c_source_compiles("
-	#include <threads.h>
-	int main(void) { mtx_t m; mtx_init(&m, mtx_plain); return 0; }
-" HAVE_THREADS_IN_LIBC)
+function(dssh_find_threads_in_libc)
+	dssh_push_platform_check_state()
+	# Header availability alone does not establish a native implementation.
+	# A parent may use static-library try-compiles or unrelated probe libraries;
+	# neither may hide this executable's actual C11 thread link dependency.
+	check_c_source_compiles("
+		#include <threads.h>
+		int main(void) { mtx_t m; return mtx_init(&m, mtx_plain); }
+	" DSSH_THREADS_IN_LIBC_LINKS)
+	cmake_pop_check_state()
+endfunction()
+# Use a fresh result key rather than trust the former unrestricted probe cache.
+dssh_find_threads_in_libc()
 set(DSSH_THREADS_SHIM_SOURCES "")
 set(DSSH_THREADS_SHIM_INCLUDE "")
-if(NOT HAVE_THREADS_IN_LIBC)
+if(NOT DSSH_THREADS_IN_LIBC_LINKS)
 	find_library(STDTHREADS_LIB stdthreads)
 	if(STDTHREADS_LIB)
 		set(THREADS_LINK_LIB ${STDTHREADS_LIB})
@@ -235,9 +256,9 @@ else()
 	set(DSSH_PC_LIBS_PRIVATE "")
 endif()
 
-if(STDTHREADS_LIB)
+if(THREADS_LINK_LIB AND STDTHREADS_LIB)
 	string(APPEND DSSH_PC_LIBS_PRIVATE " ${STDTHREADS_LIB}")
-elseif(TARGET Threads::Threads AND CMAKE_THREAD_LIBS_INIT)
+elseif(THREADS_LINK_LIB STREQUAL "Threads::Threads" AND CMAKE_THREAD_LIBS_INIT)
 	string(REPLACE ";" " " DSSH_PC_THREAD_LIBS
 		"${CMAKE_THREAD_LIBS_INIT}")
 	string(APPEND DSSH_PC_LIBS_PRIVATE " ${DSSH_PC_THREAD_LIBS}")

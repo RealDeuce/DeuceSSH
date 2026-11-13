@@ -87,8 +87,10 @@ static inline void
 dssh_secure_zero(void *p, size_t n)
 {
 	volatile unsigned char *vp = (volatile unsigned char *)p;
-	while (n--)
+	while (n > 0) {
 		*vp++ = 0;
+		n--;
+	}
 }
 
 #endif   // ifndef DSSH_PORTABLE_H

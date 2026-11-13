@@ -661,6 +661,15 @@ endmacro()
 # Tier 1: Unit tests
 # ================================================================
 
+add_executable(dssh_test_portable_api test_portable_api.c)
+set_target_properties(dssh_test_portable_api PROPERTIES
+	C_STANDARD ${DEUCESSH_C_STANDARD} C_STANDARD_REQUIRED ON)
+target_include_directories(dssh_test_portable_api PRIVATE "${PROJECT_SOURCE_DIR}")
+target_compile_options(dssh_test_portable_api PRIVATE ${DEUCESSH_COMPILE_OPTIONS})
+dssh_add_output_test(dssh_portable_api dssh_test_portable_api
+	"portable_api spans=16777728 wipes=2145 guards=1 null_zero=1 valid=1")
+set_tests_properties(dssh_portable_api PROPERTIES TIMEOUT 60)
+
 dssh_add_test(chan test_chan.c)
 add_test(NAME dssh_unit_chan COMMAND dssh_test_chan)
 

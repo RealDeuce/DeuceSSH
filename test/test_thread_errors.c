@@ -521,92 +521,304 @@ test_terminate_idempotent(void)
  * whether that owner is the terminating thread.
  * ================================================================ */
 
-struct terminate_wakeup_ctx {
-	dssh_session sess;
-	atomic_bool  owner_ready;
-	atomic_bool  enter_wait;
-	atomic_bool  terminator_done;
-	atomic_int   wait_result;
+struct terminate_wakeup_report {
+	dssh_session observed;
+	unsigned created;
+	unsigned joined;
+	unsigned freed;
+	bool expected_assertion;
 };
 
-static int
-terminate_wakeup_owner(void *arg)
+struct terminate_wakeup_ctx {
+	dssh_session sess;
+	thrd_t worker;
+	bool created;
+	bool locked;
+	atomic_bool configured;
+	atomic_bool cancelled;
+	atomic_bool done;
+	atomic_bool *entered;
+	struct terminate_wakeup_report *report;
+};
+static struct terminate_wakeup_ctx *active_wakeup;
+static int (*wakeup_clock)(struct timespec *) = dssh_clock_read;
+static int (*wakeup_sleep)(const struct timespec *, struct timespec *) = thrd_sleep;
+
+/* No mutex is held while observing. The deadline and attempt ceiling bound
+ * observations even if UTC moves backward or stops advancing. */
+static bool
+terminate_wakeup_observe(atomic_bool *flag, atomic_bool *done)
 {
-	struct terminate_wakeup_ctx *ctx = arg;
-
-	if (mtx_lock(&ctx->sess->trans.tx_mtx) != thrd_success)
-		return -1;
-	atomic_store(&ctx->owner_ready, true);
-	while (!atomic_load(&ctx->enter_wait))
-		thrd_yield();
-
-	struct timespec deadline;
-
-	if (dssh_deadline_from_ms(&deadline, 2000) < 0) {
-		atomic_store(&ctx->wait_result, thrd_error);
-		mtx_unlock(&ctx->sess->trans.tx_mtx);
-		return -1;
+	if (atomic_load(flag))
+		return true;
+	if (atomic_load(done))
+		return false;
+	struct timespec begin;
+	if (wakeup_clock(&begin) != 0)
+		return false;
+	struct timespec deadline = begin;
+	if (!dssh_timespec_add_ms(&deadline, 2000))
+		return false;
+	for (unsigned attempt = 0; attempt < 2000; attempt++) {
+		if (atomic_load(flag))
+			return true;
+		if (atomic_load(done))
+			return false;
+		struct timespec now;
+		if (wakeup_clock(&now) != 0 || now.tv_sec < begin.tv_sec
+		    || (now.tv_sec == begin.tv_sec && now.tv_nsec < begin.tv_nsec)
+		    || now.tv_sec > deadline.tv_sec
+		    || (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec))
+			return false;
+		const struct timespec delay = { .tv_nsec = 1000000L };
+		int ret = wakeup_sleep(&delay, NULL);
+		if (ret != 0 && ret != -1)
+			return false;
 	}
-	int wr = cnd_timedwait(&ctx->sess->trans.rekey_cnd,
-	    &ctx->sess->trans.tx_mtx, &deadline);
-
-	atomic_store(&ctx->wait_result, wr);
-	mtx_unlock(&ctx->sess->trans.tx_mtx);
-	return 0;
+	return atomic_load(flag);
 }
 
 static int
 terminate_wakeup_terminator(void *arg)
 {
 	struct terminate_wakeup_ctx *ctx = arg;
-
-	session_set_terminate(ctx->sess);
-	atomic_store(&ctx->terminator_done, true);
+	/* This pause is local to this worker and precedes its native acquisition.
+	 * Publish its process-lifetime observation flag before the controller reads it. */
+	ctx->entered = dssh_test_thrd_pause_mutex_after(&ctx->sess->trans.tx_mtx, 0);
+	atomic_store(&ctx->configured, true);
+	/* Cleanup may run before this worker is scheduled. Releasing a pause before
+	 * its configuration must not leave a later configuration parked at join. */
+	if (atomic_load(&ctx->cancelled))
+		dssh_test_thrd_resume_mutex();
+	else
+		session_set_terminate(ctx->sess);
+	atomic_store(&ctx->done, true);
 	return 0;
+}
+
+static void
+terminate_wakeup_freed(const void *pointer, void *opaque)
+{
+	struct terminate_wakeup_report *report = opaque;
+	if (pointer != NULL && pointer == report->observed) {
+		report->observed = NULL;
+		report->freed++;
+	}
+}
+
+static bool
+terminate_wakeup_cleanup(struct terminate_wakeup_ctx *ctx)
+{
+	if (active_wakeup == ctx)
+		active_wakeup = NULL;
+	/* Release the only possible controller-owned lock before resuming/joining. */
+	if (ctx->locked) {
+		if (mtx_unlock(&ctx->sess->trans.tx_mtx) != thrd_success)
+			abort();
+		ctx->locked = false;
+	}
+	atomic_store(&ctx->cancelled, true);
+	dssh_test_thrd_resume_mutex();
+	bool valid = true;
+	if (ctx->created) {
+		int result;
+		if (thrd_join(ctx->worker, &result) != thrd_success)
+			abort();
+		ctx->created = false;
+		ctx->report->joined++;
+		valid = result == 0 && atomic_load(&ctx->done);
+	}
+	if (ctx->sess != NULL) {
+		dssh_session_cleanup(ctx->sess);
+		ctx->sess = NULL;
+	}
+	return valid;
+}
+
+static bool
+terminate_wakeup_start(struct terminate_wakeup_ctx *ctx,
+    struct terminate_wakeup_report *report)
+{
+	memset(ctx, 0, sizeof(*ctx));
+	ctx->report = report;
+	atomic_init(&ctx->configured, false);
+	atomic_init(&ctx->cancelled, false);
+	atomic_init(&ctx->done, false);
+	ctx->sess = dssh_session_init(true, 0);
+	if (ctx->sess == NULL)
+		return false;
+	report->observed = ctx->sess;
+	dssh_test_alloc_observe_frees(terminate_wakeup_freed, report);
+	active_wakeup = ctx;
+	if (fixture_thread_create(&ctx->worker, terminate_wakeup_terminator, ctx) != thrd_success)
+		return false;
+	ctx->created = true;
+	report->created++;
+	return true;
 }
 
 static int
 test_set_terminate_rekey_wakeup(void)
 {
-	dssh_session sess = dssh_session_init(true, 0);
+	struct terminate_wakeup_report report = {0};
+	struct terminate_wakeup_ctx ctx;
+	bool valid = terminate_wakeup_start(&ctx, &report);
+	if (valid)
+		valid = terminate_wakeup_observe(&ctx.configured, &ctx.done)
+		    && terminate_wakeup_observe(ctx.entered, &ctx.done);
+	struct timespec deadline;
+	if (valid)
+		valid = dssh_deadline_from_ms(&deadline, 2000) == 0;
+	if (valid) {
+		valid = mtx_lock(&ctx.sess->trans.tx_mtx) == thrd_success;
+		ctx.locked = valid;
+	}
+	if (valid) {
+		/* Only tx_mtx is held. The real C11 wait releases/reacquires it;
+		 * termination's observed acquisition must serialize with that release. */
+		dssh_test_thrd_resume_mutex();
+		valid = cnd_timedwait(&ctx.sess->trans.rekey_cnd,
+		    &ctx.sess->trans.tx_mtx, &deadline) == thrd_success;
+	}
+	bool finished = terminate_wakeup_cleanup(&ctx);
+	dssh_test_alloc_observe_frees(NULL, NULL);
+	ASSERT_TRUE(valid && finished && active_wakeup == NULL && ctx.sess == NULL
+	    && !ctx.created && !ctx.locked && report.created == 1 && report.joined == 1
+	    && report.freed == 1 && report.observed == NULL);
+	return TEST_PASS;
+}
 
-	ASSERT_NOT_NULL(sess);
-	struct terminate_wakeup_ctx ctx = {
-	    .sess = sess,
-	};
-	atomic_init(&ctx.owner_ready, false);
-	atomic_init(&ctx.enter_wait, false);
-	atomic_init(&ctx.terminator_done, false);
-	atomic_init(&ctx.wait_result, thrd_error);
+static int
+wakeup_refuse_create(thrd_t *thread, thrd_start_t function, void *data)
+{
+	(void)thread;
+	(void)function;
+	(void)data;
+	return thrd_error;
+}
 
-	thrd_t owner;
-	thrd_t terminator;
+static int
+test_wakeup_setup_ownership(void)
+{
+	struct terminate_wakeup_report report = {0};
+	struct terminate_wakeup_ctx ctx;
+	fixture_thread_create = wakeup_refuse_create;
+	bool started = terminate_wakeup_start(&ctx, &report);
+	fixture_thread_create = thrd_create;
+	bool finished = terminate_wakeup_cleanup(&ctx);
+	bool repeated = terminate_wakeup_cleanup(&ctx);
+	dssh_test_alloc_observe_frees(NULL, NULL);
+	ASSERT_TRUE(!started && finished && repeated && active_wakeup == NULL
+	    && ctx.sess == NULL && !ctx.created && !ctx.locked && report.created == 0
+	    && report.joined == 0 && report.freed == 1 && report.observed == NULL);
+	return TEST_PASS;
+}
 
-	ASSERT_EQ(thrd_create(&owner, terminate_wakeup_owner, &ctx), thrd_success);
-	while (!atomic_load(&ctx.owner_ready))
-		thrd_yield();
-	ASSERT_EQ(thrd_create(&terminator, terminate_wakeup_terminator, &ctx), thrd_success);
-	while (!dssh_session_is_terminated(sess))
-		thrd_yield();
+static int
+wakeup_assert_with_active_owner(unsigned phase, struct terminate_wakeup_report *report)
+{
+	struct terminate_wakeup_ctx ctx;
+	if (!terminate_wakeup_start(&ctx, report)) {
+		if (!terminate_wakeup_cleanup(&ctx))
+			abort();
+		return TEST_FAIL;
+	}
+	if (phase != 0) {
+		ASSERT_TRUE(terminate_wakeup_observe(&ctx.configured, &ctx.done));
+		ASSERT_TRUE(terminate_wakeup_observe(ctx.entered, &ctx.done));
+	}
+	if (phase == 2) {
+		int ret = mtx_lock(&ctx.sess->trans.tx_mtx);
+		ctx.locked = ret == thrd_success;
+		ASSERT_EQ(ret, thrd_success);
+	}
+	report->expected_assertion = true;
+	ASSERT_TRUE(false); /* Cleanup must finish before this owner frame returns. */
+	return TEST_PASS;
+}
 
-	/* With the old trylock path, termination broadcasts and returns while
-	 * another owner still has the packet engine.  Give it ample time to complete before the
-	 * owner enters cnd_timedwait, making the lost wake deterministic. */
-	struct timespec settle = { .tv_sec = 0, .tv_nsec = 100000000 };
+static int
+test_wakeup_assertion_ownership(void)
+{
+	for (unsigned phase = 0; phase < 3; phase++) {
+		struct terminate_wakeup_report report = {0};
+		int ret = wakeup_assert_with_active_owner(phase, &report);
+		dssh_test_alloc_observe_frees(NULL, NULL);
+		ASSERT_TRUE(ret == TEST_FAIL && report.expected_assertion && active_wakeup == NULL
+		    && report.created == 1 && report.joined == 1 && report.freed == 1
+		    && report.observed == NULL);
+	}
+	return TEST_PASS;
+}
 
-	thrd_sleep(&settle, NULL);
-	atomic_store(&ctx.enter_wait, true);
-	int owner_result;
-	int terminator_result;
+struct wakeup_observation_script {
+	unsigned mode;
+	unsigned clocks;
+	unsigned sleeps;
+	atomic_bool flag;
+};
+static struct wakeup_observation_script *wakeup_script;
 
-	ASSERT_EQ(thrd_join(owner, &owner_result), thrd_success);
-	ASSERT_EQ(thrd_join(terminator, &terminator_result), thrd_success);
-	ASSERT_EQ(owner_result, 0);
-	ASSERT_EQ(terminator_result, 0);
-	ASSERT_TRUE(atomic_load(&ctx.terminator_done));
-	ASSERT_EQ(atomic_load(&ctx.wait_result), thrd_success);
+static int
+wakeup_script_clock(struct timespec *now)
+{
+	struct wakeup_observation_script *script = wakeup_script;
+	unsigned call = script->clocks++;
+	if ((script->mode == 0 && call == 0) || (script->mode == 1 && call == 1))
+		return DSSH_ERROR_INIT;
+	*now = (struct timespec){ .tv_sec = 100 };
+	if (call != 0 && script->mode == 2)
+		now->tv_sec = 99;
+	if (call != 0 && script->mode == 3)
+		now->tv_sec = 102;
+	return 0;
+}
 
-	dssh_session_cleanup(sess);
+static int
+wakeup_script_sleep(const struct timespec *duration, struct timespec *remaining)
+{
+	struct wakeup_observation_script *script = wakeup_script;
+	if (duration->tv_sec != 0 || duration->tv_nsec != 1000000L || remaining != NULL)
+		abort();
+	script->sleeps++;
+	if (script->mode == 4)
+		return -2;
+	if (script->mode == 5 || script->mode == 6)
+		atomic_store(&script->flag, true);
+	return script->mode == 5 ? -1 : 0;
+}
+
+static int
+test_wakeup_observation_bounds(void)
+{
+	atomic_bool done;
+	atomic_init(&done, false);
+	for (unsigned mode = 0; mode < 8; mode++) {
+		struct wakeup_observation_script script = { .mode = mode };
+		atomic_init(&script.flag, false);
+		wakeup_script = &script;
+		wakeup_clock = wakeup_script_clock;
+		wakeup_sleep = wakeup_script_sleep;
+		bool observed = terminate_wakeup_observe(&script.flag, &done);
+		wakeup_clock = dssh_clock_read;
+		wakeup_sleep = thrd_sleep;
+		wakeup_script = NULL;
+		unsigned clocks = mode == 0 ? 1U : mode == 7 ? 2001U : 2U;
+		unsigned sleeps = mode < 4 ? 0U : mode == 7 ? 2000U : 1U;
+		ASSERT_TRUE(observed == (mode == 5 || mode == 6)
+		    && script.clocks == clocks && script.sleeps == sleeps);
+	}
+	struct wakeup_observation_script script = {0};
+	atomic_init(&script.flag, true);
+	wakeup_script = &script;
+	wakeup_clock = wakeup_script_clock;
+	bool ready = terminate_wakeup_observe(&script.flag, &done);
+	atomic_store(&script.flag, false);
+	atomic_store(&done, true);
+	bool stopped = terminate_wakeup_observe(&script.flag, &done);
+	wakeup_clock = dssh_clock_read;
+	wakeup_script = NULL;
+	ASSERT_TRUE(ready && !stopped && script.clocks == 0 && script.sleeps == 0);
 	return TEST_PASS;
 }
 
@@ -858,6 +1070,9 @@ test_limit_acquire(void)
 static struct dssh_test_entry tests[] = {
 	{ "thrd/setup_ownership", test_setup_ownership },
 	{ "thrd/assertion_ownership", test_assertion_ownership },
+	{ "thrd/wakeup_setup_ownership", test_wakeup_setup_ownership },
+	{ "thrd/wakeup_assertion_ownership", test_wakeup_assertion_ownership },
+	{ "thrd/wakeup_observation_bounds", test_wakeup_observation_bounds },
 	{ "thrd/wait_contract_errors", test_wait_contract_errors },
 	{ "thrd/wait_contract_spurious", test_wait_contract_spurious },
 	{ "thrd/wait_contract_timeout_errors", test_wait_contract_timeout_errors },
@@ -990,6 +1205,8 @@ unlock_fatal_child(const char *name, const char *mode)
 void
 dssh_test_failure_cleanup(void)
 {
+	if (active_wakeup != NULL && !terminate_wakeup_cleanup(active_wakeup))
+		abort();
 	if (active_handshake != NULL)
 		handshake_cleanup(active_handshake);
 }

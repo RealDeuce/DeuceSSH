@@ -21,6 +21,15 @@ add_test(NAME dssh_c_standard COMMAND "${CMAKE_COMMAND}"
 	"-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/c-standard-tests"
 	-P "${CMAKE_CURRENT_SOURCE_DIR}/c_standard.cmake")
 
+if(UNIX AND NOT APPLE)
+	add_test(NAME dssh_build_options COMMAND "${CMAKE_COMMAND}"
+		"-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/c-standard-tests/options"
+		"-DTEST_C_COMPILER=${CMAKE_C_COMPILER}"
+		"-DTEST_CXX_COMPILER=${CMAKE_CXX_COMPILER}"
+		"-DTEST_BACKEND=${DEUCESSH_CRYPTO_BACKEND}"
+		-P "${CMAKE_CURRENT_SOURCE_DIR}/build_options.cmake")
+endif()
+
 if(UNIX)
 	add_executable(dssh_test_timespec_shim test_timespec.c)
 	set_property(TARGET dssh_test_timespec_shim PROPERTY C_STANDARD ${DEUCESSH_C_STANDARD})

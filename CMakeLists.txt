@@ -98,21 +98,7 @@ if(DEUCESSH_CRYPTO_BACKEND STREQUAL "Botan")
 endif()
 
 include(CheckCSourceCompiles)
-include(CMakePushCheckState)
-
-# Use only inside a function, so the try-compile type is local to that probe.
-# Resetting check state unsets variables, which can expose cached values again;
-# explicitly empty bindings also exclude cached inputs from a parent project.
-macro(dssh_push_platform_check_state)
-	cmake_push_check_state(RESET)
-	foreach(dssh_check_input IN ITEMS CMAKE_EXTRA_INCLUDE_FILES
-		CMAKE_REQUIRED_FLAGS CMAKE_REQUIRED_DEFINITIONS CMAKE_REQUIRED_INCLUDES
-		CMAKE_REQUIRED_LINK_OPTIONS CMAKE_REQUIRED_LINK_DIRECTORIES
-		CMAKE_REQUIRED_LIBRARIES CMAKE_REQUIRED_QUIET)
-		set(${dssh_check_input} "")
-	endforeach()
-	set(CMAKE_TRY_COMPILE_TARGET_TYPE EXECUTABLE)
-endmacro()
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/DeuceSSHCheckState.cmake")
 
 # The deadline helpers classify long double values. Some C runtimes
 # implement isfinite for that type in a separate math library.
@@ -358,154 +344,8 @@ set(DEUCESSH_PUBLIC_HEADERS
 	deucessh-comp.h deucessh-lang.h deucessh-portable.h deucessh-result.h
 )
 
-include(CheckCCompilerFlag)
-include(CheckLinkerFlag)
-
-# Probe for supported hardening flags (per OpenSSF Compiler Hardening Guide)
-set(DEUCESSH_COMPILE_OPTIONS "")
-set(DEUCESSH_LINK_OPTIONS "")
-
-if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
-	# Baseline warnings (GCC 2.95+, Clang 4+).  -Werror=implicit,
-	# -Werror=incompatible-pointer-types, -Werror=int-conversion are
-	# C-only diagnostics; g++ rejects them with "not valid for C++".
-	# Targeted -Werror=... stays on in all configs: those catch
-	# C-obsolete constructs and security-relevant misuse, not stylistic
-	# warnings that a future compiler might broaden.
-	list(APPEND DEUCESSH_COMPILE_OPTIONS
-		-Wall -Wpedantic -pedantic
-		-Wformat -Wformat=2
-		-Wimplicit-fallthrough
-		-Werror=format-security
-		$<$<COMPILE_LANGUAGE:C>:-Werror=implicit>
-		$<$<COMPILE_LANGUAGE:C>:-Werror=incompatible-pointer-types>
-		$<$<COMPILE_LANGUAGE:C>:-Werror=int-conversion>)
-
-	# Blanket -Werror is Debug-only.  Release/RelWithDebInfo/MinSizeRel
-	# must tolerate future compiler warnings — failing a packager's
-	# build on a new diagnostic is hostile.
-	list(APPEND DEUCESSH_COMPILE_OPTIONS $<$<CONFIG:Debug>:-Werror>)
-	if(CMAKE_CONFIGURATION_TYPES OR CMAKE_BUILD_TYPE STREQUAL "Debug")
-		set(DEUCESSH_PROBE_WERROR "-Werror")
-	else()
-		set(DEUCESSH_PROBE_WERROR "")
-	endif()
-
-	# Strict probes: AppleClang accepts a number of GCC-style
-	# hardening flags (-fstack-clash-protection, -fstrict-flex-arrays,
-	# -ftrivial-auto-var-init, ...) but treats them as no-ops, emitting
-	# -Wunused-command-line-argument.  Plain check_c_compiler_flag
-	# would then return HAVE_X=YES even though the resulting binary
-	# gets none of the actual mitigation.  Gate the probe on the
-	# unused-arg warning so silently-discarded flags are correctly
-	# rejected.  Debug and multi-config probes additionally use -Werror so
-	# accepted flags also satisfy Debug's compile discipline. CMake selects the
-	# same C dialect for these probes and the real targets.
-	set(_dssh_saved_required_flags "${CMAKE_REQUIRED_FLAGS}")
-	if(CMAKE_C_COMPILER_ID MATCHES "Clang|AppleClang")
-		string(APPEND CMAKE_REQUIRED_FLAGS " -Werror=unused-command-line-argument")
-	endif()
-	string(APPEND CMAKE_REQUIRED_FLAGS " ${DEUCESSH_PROBE_WERROR}")
-
-	check_c_compiler_flag(-Wconversion HAVE_WCONVERSION)
-	if(HAVE_WCONVERSION)
-		list(APPEND DEUCESSH_COMPILE_OPTIONS -Wconversion)
-	endif()
-
-	# GCC-only warnings
-	if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
-		check_c_compiler_flag(-Wtrampolines HAVE_WTRAMPOLINES)
-		if(HAVE_WTRAMPOLINES)
-			list(APPEND DEUCESSH_COMPILE_OPTIONS -Wtrampolines)
-		endif()
-		check_c_compiler_flag(-Wbidi-chars=any HAVE_WBIDI)
-		if(HAVE_WBIDI)
-			list(APPEND DEUCESSH_COMPILE_OPTIONS -Wbidi-chars=any)
-		endif()
-		check_c_compiler_flag(-fzero-init-padding-bits=all HAVE_ZERO_PADDING)
-		if(HAVE_ZERO_PADDING)
-			list(APPEND DEUCESSH_COMPILE_OPTIONS
-				-fzero-init-padding-bits=all)
-		endif()
-	endif()
-
-	# Runtime protection — probe each flag
-	check_c_compiler_flag(-fstack-protector-strong HAVE_STACK_PROTECTOR)
-	if(HAVE_STACK_PROTECTOR)
-		list(APPEND DEUCESSH_COMPILE_OPTIONS -fstack-protector-strong)
-	endif()
-
-	check_c_compiler_flag(-fstack-clash-protection HAVE_STACK_CLASH)
-	if(HAVE_STACK_CLASH)
-		list(APPEND DEUCESSH_COMPILE_OPTIONS -fstack-clash-protection)
-	endif()
-
-	check_c_compiler_flag(-fstrict-flex-arrays=3 HAVE_STRICT_FLEX)
-	if(HAVE_STRICT_FLEX)
-		list(APPEND DEUCESSH_COMPILE_OPTIONS -fstrict-flex-arrays=3)
-	endif()
-
-	check_c_compiler_flag(-ftrivial-auto-var-init=zero HAVE_TRIVIAL_INIT)
-	if(HAVE_TRIVIAL_INIT)
-		list(APPEND DEUCESSH_COMPILE_OPTIONS
-			-ftrivial-auto-var-init=zero)
-	endif()
-
-	# UB mitigations — probe each (older AppleClang rejects
-	# -fno-delete-null-pointer-checks with -Werror,-Wignored-optimization-argument).
-	check_c_compiler_flag(-fno-delete-null-pointer-checks HAVE_NO_DELETE_NULL)
-	if(HAVE_NO_DELETE_NULL)
-		list(APPEND DEUCESSH_COMPILE_OPTIONS -fno-delete-null-pointer-checks)
-	endif()
-	check_c_compiler_flag(-fno-strict-overflow HAVE_NO_STRICT_OVERFLOW)
-	if(HAVE_NO_STRICT_OVERFLOW)
-		list(APPEND DEUCESSH_COMPILE_OPTIONS -fno-strict-overflow)
-	endif()
-	check_c_compiler_flag(-fno-strict-aliasing HAVE_NO_STRICT_ALIASING)
-	if(HAVE_NO_STRICT_ALIASING)
-		list(APPEND DEUCESSH_COMPILE_OPTIONS -fno-strict-aliasing)
-	endif()
-
-	# FORTIFY_SOURCE (requires -O1+, incompatible with sanitizers)
-	list(APPEND DEUCESSH_COMPILE_OPTIONS
-		$<$<NOT:$<CONFIG:Debug>>:-U_FORTIFY_SOURCE>
-		$<$<NOT:$<CONFIG:Debug>>:-D_FORTIFY_SOURCE=3>)
-
-	# Architecture-specific control-flow protection
-	if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|AMD64")
-		check_c_compiler_flag(-fcf-protection=full HAVE_CF_PROTECTION)
-		if(HAVE_CF_PROTECTION)
-			list(APPEND DEUCESSH_COMPILE_OPTIONS
-				-fcf-protection=full)
-		endif()
-	elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64|arm64")
-		check_c_compiler_flag(-mbranch-protection=standard
-			HAVE_BRANCH_PROTECTION)
-		if(HAVE_BRANCH_PROTECTION)
-			list(APPEND DEUCESSH_COMPILE_OPTIONS
-				-mbranch-protection=standard)
-		endif()
-	endif()
-	set(CMAKE_REQUIRED_FLAGS "${_dssh_saved_required_flags}")
-elseif(MSVC)
-	list(APPEND DEUCESSH_COMPILE_OPTIONS /W4)
-	list(APPEND DEUCESSH_COMPILE_OPTIONS /experimental:c11atomics)
-endif()
-
-# Linker hardening flags (ELF only)
-if(UNIX AND NOT APPLE)
-	foreach(flag
-		"-Wl,-z,nodlopen"
-		"-Wl,-z,noexecstack"
-		"-Wl,--as-needed"
-		"-Wl,--no-copy-dt-needed-entries")
-		string(MAKE_C_IDENTIFIER "${flag}" flag_var)
-		check_linker_flag(C "${flag}" ${flag_var})
-		if(${flag_var})
-			list(APPEND DEUCESSH_LINK_OPTIONS "${flag}")
-		endif()
-	endforeach()
-endif()
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/DeuceSSHOptions.cmake")
+dssh_configure_options()
 
 include(GNUInstallDirs)
 
@@ -583,19 +423,13 @@ if(DEUCESSH_BUILD_SHARED)
 			DSSH_VERSION_STRING="${PROJECT_VERSION}"
 			$<$<CONFIG:Release>:NDEBUG>)
 	target_compile_options(deucessh_shared PRIVATE
-		${DEUCESSH_COMPILE_OPTIONS}
-		$<$<OR:$<C_COMPILER_ID:Clang>,$<C_COMPILER_ID:AppleClang>,$<C_COMPILER_ID:GNU>>:
-			-fvisibility=hidden -fno-semantic-interposition>)
+		${DEUCESSH_COMPILE_OPTIONS} ${DEUCESSH_SHARED_COMPILE_OPTIONS})
 	if(BOTAN3_VENDORED_BUILD_TARGET)
 		add_dependencies(deucessh_shared ${BOTAN3_VENDORED_BUILD_TARGET})
 	endif()
 	# ELF shared library hardening and optimization (Linux, FreeBSD)
 	if(UNIX AND NOT APPLE)
 		target_link_options(deucessh_shared PRIVATE
-			-Wl,-z,relro,-z,now
-			-Wl,--hash-style=gnu
-			-Wl,-Bsymbolic-functions
-			-Wl,-O2
 			${DEUCESSH_LINK_OPTIONS})
 	endif()
 	list(APPEND DEUCESSH_INSTALL_TARGETS deucessh_shared)

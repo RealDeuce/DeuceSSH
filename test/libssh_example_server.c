@@ -385,11 +385,14 @@ main(int argc, char **argv)
 	handed_off = true;
 	if (ssh_bind_accept_fd(bind, state.session, fd) != SSH_OK)
 		goto done;
-	int methods = strcmp(state.auth, "password") == 0 || strcmp(state.auth, "partial") == 0
+	unsigned methods = strcmp(state.auth, "password") == 0 || strcmp(state.auth, "partial") == 0
 	    ? SSH_AUTH_METHOD_PASSWORD : SSH_AUTH_METHOD_INTERACTIVE;
 	if (strcmp(state.auth, "fallback") == 0)
 		methods |= SSH_AUTH_METHOD_PASSWORD;
-	ssh_set_auth_methods(state.session, methods);
+	if (methods > INT_MAX)
+		goto done;
+	int methods_int = (int)methods;
+	ssh_set_auth_methods(state.session, methods_int);
 	ready = true;
 	ret = run_server();
 done:

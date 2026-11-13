@@ -1219,6 +1219,7 @@ add_test(NAME dssh_auth_request_capacity
 target_link_libraries(dssh_test_auth PRIVATE dssh_mock_io dssh_mock_comp)
 target_sources(dssh_test_auth PRIVATE password_result_provider.c kbi_result_provider.c signature_result_provider.c)
 set(AUTH_TESTS
+	auth/post_success/direct auth/post_success/wire
 	auth/continuation/snapshots
 	auth/continuation/storage
 	auth/kbi/prompt_counts

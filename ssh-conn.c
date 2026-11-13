@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "deucessh-auth.h"
 #include "deucessh-conn.h"
 #include "ssh-internal.h"
 #include "ssh-window.h"
@@ -3222,6 +3223,13 @@ static int
 dispatch_connection_packet(struct dssh_session_s *sess, uint8_t msg_type,
     uint8_t *payload, size_t payload_len)
 {
+	/* RFC 4252 s5.1: the completed server auth protocol no longer receives
+	 * requests. Keep later service traffic on the ordinary dispatch path. */
+	if (!sess->trans.client && sess->auth_complete
+	    && msg_type == SSH_MSG_USERAUTH_REQUEST) {
+		dssh_cleanse(payload, payload_len);
+		return 0;
+	}
 	if (msg_type == SSH_MSG_CHANNEL_OPEN)
 		return demux_channel_open(sess, payload, payload_len);
 	if (msg_type == SSH_MSG_CHANNEL_OPEN_CONFIRMATION

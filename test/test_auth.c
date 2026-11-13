@@ -12633,8 +12633,11 @@ test_auth_request_capacity(void)
 #include "lifecycle_phase_cases.h"
 #include "kbi_prompt_count_cases.h"
 #include "auth_continuation_cases.h"
+#include "auth_post_success_cases.h"
 
 static struct dssh_test_entry tests[] = {
+	{ "auth/post_success/direct", test_auth_post_success_direct },
+	{ "auth/post_success/wire", test_auth_post_success_wire },
 	{ "auth/continuation/snapshots", test_auth_continuation_snapshots },
 	{ "auth/continuation/storage", test_auth_continuation_storage },
 	{ "auth/kbi/prompt_counts", test_kbi_prompt_counts },

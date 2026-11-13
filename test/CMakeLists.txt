@@ -2228,13 +2228,28 @@ if(DEUCESSH_TEST_OPENSSH)
 					diffie-hellman-group14-sha256 diffie-hellman-group16-sha512)
 				foreach(role IN ITEMS client server)
 					set(interop_name dssh_openssh_${form}_${role}_${method})
+					set(interop_extra_args)
+					set(interop_timeout 210)
+					if(method STREQUAL "diffie-hellman-group-exchange-sha256"
+					    AND role STREQUAL client AND DEUCESSH_CRYPTO_BACKEND STREQUAL "OpenSSL"
+					    AND CMAKE_C_FLAGS MATCHES "-fsanitize=[^ ]*thread")
+						get_target_property(interop_crypto OpenSSL::Crypto IMPORTED_LOCATION)
+						if(interop_crypto MATCHES "[.]a$")
+							# Instrumented no-assembly 4096-bit p/q validation costs
+							# about 105s per exchange on the qualified native host.
+							# Retain system moduli and full initial/rekey checks.
+							set(interop_extra_args --client-exchange-seconds 540)
+							set(interop_timeout 660)
+						endif()
+					endif()
 					add_test(NAME ${interop_name} COMMAND ${Python3_EXECUTABLE}
 						${CMAKE_CURRENT_SOURCE_DIR}/openssh_interop.py run
 						--peer $<TARGET_FILE:dssh_openssh_${form}> --role ${role} --algorithm ${method}
 						--ssh ${DSSH_OPENSSH_EXECUTABLE} --sshd ${DSSH_OPENSSH_DAEMON}
 						--keygen ${DSSH_OPENSSH_KEYGEN}
-						--evidence ${CMAKE_CURRENT_BINARY_DIR}/openssh-evidence/${interop_name})
-					set_tests_properties(${interop_name} PROPERTIES TIMEOUT 210 LABELS openssh)
+						--evidence ${CMAKE_CURRENT_BINARY_DIR}/openssh-evidence/${interop_name}
+						${interop_extra_args})
+					set_tests_properties(${interop_name} PROPERTIES TIMEOUT ${interop_timeout} LABELS openssh)
 				endforeach()
 			endforeach()
 			set(cbc_name dssh_openssh_${form}_client_aes128-cbc)

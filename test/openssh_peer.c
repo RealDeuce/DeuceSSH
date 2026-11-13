@@ -23,6 +23,7 @@ static const uint8_t digits[] = "0123456789abcdef";
 static const uint8_t error_text[] = "interop-stderr\n";
 static const uint8_t acknowledgement[] = "dssh-ack\n";
 static struct timespec started;
+static unsigned peer_seconds = 120;
 
 struct break_observation {
 	atomic_uint count;
@@ -104,9 +105,10 @@ remaining(void)
 	if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
 		return DSSH_ERROR_INIT;
 	double seconds = difftime(now.tv_sec, started.tv_sec);
+	double budget = (double)peer_seconds;
 	if (seconds < 0)
 		return DSSH_ERROR_INIT;
-	if (seconds > 120 || (seconds == 120 && now.tv_nsec >= started.tv_nsec))
+	if (seconds > budget || (seconds == budget && now.tv_nsec >= started.tv_nsec))
 		return DSSH_ERROR_TIMEOUT;
 	return 0;
 }
@@ -391,7 +393,7 @@ server_channel(dssh_session session, bool *acknowledged, bool bidirectional)
 }
 
 static int
-client_channel(dssh_session session, bool bidirectional)
+client_channel(dssh_session session, bool bidirectional, bool group_exchange)
 {
 	struct dssh_chan_params params;
 	int ret = dssh_chan_params_init(&params, DSSH_CHAN_EXEC);
@@ -400,6 +402,10 @@ client_channel(dssh_session session, bool bidirectional)
 	ret = dssh_chan_params_set_command(&params, "dssh-interop");
 	if (ret == 0)
 		ret = dssh_chan_params_set_pty(&params, false);
+	/* Bound channel-data chunks independently of the external producer while
+	 * retaining the complete transfer and the peer's byte-triggered rekeys. */
+	if (ret == 0 && group_exchange)
+		ret = dssh_chan_params_set_max_window(&params, 1024);
 	dssh_channel channel = ret == 0 ? dssh_chan_open(session, &params) : NULL;
 	dssh_chan_params_free(&params);
 	if (channel == NULL)
@@ -521,6 +527,13 @@ main(int argc, char **argv)
 	if (argc != 6 || (strcmp(argv[1], "server") != 0 && strcmp(argv[1], "client") != 0))
 		return 2;
 	bool client = strcmp(argv[1], "client") == 0;
+	const char *peer_budget = getenv("DSSH_OPENSSH_PEER_SECONDS");
+	if (peer_budget != NULL && strcmp(peer_budget, "120") != 0) {
+		if (!client || strcmp(argv[2], "diffie-hellman-group-exchange-sha256") != 0
+		    || strcmp(peer_budget, "520") != 0)
+			return 2;
+		peer_seconds = 520;
+	}
 	bool notification_flags = getenv("DSSH_TEST_NOTIFICATION_FLAGS") != NULL;
 	if (notification_flags && client)
 		return 2;
@@ -663,7 +676,8 @@ main(int argc, char **argv)
 	if (ret == 0) {
 		stage = "channel";
 		bool bidirectional = strcmp(mac, mac_s2c) != 0 || strcmp(cipher, cipher_s2c) != 0;
-		ret = client ? client_channel(session, bidirectional) : server_channel(session, &channel_ack, bidirectional);
+		ret = client ? client_channel(session, bidirectional,
+		    strcmp(argv[2], "diffie-hellman-group-exchange-sha256") == 0) : server_channel(session, &channel_ack, bidirectional);
 	}
 	if (ret == 0 && language_fields) {
 		ret = check_language_fields(session, true);
@@ -696,7 +710,9 @@ main(int argc, char **argv)
 	}
 	if (ret == 0 && client && auth.host_checks < 2)
 		ret = DSSH_ERROR_INVALID;
-	fprintf(stderr, "DeuceSSH interop: role=%s kex=%s cipher=%s mac=%s stage=%s result=%d host-checks=%u signed-auth=%d channel-ack=%u language-checks=%u mac-s2c=%s algorithm-checks=%u\n",
-	    argv[1], argv[2], cipher, mac, stage, ret, auth.host_checks, auth.signed_auth, channel_ack ? 1U : 0U, language_checks, mac_s2c, algorithm_checks);
+	if (fprintf(stderr, "DeuceSSH interop: role=%s kex=%s cipher=%s mac=%s stage=%s result=%d host-checks=%u signed-auth=%d channel-ack=%u language-checks=%u mac-s2c=%s algorithm-checks=%u peer-seconds=%u\n",
+	    argv[1], argv[2], cipher, mac, stage, ret, auth.host_checks, auth.signed_auth, channel_ack ? 1U : 0U, language_checks, mac_s2c, algorithm_checks, peer_seconds) < 0
+	    || fflush(stderr) != 0)
+		return 1;
 	return ret == 0 ? 0 : 1;
 }

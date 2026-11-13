@@ -45,7 +45,8 @@ def proxy(args):
     command = [args.peer, "server", args.algorithm, args.key, args.blob, args.user]
     timed_out = False
     with Path(args.log).open("wb") as log:
-        process = subprocess.Popen(command, stderr=log)
+        process = subprocess.Popen(command, stderr=log,
+                                   env=os.environ | {"DSSH_OPENSSH_PEER_SECONDS": "120"})
         try:
             result = process.wait(timeout=130)
         except subprocess.TimeoutExpired:
@@ -115,7 +116,9 @@ def run(args):
     processes = []
     temporary = None
     result = {"role": args.role, "algorithm": args.algorithm,
-              "negative_host": args.negative_host, "status": "FAILED"}
+              "negative_host": args.negative_host, "status": "FAILED",
+              "client_exchange_seconds": args.client_exchange_seconds,
+              "native_peer_seconds": args.client_exchange_seconds - 20 if args.role == "client" else 120}
     cipher = os.environ.get("DSSH_TEST_ENC", "aes256-ctr")
     result["cipher"] = cipher
     mac = os.environ.get("DSSH_TEST_MAC", "hmac-sha2-256")
@@ -218,9 +221,13 @@ def run(args):
         else:
             # Quoted OpenSSH configuration paths support spaces. The forced
             # command is fixed test data, independent of the requested text.
-            forced = ("i=0; while [ \"$i\" -lt 4096 ]; do "
-                      "printf '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'; "
-                      "i=$((i+1)); done; printf 'interop-stderr\\n' >&2; exit 23")
+            # Stage the exact bulk payload once, keeping producer work independent
+            # of shell loop scheduling. The peer's channel window bounds pacing.
+            output_file = work / "fixture-output"
+            output_file.write_bytes(OUTPUT)
+            forced = ("cat " + shlex.quote(str(output_file))
+                      + " || exit 24; printf 'interop-stderr\\n' >&2; exit 23")
+            log_level = "DEBUG2" if args.algorithm == "diffie-hellman-group-exchange-sha256" else "DEBUG1"
             config.write_text(
                 f'HostKey "{key}"\nAuthorizedKeysFile "{authorized}"\n'
                 f"AllowUsers {user}\nStrictModes no\nUsePAM no\n"
@@ -229,7 +236,7 @@ def run(args):
                 f"HostKeyAlgorithms rsa-sha2-256\nCiphers {cipher}\nMACs {mac}\n"
                 f"KexAlgorithms {args.algorithm}\nCompression no\nRekeyLimit 128K\n"
                 "PermitUserEnvironment no\nAllowAgentForwarding no\nAllowTcpForwarding no\n"
-                "X11Forwarding no\nPermitTTY no\nLogLevel DEBUG1\n"
+                f"X11Forwarding no\nPermitTTY no\nLogLevel {log_level}\n"
                 "ForceCommand /bin/sh -c " + shlex.quote(forced) + "\n")
             daemon = [args.sshd, "-i", "-e", "-f", str(config)]
             command([args.sshd, "-t", "-f", str(config)], "sshd-config.log")
@@ -244,12 +251,13 @@ def run(args):
                                               stderr=daemon_log, start_new_session=True)
                     processes.append(server)
                     client = subprocess.Popen(peer_command, stdin=client_read, stdout=client_write,
-                                              stderr=peer_log, start_new_session=True)
+                                              stderr=peer_log, start_new_session=True,
+                                              env=os.environ | {"DSSH_OPENSSH_PEER_SECONDS": str(args.client_exchange_seconds - 20)})
                     processes.append(client)
                 finally:
                     for fd in descriptors:
                         os.close(fd)
-                until = time.monotonic() + 140
+                until = time.monotonic() + args.client_exchange_seconds
                 client_exit = client.wait(timeout=max(0.1, until - time.monotonic()))
                 server_exit = server.wait(timeout=max(0.1, until - time.monotonic()))
             records.extend([{"command": peer_command, "exit": client_exit},
@@ -311,6 +319,8 @@ def main():
         run_parser.add_argument("--" + name, required=True)
     run_parser.add_argument("--role", required=True, choices=("client", "server"))
     run_parser.add_argument("--negative-host", action="store_true")
+    run_parser.add_argument("--client-exchange-seconds", type=int, choices=(140, 540), default=140,
+                            help="client exchange budget; 540 for instrumented native group validation")
     proxy_parser = subparsers.add_parser("proxy")
     for name in ("peer", "algorithm", "key", "blob", "user", "result", "log"):
         proxy_parser.add_argument("--" + name, required=True)

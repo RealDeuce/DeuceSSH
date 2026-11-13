@@ -18,7 +18,7 @@ if(DEFINED OUTPUT_POLICY_CHILD)
 endif()
 
 set(checks 0)
-foreach(kind IN ITEMS success nonzero missing AddressSanitizer ThreadSanitizer
+foreach(kind IN ITEMS success nonzero missing AddressSanitizer LeakSanitizer ThreadSanitizer
 	UndefinedBehaviorSanitizer "runtime error:")
 	set(command "${CMAKE_COMMAND};-DOUTPUT_POLICY_CHILD=${kind};-DOUTPUT_POLICY_PAYLOAD=argument with spaces;-P;${CMAKE_CURRENT_LIST_FILE}")
 	execute_process(COMMAND "${CMAKE_COMMAND}" "-DTEST_COMMAND=${command}"

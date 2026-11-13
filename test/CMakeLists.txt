@@ -1794,10 +1794,19 @@ if(UNIX)
 	set_property(TARGET dssh_test_fatal_driver PROPERTY C_STANDARD_REQUIRED ON)
 	target_compile_definitions(dssh_test_fatal_driver PRIVATE _POSIX_C_SOURCE=200809L)
 	target_compile_options(dssh_test_fatal_driver PRIVATE ${DEUCESSH_COMPILE_OPTIONS})
+	add_executable(dssh_test_fatal_child fatal_driver_child.c)
+	set_target_properties(dssh_test_fatal_child PROPERTIES
+		C_STANDARD ${DEUCESSH_C_STANDARD} C_STANDARD_REQUIRED ON)
+	target_compile_options(dssh_test_fatal_child PRIVATE ${DEUCESSH_COMPILE_OPTIONS})
+	add_test(NAME dssh_fatal_driver_policy COMMAND ${CMAKE_COMMAND}
+		"-DFATAL_DRIVER=$<TARGET_FILE:dssh_test_fatal_driver>"
+		"-DFATAL_CHILD=$<TARGET_FILE:dssh_test_fatal_child>"
+		-P "${CMAKE_CURRENT_SOURCE_DIR}/fatal_driver_policy.cmake")
 	if(TARGET dssh_test_threads_shim_posix)
 		foreach(operation IN ITEMS mutex-destroy condition-destroy)
-			add_test(NAME dssh_threads_shim_posix_fatal_${operation}
-				COMMAND dssh_test_fatal_driver $<TARGET_FILE:dssh_test_threads_shim_posix> ${operation})
+			dssh_add_output_test(dssh_threads_shim_posix_fatal_${operation}
+				dssh_test_fatal_driver "fatal_child=1"
+				$<TARGET_FILE:dssh_test_threads_shim_posix> ${operation})
 		endforeach()
 	endif()
 	foreach(operation IN ITEMS open exec shell subsystem accept)
@@ -1810,8 +1819,8 @@ if(UNIX)
 		endforeach()
 	endforeach()
 	foreach(operation IN ITEMS stop cleanup)
-		add_test(NAME dssh_lifecycle_fatal_${operation}
-			COMMAND dssh_test_fatal_driver $<TARGET_FILE:dssh_test_conn> ${operation})
+		dssh_add_output_test(dssh_lifecycle_fatal_${operation} dssh_test_fatal_driver
+			"fatal_child=1" $<TARGET_FILE:dssh_test_conn> ${operation})
 		set_tests_properties(dssh_lifecycle_fatal_${operation} PROPERTIES
 			FIXTURES_REQUIRED dssh_cached_keys ENVIRONMENT "${DSSH_TEST_KEY_ENV}"
 			TIMEOUT 60)
@@ -1934,9 +1943,9 @@ dssh_add_individual_tests(dssh_test_thread_errors dssh_wait WAIT_CONTRACT_TESTS)
 if(UNIX)
 	foreach(path IN ITEMS primitive event limit eof close log-queue log-empty log-data wa-idle wa-zero wa-send)
 		foreach(mode IN ITEMS held released)
-			add_test(NAME dssh_unlock_fatal_${path}_${mode}
-				COMMAND dssh_test_fatal_driver $<TARGET_FILE:dssh_test_thread_errors>
-					--unlock-fatal ${path} ${mode})
+			dssh_add_output_test(dssh_unlock_fatal_${path}_${mode} dssh_test_fatal_driver
+				"fatal_child=1" $<TARGET_FILE:dssh_test_thread_errors>
+				--unlock-fatal ${path} ${mode})
 			set_tests_properties(dssh_unlock_fatal_${path}_${mode} PROPERTIES
 				FIXTURES_REQUIRED dssh_cached_keys ENVIRONMENT "${DSSH_TEST_KEY_ENV}"
 				TIMEOUT 60)
@@ -1945,9 +1954,9 @@ if(UNIX)
 	foreach(path IN ITEMS lock-tx lock-slot lock-accept lock-registry lock-channel
 		notify-tx notify-slot notify-accept notify-channel retry-notify)
 		foreach(mode IN ITEMS before after)
-			add_test(NAME dssh_wake_fatal_${path}_${mode}
-				COMMAND dssh_test_fatal_driver $<TARGET_FILE:dssh_test_thread_errors>
-					--wake-fatal ${path} ${mode})
+			dssh_add_output_test(dssh_wake_fatal_${path}_${mode} dssh_test_fatal_driver
+				"fatal_child=1" $<TARGET_FILE:dssh_test_thread_errors>
+				--wake-fatal ${path} ${mode})
 			set_tests_properties(dssh_wake_fatal_${path}_${mode} PROPERTIES TIMEOUT 30)
 		endforeach()
 	endforeach()

@@ -18,6 +18,7 @@ enum operation {
 static enum operation failure;
 static int native_error;
 static bool allocation_failure;
+static bool report_destroy_failure;
 static unsigned allocations, releases;
 
 #define NATIVE(name, parameters, arguments, operation) \
@@ -25,6 +26,10 @@ static unsigned allocations, releases;
 	{ \
 		if (failure == operation) { \
 			failure = OP_NONE; \
+			if (report_destroy_failure) { \
+				if (fputs("DSSH_TEST_SHIM_DESTROY_FAILURE\n", stderr) < 0 || fflush(stderr) != 0) \
+					_Exit(9); \
+			} \
 			return native_error; \
 		} \
 		return name arguments; \
@@ -150,6 +155,7 @@ main(int argc, char **argv)
 		if (mtx_init(&mutex, mtx_plain) != thrd_success || cnd_init(&condition) != thrd_success)
 			return 2;
 		native_error = EBUSY;
+		report_destroy_failure = true;
 		if (strcmp(argv[2], "mutex-destroy") == 0) {
 			failure = OP_MUTEX_DESTROY;
 			mtx_destroy(&mutex);

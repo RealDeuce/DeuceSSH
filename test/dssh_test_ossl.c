@@ -543,8 +543,11 @@ int
 dssh_test_thrd_join(thrd_t thr, int *res)
 {
 	atomic_fetch_add(&join_call_num, 1);
-	if (atomic_exchange(&join_fail_next, false))
+	if (atomic_exchange(&join_fail_next, false)) {
+		if (fputs("DSSH_TEST_JOIN_FAILURE\n", stderr) < 0 || fflush(stderr) != 0)
+			_Exit(9);
 		return thrd_error;
+	}
 	if (should_thrd_fail())
 		return thrd_error;
 	return thrd_join(thr, res);

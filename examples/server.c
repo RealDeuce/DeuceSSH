@@ -27,6 +27,7 @@
 #include "deucessh.h"
 #include "server-io.h"
 #include "server-output.h"
+#include "server-shell.h"
 
 static int          conn_fd = -1;
 static dssh_session sess;
@@ -1035,61 +1036,63 @@ handle_connection(void)
 		}
 	}
 	else {
-		/* Shell mode -- simple line-based command parser */
-		uint8_t buf[4096];
-		size_t  line_len = 0;
-
+		uint8_t input[4096];
+		struct example_shell_line line = EXAMPLE_SHELL_INITIALIZER;
 		WRITE(0, (const uint8_t *)"> ", 2);
-
 		for (;;) {
-			int ev = dssh_chan_poll(ch, DSSH_POLL_READ, -1);
-
-			if (ev <= 0)
+			int events = dssh_chan_poll(ch, DSSH_POLL_READ, -1);
+			if (events < 0) {
+				status = 1;
+				goto connection_done;
+			}
+			if ((events & DSSH_POLL_READ) == 0)
+				continue;
+			int64_t received = dssh_chan_read(ch, 0, input, sizeof(input));
+			if (received == DSSH_ERROR_NOMORE)
+				continue;
+			if (received == 0)
 				break;
-
-			ssize_t n = dssh_chan_read(ch, 0, &buf[line_len], sizeof(buf) - line_len - 1);
-
-			if (n <= 0)
-				break;
-
-			/* Echo input back, translating \r to \r\n */
-			for (ssize_t ei = 0; ei < n; ei++) {
-				if (buf[line_len + ei] == '\r')
+			if (received < 0 || received > 4096) {
+				status = 1;
+				goto connection_done;
+			}
+			size_t count = (size_t)received;
+			size_t echo_from = 0;
+			for (size_t i = 0; i < count; i++) {
+				enum example_shell_event event = example_shell_byte(&line, input[i]);
+				if (event == EXAMPLE_SHELL_DATA)
+					continue;
+				/* Emit each contiguous span once, preserving binary input. */
+				if (i > echo_from)
+					WRITE(0, input + echo_from, i - echo_from);
+				echo_from = i + 1;
+				if (event == EXAMPLE_SHELL_SKIP_LF)
+					continue;
+				if (input[i] == '\r')
 					WRITE(0, (const uint8_t *)"\r\n", 2);
 				else
-					WRITE(0, &buf[line_len + ei], 1);
+					WRITE(0, input + i, 1);
+				if (event == EXAMPLE_SHELL_PING) {
+					WRITE(0, (const uint8_t *)"pong\r\n", 6);
+				}
+				else if (event == EXAMPLE_SHELL_QUIT) {
+					WRITE(0, (const uint8_t *)"bye\r\n", 5);
+					goto connection_done;
+				}
+				else if (event == EXAMPLE_SHELL_STOP_PARENT) {
+					WRITE(0, (const uint8_t *)"dying...\r\n", 10);
+					if (kill(getppid(), SIGTERM) != 0)
+						status = 1;
+					goto connection_done;
+				}
+				else if (event == EXAMPLE_SHELL_UNKNOWN) {
+					static const char help[] = "commands: ping, quit, exit\r\n";
+					WRITE(0, (const uint8_t *)help, sizeof(help) - 1);
+				}
+				WRITE(0, (const uint8_t *)"> ", 2);
 			}
-
-			line_len += n;
-
-			/* Look for newline */
-			if (line_len == 0 || (buf[line_len - 1] != '\n' && buf[line_len - 1] != '\r'))
-				continue;
-
-			/* Strip trailing CR/LF */
-			while (line_len > 0 && (buf[line_len - 1] == '\n' || buf[line_len - 1] == '\r'))
-				line_len--;
-			buf[line_len] = '\0';
-
-			if (strcmp((char *)buf, "ping") == 0) {
-				WRITE(0, (const uint8_t *)"pong\r\n", 6);
-			}
-			else if (strcmp((char *)buf, "quit") == 0 || strcmp((char *)buf, "exit") == 0) {
-				WRITE(0, (const uint8_t *)"bye\r\n", 5);
-				break;
-			}
-			else if (strcmp((char *)buf, "diediedie") == 0) {
-				WRITE(0, (const uint8_t *)"dying...\r\n", 10);
-				kill(getppid(), SIGTERM);
-				break;
-			}
-			else if (line_len > 0) {
-				static const char help[] = "commands: ping, quit, exit\r\n";
-				WRITE(0, (const uint8_t *)help, sizeof(help) - 1);
-			}
-
-			line_len = 0;
-			WRITE(0, (const uint8_t *)"> ", 2);
+			if (count > echo_from)
+				WRITE(0, input + echo_from, count - echo_from);
 		}
 	}
 

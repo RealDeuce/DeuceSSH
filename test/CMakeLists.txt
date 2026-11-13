@@ -65,7 +65,8 @@ foreach(kind IN ITEMS static shared)
 			if(EXISTS "${PROJECT_SOURCE_DIR}/examples/server.c"
 				AND EXISTS "${PROJECT_SOURCE_DIR}/examples/kbi-game-server.c"
 				AND EXISTS "${PROJECT_SOURCE_DIR}/examples/server-io.h"
-				AND EXISTS "${PROJECT_SOURCE_DIR}/examples/server-output.h")
+				AND EXISTS "${PROJECT_SOURCE_DIR}/examples/server-output.h"
+				AND EXISTS "${PROJECT_SOURCE_DIR}/examples/server-shell.h")
 				foreach(example IN ITEMS server game)
 					set(io_target dssh_server_io_${example}_${kind})
 					add_executable(${io_target} test_server_io.c)

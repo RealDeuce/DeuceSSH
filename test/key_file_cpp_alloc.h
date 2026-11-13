@@ -9,6 +9,7 @@ void dssh_test_cpp_new_disable(void);
 void dssh_test_cpp_new_fail_nothrow_size(size_t size);
 size_t dssh_test_cpp_new_count(void);
 bool dssh_test_cpp_new_failed(void);
+bool dssh_test_cpp_new_failed_nothrow(void);
 size_t dssh_test_cpp_new_failed_size(void);
 extern "C" {
 #endif

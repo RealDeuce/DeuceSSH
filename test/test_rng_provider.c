@@ -66,6 +66,12 @@ main(int argc, char **argv)
 	}
 	ERR_clear_error();
 	int expected = strength == 256 ? 0 : DSSH_ERROR_INIT;
+	unsigned isolated = 0;
+#ifdef DSSH_TEST_RNG_PRIVATE_ARCHIVE
+	/* The application's configured provider is a separate archive instance. */
+	expected = 0;
+	isolated = 1;
+#endif
 	int actual = dssh_random(frame + 1, 32);
 	REQUIRE(actual == expected);
 	REQUIRE(frame[0] == 0xa5 && frame[33] == 0xa5);
@@ -77,10 +83,17 @@ main(int argc, char **argv)
 	if (strength != 0) {
 		ERR_clear_error();
 		REQUIRE(RAND_priv_bytes_ex(NULL, native, sizeof(native), 0) == 1);
+		REQUIRE(EVP_RAND_get_strength(context) == strength);
+	}
+	else {
+		ERR_clear_error();
+		REQUIRE(RAND_priv_bytes_ex(NULL, native, sizeof(native), 0) != 1);
+		REQUIRE(RAND_get0_private(NULL) == NULL);
 	}
 	dssh_cleanse(native, sizeof(native));
 	dssh_cleanse(frame, sizeof(frame));
-	if (printf("rng_policy=1 mode=%s production=1 bits=%u\n", argv[1], strength) < 0)
+	if (printf("rng_policy=1 mode=%s production=1 bits=%u isolated=%u\n",
+	    argv[1], strength, isolated) < 0 || fflush(stdout) != 0)
 		return 2;
 	return 0;
 }

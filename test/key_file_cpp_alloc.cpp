@@ -8,6 +8,7 @@
 
 static thread_local bool active;
 static thread_local bool failed;
+static thread_local bool failed_nothrow;
 static thread_local size_t fail_at;
 static thread_local size_t attempts;
 static thread_local size_t failed_size;
@@ -20,6 +21,7 @@ dssh_test_cpp_new_fail_after(size_t index)
 	active = true;
 	nothrow_only = false;
 	failed = false;
+	failed_nothrow = false;
 	failed_size = 0;
 	fail_at = index;
 	attempts = 0;
@@ -51,6 +53,12 @@ dssh_test_cpp_new_failed(void)
 	return failed;
 }
 
+bool
+dssh_test_cpp_new_failed_nothrow(void)
+{
+	return failed_nothrow;
+}
+
 size_t
 dssh_test_cpp_new_failed_size(void)
 {
@@ -66,6 +74,7 @@ operator new(std::size_t size)
 			attempts++;
 		if (!failed && index == fail_at) {
 			failed = true;
+			failed_nothrow = in_nothrow;
 			failed_size = size;
 			throw std::bad_alloc();
 		}

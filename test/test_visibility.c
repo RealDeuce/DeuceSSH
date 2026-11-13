@@ -19,6 +19,10 @@ main(int argc, char **argv)
 		return 1;
 #else
 	(void)argv;
+#ifdef DSSH_TEST_ELF_ARCHIVE
+	if (dlsym(RTLD_DEFAULT, "dssh_visibility_archive") != NULL)
+		return 1;
+#endif
 	if (dlsym(RTLD_DEFAULT, "dssh_visibility_probe") == NULL
 	    || dlsym(RTLD_DEFAULT, "dssh_visibility_private") != NULL)
 		return 1;

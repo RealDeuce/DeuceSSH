@@ -114,6 +114,17 @@ if(UNIX OR WIN32)
 	target_compile_definitions(dssh_test_visibility PRIVATE DSSH_SHARED_IMPORT)
 	target_compile_options(dssh_test_visibility PRIVATE ${DEUCESSH_COMPILE_OPTIONS})
 	target_link_libraries(dssh_test_visibility PRIVATE dssh_visibility_probe ${CMAKE_DL_LIBS})
+	if(UNIX AND NOT APPLE AND "-Wl,--exclude-libs,ALL" IN_LIST DEUCESSH_LINK_OPTIONS)
+		add_library(dssh_visibility_archive STATIC visibility_archive.c)
+		set_target_properties(dssh_visibility_archive PROPERTIES
+			C_STANDARD ${DEUCESSH_C_STANDARD} C_STANDARD_REQUIRED ON POSITION_INDEPENDENT_CODE ON)
+		target_compile_definitions(dssh_visibility_archive PRIVATE DSSH_SHARED)
+		target_compile_options(dssh_visibility_archive PRIVATE ${DEUCESSH_COMPILE_OPTIONS})
+		target_link_libraries(dssh_visibility_probe PRIVATE dssh_visibility_archive)
+		target_compile_definitions(dssh_visibility_probe PRIVATE DSSH_TEST_ELF_ARCHIVE)
+		target_compile_definitions(dssh_test_visibility PRIVATE DSSH_TEST_ELF_ARCHIVE)
+		target_link_options(dssh_visibility_probe PRIVATE ${DEUCESSH_LINK_OPTIONS})
+	endif()
 	dssh_add_output_test(dssh_visibility dssh_test_visibility
 		"visibility_probe public=42 private=0 valid=1" $<TARGET_FILE_NAME:dssh_visibility_probe>)
 endif()
@@ -241,6 +252,15 @@ foreach(kind IN ITEMS static shared)
 			set_property(TARGET ${rng_target} PROPERTY C_STANDARD_REQUIRED ON)
 			target_compile_options(${rng_target} PRIVATE ${DEUCESSH_COMPILE_OPTIONS})
 			target_link_libraries(${rng_target} PRIVATE deucessh_${kind} OpenSSL::Crypto)
+			# A privately embedded archive has its own native global context.
+			# Configuring the application's copy must leave that provider intact.
+			if(kind STREQUAL shared AND UNIX AND NOT APPLE
+			    AND "-Wl,--exclude-libs,ALL" IN_LIST DEUCESSH_LINK_OPTIONS)
+				get_target_property(rng_crypto OpenSSL::Crypto IMPORTED_LOCATION)
+				if(rng_crypto MATCHES "[.]a$")
+					target_compile_definitions(${rng_target} PRIVATE DSSH_TEST_RNG_PRIVATE_ARCHIVE)
+				endif()
+			endif()
 			foreach(mode IN ITEMS aes128 aes192 aes256 invalid)
 				dssh_add_output_test(dssh_rng_provider_${kind}_${mode} ${rng_target}
 					"rng_policy=1 mode=${mode} production=1" ${mode})
@@ -316,6 +336,41 @@ foreach(kind IN ITEMS static shared)
 			endforeach()
 
 		endif()
+	endif()
+endforeach()
+
+# Actual production C17 entry across native provider key/exception boundaries.
+# An independent application crypto dependency belongs outside our shared object.
+if(UNIX AND NOT APPLE)
+	find_library(DSSH_OBSERVER_CRYPTO_LIBRARY NAMES crypto PATHS /usr/lib /usr/local/lib NO_DEFAULT_PATH)
+	find_path(DSSH_OBSERVER_CRYPTO_INCLUDE openssl/evp.h PATHS /usr/include /usr/local/include NO_DEFAULT_PATH)
+endif()
+foreach(kind IN ITEMS static shared)
+	if(TARGET deucessh_${kind})
+		set(target dssh_test_provider_boundary_${kind})
+		add_executable(${target} provider_boundary.c)
+		set_target_properties(${target} PROPERTIES
+			C_STANDARD ${DEUCESSH_C_STANDARD} C_STANDARD_REQUIRED ON)
+		target_compile_options(${target} PRIVATE ${DEUCESSH_COMPILE_OPTIONS})
+		target_link_libraries(${target} PRIVATE deucessh_${kind})
+		if(kind STREQUAL shared)
+			target_compile_definitions(${target} PRIVATE DSSH_SHARED_IMPORT)
+			if(UNIX AND NOT APPLE AND DSSH_OBSERVER_CRYPTO_LIBRARY AND DSSH_OBSERVER_CRYPTO_INCLUDE)
+				target_compile_definitions(${target} PRIVATE DSSH_PROVIDER_SYSTEM_OPENSSL)
+				target_include_directories(${target} SYSTEM PRIVATE ${DSSH_OBSERVER_CRYPTO_INCLUDE})
+				target_link_libraries(${target} PRIVATE ${DSSH_OBSERVER_CRYPTO_LIBRARY} ${CMAKE_DL_LIBS})
+			endif()
+		endif()
+		if(DEUCESSH_CRYPTO_BACKEND STREQUAL "Botan" AND UNIX AND NOT APPLE)
+			target_sources(${target} PRIVATE provider_boundary_cpp.cpp key_file_cpp_alloc.cpp)
+			set_target_properties(${target} PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+			target_compile_definitions(${target} PRIVATE DSSH_PROVIDER_CPP_CONTROLS)
+		endif()
+		dssh_add_output_test(dssh_provider_boundary_${kind} ${target}
+			"provider_boundary algorithms=3 rejected=3 wrong=3 cpp=[01] faults=[04] valid=1"
+			"${CMAKE_CURRENT_BINARY_DIR}/provider-boundary-${kind}.pem"
+			"${CMAKE_CURRENT_BINARY_DIR}/test_ed25519.pem" "${CMAKE_CURRENT_BINARY_DIR}/test_rsa.pem")
+		set_tests_properties(dssh_provider_boundary_${kind} PROPERTIES FIXTURES_REQUIRED dssh_cached_keys)
 	endif()
 endforeach()
 

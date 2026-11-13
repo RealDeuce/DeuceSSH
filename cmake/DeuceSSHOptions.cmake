@@ -130,7 +130,7 @@ function(dssh_configure_options)
 		foreach(flag IN ITEMS "-Wl,-z,relro,-z,now" "-Wl,--hash-style=gnu"
 			"-Wl,-Bsymbolic-functions" "-Wl,-O2" "-Wl,-z,nodlopen"
 			"-Wl,-z,noexecstack" "-Wl,--as-needed"
-			"-Wl,--no-copy-dt-needed-entries")
+			"-Wl,--no-copy-dt-needed-entries" "-Wl,--exclude-libs,ALL")
 			dssh_check_option(${link_language} LINK "${flag}" supported)
 			if(supported)
 				list(APPEND link_options "${flag}")

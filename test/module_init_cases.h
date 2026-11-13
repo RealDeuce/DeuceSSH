@@ -7,6 +7,7 @@ struct init_context {
 
 struct init_trace {
 	void (*observe_init)(void);
+	void (*observe_transition)(unsigned provider, unsigned slot, bool cleanup);
 	bool stateless[2];
 	bool partial;
 	bool client;
@@ -26,6 +27,8 @@ trace_initialize(unsigned provider, unsigned slot, void **out)
 {
 	if (init_trace->observe_init != NULL)
 		init_trace->observe_init();
+	if (init_trace->observe_transition != NULL)
+		init_trace->observe_transition(provider, slot, false);
 	init_trace->inits[provider][slot]++;
 	bool failed = provider == init_trace->fail_provider && slot == init_trace->fail_slot;
 	*out = NULL;
@@ -44,6 +47,8 @@ trace_initialize(unsigned provider, unsigned slot, void **out)
 static void
 trace_cleanup(unsigned provider, unsigned slot, void *opaque)
 {
+	if (init_trace->observe_transition != NULL)
+		init_trace->observe_transition(provider, slot, true);
 	init_trace->cleanups[provider][slot]++;
 	struct init_context *ctx = opaque;
 	if (ctx != NULL) {
@@ -314,6 +319,149 @@ test_init_preparation_failures(void)
 		}
 	}
 	ASSERT_TRUE(valid);
+	return TEST_PASS;
+}
+
+struct init_lifecycle_observation {
+	dssh_session sess;
+	unsigned provider;
+	unsigned slot;
+	unsigned calls;
+	bool cleanup;
+	bool teardown;
+	bool stop;
+	bool valid;
+};
+
+static struct init_lifecycle_observation *init_lifecycle;
+
+static void
+observe_init_lifecycle(unsigned provider, unsigned slot, bool cleanup)
+{
+	struct init_lifecycle_observation *state = init_lifecycle;
+	if (provider != state->provider || slot != state->slot || cleanup != state->cleanup)
+		return;
+	state->calls++;
+	if (state->calls != 1) {
+		state->valid = false;
+		return;
+	}
+	dssh_session sess = state->sess;
+	mtx_t *locks[] = { &sess->mtx, &sess->trans.tx_mtx, &sess->trans.tx_queue_mtx };
+	for (size_t i = 0; i < sizeof(locks) / sizeof(locks[0]); i++) {
+		int ret = mtx_trylock(locks[i]);
+		if (ret == thrd_success) {
+			if (mtx_unlock(locks[i]) != thrd_success)
+				abort();
+		}
+		else
+			state->valid = false;
+	}
+	unsigned live = init_trace->live;
+	unsigned released = init_trace->cleanups[provider][slot];
+	state->valid &= tx_owner_is_current(sess) == !state->teardown;
+	state->valid &= atomic_load(&sess->lifecycle_busy) == state->teardown;
+	if (state->stop)
+		dssh_session_stop(sess);
+	else
+		dssh_session_cleanup(sess);
+	/* The outer owner still owns every context. A lifecycle call may request
+	 * termination here, but cannot recursively release or free the session. */
+	state->valid &= dssh_session_is_terminated(sess)
+	    && init_trace->live == live && init_trace->cleanups[provider][slot] == released
+	    && tx_owner_is_current(sess) == !state->teardown
+	    && atomic_load(&sess->lifecycle_busy) == state->teardown;
+}
+
+static bool
+init_lifecycle_case(bool client, bool old_stateless, bool new_stateless,
+    bool stop, unsigned phase, unsigned slot)
+{
+	dssh_test_reset_global_config();
+	struct init_trace trace = {
+		.stateless = { old_stateless, new_stateless }, .client = client, .fail_slot = 4,
+	};
+	init_trace = &trace;
+	struct init_modules modules;
+	bool valid = make_init_modules(&modules, false);
+	dssh_session sess = dssh_session_init(client, 0);
+	valid &= sess != NULL;
+	struct dssh_kex_s method = { .hash_name = "SHA-256" };
+	uint8_t hash[32] = {0};
+	struct init_lifecycle_observation observation = {
+		.sess = sess, .provider = phase == 1 ? 1U : 0U, .slot = slot,
+		.cleanup = phase >= 2, .teardown = phase == 3, .stop = stop, .valid = true,
+	};
+	init_lifecycle = &observation;
+	if (valid) {
+		sess->trans.kex_selected = &method;
+		sess->trans.session_id = hash;
+		sess->trans.session_id_sz = sizeof(hash);
+		sess->trans.kex_result.exchange_hash = (struct dssh_bytes){hash, sizeof(hash)};
+		select_init_modules(sess, &modules, 0);
+		if (phase != 0)
+			valid = install_init_modules(sess, &modules, true) == 0;
+		if (valid) {
+			trace.observe_transition = observe_init_lifecycle;
+			if (phase != 3) {
+				sess->trans.kex_result.exchange_hash = (struct dssh_bytes){hash, sizeof(hash)};
+				if (phase != 0)
+					select_init_modules(sess, &modules, 1);
+				/* NEWKEYS owns the engine, with no physical TX mutex held.
+				 * Exercise that same ownership around the private installer. */
+				int ret = tx_acquire(sess, SSH_MSG_NEWKEYS);
+				valid = ret == 0;
+				if (ret == 0) {
+					ret = install_init_modules(sess, &modules, phase == 0);
+					valid &= ret == 0 && sess->terminate;
+					tx_unlock_with_slots(sess);
+					valid &= !tx_owner_is_current(sess)
+					    && !atomic_load(&sess->trans.tx_owner_active);
+				}
+			}
+		}
+	}
+	if (sess != NULL) {
+		sess->trans.kex_result.exchange_hash = (struct dssh_bytes){0};
+		sess->trans.session_id = NULL;
+		dssh_session_cleanup(sess);
+	}
+	valid &= observation.valid && observation.calls == 1 && trace.live == 0 && !trace.wrong_owner;
+	for (unsigned provider = 0; provider < 2; provider++) {
+		for (unsigned direction = 0; direction < 4; direction++)
+			valid &= trace.inits[provider][direction] == trace.cleanups[provider][direction];
+	}
+	free_init_modules(&modules);
+	init_lifecycle = NULL;
+	init_trace = NULL;
+	dssh_test_reset_global_config();
+	if (!valid)
+		fprintf(stderr, "init lifecycle: client=%d old=%d new=%d stop=%d phase=%u slot=%u calls=%u\n",
+		    client, old_stateless, new_stateless, stop, phase, slot, observation.calls);
+	return valid;
+}
+
+static int
+test_init_lifecycle(void)
+{
+	unsigned failures = 0;
+	unsigned cases = 0;
+	for (unsigned mode = 0; mode < 16; mode++) {
+		for (unsigned phase = 0; phase < 4; phase++) {
+			if ((phase == 0 || phase == 3) && (mode & 4) != 0)
+				continue;
+			for (unsigned slot = 0; slot < 4; slot++) {
+				bool valid = init_lifecycle_case((mode & 1) != 0, (mode & 2) != 0,
+				    (mode & 4) != 0, (mode & 8) != 0, phase, slot);
+				if (!valid)
+					failures++;
+				cases++;
+			}
+		}
+	}
+	printf("init_lifecycle cases=%u failures=%u\n", cases, failures);
+	ASSERT_EQ_U(cases, 192);
+	ASSERT_EQ_U(failures, 0);
 	return TEST_PASS;
 }
 

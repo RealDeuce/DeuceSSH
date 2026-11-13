@@ -36,6 +36,7 @@ struct module_fixture {
 	int availability;
 	unsigned availability_calls;
 	unsigned pubkey_calls;
+	unsigned sign_calls;
 	unsigned kex_allocations;
 	unsigned kex_frees;
 	unsigned kex_bad_release;
@@ -565,6 +566,7 @@ observe_signature_release(const void *storage, size_t length, void *data)
 static int
 auth_sign(struct dssh_bytes_result *output_result, const uint8_t *data, size_t data_len, dssh_key_algo_ctx *ctx)
 {
+	active->sign_calls++;
 	uint8_t *fixture_output = NULL;
 	size_t fixture_length = 0;
 	uint8_t **out = &fixture_output;
@@ -669,10 +671,14 @@ test_auth_client_results(void)
 				if (valid) {
 					sess->trans.session_id[0] = 7;
 					sess->trans.session_id_sz = 1;
+					sess->handshake_complete = true;
 					sess->auth_service_requested = true;
 					int ret = dssh_auth_publickey(sess, "user", "contract-key");
 					int expected = stages[i] <= 2 && variant == 0 ? DSSH_ERROR_INIT : DSSH_ERROR_INVALID;
-					valid = ret == expected && fixture.writes == 0;
+					unsigned signatures = stages[i] == 2 || stages[i] >= 8 ? 1U : 0U;
+					valid = ret == expected && fixture.writes == 0
+					    && fixture.availability_calls == 1 && fixture.pubkey_calls == 1
+					    && fixture.sign_calls == signatures;
 				}
 			}
 			dssh_session_cleanup(sess);
@@ -783,6 +789,7 @@ static struct dssh_test_entry tests[] = {
 	{ "init/publication", test_init_publication },
 	{ "init/rekey_ownership", test_init_rekey_ownership },
 	{ "init/preparation_failures", test_init_preparation_failures },
+	{ "init/lifecycle", test_init_lifecycle },
 	{ "packet/results", test_packet_results },
 	{ "auth/client", test_auth_client_results },
 	{ "auth/server", test_auth_server_results },

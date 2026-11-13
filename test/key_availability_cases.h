@@ -20,6 +20,7 @@ test_key_availability_auth(void)
 		dssh_session sess = dssh_session_init(true, 0);
 		matched = matched && sess != NULL;
 		if (matched) {
+			sess->handshake_complete = true;
 			sess->auth_service_requested = true;
 			int ret = dssh_auth_publickey(sess, "user", "contract-key");
 			int expected = available < 0 ? available : (available == 0 ? DSSH_ERROR_INIT : DSSH_ERROR_INVALID);

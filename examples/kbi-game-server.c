@@ -72,8 +72,10 @@ log_bytes(const char *prefix, const uint8_t *bytes, size_t length)
 static void
 on_terminate(dssh_session s, void *cbdata)
 {
-	if (conn_fd != -1)
-		shutdown(conn_fd, SHUT_RDWR);
+	(void)s;
+	(void)cbdata;
+	if (conn_fd >= 0 && shutdown(conn_fd, SHUT_RDWR) != 0 && errno != ENOTCONN)
+		atomic_store(&diagnostic_failed, true);
 }
 
 /* ================================================================
@@ -807,96 +809,99 @@ global_request_cb(const uint8_t *name, size_t name_len, bool want_reply, const u
 static int
 handle_connection(void)
 {
+	int status = 1;
+	dssh_channel ch = NULL;
 	atomic_store(&diagnostic_failed, false);
+	connection_io = (struct example_socket_io){ .descriptor = conn_fd };
 	/* Readiness alone does not make a blocking transfer bounded. */
 	int flags = fcntl(conn_fd, F_GETFL);
 	if (flags < 0 || fcntl(conn_fd, F_SETFL, flags | O_NONBLOCK) != 0) {
-		perror("fcntl");
-		return 1;
+		(void)log_message("socket configuration failed\n");
+		goto connection_done;
 	}
 	/* The deadline is immutable after authentication/connection startup. */
-	connection_io = (struct example_socket_io){ .descriptor = conn_fd };
 	if (example_socket_reset(&connection_io) != 0) {
-		fputs("clock initialization failed\n", stderr);
-		return 1;
+		(void)log_message("clock initialization failed\n");
+		goto connection_done;
 	}
 
-	/* Initialize session */
 	sess = dssh_session_init(false, 0);
 	if (sess == NULL) {
-		fprintf(stderr, "session_init failed\n");
-		return 1;
+		(void)log_message("session_init failed\n");
+		goto connection_done;
 	}
-	dssh_session_set_terminate_cb(sess, on_terminate, NULL);
-	dssh_session_set_debug_cb(sess, debug_cb, NULL);
-	dssh_session_set_unimplemented_cb(sess, unimplemented_cb, NULL);
-	dssh_session_set_global_request_cb(sess, global_request_cb, NULL);
-	/* Handshake */
-	fprintf(stderr, "Handshake...\n");
+	if (dssh_session_set_terminate_cb(sess, on_terminate, NULL) != 0
+	    || dssh_session_set_debug_cb(sess, debug_cb, NULL) != 0
+	    || dssh_session_set_unimplemented_cb(sess, unimplemented_cb, NULL) != 0
+	    || dssh_session_set_global_request_cb(sess, global_request_cb, NULL) != 0) {
+		(void)log_message("callback setup failed\n");
+		goto connection_done;
+	}
+	if (!log_message("Handshake...\n"))
+		goto connection_done;
 	int res = dssh_transport_handshake(sess);
-	if (res < 0) {
-		fprintf(stderr, "handshake failed: %d\n", res);
-		return 1;
+	if (res != 0) {
+		(void)log_message("handshake failed: %d\n", res);
+		goto connection_done;
 	}
-	fprintf(stderr, "Remote: %s\n", dssh_transport_get_remote_version(sess));
-	fprintf(stderr, "KEX: %s, Host key: %s\n", dssh_transport_get_kex_name(sess),
-	    dssh_transport_get_hostkey_name(sess));
+	const char *remote = dssh_transport_get_remote_version(sess);
+	if (remote == NULL || !log_bytes("Remote: ", (const uint8_t *)remote, strlen(remote)))
+		goto connection_done;
+	const char *kex = dssh_transport_get_kex_name(sess);
+	if (kex == NULL)
+		goto connection_done;
+	const char *host = dssh_transport_get_hostkey_name(sess);
+	if (host == NULL || !log_message("KEX: %s, Host key: %s\n", kex, host))
+		goto connection_done;
 	const enum dssh_direction directions[] = {DSSH_CLIENT_TO_SERVER, DSSH_SERVER_TO_CLIENT};
 	const char *labels[] = {"Client to server", "Server to client"};
-	for (size_t i = 0; i < 2; i++) {
-		fprintf(stderr, "%s: Enc: %s, MAC: %s, Compression: %s\n", labels[i],
-		    dssh_transport_get_enc_name(sess, directions[i]),
-		    dssh_transport_get_mac_name(sess, directions[i]),
-		    dssh_transport_get_comp_name(sess, directions[i]));
+	for (size_t i = 0; i < sizeof(directions) / sizeof(directions[0]); i++) {
+		const char *enc = dssh_transport_get_enc_name(sess, directions[i]);
+		if (enc == NULL)
+			goto connection_done;
+		const char *mac = dssh_transport_get_mac_name(sess, directions[i]);
+		if (mac == NULL)
+			goto connection_done;
+		const char *comp = dssh_transport_get_comp_name(sess, directions[i]);
+		if (comp == NULL || !log_message("%s: Enc: %s, MAC: %s, Compression: %s\n",
+		    labels[i], enc, mac, comp))
+			goto connection_done;
 	}
 
-	/* Auth */
-	fprintf(stderr, "Handling auth...\n");
-	if (publish_banner("Welcome to the DeuceSSH test server, have fun!\r\n") < 0) {
-		dssh_session_cleanup(sess);
-		sess = NULL;
-		return 1;
+	if (!log_message("Handling auth...\n")
+	    || publish_banner("Welcome to the DeuceSSH test server, have fun!\r\n") < 0)
+		goto connection_done;
+	/* The application does not use a copy of the authenticated username. */
+	res = dssh_auth_server(sess, &auth_cbs, NULL, NULL);
+	if (res != DSSH_AUTH_SUCCESS) {
+		(void)log_message("auth failed: %d\n", res);
+		goto connection_done;
 	}
-
-	uint8_t auth_user[256];
-	size_t  auth_user_len = sizeof(auth_user);
-
-	res = dssh_auth_server(sess, &auth_cbs, auth_user, &auth_user_len);
-	if (res < 0) {
-		fprintf(stderr, "auth failed: %d\n", res);
-		return 1;
-	}
-	fprintf(stderr, "Client authenticated.\n");
-
-	/* Start demux thread */
+	if (!log_message("Client authenticated.\n"))
+		goto connection_done;
 	res = dssh_session_start(sess);
-	if (res < 0) {
-		fprintf(stderr, "session_start failed: %d\n", res);
-		return 1;
+	if (res != 0) {
+		(void)log_message("session_start failed: %d\n", res);
+		goto connection_done;
 	}
-
-	/* Accept incoming channel */
-	fprintf(stderr, "Handling channel...\n");
-
-	dssh_channel ch = dssh_chan_accept(sess, &accept_cbs, -1);
-
+	if (!log_message("Handling channel...\n"))
+		goto connection_done;
+	ch = dssh_chan_accept(sess, &accept_cbs, -1);
 	if (ch == NULL) {
-		fprintf(stderr, "chan_accept failed\n");
-		return 1;
+		(void)log_message("chan_accept failed\n");
+		goto connection_done;
 	}
-
 	enum dssh_chan_type ctype = dssh_chan_get_type(ch);
-
-	fprintf(stderr, "  Type: %s\n",
-	    ctype == DSSH_CHAN_EXEC    ? "exec"
-	    : ctype == DSSH_CHAN_SHELL ? "shell"
-				       : "subsystem");
-
-	int status = 0;
+	if (ctype != DSSH_CHAN_EXEC && ctype != DSSH_CHAN_SHELL && ctype != DSSH_CHAN_SUBSYSTEM)
+		goto connection_done;
+	if (!log_message("  Type: %s\n", ctype == DSSH_CHAN_EXEC ? "exec"
+	    : ctype == DSSH_CHAN_SHELL ? "shell" : "subsystem"))
+		goto connection_done;
+	status = 0;
 #define WRITE(stream, bytes, length) do { \
 	if (example_channel_write(ch, stream, bytes, length) < 0) { \
 		status = 1; \
-		goto channel_done; \
+		goto connection_done; \
 	} \
 } while (0)
 
@@ -972,19 +977,30 @@ handle_connection(void)
 	}
 
 #undef WRITE
-channel_done:
-	/* Clean shutdown */
-	fprintf(stderr, "Channel closed.\n");
-	int closed = dssh_chan_close(ch, 0);
-	ch = NULL;
-	dssh_session_cleanup(sess);
-	sess = NULL;
-	if (close(conn_fd) != 0) {
-		perror("close");
-		closed = 1;
+connection_done:
+	/* Keep the socket available until cleanup has joined the reader. */
+	if (ch != NULL) {
+		if (!log_message("Channel closed.\n"))
+			status = 1;
+		int closed = dssh_chan_close(ch, status);
+		ch = NULL;
+		if (closed != 0)
+			status = 1;
 	}
-	conn_fd = -1;
-	if (closed != 0 || atomic_load(&diagnostic_failed))
+	if (sess != NULL) {
+		dssh_session_cleanup(sess);
+		sess = NULL;
+	}
+	if (conn_fd >= 0) {
+		/* A failed close does not authorize retrying a possibly reused fd. */
+		if (close(conn_fd) != 0) {
+			(void)log_message("socket close failed\n");
+			status = 1;
+		}
+		conn_fd = -1;
+	}
+	connection_io = (struct example_socket_io){ .descriptor = -1 };
+	if (atomic_load(&diagnostic_failed))
 		status = 1;
 	return status;
 }

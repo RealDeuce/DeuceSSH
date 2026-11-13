@@ -12634,6 +12634,7 @@ test_auth_request_capacity(void)
 #include "kbi_prompt_count_cases.h"
 #include "auth_continuation_cases.h"
 #include "auth_post_success_cases.h"
+#include "auth_request_boundary_cases.h"
 
 static struct dssh_test_entry tests[] = {
 	{ "auth/post_success/direct", test_auth_post_success_direct },
@@ -12925,4 +12926,14 @@ static struct dssh_test_entry tests[] = {
 };
 
 DSSH_TEST_NO_CLEANUP
+#define main dssh_test_auth_main
 DSSH_TEST_MAIN(tests)
+#undef main
+
+int
+main(int argc, char *argv[])
+{
+	if (argc == 2 && strcmp(argv[1], "--audit-auth-boundaries") == 0)
+		return auth_boundary_probe();
+	return dssh_test_auth_main(argc, argv);
+}

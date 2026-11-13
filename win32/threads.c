@@ -16,39 +16,35 @@
 /* ------------------------------------------------------------- mutexes */
 
 int
-mtx_init(mtx_t *mtx, int type)
+dssh_thread_mtx_init(mtx_t *mtx, int type)
 {
-	/* DeuceSSH only uses mtx_plain; the other C11 attributes (timed,
-	 * recursive) aren't exercised.  Accept any combination silently —
-	 * CRITICAL_SECTION is already recursive on the same thread, and
-	 * timed-lock support would need SRWLock or a condition variable
-	 * retrofit that we don't need today. */
-	(void)type;
+	if (type != mtx_plain)
+		return thrd_error;
 	InitializeCriticalSection(mtx);
 	return thrd_success;
 }
 
 void
-mtx_destroy(mtx_t *mtx)
+dssh_thread_mtx_destroy(mtx_t *mtx)
 {
 	DeleteCriticalSection(mtx);
 }
 
 int
-mtx_lock(mtx_t *mtx)
+dssh_thread_mtx_lock(mtx_t *mtx)
 {
 	EnterCriticalSection(mtx);
 	return thrd_success;
 }
 
 int
-mtx_trylock(mtx_t *mtx)
+dssh_thread_mtx_trylock(mtx_t *mtx)
 {
 	return TryEnterCriticalSection(mtx) ? thrd_success : thrd_busy;
 }
 
 int
-mtx_unlock(mtx_t *mtx)
+dssh_thread_mtx_unlock(mtx_t *mtx)
 {
 	LeaveCriticalSection(mtx);
 	return thrd_success;
@@ -57,42 +53,42 @@ mtx_unlock(mtx_t *mtx)
 /* ----------------------------------------------------- condition vars */
 
 int
-cnd_init(cnd_t *cnd)
+dssh_thread_cnd_init(cnd_t *cnd)
 {
 	InitializeConditionVariable(cnd);
 	return thrd_success;
 }
 
 void
-cnd_destroy(cnd_t *cnd)
+dssh_thread_cnd_destroy(cnd_t *cnd)
 {
 	/* CONDITION_VARIABLE has no destructor on Windows. */
 	(void)cnd;
 }
 
 int
-cnd_signal(cnd_t *cnd)
+dssh_thread_cnd_signal(cnd_t *cnd)
 {
 	WakeConditionVariable(cnd);
 	return thrd_success;
 }
 
 int
-cnd_broadcast(cnd_t *cnd)
+dssh_thread_cnd_broadcast(cnd_t *cnd)
 {
 	WakeAllConditionVariable(cnd);
 	return thrd_success;
 }
 
 int
-cnd_wait(cnd_t *cnd, mtx_t *mtx)
+dssh_thread_cnd_wait(cnd_t *cnd, mtx_t *mtx)
 {
 	return SleepConditionVariableCS(cnd, mtx, INFINITE)
 	    ? thrd_success : thrd_error;
 }
 
 int
-cnd_timedwait(cnd_t *cnd, mtx_t *mtx, const struct timespec *ts)
+dssh_thread_cnd_timedwait(cnd_t *cnd, mtx_t *mtx, const struct timespec *ts)
 {
 	if (ts->tv_nsec < 0 || ts->tv_nsec >= 1000000000L)
 		return thrd_error;
@@ -161,11 +157,12 @@ dssh_thrd_trampoline(void *arg)
 	struct dssh_thrd_ctx *ctx = arg;
 	int rc = ctx->func(ctx->arg);
 	free(ctx);
-	return (unsigned)rc;
+	unsigned result = (unsigned)rc;
+	return result;
 }
 
 int
-thrd_create(thrd_t *thr, thrd_start_t func, void *arg)
+dssh_thread_thrd_create(thrd_t *thr, thrd_start_t func, void *arg)
 {
 	struct dssh_thrd_ctx *ctx = malloc(sizeof(*ctx));
 	if (ctx == NULL)
@@ -179,12 +176,13 @@ thrd_create(thrd_t *thr, thrd_start_t func, void *arg)
 		free(ctx);
 		return thrd_error;
 	}
-	*thr = (HANDLE)h;
+	HANDLE handle = (HANDLE)h;
+	*thr = handle;
 	return thrd_success;
 }
 
 int
-thrd_join(thrd_t thr, int *res)
+dssh_thread_thrd_join(thrd_t thr, int *res)
 {
 	/* Consume the handle only after every operation needed by this join
 	 * succeeds.  A failure must allow the owner to retry joining. */
@@ -213,8 +211,68 @@ thrd_join(thrd_t thr, int *res)
 	return thrd_success;
 }
 
+/* Sleep alone may wake before its requested interval. Recheck a monotonic
+ * lower bound, allowing one counter tick for sampling quantization. Ceiling
+ * ticks/ms underestimates elapsed time without multiplying a large counter. */
+static int
+dssh_sleep_millis(DWORD millis)
+{
+	if (millis == 0) {
+		Sleep(0);
+		return 0;
+	}
+	LARGE_INTEGER frequency, start, now;
+	if (!QueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0
+	    || !QueryPerformanceCounter(&start) || start.QuadPart < 0)
+		return -2;
+	uint64_t rate = (uint64_t)frequency.QuadPart;
+	uint64_t ticks_per_ms = rate / 1000 + (rate % 1000 != 0 ? 1U : 0U);
+	DWORD remaining = millis;
+	for (;;) {
+		Sleep(remaining);
+		if (!QueryPerformanceCounter(&now) || now.QuadPart < start.QuadPart)
+			return -2;
+		int64_t difference = now.QuadPart - start.QuadPart;
+		uint64_t ticks = (uint64_t)difference;
+		if (ticks > 0)
+			ticks--;
+		uint64_t seconds = ticks / rate;
+		if (seconds > millis / 1000)
+			return 0;
+		uint64_t elapsed = seconds * 1000 + (ticks % rate) / ticks_per_ms;
+		if (elapsed >= millis)
+			return 0;
+		uint64_t left = millis - elapsed;
+		/* left is positive and at most the original finite DWORD interval. */
+		DWORD interval = (DWORD)left;
+		remaining = interval;
+	}
+}
+
+int
+dssh_thread_thrd_sleep(const struct timespec *duration, struct timespec *remaining)
+{
+	(void)remaining; /* Sleep is not interrupted by signals or APC callbacks. */
+	if (duration == NULL || duration->tv_sec < 0
+	    || duration->tv_nsec < 0 || duration->tv_nsec >= 1000000000L)
+		return -2;
+	uint64_t seconds = (uint64_t)duration->tv_sec;
+	/* Leave space for rounding the final fractional second, and never pass
+	 * the INFINITE sentinel to Sleep. Each subtraction is guarded. */
+	while (seconds > UINT32_C(4294966)) {
+		if (dssh_sleep_millis(UINT32_C(4294966000)) != 0)
+			return -2;
+		seconds -= UINT32_C(4294966);
+	}
+	uint32_t last_seconds = (uint32_t)seconds;
+	long rounded_nanos = (duration->tv_nsec + 999999L) / 1000000L;
+	uint32_t fraction = (uint32_t)rounded_nanos;
+	DWORD millis = last_seconds * UINT32_C(1000) + fraction;
+	return dssh_sleep_millis(millis);
+}
+
 void
-thrd_yield(void)
+dssh_thread_thrd_yield(void)
 {
 	SwitchToThread();
 }

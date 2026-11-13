@@ -5,6 +5,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <time.h>
+#include <stdlib.h>
 
 static int fail_operation;
 
@@ -76,12 +77,70 @@ test_cond_wait(PCONDITION_VARIABLE cnd, PCRITICAL_SECTION mtx, DWORD timeout)
 	return wait_success;
 }
 
+static bool scripted_sleep;
+static DWORD sleep_requests[2];
+static size_t sleep_calls;
+static bool sleep_early;
+static int sleep_failure;
+static unsigned counter_calls;
+static LONGLONG sleep_ticks;
+
+static void WINAPI
+native_sleep(DWORD millis)
+{
+	if (!scripted_sleep) {
+		Sleep(millis);
+		return;
+	}
+	if (sleep_calls >= sizeof(sleep_requests) / sizeof(sleep_requests[0]))
+		abort();
+	sleep_requests[sleep_calls] = millis;
+	sleep_calls++;
+	if (sleep_early) {
+		sleep_early = false;
+		return;
+	}
+	sleep_ticks += millis;
+	sleep_ticks++;
+}
+
+static BOOL WINAPI
+native_frequency(LARGE_INTEGER *frequency)
+{
+	if (!scripted_sleep)
+		return QueryPerformanceFrequency(frequency);
+	if (sleep_failure == 1)
+		return FALSE;
+	frequency->QuadPart = sleep_failure == 2 ? 0 : 1000;
+	return TRUE;
+}
+
+static BOOL WINAPI
+native_counter(LARGE_INTEGER *counter)
+{
+	if (!scripted_sleep)
+		return QueryPerformanceCounter(counter);
+	counter_calls++;
+	if (sleep_failure == 3 || (sleep_failure == 4 && counter_calls == 2))
+		return FALSE;
+	counter->QuadPart = sleep_ticks;
+	if (sleep_failure == 5 && counter_calls == 2)
+		counter->QuadPart = -1;
+	return TRUE;
+}
+
+#define QueryPerformanceFrequency native_frequency
+#define QueryPerformanceCounter native_counter
+#define Sleep native_sleep
 #define timespec_get test_timespec_get
 #define SleepConditionVariableCS test_cond_wait
 #define WaitForSingleObject test_wait
 #define GetExitCodeThread test_exit_code
 #define CloseHandle test_close
 #include "../win32/threads.c"
+#undef QueryPerformanceCounter
+#undef QueryPerformanceFrequency
+#undef Sleep
 #undef WaitForSingleObject
 #undef GetExitCodeThread
 #undef CloseHandle
@@ -90,7 +149,8 @@ test_cond_wait(PCONDITION_VARIABLE cnd, PCRITICAL_SECTION mtx, DWORD timeout)
 
 #define CHECK(expr) do { \
 	if (!(expr)) { \
-		fprintf(stderr, "Failed at line %d: %s\n", __LINE__, #expr); \
+		if (fprintf(stderr, "Failed at line %d: %s\n", __LINE__, #expr) < 0) \
+			return 2; \
 		return 1; \
 	} \
 } while (0)
@@ -222,6 +282,51 @@ test_deadlines(void)
 }
 
 static int
+test_sleep_requests(void)
+{
+	struct timespec duration = { .tv_nsec = 1 };
+	CHECK(thrd_sleep(&duration, NULL) == 0); /* Actual native Windows wait. */
+	scripted_sleep = true;
+	sleep_calls = 0;
+	CHECK(thrd_sleep(&duration, NULL) == 0);
+	CHECK(sleep_calls == 1 && sleep_requests[0] == 1);
+	sleep_calls = 0;
+	duration.tv_sec = 4294967;
+	duration.tv_nsec = 999999999L;
+	CHECK(thrd_sleep(&duration, NULL) == 0);
+	CHECK(sleep_calls == 2 && sleep_requests[0] == UINT32_C(4294966000)
+	    && sleep_requests[1] == 2000);
+	sleep_calls = 0;
+	CHECK(thrd_sleep(NULL, NULL) == -2);
+	duration.tv_sec = -1;
+	CHECK(thrd_sleep(&duration, NULL) == -2);
+	duration.tv_sec = 0;
+	duration.tv_nsec = -1;
+	CHECK(thrd_sleep(&duration, NULL) == -2);
+	duration.tv_nsec = 1000000000L;
+	CHECK(thrd_sleep(&duration, NULL) == -2);
+	CHECK(sleep_calls == 0);
+	duration.tv_nsec = 0;
+	CHECK(thrd_sleep(&duration, NULL) == 0);
+	CHECK(sleep_calls == 1 && sleep_requests[0] == 0);
+	sleep_calls = 0;
+	duration.tv_nsec = 1;
+	sleep_early = true;
+	CHECK(thrd_sleep(&duration, NULL) == 0);
+	CHECK(sleep_calls == 2 && sleep_requests[0] == 1 && sleep_requests[1] == 1);
+	for (int fail = 1; fail <= 5; fail++) {
+		sleep_calls = 0;
+		counter_calls = 0;
+		sleep_failure = fail;
+		CHECK(thrd_sleep(&duration, NULL) == -2);
+		CHECK(sleep_calls == (fail >= 4 ? 1 : 0));
+	}
+	sleep_failure = 0;
+	scripted_sleep = false;
+	return 0;
+}
+
+static int
 worker(void *arg)
 {
 	return *(const int *)arg;
@@ -231,6 +336,9 @@ int
 main(void)
 {
 	int results[] = { 0, 1, -1, INT_MIN, INT_MAX };
+	mtx_t unsupported;
+	CHECK(mtx_init(&unsupported, mtx_recursive) == thrd_error);
+	CHECK(mtx_init(&unsupported, mtx_timed) == thrd_error);
 
 	for (size_t i = 0; i < sizeof(results) / sizeof(results[0]); i++) {
 		for (int failure = 0; failure < 4; failure++) {
@@ -253,6 +361,8 @@ main(void)
 	CHECK(thrd_create(&thread, worker, &result) == thrd_success);
 	CHECK(thrd_join(thread, NULL) == thrd_success);
 	CHECK(test_deadlines() == 0);
-	puts("Win32 thread join and deadline checks passed");
+	CHECK(test_sleep_requests() == 0);
+	if (puts("Win32 thread join, deadline and sleep checks passed") == EOF || fflush(stdout) != 0)
+		return 2;
 	return 0;
 }

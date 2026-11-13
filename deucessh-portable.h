@@ -37,12 +37,12 @@ dssh_buffer_has(size_t buffer_len, size_t offset, size_t field_len)
  * are no-ops.
  */
 #if defined(DSSH_SHARED)
- #if defined(__GNUC__) || defined(__clang__)
-  #define DSSH_PUBLIC  __attribute__((visibility("default")))
-  #define DSSH_PRIVATE __attribute__((visibility("hidden")))
- #elif defined(_MSC_VER)
+ #if defined(_WIN32) && (defined(_MSC_VER) || defined(__GNUC__) || defined(__clang__))
   #define DSSH_PUBLIC __declspec(dllexport)
   #define DSSH_PRIVATE
+ #elif defined(__GNUC__) || defined(__clang__)
+  #define DSSH_PUBLIC  __attribute__((visibility("default")))
+  #define DSSH_PRIVATE __attribute__((visibility("hidden")))
  #else
   #define DSSH_PUBLIC
   #define DSSH_PRIVATE
@@ -50,7 +50,7 @@ dssh_buffer_has(size_t buffer_len, size_t offset, size_t field_len)
 #elif defined(DSSH_SHARED_IMPORT)
 
 	/* Consumer of the shared library on Windows */
- #if defined(_MSC_VER)
+ #if defined(_WIN32) && (defined(_MSC_VER) || defined(__GNUC__) || defined(__clang__))
   #define DSSH_PUBLIC __declspec(dllimport)
   #define DSSH_PRIVATE
  #else

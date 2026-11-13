@@ -18,6 +18,7 @@
 #include "ssh-internal.h"
 #include "dssh_test_internal.h"
 #include "dssh_test_ossl.h"
+#include "dssh_test_alloc.h"
 #include "mock_io.h"
 #include "test_dhgex_provider.h"
 
@@ -61,15 +62,6 @@ mock_rxline_dispatch(uint8_t *buf, size_t bufsz,
  * Algorithm registration + server helpers
  * ================================================================ */
 
-static dssh_session
-init_server_session(void)
-{
-	dssh_session s = dssh_session_init(false, 0);
-	if (s != NULL)
-		test_dhgex_setup(s);
-	return s;
-}
-
 static int
 register_all_algorithms(void)
 {
@@ -105,11 +97,15 @@ register_all_algorithms(void)
 
 struct handshake_ctx {
 	struct mock_io_state io;
+	bool io_initialized;
 	dssh_session client;
 	dssh_session server;
 	int client_result;
 	int server_result;
 };
+
+static struct handshake_ctx *active_handshake;
+static int (*fixture_thread_create)(thrd_t *, thrd_start_t, void *) = thrd_create;
 
 static int
 handshake_client_thread(void *arg)
@@ -140,72 +136,263 @@ handshake_setup(struct handshake_ctx *ctx)
 {
 	memset(ctx, 0, sizeof(*ctx));
 	dssh_test_reset_global_config();
-
-	if (register_all_algorithms() < 0)
+	if (register_all_algorithms() < 0 || test_generate_host_key() < 0)
 		return -1;
-	if (test_generate_host_key() < 0)
-		return -1;
-
+	ctx->io_initialized = true;
 	if (mock_io_init(&ctx->io, 0) < 0)
 		return -1;
-
-	dssh_transport_set_callbacks(mock_tx_dispatch, mock_rx_dispatch,
-	    mock_rxline_dispatch, mock_extra_line_cb);
-
+	if (dssh_transport_set_callbacks(mock_tx_dispatch, mock_rx_dispatch,
+	    mock_rxline_dispatch, mock_extra_line_cb) != 0)
+		return -1;
 	ctx->client = dssh_session_init(true, 0);
-	if (ctx->client == NULL) {
-		mock_io_free(&ctx->io);
+	if (ctx->client == NULL)
 		return -1;
-	}
-	dssh_session_set_cbdata(ctx->client, &ctx->io, &ctx->io,
-	    &ctx->io, &ctx->io);
-	dssh_session_set_hostkey_verify_cb(ctx->client, dssh_test_accept_hostkey, NULL);
+	if (dssh_session_set_cbdata(ctx->client, &ctx->io, &ctx->io, &ctx->io, &ctx->io) != 0
+	    || dssh_session_set_hostkey_verify_cb(ctx->client, dssh_test_accept_hostkey, NULL) != 0)
+		return -1;
+	ctx->server = dssh_session_init(false, 0);
+	if (ctx->server == NULL)
+		return -1;
+	if (dssh_session_set_cbdata(ctx->server, &ctx->io, &ctx->io, &ctx->io, &ctx->io) != 0)
+		return -1;
 
-	ctx->server = init_server_session();
-	if (ctx->server == NULL) {
-		dssh_session_cleanup(ctx->client);
-		mock_io_free(&ctx->io);
+	thrd_t client, server;
+	if (fixture_thread_create(&client, handshake_client_thread, ctx) != thrd_success)
 		return -1;
-	}
-	dssh_session_set_cbdata(ctx->server, &ctx->io, &ctx->io,
-	    &ctx->io, &ctx->io);
-
-	thrd_t ct, st;
-	if (thrd_create(&ct, handshake_client_thread, ctx) != thrd_success) {
-		dssh_session_cleanup(ctx->server);
-		dssh_session_cleanup(ctx->client);
-		mock_io_free(&ctx->io);
-		return -1;
-	}
-	if (thrd_create(&st, handshake_server_thread, ctx) != thrd_success) {
+	if (fixture_thread_create(&server, handshake_server_thread, ctx) != thrd_success) {
 		dssh_session_terminate(ctx->client);
 		mock_io_close_c2s(&ctx->io);
 		mock_io_close_s2c(&ctx->io);
-		thrd_join(ct, NULL);
-		dssh_session_cleanup(ctx->server);
-		dssh_session_cleanup(ctx->client);
-		mock_io_free(&ctx->io);
+		if (thrd_join(client, NULL) != thrd_success)
+			abort();
 		return -1;
 	}
-
-	thrd_join(ct, NULL);
-	thrd_join(st, NULL);
-
+	if (thrd_join(client, NULL) != thrd_success || thrd_join(server, NULL) != thrd_success)
+		abort();
 	if (ctx->client_result != 0 || ctx->server_result != 0)
 		return -1;
-
+	active_handshake = ctx;
 	return 0;
 }
 
 static void
 handshake_cleanup(struct handshake_ctx *ctx)
 {
-	if (ctx->server)
+	if (active_handshake == ctx)
+		active_handshake = NULL;
+	dssh_test_ossl_reset();
+	if (ctx->io_initialized) {
+		mock_io_close_c2s(&ctx->io);
+		mock_io_close_s2c(&ctx->io);
+	}
+	if (ctx->server != NULL) {
 		dssh_session_cleanup(ctx->server);
-	if (ctx->client)
+		ctx->server = NULL;
+	}
+	if (ctx->client != NULL) {
 		dssh_session_cleanup(ctx->client);
-	mock_io_free(&ctx->io);
+		ctx->client = NULL;
+	}
+	if (ctx->io_initialized) {
+		mock_io_free(&ctx->io);
+		ctx->io_initialized = false;
+	}
 	dssh_test_reset_global_config();
+}
+
+static int
+fixture_auth_none(const uint8_t *username, size_t length, void *data)
+{
+	(void)data;
+	static const uint8_t expected[] = "thread-fixture";
+	return username != NULL && length == sizeof(expected) - 1
+	    && memcmp(username, expected, length) == 0 ? DSSH_AUTH_SUCCESS : DSSH_AUTH_FAILURE;
+}
+
+static int
+fixture_auth_server(void *opaque)
+{
+	struct handshake_ctx *ctx = opaque;
+	const struct dssh_auth_server_cbs callbacks = { .methods_str = "", .none_cb = fixture_auth_none };
+	uint8_t username[32];
+	size_t length = sizeof(username);
+	ctx->server_result = dssh_auth_server(ctx->server, &callbacks, username, &length);
+	if (ctx->server_result != DSSH_AUTH_SUCCESS) {
+		mock_io_close_c2s(&ctx->io);
+		mock_io_close_s2c(&ctx->io);
+	}
+	return 0;
+}
+
+static int
+authenticated_setup(struct handshake_ctx *ctx)
+{
+	if (handshake_setup(ctx) != 0)
+		return -1;
+	thrd_t server;
+	if (fixture_thread_create(&server, fixture_auth_server, ctx) != thrd_success)
+		return -1;
+	ctx->client_result = dssh_auth_begin(ctx->client, "thread-fixture");
+	if (ctx->client_result != DSSH_AUTH_SUCCESS) {
+		mock_io_close_c2s(&ctx->io);
+		mock_io_close_s2c(&ctx->io);
+	}
+	if (thrd_join(server, NULL) != thrd_success)
+		abort();
+	return ctx->client_result == DSSH_AUTH_SUCCESS && ctx->server_result == DSSH_AUTH_SUCCESS ? 0 : -1;
+}
+
+struct fixture_worker {
+	thrd_start_t function;
+	void *data;
+	atomic_bool finished;
+};
+struct fixture_creates {
+	unsigned fail_at;
+	unsigned calls;
+	unsigned created;
+	struct fixture_worker workers[3];
+};
+static struct fixture_creates *fixture_creates;
+
+static int
+fixture_worker(void *data)
+{
+	struct fixture_worker *worker = data;
+	int result = worker->function(worker->data);
+	atomic_store(&worker->finished, true);
+	return result;
+}
+
+static int
+fixture_controlled_create(thrd_t *thread, thrd_start_t function, void *data)
+{
+	struct fixture_creates *probe = fixture_creates;
+	unsigned index = probe->calls++;
+	if (index == probe->fail_at)
+		return thrd_error;
+	if (index >= 3)
+		abort();
+	struct fixture_worker *worker = &probe->workers[index];
+	worker->function = function;
+	worker->data = data;
+	int ret = thrd_create(thread, fixture_worker, worker);
+	if (ret == thrd_success)
+		probe->created++;
+	return ret;
+}
+
+static int
+test_setup_ownership(void)
+{
+	for (unsigned target = 0; target < 3; target++) {
+		struct fixture_creates probe = { .fail_at = target };
+		for (unsigned i = 0; i < 3; i++)
+			atomic_init(&probe.workers[i].finished, false);
+		fixture_creates = &probe;
+		fixture_thread_create = fixture_controlled_create;
+		struct handshake_ctx ctx;
+		int ret = authenticated_setup(&ctx);
+		fixture_thread_create = thrd_create;
+		fixture_creates = NULL;
+		bool acquired = ctx.io_initialized;
+		bool joined = true;
+		for (unsigned i = 0; i < probe.created; i++)
+			joined = joined && atomic_load(&probe.workers[i].finished);
+		handshake_cleanup(&ctx);
+		bool empty = ctx.client == NULL && ctx.server == NULL && !ctx.io_initialized
+		    && active_handshake == NULL;
+		bool closed = !acquired || (atomic_load(&ctx.io.c2s.rfd) == -1
+		    && atomic_load(&ctx.io.c2s.wfd) == -1 && atomic_load(&ctx.io.s2c.rfd) == -1
+		    && atomic_load(&ctx.io.s2c.wfd) == -1);
+		handshake_cleanup(&ctx);
+		ASSERT_TRUE(ret < 0 && joined && empty && closed && probe.calls == target + 1 && probe.created == target);
+	}
+	return TEST_PASS;
+}
+
+struct fixture_retirements {
+	_Atomic(dssh_session) client;
+	_Atomic(dssh_session) server;
+	atomic_uint frees;
+	atomic_uint worker_frees;
+	bool expected_assertion;
+};
+static _Thread_local bool fixture_free_controller;
+
+static void
+fixture_observe_free(const void *pointer, void *data)
+{
+	struct fixture_retirements *probe = data;
+	if (!fixture_free_controller) {
+		atomic_fetch_add(&probe->worker_frees, 1);
+		return;
+	}
+	if (pointer != NULL && pointer == atomic_load(&probe->client)) {
+		atomic_store(&probe->client, NULL);
+		atomic_fetch_add(&probe->frees, 1);
+	}
+	if (pointer != NULL && pointer == atomic_load(&probe->server)) {
+		atomic_store(&probe->server, NULL);
+		atomic_fetch_add(&probe->frees, 1);
+	}
+}
+
+static int
+fixture_worker_free(void *data)
+{
+	(void)data;
+	void *memory = dssh_test_malloc(1);
+	if (memory == NULL)
+		return -1;
+	dssh_test_free(memory);
+	return 0;
+}
+
+static int
+fixture_fail_with_active_sessions(struct fixture_retirements *probe)
+{
+	struct handshake_ctx ctx;
+	if (authenticated_setup(&ctx) != 0) {
+		handshake_cleanup(&ctx);
+		return TEST_FAIL;
+	}
+	atomic_store(&probe->client, ctx.client);
+	atomic_store(&probe->server, ctx.server);
+	/* Publish before creating workers, and retain until all have joined.
+	 * Only the controlling thread inspects session-pointer aliases; other
+	 * threads return before loading them, including across final frees. */
+	fixture_free_controller = true;
+	dssh_test_alloc_observe_frees(fixture_observe_free, probe);
+	ASSERT_OK(dssh_session_start(ctx.client));
+	ASSERT_OK(dssh_session_start(ctx.server));
+	thrd_t worker;
+	ASSERT_EQ(thrd_create(&worker, fixture_worker_free, probe), thrd_success);
+	int worker_result;
+	if (thrd_join(worker, &worker_result) != thrd_success)
+		abort();
+	ASSERT_EQ(worker_result, 0);
+	probe->expected_assertion = true;
+	ASSERT_TRUE(false); /* The real assertion hook must release the stack owner. */
+	return TEST_PASS;
+}
+
+static int
+test_assertion_ownership(void)
+{
+	struct fixture_retirements probe;
+	atomic_init(&probe.client, NULL);
+	atomic_init(&probe.server, NULL);
+	atomic_init(&probe.frees, 0);
+	atomic_init(&probe.worker_frees, 0);
+	probe.expected_assertion = false;
+	int result = fixture_fail_with_active_sessions(&probe);
+	dssh_test_alloc_observe_frees(NULL, NULL);
+	fixture_free_controller = false;
+	ASSERT_TRUE(result == TEST_FAIL && probe.expected_assertion && active_handshake == NULL
+	    && atomic_load(&probe.client) == NULL && atomic_load(&probe.server) == NULL
+	    && atomic_load(&probe.frees) == 2 && atomic_load(&probe.worker_frees) == 0);
+	return TEST_PASS;
 }
 
 /* ================================================================
@@ -222,7 +409,7 @@ test_send_lock_fail(void)
 	struct handshake_ctx ctx;
 	if (handshake_setup(&ctx) < 0) {
 		handshake_cleanup(&ctx);
-		return TEST_SKIP;
+		return TEST_FAIL;
 	}
 
 	ASSERT_FALSE(ctx.client->terminate);
@@ -270,7 +457,7 @@ test_recv_has_no_lock(void)
 	struct handshake_ctx ctx;
 	if (handshake_setup(&ctx) < 0) {
 		handshake_cleanup(&ctx);
-		return TEST_SKIP;
+		return TEST_FAIL;
 	}
 
 	/* Send a packet from client so server has something to receive */
@@ -303,9 +490,9 @@ static int
 test_terminate_idempotent(void)
 {
 	struct handshake_ctx ctx;
-	if (handshake_setup(&ctx) < 0) {
+	if (authenticated_setup(&ctx) < 0) {
 		handshake_cleanup(&ctx);
-		return TEST_SKIP;
+		return TEST_FAIL;
 	}
 
 	/* Start the connection layer so set_terminate exercises
@@ -324,15 +511,7 @@ test_terminate_idempotent(void)
 
 	ASSERT_TRUE(ctx.client->terminate);
 
-	/* Clean up: close pipes so demux threads exit */
-	mock_io_close_c2s(&ctx.io);
-	mock_io_close_s2c(&ctx.io);
-	dssh_session_stop(ctx.client);
-	dssh_session_stop(ctx.server);
-	dssh_session_cleanup(ctx.server);
-	dssh_session_cleanup(ctx.client);
-	mock_io_free(&ctx.io);
-	dssh_test_reset_global_config();
+	handshake_cleanup(&ctx);
 	return TEST_PASS;
 }
 
@@ -441,7 +620,7 @@ test_send_sweep(void)
 	struct handshake_ctx ctx;
 	if (handshake_setup(&ctx) < 0) {
 		handshake_cleanup(&ctx);
-		return TEST_SKIP;
+		return TEST_FAIL;
 	}
 
 	/* Count thrd calls in a normal send */
@@ -458,7 +637,7 @@ test_send_sweep(void)
 	for (int n = 0; n < count; n++) {
 		if (handshake_setup(&ctx) < 0) {
 			handshake_cleanup(&ctx);
-			return TEST_SKIP;
+			return TEST_FAIL;
 		}
 
 		dssh_test_thrd_fail_after(n);
@@ -481,7 +660,7 @@ test_recv_sweep(void)
 	struct handshake_ctx ctx;
 	if (handshake_setup(&ctx) < 0) {
 		handshake_cleanup(&ctx);
-		return TEST_SKIP;
+		return TEST_FAIL;
 	}
 
 	/* Send a packet */
@@ -524,9 +703,9 @@ test_start_init_sweep(void)
 {
 	for (int n = 0; n < 4; n++) {
 		struct handshake_ctx ctx;
-		if (handshake_setup(&ctx) < 0) {
+		if (authenticated_setup(&ctx) < 0) {
 			handshake_cleanup(&ctx);
-			return TEST_SKIP;
+			return TEST_FAIL;
 		}
 
 		/* Arm ossl countdown to fail the Nth init/create call */
@@ -563,9 +742,9 @@ static int
 test_start_double(void)
 {
 	struct handshake_ctx ctx;
-	if (handshake_setup(&ctx) < 0) {
+	if (authenticated_setup(&ctx) < 0) {
 		handshake_cleanup(&ctx);
-		return TEST_SKIP;
+		return TEST_FAIL;
 	}
 
 	ASSERT_OK(dssh_session_start(ctx.client));
@@ -677,6 +856,8 @@ test_limit_acquire(void)
 #include "condition_wait_cases.h"
 
 static struct dssh_test_entry tests[] = {
+	{ "thrd/setup_ownership", test_setup_ownership },
+	{ "thrd/assertion_ownership", test_assertion_ownership },
 	{ "thrd/wait_contract_errors", test_wait_contract_errors },
 	{ "thrd/wait_contract_spurious", test_wait_contract_spurious },
 	{ "thrd/wait_contract_timeout_errors", test_wait_contract_timeout_errors },
@@ -806,8 +987,14 @@ unlock_fatal_child(const char *name, const char *mode)
 	_Exit(4);
 }
 
+void
+dssh_test_failure_cleanup(void)
+{
+	if (active_handshake != NULL)
+		handshake_cleanup(active_handshake);
+}
+
 #define main dssh_test_thread_errors_main
-DSSH_TEST_NO_CLEANUP
 DSSH_TEST_MAIN(tests)
 #undef main
 

@@ -401,6 +401,7 @@ if(DEUCESSH_BUILD_SHARED)
 	endif()
 	set_property(TARGET deucessh_shared PROPERTY OUTPUT_NAME deucessh)
 	set_property(TARGET deucessh_shared PROPERTY POSITION_INDEPENDENT_CODE ON)
+	set_property(TARGET deucessh_shared PROPERTY WINDOWS_EXPORT_ALL_SYMBOLS OFF)
 	set_property(TARGET deucessh_shared PROPERTY VERSION ${PROJECT_VERSION})
 	set_property(TARGET deucessh_shared PROPERTY SOVERSION ${PROJECT_VERSION_MAJOR})
 	target_include_directories(deucessh_shared

@@ -14,8 +14,20 @@
 
 #include "deucessh.h"
 
-int __real_thrd_create(thrd_t *, thrd_start_t, void *);
-int __real_thrd_join(thrd_t, int *);
+#ifdef DSSH_THREADS_SHIM
+ #define REAL_CREATE __real_dssh_thread_thrd_create
+ #define REAL_JOIN __real_dssh_thread_thrd_join
+ #define WRAP_CREATE __wrap_dssh_thread_thrd_create
+ #define WRAP_JOIN __wrap_dssh_thread_thrd_join
+#else
+ #define REAL_CREATE __real_thrd_create
+ #define REAL_JOIN __real_thrd_join
+ #define WRAP_CREATE __wrap_thrd_create
+ #define WRAP_JOIN __wrap_thrd_join
+#endif
+
+int REAL_CREATE(thrd_t *, thrd_start_t, void *);
+int REAL_JOIN(thrd_t, int *);
 int __real_mock_tx_client(uint8_t *, size_t, dssh_session, void *);
 
 static bool configured;
@@ -45,7 +57,7 @@ selected(const char *prefix, unsigned index, const char *suffix)
 }
 
 int
-__wrap_thrd_create(thrd_t *thread, thrd_start_t start, void *arg)
+WRAP_CREATE(thrd_t *thread, thrd_start_t start, void *arg)
 {
 	/* This publication precedes the first real native create. Every child
 	 * therefore observes configured/mode after native thread startup. */
@@ -59,19 +71,19 @@ __wrap_thrd_create(thrd_t *thread, thrd_start_t start, void *arg)
 			fprintf(stderr, "PEER_CREATE_FAILURE index=%u\n", index);
 			return thrd_error;
 		}
-		int ret = __real_thrd_create(thread, start, arg);
+		int ret = REAL_CREATE(thread, start, arg);
 		if (ret == thrd_success && application_workers != UINT_MAX)
 			application_workers++;
 		return ret;
 	}
-	return __real_thrd_create(thread, start, arg);
+	return REAL_CREATE(thread, start, arg);
 }
 
 int
-__wrap_thrd_join(thrd_t thread, int *result)
+WRAP_JOIN(thrd_t thread, int *result)
 {
 	if (!controller || join_index >= application_workers)
-		return __real_thrd_join(thread, result);
+		return REAL_JOIN(thread, result);
 	unsigned index = join_index;
 	if (join_index != UINT_MAX)
 		join_index++;
@@ -79,7 +91,7 @@ __wrap_thrd_join(thrd_t thread, int *result)
 		fprintf(stderr, "PEER_JOIN_FAILURE index=%u retained=1\n", index);
 		return thrd_error;
 	}
-	int ret = __real_thrd_join(thread, result);
+	int ret = REAL_JOIN(thread, result);
 	fprintf(stderr, "PEER_NATIVE_JOIN index=%u success=%u\n", index,
 	    ret == thrd_success ? 1U : 0U);
 	if (ret == thrd_success && selected("join-", index, "-released")) {

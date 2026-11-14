@@ -686,6 +686,13 @@ foreach(model IN ITEMS i16 u16 i32 u32 i64 u64 f32 f64 fwide)
 endforeach()
 
 # The assertion hook must run before stack-owned contexts go out of scope.
+if(UNIX)
+	dssh_add_test(mock_io test_mock_io.c)
+	# Use the same native socket namespace as mock_io.c itself.
+	get_target_property(mock_io_definitions dssh_test_mock_io COMPILE_DEFINITIONS)
+	list(FILTER mock_io_definitions EXCLUDE REGEX "_POSIX_C_SOURCE")
+	set_property(TARGET dssh_test_mock_io PROPERTY COMPILE_DEFINITIONS "${mock_io_definitions}")
+endif()
 dssh_add_test(framework test_framework.c)
 dssh_add_test(runner test_runner.c)
 dssh_add_output_test(dssh_runner_elapsed dssh_test_runner "runner_elapsed cases=10 valid=1" elapsed)
@@ -1104,6 +1111,23 @@ foreach(part IN LISTS key_generation_parts)
 	set_tests_properties(dssh_key_generation_${part} PROPERTIES ENVIRONMENT "${DSSH_TEST_KEY_ENV}" TIMEOUT 180)
 endforeach()
 find_package(Python3 3.9 QUIET COMPONENTS Interpreter)
+if(Python3_Interpreter_FOUND AND UNIX)
+	set(MOCK_IO_CONTROLS normal math queued overflow arguments disconnected zero-cap line-exact
+		read-intr read-again read-zero read-over write-intr write-again write-zero write-over
+		line-intr line-again line-over inject-over drain-over pair-0 pair-1)
+	foreach(index RANGE 0 7)
+		list(APPEND MOCK_IO_CONTROLS option-${index}-before option-${index}-after)
+	endforeach()
+	foreach(index RANGE 0 3)
+		foreach(kind IN ITEMS close shutdown)
+			list(APPEND MOCK_IO_CONTROLS ${kind}-${index}-before ${kind}-${index}-after)
+		endforeach()
+	endforeach()
+	foreach(mode IN LISTS MOCK_IO_CONTROLS)
+		add_test(NAME dssh_mock_native_${mode} COMMAND ${Python3_EXECUTABLE}
+			${CMAKE_CURRENT_SOURCE_DIR}/mock_io_controls.py $<TARGET_FILE:dssh_test_mock_io> ${mode})
+	endforeach()
+endif()
 if(Python3_Interpreter_FOUND)
 	set(RUNNER_CONTROL_MODES exact all substring none missing-exact extra empty bad-option
 		duplicate null-name null-function skip fail positive negative

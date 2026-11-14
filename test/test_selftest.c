@@ -228,43 +228,71 @@ struct selftest_ctx {
 	int server_hs_result;
 	int client_auth_result;
 	int server_auth_result;
+	thrd_t setup_thread[2];
+	bool setup_thread_active[2];
 	thrd_t server_thread;
 	bool server_thread_active;
+	bool registered;
 };
 
 static struct selftest_ctx *g_active_ctx;
 
 static void
-selftest_cleanup(struct selftest_ctx *ctx)
+selftest_shutdown(int fd)
 {
-	if (g_active_ctx == ctx)
-		g_active_ctx = NULL;
-	/* Shutdown sockets first to unblock threads blocked in recv/send. */
-	if (ctx->client_fd >= 0)
-		shutdown(ctx->client_fd, SHUT_RDWR);
-	if (ctx->server_fd >= 0)
-		shutdown(ctx->server_fd, SHUT_RDWR);
-	/* Terminate sessions to unblock the server thread from any
-	 * dssh_* blocking call (sets terminate flag, broadcasts condvars).
-	 * dssh_session_terminate is idempotent; dssh_session_cleanup
-	 * calling it again is a no-op. */
+	if (fd >= 0 && shutdown(fd, SHUT_RDWR) < 0 && errno != ENOTCONN)
+		abort();
+}
+
+static void
+selftest_cancel(struct selftest_ctx *ctx)
+{
+	/* Keep descriptors allocated until every borrower has joined. */
+	selftest_shutdown(ctx->client_fd);
+	selftest_shutdown(ctx->server_fd);
 	if (ctx->server)
 		dssh_session_terminate(ctx->server);
 	if (ctx->client)
 		dssh_session_terminate(ctx->client);
-	/* Join server thread BEFORE freeing sessions.  After shutdown +
-	 * terminate, the thread's I/O and blocking calls return errors,
-	 * so the join completes promptly. */
-	if (ctx->server_thread_active)
-		thrd_join(ctx->server_thread, NULL);
-	if (ctx->server)
-		dssh_session_cleanup(ctx->server);
-	if (ctx->client)
-		dssh_session_cleanup(ctx->client);
-	if (ctx->client_fd >= 0)
-		close(ctx->client_fd);
-	if (ctx->server_fd >= 0)
-		close(ctx->server_fd);
+}
+
+static void
+selftest_join(thrd_t *thread, bool *active)
+{
+	if (!*active)
+		return;
+	/* An unsuccessful native join leaves ownership unknown. Do not retry
+	 * the handle or retire any storage that its worker may still borrow. */
+	if (thrd_join(*thread, NULL) != thrd_success)
+		abort();
+	*active = false;
+}
+
+static void
+selftest_cleanup(struct selftest_ctx *ctx)
+{
+	if (!ctx->registered)
+		return;
+	if (g_active_ctx != ctx)
+		abort();
+	selftest_cancel(ctx);
+	for (unsigned i = 0; i < 2; i++)
+		selftest_join(&ctx->setup_thread[i], &ctx->setup_thread_active[i]);
+	selftest_join(&ctx->server_thread, &ctx->server_thread_active);
+	dssh_session server = ctx->server;
+	dssh_session client = ctx->client;
+	ctx->server = NULL;
+	ctx->client = NULL;
+	dssh_session_cleanup(server);
+	dssh_session_cleanup(client);
+	int fds[] = { ctx->client_fd, ctx->server_fd };
+	ctx->client_fd = -1;
+	ctx->server_fd = -1;
+	for (unsigned i = 0; i < 2; i++) {
+		/* Do not retry a native release with an unknown outcome. */
+		if (fds[i] >= 0 && close(fds[i]) < 0)
+			abort();
+	}
 	delayed_tx_sess = NULL;
 	atomic_store(&delayed_tx_countdown, 0);
 	atomic_store(&delayed_tx_seen, false);
@@ -272,12 +300,16 @@ selftest_cleanup(struct selftest_ctx *ctx)
 	callback_probe_other_sess = NULL;
 	atomic_store(&callback_probe_kind, CALLBACK_PROBE_NONE);
 	dssh_test_reset_global_config();
+	ctx->registered = false;
+	g_active_ctx = NULL;
 }
 
 static int
 selftest_start_thread(struct selftest_ctx *ctx,
     thrd_start_t func, void *arg)
 {
+	if (!ctx->registered || ctx->server_thread_active || func == NULL)
+		return -1;
 	if (thrd_create(&ctx->server_thread, func, arg) != thrd_success)
 		return -1;
 	ctx->server_thread_active = true;
@@ -316,7 +348,7 @@ client_handshake_thread(void *arg)
 	struct selftest_ctx *ctx = arg;
 	ctx->client_hs_result = dssh_transport_handshake(ctx->client);
 	if (ctx->client_hs_result != 0)
-		shutdown(ctx->client_fd, SHUT_RDWR);
+		selftest_cancel(ctx);
 	return 0;
 }
 
@@ -326,7 +358,7 @@ server_handshake_thread(void *arg)
 	struct selftest_ctx *ctx = arg;
 	ctx->server_hs_result = dssh_transport_handshake(ctx->server);
 	if (ctx->server_hs_result != 0)
-		shutdown(ctx->server_fd, SHUT_RDWR);
+		selftest_cancel(ctx);
 	return 0;
 }
 
@@ -340,6 +372,8 @@ client_auth_thread(void *arg)
 	struct selftest_ctx *ctx = arg;
 	ctx->client_auth_result = dssh_auth_password(ctx->client,
 	    "testuser", "testpass", NULL, NULL);
+	if (ctx->client_auth_result != 0)
+		selftest_cancel(ctx);
 	return 0;
 }
 
@@ -351,6 +385,33 @@ server_auth_thread(void *arg)
 	size_t ulen = sizeof(username);
 	ctx->server_auth_result = dssh_auth_server(ctx->server,
 	    &selftest_auth_cbs, username, &ulen);
+	if (ctx->server_auth_result != 0)
+		selftest_cancel(ctx);
+	return 0;
+}
+
+static int
+selftest_start_setup_thread(struct selftest_ctx *ctx, unsigned index,
+    thrd_start_t operation)
+{
+	if (!ctx->registered || index >= 2 || ctx->setup_thread_active[index]
+	    || operation == NULL)
+		return -1;
+	if (thrd_create(&ctx->setup_thread[index], operation, ctx) != thrd_success)
+		return -1;
+	ctx->setup_thread_active[index] = true;
+	return 0;
+}
+
+static int
+selftest_run_setup_pair(struct selftest_ctx *ctx,
+    thrd_start_t client, thrd_start_t server)
+{
+	if (selftest_start_setup_thread(ctx, 0, client) < 0
+	    || selftest_start_setup_thread(ctx, 1, server) < 0)
+		return -1;
+	for (unsigned i = 0; i < 2; i++)
+		selftest_join(&ctx->setup_thread[i], &ctx->setup_thread_active[i]);
 	return 0;
 }
 
@@ -362,13 +423,15 @@ server_auth_thread(void *arg)
  * ================================================================ */
 
 static int
-selftest_setup(struct selftest_ctx *ctx)
+selftest_prepare(struct selftest_ctx *ctx)
 {
-	memset(ctx, 0, sizeof(*ctx));
-	ctx->client_fd = -1;
-	ctx->server_fd = -1;
-	ctx->client = NULL;
-	ctx->server = NULL;
+	if (g_active_ctx != NULL)
+		abort();
+	*ctx = (struct selftest_ctx){.client_fd = -1, .server_fd = -1,
+	    .client_hs_result = DSSH_ERROR_INIT, .server_hs_result = DSSH_ERROR_INIT,
+	    .client_auth_result = DSSH_ERROR_INIT, .server_auth_result = DSSH_ERROR_INIT,
+	    .registered = true};
+	g_active_ctx = ctx;
 
 	dssh_test_reset_global_config();
 
@@ -383,55 +446,58 @@ selftest_setup(struct selftest_ctx *ctx)
 	ctx->client_fd = fds[0];
 	ctx->server_fd = fds[1];
 
-	dssh_transport_set_callbacks(socket_tx, socket_rx,
-	    socket_rxline, NULL);
+	if (dssh_transport_set_callbacks(socket_tx, socket_rx,
+	        socket_rxline, NULL) != 0)
+		goto fail;
 
 	ctx->client = dssh_session_init(true, 0);
 	if (ctx->client == NULL)
 		goto fail;
-	dssh_session_set_cbdata(ctx->client,
+	if (dssh_session_set_cbdata(ctx->client,
 	    &ctx->client_fd, &ctx->client_fd,
-	    &ctx->client_fd, &ctx->client_fd);
-	dssh_session_set_hostkey_verify_cb(ctx->client, dssh_test_accept_hostkey, NULL);
+	    &ctx->client_fd, &ctx->client_fd) != 0)
+		goto fail;
+	if (dssh_session_set_hostkey_verify_cb(ctx->client,
+	        dssh_test_accept_hostkey, NULL) != 0)
+		goto fail;
 
 	ctx->server = init_server_session();
 	if (ctx->server == NULL)
 		goto fail;
-	dssh_session_set_cbdata(ctx->server,
+	if (dssh_session_set_cbdata(ctx->server,
 	    &ctx->server_fd, &ctx->server_fd,
-	    &ctx->server_fd, &ctx->server_fd);
+	    &ctx->server_fd, &ctx->server_fd) != 0)
+		goto fail;
+	return 0;
+
+fail:
+	selftest_cleanup(ctx);
+	return -1;
+}
+
+static int
+selftest_setup(struct selftest_ctx *ctx)
+{
+	if (selftest_prepare(ctx) < 0)
+		return -1;
 
 	/* Run handshake in two threads */
-	thrd_t ct, st;
-	if (thrd_create(&ct, client_handshake_thread, ctx) != thrd_success)
+	if (selftest_run_setup_pair(ctx, client_handshake_thread,
+	        server_handshake_thread) < 0)
 		goto fail;
-	if (thrd_create(&st, server_handshake_thread, ctx) != thrd_success) {
-		dssh_session_terminate(ctx->client);
-		thrd_join(ct, NULL);
-		goto fail;
-	}
-	thrd_join(ct, NULL);
-	thrd_join(st, NULL);
 
 	if (ctx->client_hs_result != 0 || ctx->server_hs_result != 0
 	    || !compression_fixture_selected(ctx->client, ctx->server))
 		goto fail;
 
 	/* Run auth in two threads */
-	if (thrd_create(&ct, client_auth_thread, ctx) != thrd_success)
+	if (selftest_run_setup_pair(ctx, client_auth_thread,
+	        server_auth_thread) < 0)
 		goto fail;
-	if (thrd_create(&st, server_auth_thread, ctx) != thrd_success) {
-		dssh_session_terminate(ctx->client);
-		thrd_join(ct, NULL);
-		goto fail;
-	}
-	thrd_join(ct, NULL);
-	thrd_join(st, NULL);
 
 	if (ctx->client_auth_result != 0 || ctx->server_auth_result != 0)
 		goto fail;
 
-	g_active_ctx = ctx;
 	return 0;
 
 fail:
@@ -914,8 +980,7 @@ test_self_exec_echo(void)
 	ASSERT_MEM_EQ(buf, data, sizeof(data) - 1);
 
 	dssh_chan_close(ch, 0);
-	thrd_join(ctx.server_thread, NULL);
-	ctx.server_thread_active = false;
+	selftest_join(&ctx.server_thread, &ctx.server_thread_active);
 	ASSERT_EQ(sarg.result, 0);
 
 	selftest_cleanup(&ctx);
@@ -969,8 +1034,7 @@ test_self_window_adjust_race(void)
 	ASSERT_TRUE(dssh_test_wait_bool(&delayed_tx_seen, true));
 
 	dssh_chan_close(ch, 0);
-	thrd_join(ctx.server_thread, NULL);
-	ctx.server_thread_active = false;
+	selftest_join(&ctx.server_thread, &ctx.server_thread_active);
 	ASSERT_EQ(sarg.result, 0);
 
 	selftest_cleanup(&ctx);
@@ -1013,8 +1077,7 @@ test_self_exec_exit_code(void)
 	}
 
 	dssh_chan_close(ch, 0);
-	thrd_join(ctx.server_thread, NULL);
-	ctx.server_thread_active = false;
+	selftest_join(&ctx.server_thread, &ctx.server_thread_active);
 	ASSERT_EQ(sarg.result, 0);
 
 	selftest_cleanup(&ctx);
@@ -1068,8 +1131,7 @@ test_self_shell_echo(void)
 	ASSERT_MEM_EQ(buf, data, sizeof(data) - 1);
 
 	dssh_chan_close(ch, 0);
-	thrd_join(ctx.server_thread, NULL);
-	ctx.server_thread_active = false;
+	selftest_join(&ctx.server_thread, &ctx.server_thread_active);
 	ASSERT_EQ(sarg.result, 0);
 
 	selftest_cleanup(&ctx);
@@ -1143,8 +1205,7 @@ test_self_shell_large_data(void)
 	free(recv_buf);
 
 	dssh_chan_close(ch, 0);
-	thrd_join(ctx.server_thread, NULL);
-	ctx.server_thread_active = false;
+	selftest_join(&ctx.server_thread, &ctx.server_thread_active);
 	ASSERT_EQ(sarg.result, 0);
 
 	selftest_cleanup(&ctx);
@@ -1211,8 +1272,7 @@ test_self_signal(void)
 	ASSERT_TRUE(got_signal);
 
 	dssh_chan_close(ch, 0);
-	thrd_join(ctx.server_thread, NULL);
-	ctx.server_thread_active = false;
+	selftest_join(&ctx.server_thread, &ctx.server_thread_active);
 	ASSERT_EQ(sarg.result, 0);
 
 	selftest_cleanup(&ctx);
@@ -1250,8 +1310,7 @@ test_self_window_change(void)
 	thrd_sleep(&ts, NULL);
 
 	dssh_chan_close(ch, 0);
-	thrd_join(ctx.server_thread, NULL);
-	ctx.server_thread_active = false;
+	selftest_join(&ctx.server_thread, &ctx.server_thread_active);
 
 	ASSERT_TRUE(sarg.wc_received);
 	ASSERT_EQ_U(sarg.wc_cols, 132);
@@ -1335,8 +1394,7 @@ test_self_multiple_channels(void)
 
 	dssh_chan_close(ch2, 0);
 
-	thrd_join(ctx.server_thread, NULL);
-	ctx.server_thread_active = false;
+	selftest_join(&ctx.server_thread, &ctx.server_thread_active);
 	ASSERT_EQ(sarg.result, 0);
 	ASSERT_EQ(sarg.channels_handled, 2);
 
@@ -1368,8 +1426,7 @@ test_self_graceful_disconnect(void)
 	dssh_transport_disconnect(ctx.client,
 	    SSH_DISCONNECT_BY_APPLICATION, "test done");
 
-	thrd_join(ctx.server_thread, NULL);
-	ctx.server_thread_active = false;
+	selftest_join(&ctx.server_thread, &ctx.server_thread_active);
 
 	ASSERT_TRUE(dssh_session_is_terminated(ctx.client));
 
@@ -1403,8 +1460,7 @@ test_self_eof_half_close(void)
 	dssh_chan_write(ch, 0, data, sizeof(data) - 1);
 	dssh_chan_close(ch, 0);
 
-	thrd_join(ctx.server_thread, NULL);
-	ctx.server_thread_active = false;
+	selftest_join(&ctx.server_thread, &ctx.server_thread_active);
 	ASSERT_EQ(sarg.result, 0);
 
 	selftest_cleanup(&ctx);
@@ -1468,8 +1524,7 @@ test_self_rekey_during_data(void)
 	ASSERT_FALSE(dssh_session_is_terminated(ctx.client));
 
 	dssh_chan_close(ch, 0);
-	thrd_join(ctx.server_thread, NULL);
-	ctx.server_thread_active = false;
+	selftest_join(&ctx.server_thread, &ctx.server_thread_active);
 	ASSERT_EQ(sarg.result, 0);
 
 	selftest_cleanup(&ctx);
@@ -1531,8 +1586,7 @@ test_self_rekey_manual(void)
 	ASSERT_FALSE(dssh_session_is_terminated(ctx.client));
 
 	dssh_chan_close(ch, 0);
-	thrd_join(ctx.server_thread, NULL);
-	ctx.server_thread_active = false;
+	selftest_join(&ctx.server_thread, &ctx.server_thread_active);
 
 	selftest_cleanup(&ctx);
 	return TEST_PASS;
@@ -1627,8 +1681,7 @@ test_self_rekey_preserves_channels(void)
 	ASSERT_MEM_EQ(ctx.client->trans.session_id, sid_before, sid_sz);
 
 	dssh_chan_close(ch, 0);
-	thrd_join(ctx.server_thread, NULL);
-	ctx.server_thread_active = false;
+	selftest_join(&ctx.server_thread, &ctx.server_thread_active);
 	ASSERT_EQ(sarg.result, 0);
 
 	selftest_cleanup(&ctx);
@@ -1742,8 +1795,7 @@ test_self_rekey_inflight_data(void)
 	ASSERT_FALSE(dssh_session_is_terminated(ctx.client));
 
 	dssh_chan_close(ch, 0);
-	thrd_join(ctx.server_thread, NULL);
-	ctx.server_thread_active = false;
+	selftest_join(&ctx.server_thread, &ctx.server_thread_active);
 	ASSERT_EQ(sarg.result, 0);
 
 	selftest_cleanup(&ctx);
@@ -1819,8 +1871,7 @@ test_self_connection_drop(void)
 	ASSERT_TRUE(w <= 0);
 
 	/* Server echo thread should have exited */
-	thrd_join(ctx.server_thread, NULL);
-	ctx.server_thread_active = false;
+	selftest_join(&ctx.server_thread, &ctx.server_thread_active);
 
 	/* Cleanup must succeed without hanging */
 	selftest_cleanup(&ctx);
@@ -2028,7 +2079,7 @@ test_open_channel_timeout(void)
 {
 	struct selftest_ctx ctx;
 	if (selftest_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	/* Short timeout so the test completes quickly */
 	dssh_session_set_timeout(ctx.client, 200);
@@ -2084,7 +2135,7 @@ test_setup_recv_timeout(void)
 {
 	struct selftest_ctx ctx;
 	if (selftest_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	/* Short timeout on the server (where setup_recv runs) */
 	dssh_session_set_timeout(ctx.server, 200);
@@ -2123,8 +2174,7 @@ test_setup_recv_timeout(void)
 	ASSERT_OK(res);
 
 	/* Wait for server thread to complete (it should time out) */
-	thrd_join(ctx.server_thread, NULL);
-	ctx.server_thread_active = false;
+	selftest_join(&ctx.server_thread, &ctx.server_thread_active);
 
 	struct timespec t1;
 	timespec_get(&t1, TIME_UTC);
@@ -2151,7 +2201,7 @@ test_rekey_send_timeout(void)
 {
 	struct selftest_ctx ctx;
 	if (selftest_setup(&ctx) < 0)
-		return TEST_SKIP;
+		return TEST_FAIL;
 
 	/* Short timeout */
 	dssh_session_set_timeout(ctx.client, 200);
@@ -2257,8 +2307,7 @@ test_self_chan_exec_echo(void)
 	ASSERT_MEM_EQ(buf, data, sizeof(data) - 1);
 
 	dssh_chan_close(ch, -1);
-	thrd_join(ctx.server_thread, NULL);
-	ctx.server_thread_active = false;
+	selftest_join(&ctx.server_thread, &ctx.server_thread_active);
 	ASSERT_EQ(sarg.result, 0);
 
 	selftest_cleanup(&ctx);
@@ -2328,8 +2377,7 @@ test_self_chan_shell_pty(void)
 	ASSERT_MEM_EQ(buf, data, sizeof(data) - 1);
 
 	dssh_chan_close(ch, 0);
-	thrd_join(ctx.server_thread, NULL);
-	ctx.server_thread_active = false;
+	selftest_join(&ctx.server_thread, &ctx.server_thread_active);
 	ASSERT_EQ(sarg.result, 0);
 
 	selftest_cleanup(&ctx);
@@ -2489,8 +2537,7 @@ test_self_chan_accept_exec(void)
 	ASSERT_MEM_EQ(buf, data, sizeof(data) - 1);
 
 	dssh_chan_close(ch, -1);
-	thrd_join(ctx.server_thread, NULL);
-	ctx.server_thread_active = false;
+	selftest_join(&ctx.server_thread, &ctx.server_thread_active);
 	ASSERT_EQ(sarg.result, 0);
 
 	selftest_cleanup(&ctx);
@@ -2604,8 +2651,7 @@ test_self_chan_accept_shell_pty(void)
 	ASSERT_EQ_U(recvd, sizeof(data) - 1);
 
 	dssh_chan_close(ch, 0);
-	thrd_join(ctx.server_thread, NULL);
-	ctx.server_thread_active = false;
+	selftest_join(&ctx.server_thread, &ctx.server_thread_active);
 	ASSERT_EQ(sarg.result, 0);
 	ASSERT_TRUE(sarg.has_pty);
 
@@ -2718,8 +2764,7 @@ test_self_chan_event_exit_status(void)
 	ASSERT_TRUE(got_eof);
 
 	dssh_chan_close(ch, -1);
-	thrd_join(ctx.server_thread, NULL);
-	ctx.server_thread_active = false;
+	selftest_join(&ctx.server_thread, &ctx.server_thread_active);
 	ASSERT_EQ(sarg.result, 0);
 
 	selftest_cleanup(&ctx);
@@ -2775,8 +2820,7 @@ test_self_chan_read_peek(void)
 	ASSERT_EQ(n, avail);
 
 	dssh_chan_close(ch, -1);
-	thrd_join(ctx.server_thread, NULL);
-	ctx.server_thread_active = false;
+	selftest_join(&ctx.server_thread, &ctx.server_thread_active);
 	selftest_cleanup(&ctx);
 	return TEST_PASS;
 }
@@ -2806,8 +2850,7 @@ test_self_chan_shutwr_then_close(void)
 	/* close should not fail even though EOF already sent */
 	ASSERT_OK(dssh_chan_close(ch, 0));
 
-	thrd_join(ctx.server_thread, NULL);
-	ctx.server_thread_active = false;
+	selftest_join(&ctx.server_thread, &ctx.server_thread_active);
 	ASSERT_EQ(sarg.result, 0);
 
 	selftest_cleanup(&ctx);
@@ -2839,8 +2882,7 @@ test_self_chan_close_exit_code(void)
 
 	/* Close with exit_code=42 */
 	dssh_chan_close(ch, 42);
-	thrd_join(ctx.server_thread, NULL);
-	ctx.server_thread_active = false;
+	selftest_join(&ctx.server_thread, &ctx.server_thread_active);
 
 	selftest_cleanup(&ctx);
 	return TEST_PASS;
@@ -2867,8 +2909,7 @@ test_self_chan_close_no_exit_code(void)
 
 	/* Close with negative = no exit-status sent */
 	dssh_chan_close(ch, -1);
-	thrd_join(ctx.server_thread, NULL);
-	ctx.server_thread_active = false;
+	selftest_join(&ctx.server_thread, &ctx.server_thread_active);
 
 	selftest_cleanup(&ctx);
 	return TEST_PASS;
@@ -2904,8 +2945,7 @@ test_self_chan_send_break(void)
 	ASSERT_TRUE(dssh_test_wait_bool(&delayed_tx_seen, true));
 
 	dssh_chan_close(ch, -1);
-	thrd_join(ctx.server_thread, NULL);
-	ctx.server_thread_active = false;
+	selftest_join(&ctx.server_thread, &ctx.server_thread_active);
 	selftest_cleanup(&ctx);
 	return TEST_PASS;
 }
@@ -2972,8 +3012,7 @@ test_self_chan_getters_after_accept(void)
 	ASSERT_NOT_NULL(ch);
 
 	dssh_chan_close(ch, -1);
-	thrd_join(ctx.server_thread, NULL);
-	ctx.server_thread_active = false;
+	selftest_join(&ctx.server_thread, &ctx.server_thread_active);
 
 	ASSERT_EQ(sarg.result, 0);
 	ASSERT_EQ(sarg.type, DSSH_CHAN_EXEC);
@@ -3042,8 +3081,7 @@ test_self_chan_accept_env_reject(void)
 	ASSERT_NOT_NULL(ch);
 
 	dssh_chan_close(ch, -1);
-	thrd_join(ctx.server_thread, NULL);
-	ctx.server_thread_active = false;
+	selftest_join(&ctx.server_thread, &ctx.server_thread_active);
 	ASSERT_EQ(sarg.result, 0);
 
 	selftest_cleanup(&ctx);

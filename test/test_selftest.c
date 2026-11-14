@@ -30,6 +30,7 @@
 #include "test_comp.h"
 #include "compression_fixture.h"
 #include "fixture_writer.h"
+#include "selftest_metadata.h"
 
 /* ================================================================
  * Socket I/O callbacks
@@ -1172,7 +1173,7 @@ open_shell(struct selftest_ctx *ctx, const char *term,
 }
 
 /* ================================================================
- * Test: Handshake with curve25519
+ * Test: handshake with the selected algorithms
  * ================================================================ */
 
 static int
@@ -1192,8 +1193,25 @@ test_self_handshake_curve25519(void)
 	ASSERT_STR_EQ(dssh_transport_get_kex_name(ctx.server), test_kex_algo_name());
 	ASSERT_STR_EQ(dssh_transport_get_hostkey_name(ctx.client),
 	    test_key_algo_name());
-	ASSERT_STR_EQ(dssh_transport_get_enc_name(ctx.client, DSSH_CLIENT_TO_SERVER),
-	    dssh_transport_get_enc_name(ctx.server, DSSH_CLIENT_TO_SERVER));
+	ASSERT_STR_EQ(dssh_transport_get_hostkey_name(ctx.server), test_key_algo_name());
+	const enum dssh_direction directions[] = { DSSH_CLIENT_TO_SERVER, DSSH_SERVER_TO_CLIENT };
+	for (size_t i = 0; i < 2; i++) {
+		const char *client_enc = dssh_transport_get_enc_name(ctx.client, directions[i]);
+		const char *server_enc = dssh_transport_get_enc_name(ctx.server, directions[i]);
+		const char *client_mac = dssh_transport_get_mac_name(ctx.client, directions[i]);
+		const char *server_mac = dssh_transport_get_mac_name(ctx.server, directions[i]);
+		const char *client_comp = dssh_transport_get_comp_name(ctx.client, directions[i]);
+		const char *server_comp = dssh_transport_get_comp_name(ctx.server, directions[i]);
+		ASSERT_NOT_NULL(client_enc);
+		ASSERT_NOT_NULL(server_enc);
+		ASSERT_NOT_NULL(client_mac);
+		ASSERT_NOT_NULL(server_mac);
+		ASSERT_NOT_NULL(client_comp);
+		ASSERT_NOT_NULL(server_comp);
+		ASSERT_STR_EQ(client_enc, server_enc);
+		ASSERT_STR_EQ(client_mac, server_mac);
+		ASSERT_STR_EQ(client_comp, server_comp);
+	}
 
 	selftest_cleanup(&ctx);
 	return TEST_PASS;
@@ -1759,6 +1777,7 @@ test_self_rekey_manual(void)
 	}
 	ASSERT_EQ_U(recvd, sizeof(data) - 1);
 
+	ASSERT_MEM_EQ(buf, data, sizeof(data) - 1);
 	/* The echo and both peers' compression resets must complete before
 	 * closing the channel can hide an unfinished key transition. */
 	ASSERT_TRUE(compression_fixture_wait_reset(resets_before));
@@ -1766,6 +1785,7 @@ test_self_rekey_manual(void)
 
 	ASSERT_EQ(selftest_channel_close(&ctx, true, ch, 0), 0);
 	selftest_join(&ctx.server_thread, &ctx.server_thread_active);
+	ASSERT_EQ(sarg.result, 0);
 
 	selftest_cleanup(&ctx);
 	return TEST_PASS;
@@ -1818,10 +1838,10 @@ test_self_rekey_preserves_channels(void)
 	ASSERT_MEM_EQ(buf, before, sizeof(before) - 1);
 
 	/* Save session ID */
-	size_t sid_sz = ctx.client->trans.session_id_sz;
+	size_t sid_sz = 0;
 	uint8_t sid_before[64];
-	ASSERT_TRUE(sid_sz <= sizeof(sid_before));
-	memcpy(sid_before, ctx.client->trans.session_id, sid_sz);
+	ASSERT_TRUE(selftest_snapshot_id(ctx.client->trans.session_id,
+	    ctx.client->trans.session_id_sz, sid_before, sizeof(sid_before), &sid_sz));
 
 	/* Force rekey */
 	unsigned resets_before = compression_fixture_reset_count();
@@ -2578,7 +2598,7 @@ test_self_chan_exec_echo(void)
 }
 
 /*
- * Test: shell with pty using the new dssh_chan_* API.
+ * Test: shell with pty using the channel API.
  */
 static int
 test_self_chan_shell_pty(void)

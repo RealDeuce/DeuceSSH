@@ -7,6 +7,7 @@
 #include <unistd.h>
 #include "dssh_test.h"
 #include "ssh-internal.h"
+#include "selftest_metadata.h"
 
 static int owner_create(thrd_t *, thrd_start_t, void *);
 static int owner_join(thrd_t, int *);
@@ -41,6 +42,17 @@ static int owner_env(struct dssh_chan_params *, const char *, const char *);
 static void owner_wire_server_retired(void);
 static void owner_constructor_begin(bool);
 static void owner_constructor_end(dssh_channel);
+static bool owner_metadata_snapshot(const uint8_t *, size_t, uint8_t *, size_t, size_t *);
+static int owner_metadata_clock(clockid_t, struct timespec *);
+static int owner_metadata_sleep(const struct timespec *, struct timespec *);
+static bool owner_metadata_runner_clock(struct timespec *);
+static int64_t owner_metadata_read(uint8_t *, size_t, int64_t);
+static thrd_start_t owner_metadata_worker_function(thrd_start_t);
+static const char *owner_metadata_kex(dssh_session);
+static const char *owner_metadata_key(dssh_session);
+static const char *owner_metadata_enc(dssh_session, enum dssh_direction);
+static const char *owner_metadata_mac(dssh_session, enum dssh_direction);
+static const char *owner_metadata_comp(dssh_session, enum dssh_direction);
 
 /* Capture the existing native/test redirections before overriding only calls
  * in the included fixture. No library demux create/join is intercepted. */
@@ -84,6 +96,15 @@ static int native_unlock(mtx_t *mutex)
 #define dssh_session_set_terminate_cb owner_terminate
 #define dssh_session_set_break_cb owner_break
 #define dssh_chan_params_add_env owner_env
+#define selftest_snapshot_id owner_metadata_snapshot
+#define clock_gettime owner_metadata_clock
+#define thrd_sleep owner_metadata_sleep
+#define dssh_test_runner_clock owner_metadata_runner_clock
+#define dssh_transport_get_kex_name owner_metadata_kex
+#define dssh_transport_get_hostkey_name owner_metadata_key
+#define dssh_transport_get_enc_name owner_metadata_enc
+#define dssh_transport_get_mac_name owner_metadata_mac
+#define dssh_transport_get_comp_name owner_metadata_comp
 #define poll owner_socket_poll
 #define send owner_socket_send
 #define recv owner_socket_recv
@@ -92,6 +113,15 @@ static int native_unlock(mtx_t *mutex)
 #define main selftest_suite_main
 #include "test_selftest.c"
 #undef main
+#undef selftest_snapshot_id
+#undef clock_gettime
+#undef thrd_sleep
+#undef dssh_test_runner_clock
+#undef dssh_transport_get_kex_name
+#undef dssh_transport_get_hostkey_name
+#undef dssh_transport_get_enc_name
+#undef dssh_transport_get_mac_name
+#undef dssh_transport_get_comp_name
 #undef dssh_session_set_break_cb
 #undef dssh_chan_params_add_env
 #undef mtx_unlock
@@ -417,7 +447,7 @@ static int64_t
 owner_read(dssh_channel ch, int stream, uint8_t *buf, size_t length)
 {
 	if (!owner_main || !owner_io_armed)
-		return dssh_chan_read(ch, stream, buf, length);
+		return owner_metadata_read(buf, length, dssh_chan_read(ch, stream, buf, length));
 	if (owner_read_calls == UINT_MAX)
 		abort();
 	owner_read_calls++;
@@ -454,7 +484,7 @@ owner_create(thrd_t *thread, thrd_start_t function, void *argument)
 		owner_note("SELFTEST_CREATE_FAILURE index=%u\n", index);
 		return thrd_error;
 	}
-	int ret = native_create(thread, function, argument);
+	int ret = native_create(thread, owner_metadata_worker_function(function), argument);
 	if (ret == thrd_success)
 		owner_created++;
 	return ret;
@@ -646,6 +676,7 @@ owner_channel_body(void *argument)
 #include "selftest_socket_controls.h"
 #include "selftest_wire_controls.h"
 #include "selftest_constructor_controls.h"
+#include "selftest_metadata_controls.h"
 
 static bool
 owner_extent_boundaries(void)
@@ -754,6 +785,8 @@ main(int argc, char **argv)
 	atomic_init(&owner_channels_created, 0);
 	atomic_init(&owner_channels_closed, 0);
 	atomic_init(&owner_channel_ready, false);
+	if (strncmp(owner_mode, "metadata-", 9) == 0)
+		return owner_metadata_control();
 	if (strncmp(owner_mode, "constructor-", 12) == 0)
 		return owner_constructor_control();
 	if (strncmp(owner_mode, "wire-", 5) == 0)

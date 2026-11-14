@@ -13,12 +13,17 @@ dssh_test_wait_tick(const struct timespec *start)
 	struct timespec now;
 	const struct timespec pause = { .tv_nsec = 1000000 };
 
+	if (start == NULL || start->tv_nsec < 0 || start->tv_nsec >= 1000000000L)
+		return false;
 	if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
 		return false;
-	if (now.tv_sec - start->tv_sec > 5
-	    || (now.tv_sec - start->tv_sec == 5 && now.tv_nsec >= start->tv_nsec))
+	double seconds = difftime(now.tv_sec, start->tv_sec);
+	if (!(seconds >= 0 && seconds <= 5) || now.tv_nsec < 0 || now.tv_nsec >= 1000000000L
+	    || (seconds == 0 && now.tv_nsec < start->tv_nsec)
+	    || (seconds == 5 && now.tv_nsec >= start->tv_nsec))
 		return false;
-	return thrd_sleep(&pause, NULL) >= -1;
+	int ret = thrd_sleep(&pause, NULL);
+	return ret == 0 || ret == -1;
 }
 
 static inline bool
@@ -26,7 +31,8 @@ dssh_test_wait_bool(const atomic_bool *value, bool expected)
 {
 	struct timespec start;
 
-	if (clock_gettime(CLOCK_MONOTONIC, &start) != 0)
+	if (clock_gettime(CLOCK_MONOTONIC, &start) != 0
+	    || start.tv_nsec < 0 || start.tv_nsec >= 1000000000L)
 		return false;
 	while (atomic_load(value) != expected) {
 		if (!dssh_test_wait_tick(&start))
@@ -40,7 +46,8 @@ dssh_test_wait_int(const atomic_int *value, int expected)
 {
 	struct timespec start;
 
-	if (clock_gettime(CLOCK_MONOTONIC, &start) != 0)
+	if (clock_gettime(CLOCK_MONOTONIC, &start) != 0
+	    || start.tv_nsec < 0 || start.tv_nsec >= 1000000000L)
 		return false;
 	while (atomic_load(value) != expected) {
 		if (!dssh_test_wait_tick(&start))

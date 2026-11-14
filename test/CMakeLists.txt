@@ -2384,6 +2384,17 @@ target_link_libraries(dssh_test_selftest PRIVATE dssh_mock_comp)
 if(Python3_Interpreter_FOUND AND UNIX AND NOT APPLE)
 	dssh_add_test(selftest_owner test_selftest_owner.c)
 	target_link_libraries(dssh_test_selftest_owner PRIVATE dssh_mock_comp)
+	foreach(mode IN ITEMS metadata-rekey-native metadata-rekey-corrupt metadata-rekey-worker
+		metadata-sid-native metadata-sid-zero metadata-sid-null metadata-sid-oversize
+		metadata-sid-corrupt metadata-sid-length metadata-clock-start metadata-clock-end
+		metadata-getter-kex metadata-getter-key metadata-getter-enc metadata-getter-mac
+		metadata-getter-comp metadata-getter-direction metadata-boundaries)
+		add_test(NAME dssh_selftest_metadata_${mode} COMMAND ${Python3_EXECUTABLE}
+			${CMAKE_CURRENT_SOURCE_DIR}/selftest_metadata_controls.py
+			$<TARGET_FILE:dssh_test_selftest_owner> ${mode})
+		set_tests_properties(dssh_selftest_metadata_${mode} PROPERTIES
+			FIXTURES_REQUIRED dssh_cached_keys ENVIRONMENT "${DSSH_TEST_KEY_ENV}")
+	endforeach()
 	target_link_options(dssh_test_selftest_owner PRIVATE "-Wl,--wrap=send_commit"
 		"-Wl,--wrap=recv_packet")
 	set(selftest_constructor_mutex_destroy mtx_destroy)

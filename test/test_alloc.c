@@ -1538,207 +1538,217 @@ ve_ki_thread(void *arg)
 	return 0;
 }
 
+/* Direct KEX sweeps use real peers in both directions. The preparation phase
+ * completes version exchange and KEXINIT before arming either injector. The
+ * opposite KEX actor excludes itself before its first failable operation. */
+static int
+allocation_kex_negotiate(dssh_session sess)
+{
+	int ret = version_exchange(sess);
+	if (ret == 0)
+		ret = kexinit(sess);
+	return ret;
+}
+
+static int
+allocation_kex_excluded_peer(dssh_session sess)
+{
+	dssh_test_alloc_exclude_thread();
+	dssh_test_ossl_exclude_thread();
+	return kex(sess);
+}
+
+struct allocation_kex_observation {
+	int target_result;
+	int peer_result;
+	int calls;
+	unsigned created;
+	unsigned joined;
+	bool completed;
+	bool retired;
+	bool valid;
+};
+
+static bool
+allocation_kex_results_equal(const struct test_session_pair *pair)
+{
+	const struct dssh_kex_result *client = &pair->client->trans.kex_result;
+	const struct dssh_kex_result *server = &pair->server->trans.kex_result;
+	return client->lease.release != NULL && server->lease.release != NULL
+	    && client->shared_secret.data != NULL && server->shared_secret.data != NULL
+	    && client->exchange_hash.data != NULL && server->exchange_hash.data != NULL
+	    && client->shared_secret.len > 0 && client->exchange_hash.len > 0
+	    && client->shared_secret.len == server->shared_secret.len
+	    && client->exchange_hash.len == server->exchange_hash.len
+	    && memcmp(client->shared_secret.data, server->shared_secret.data,
+	        client->shared_secret.len) == 0
+	    && memcmp(client->exchange_hash.data, server->exchange_hash.data,
+	        client->exchange_hash.len) == 0;
+}
+
+static bool
+allocation_kex_result_empty(dssh_session sess)
+{
+	const struct dssh_kex_result *result = &sess->trans.kex_result;
+	return result->shared_secret.data == NULL && result->shared_secret.len == 0
+	    && result->exchange_hash.data == NULL && result->exchange_hash.len == 0
+	    && result->lease.owner == NULL && result->lease.release == NULL
+	    && sess->trans.kex_active == NULL && sess->trans.kex_state == NULL;
+}
+
+static int
+allocation_kex_case(bool client, bool provider, int point,
+    struct allocation_kex_observation *observed)
+{
+	*observed = (struct allocation_kex_observation){
+	    .target_result = DSSH_ERROR_INIT, .peer_result = DSSH_ERROR_INIT};
+	struct allocation_pair owner;
+	int ret = allocation_prepare(&owner, false);
+	if (ret == 0)
+		ret = test_pair_run(&owner.pair, allocation_kex_negotiate);
+	if (ret == 0) {
+		bool selected = owner.pair.client->trans.kex_selected != NULL
+		    && owner.pair.server->trans.kex_selected != NULL
+		    && strcmp(owner.pair.client->trans.kex_selected->name, test_kex_algo_name()) == 0
+		    && strcmp(owner.pair.server->trans.kex_selected->name, test_kex_algo_name()) == 0
+		    && owner.pair.client->trans.key_algo_selected != NULL
+		    && owner.pair.server->trans.key_algo_selected != NULL
+		    && strcmp(owner.pair.client->trans.key_algo_selected->name, test_key_algo_name()) == 0
+		    && strcmp(owner.pair.server->trans.key_algo_selected->name, test_key_algo_name()) == 0;
+		if (!selected)
+			ret = DSSH_ERROR_INVALID;
+	}
+	if (ret == 0) {
+		owner.pair.operation = allocation_kex_excluded_peer;
+		ret = test_pair_start(&owner.pair, client ? 1U : 0U);
+	}
+	if (ret == 0) {
+		if (point >= 0) {
+			if (provider)
+				dssh_test_ossl_fail_after(point);
+			else
+				dssh_test_alloc_fail_after(point);
+		}
+		dssh_session target = client ? owner.pair.client : owner.pair.server;
+		observed->target_result = kex(target);
+		observed->calls = provider ? dssh_test_ossl_count() : dssh_test_alloc_count();
+		dssh_test_alloc_reset();
+		dssh_test_ossl_reset();
+		/* A successful exchange lets its peer finish naturally; shutting down
+		 * that peer's receive direction could discard its queued reply. */
+		if (observed->target_result != 0)
+			test_pair_cancel(&owner.pair);
+		test_pair_join(&owner.pair);
+		observed->peer_result = client ? owner.pair.server_result : owner.pair.client_result;
+		observed->completed = observed->target_result == 0 && observed->peer_result == 0;
+		observed->valid = observed->target_result <= 0 && observed->peer_result <= 0
+		    && (observed->target_result == 0
+		        ? observed->completed && allocation_kex_results_equal(&owner.pair)
+		        : allocation_kex_result_empty(target));
+	}
+	allocation_cleanup(&owner);
+	allocation_cleanup(&owner);
+	observed->created = owner.pair.created;
+	observed->joined = owner.pair.joined;
+	observed->retired = allocation_pair_retired(&owner);
+	observed->valid = observed->valid && observed->retired
+	    && observed->created == 3 && observed->joined == 3;
+	return ret;
+}
+
+/* The controlled executable wraps actual native creates/joins. Only completed
+ * negotiation precedes the third actor; every failure retires that real prefix. */
+static int
+allocation_direct_owner_control(void)
+{
+	const char *mode = getenv("DSSH_PEER_FAILURE");
+	bool plain = mode == NULL || strcmp(mode, "plain") == 0;
+	struct allocation_kex_observation observed;
+	int ret = allocation_kex_case(true, false, -1, &observed);
+	bool valid = plain ? ret == 0 && observed.completed && observed.valid : ret < 0;
+	valid = valid && observed.retired && observed.created == observed.joined;
+	if (printf("allocation_direct_control created=%u joined=%u retired=%u completed=%u fixture=%d valid=%u\n",
+	        observed.created, observed.joined, observed.retired ? 1U : 0U,
+	        observed.completed ? 1U : 0U, ret, valid ? 1U : 0U) < 0)
+		return 2;
+	return valid ? 0 : 2;
+}
+
+static int
+allocation_direct_assertion_control(unsigned phase)
+{
+	struct allocation_pair owner;
+	int ret = allocation_prepare(&owner, false);
+	owner.pair.operation = allocation_kex_negotiate;
+	if (ret == 0 && phase >= 1)
+		ret = test_pair_start(&owner.pair, 0);
+	if (ret == 0 && phase >= 2) {
+		ret = test_pair_start(&owner.pair, 1);
+		if (ret == 0) {
+			test_pair_join(&owner.pair);
+			ret = owner.pair.client_result != 0 ? owner.pair.client_result : owner.pair.server_result;
+		}
+	}
+	if (ret == 0 && phase >= 3) {
+		owner.pair.operation = allocation_kex_excluded_peer;
+		ret = test_pair_start(&owner.pair, 1);
+	}
+	if (ret != 0) {
+		allocation_cleanup(&owner);
+		return 2;
+	}
+	ret = allocation_assertion_failure();
+	bool retired = allocation_pair_retired(&owner);
+	unsigned created = owner.pair.created;
+	unsigned joined = owner.pair.joined;
+	bool valid = ret == TEST_FAIL && retired && created == phase && joined == phase;
+	allocation_cleanup(&owner);
+	if (printf("allocation_direct_assertion phase=%u created=%u joined=%u retired=%u valid=%u\n",
+	        phase, created, joined, retired ? 1U : 0U, valid ? 1U : 0U) < 0)
+		return 2;
+	return valid ? 1 : 2;
+}
+
+static int
+allocation_kex_sweep(bool client, bool provider)
+{
+	const char *name = provider ? (client ? "ossl/kex_client" : "ossl/kex_server")
+	    : (client ? "alloc/kex_client" : "alloc/kex_server");
+	struct allocation_kex_observation observed;
+	int ret = allocation_kex_case(client, provider, -1, &observed);
+	if (ret != 0 || !observed.completed || !observed.valid)
+		return TEST_FAIL;
+	if (printf("allocation_kex_preflight name=%s method=%s key=%s created=3 joined=3 equal=1 retired=1 valid=1\n",
+	        name, test_kex_algo_name(), test_key_algo_name()) < 0)
+		return TEST_FAIL;
+	struct allocation_sweep sweep = {0};
+	/* This retains the earlier largest iteration bound, independently of any
+	 * wall-clock timeout. Completion still requires an uninjected success. */
+	while (sweep.next < 100000) {
+		int point = sweep.next;
+		ret = allocation_kex_case(client, provider, point, &observed);
+		if (ret != 0)
+			return TEST_FAIL;
+		if (printf("allocation_kex_owner name=%s point=%d target=%d peer=%d created=%u joined=%u equal=%u retired=1 valid=%u\n",
+		        name, point, observed.target_result, observed.peer_result,
+		        observed.created, observed.joined, observed.completed ? 1U : 0U,
+		        observed.valid ? 1U : 0U) < 0)
+			return TEST_FAIL;
+		int step = allocation_sweep_step(&sweep, name, point, observed.calls,
+		    observed.completed, observed.valid);
+		if (step < 0)
+			return TEST_FAIL;
+		if (step > 0)
+			return TEST_PASS;
+	}
+	return TEST_FAIL;
+}
+
 #ifdef DSSH_CRYPTO_OPENSSL
 static int
 test_ossl_kex_server_iterate(void)
 {
-	/* === ONE-TIME SETUP === */
-	dssh_test_reset_global_config();
-	dssh_test_alloc_reset();
-	dssh_test_ossl_reset();
-	mock_alloc_reset();
-
-	if (register_all() < 0)
-		return TEST_FAIL;
-	if (test_generate_host_key() < 0)
-		return TEST_FAIL;
-
-	struct mock_io_state setup_io;
-	if (mock_io_init(&setup_io, 0) < 0)
-		return TEST_FAIL;
-
-	dssh_transport_set_callbacks(mock_tx_dispatch, mock_rx_dispatch,
-	    mock_rxline_dispatch, mock_extra_line_cb);
-
-	dssh_session client = dssh_session_init(true, 0);
-	if (client == NULL) {
-		mock_io_free(&setup_io);
-		return TEST_FAIL;
-	}
-	dssh_session_set_cbdata(client, &setup_io, &setup_io,
-	    &setup_io, &setup_io);
-	dssh_session_set_hostkey_verify_cb(client, dssh_test_accept_hostkey, NULL);
-
-	dssh_session server = init_server_session();
-	if (server == NULL) {
-		dssh_session_cleanup(client);
-		mock_io_free(&setup_io);
-		return TEST_FAIL;
-	}
-	dssh_session_set_cbdata(server, &setup_io, &setup_io,
-	    &setup_io, &setup_io);
-
-	/* Two-threaded version_exchange + kexinit */
-	{
-		struct ve_ki_ctx ca = { .io = &setup_io, .sess = client };
-		struct ve_ki_ctx sa = { .io = &setup_io, .sess = server };
-		thrd_t ct, st;
-		ASSERT_THRD_CREATE(&ct, ve_ki_thread, &ca);
-		ASSERT_THRD_CREATE(&st, ve_ki_thread, &sa);
-		thrd_join(ct, NULL);
-		thrd_join(st, NULL);
-		if (ca.result != 0 || sa.result != 0) {
-			mock_io_close_c2s(&setup_io);
-			mock_io_close_s2c(&setup_io);
-			dssh_session_cleanup(server);
-			dssh_session_cleanup(client);
-			mock_io_free(&setup_io);
-			dssh_test_reset_global_config();
-			return TEST_FAIL;
-		}
-	}
-
-	/* Done with client and setup I/O */
-	dssh_session_cleanup(client);
-	mock_io_close_c2s(&setup_io);
-	mock_io_close_s2c(&setup_io);
-	mock_io_free(&setup_io);
-
-	/* === BUILD CLIENT KEX PACKETS === */
-	uint8_t wire_pkts[8192];
-	size_t wire_total = 0;
-
-	if (test_using_dhgex()) {
-		/* DH-GEX: GEX_REQUEST + GEX_INIT */
-		uint8_t req[16];
-		size_t rp = 0;
-		req[rp++] = 34; /* SSH_MSG_KEX_DH_GEX_REQUEST */
-		dssh_serialize_uint32(2048, req, sizeof(req), &rp);
-		dssh_serialize_uint32(4096, req, sizeof(req), &rp);
-		dssh_serialize_uint32(8192, req, sizeof(req), &rp);
-		wire_total += build_plaintext_packet(req, rp,
-		    &wire_pkts[wire_total], sizeof(wire_pkts) - wire_total);
-
-		/* GEX_INIT with e=2 (valid: 2  in  [1, p-1]) */
-		uint8_t init[16];
-		size_t ip = 0;
-		init[ip++] = 32; /* SSH_MSG_KEX_DH_GEX_INIT */
-		dssh_serialize_uint32(1, init, sizeof(init), &ip);
-		init[ip++] = 0x02; /* mpint value 2 */
-		wire_total += build_plaintext_packet(init, ip,
-		    &wire_pkts[wire_total], sizeof(wire_pkts) - wire_total);
-	}
-	else if (test_using_sntrup()) {
-		/* sntrup761x25519: ECDH_INIT with Q_C = pk(1158) || x25519(32) */
-		uint8_t sntrup_pk[1158], sntrup_sk[1763];
-		crypto_kem_sntrup761_keypair(sntrup_pk, sntrup_sk);
-		uint8_t x25519_pk[32];
-		dssh_random(x25519_pk, sizeof(x25519_pk));
-
-		uint8_t init[1 + 4 + 1190];
-		size_t ip = 0;
-		init[ip++] = SSH_MSG_KEX_ECDH_INIT;
-		dssh_serialize_uint32(1190, init, sizeof(init), &ip);
-		memcpy(&init[ip], sntrup_pk, 1158);
-		ip += 1158;
-		memcpy(&init[ip], x25519_pk, 32);
-		ip += 32;
-		wire_total += build_plaintext_packet(init, ip,
-		    &wire_pkts[wire_total], sizeof(wire_pkts) - wire_total);
-	}
-	else if (test_using_mlkem()) {
-		/* mlkem768x25519: ECDH_INIT with Q_C = pk(1184) || x25519(32) */
-		uint8_t mlkem_pk[1184];
-		if (dssh_test_mlkem768_public_key(mlkem_pk, sizeof(mlkem_pk)) < 0) {
-			dssh_session_cleanup(server);
-			dssh_test_reset_global_config();
-			return TEST_FAIL;
-		}
-		uint8_t x25519_pk[32];
-		dssh_random(x25519_pk, sizeof(x25519_pk));
-
-		uint8_t init[1 + 4 + 1216];
-		size_t ip = 0;
-		init[ip++] = SSH_MSG_KEX_ECDH_INIT;
-		dssh_serialize_uint32(1216, init, sizeof(init), &ip);
-		memcpy(&init[ip], mlkem_pk, 1184);
-		ip += 1184;
-		memcpy(&init[ip], x25519_pk, 32);
-		ip += 32;
-		wire_total += build_plaintext_packet(init, ip,
-		    &wire_pkts[wire_total], sizeof(wire_pkts) - wire_total);
-	}
-	else {
-		/* Curve25519: ECDH_INIT(Q_C) */
-		uint8_t qc[32];
-		dssh_random(qc, sizeof(qc)); /* any 32 bytes is valid X25519 */
-
-		uint8_t init[1 + 4 + 32];
-		size_t ip = 0;
-		init[ip++] = SSH_MSG_KEX_ECDH_INIT;
-		dssh_serialize_uint32(32, init, sizeof(init), &ip);
-		memcpy(&init[ip], qc, 32);
-		ip += 32;
-		wire_total += build_plaintext_packet(init, ip,
-		    &wire_pkts[wire_total], sizeof(wire_pkts) - wire_total);
-	}
-
-	/* Save server state for reset */
-	uint32_t saved_rx_seq = server->trans.rx_seq;
-	uint32_t saved_tx_seq = server->trans.tx_seq;
-
-	/* === ITERATE === */
-	int prev_count = -1;
-	int limit = test_using_sntrup() ? 100000 : 500;
-	for (int n = 0; n < limit; n++) {
-		/* Fresh I/O for this iteration */
-		struct mock_io_state iter_io;
-		if (mock_io_init(&iter_io, 0) < 0)
-			break;
-		dssh_session_set_cbdata(server, &iter_io, &iter_io,
-		    &iter_io, &iter_io);
-
-		/* Inject pre-built client packets */
-		mock_io_inject(&iter_io.c2s, wire_pkts, wire_total);
-
-		/* Reset mutable server state */
-		dssh_result_release(&server->trans.kex_result.lease);
-		server->trans.kex_result = (struct dssh_kex_result){0};
-		server->trans.rx_seq = saved_rx_seq;
-		server->trans.tx_seq = saved_tx_seq;
-		server->trans.rx_since_rekey = 0;
-		server->trans.tx_since_rekey = 0;
-		server->trans.tx_bytes_since_rekey = 0;
-		server->trans.rx_bytes_since_rekey = 0;
-		server->terminate = false;
-
-		dssh_test_ossl_fail_after(n);
-		int res = kex(server);
-		int cur_count = dssh_test_ossl_count();
-		dssh_test_ossl_reset();
-
-		/* Drain server output */
-		uint8_t drain[16384];
-		mock_io_drain(&iter_io.s2c, drain, sizeof(drain));
-
-		mock_io_close_c2s(&iter_io);
-		mock_io_close_s2c(&iter_io);
-		mock_io_free(&iter_io);
-
-		if (res == 0) {
-			dssh_session_cleanup(server);
-			dssh_test_reset_global_config();
-			ASSERT_TRUE(n > 0);
-			return TEST_PASS;
-		}
-		prev_count = cur_count;
-	}
-
-	fprintf(stderr, "  ossl/kex_server: still incrementing at n=%d "
-	    "(count=%d), raise limit\n", limit, prev_count);
-	dssh_session_cleanup(server);
-	dssh_test_reset_global_config();
-	return TEST_FAIL;
+	return allocation_kex_sweep(false, true);
 }
 
 #endif /* DSSH_CRYPTO_OPENSSL -- ossl kex_server iterate */
@@ -1768,97 +1778,7 @@ kex_excluded_thread(void *arg)
 static int
 test_ossl_kex_client_iterate(void)
 {
-	int prev_count = -1;
-	int limit = test_using_sntrup() ? 100000 : 500;
-	for (int n = 0; n < limit; n++) {
-		dssh_test_reset_global_config();
-		dssh_test_alloc_reset();
-		dssh_test_ossl_reset();
-		mock_alloc_reset();
-
-		if (register_all() < 0)
-			return TEST_FAIL;
-		if (test_generate_host_key() < 0)
-			return TEST_FAIL;
-
-		struct mock_io_state io;
-		if (mock_io_init(&io, 0) < 0)
-			return TEST_FAIL;
-
-		dssh_transport_set_callbacks(mock_tx_dispatch, mock_rx_dispatch,
-		    mock_rxline_dispatch, mock_extra_line_cb);
-
-		dssh_session client = dssh_session_init(true, 0);
-		if (client == NULL) {
-			mock_io_free(&io);
-			continue;
-		}
-		dssh_session_set_cbdata(client, &io, &io, &io, &io);
-		dssh_session_set_hostkey_verify_cb(client, dssh_test_accept_hostkey, NULL);
-
-		dssh_session server = init_server_session();
-		if (server == NULL) {
-			dssh_session_cleanup(client);
-			mock_io_free(&io);
-			continue;
-		}
-		dssh_session_set_cbdata(server, &io, &io, &io, &io);
-
-		/* version_exchange + kexinit in threads */
-		{
-			struct ve_ki_ctx ca = { .io = &io, .sess = client };
-			struct ve_ki_ctx sa = { .io = &io, .sess = server };
-			thrd_t ct, st;
-			ASSERT_THRD_CREATE(&ct, ve_ki_thread, &ca);
-			ASSERT_THRD_CREATE(&st, ve_ki_thread, &sa);
-			thrd_join(ct, NULL);
-			thrd_join(st, NULL);
-			if (ca.result != 0 || sa.result != 0) {
-				mock_io_close_c2s(&io);
-				mock_io_close_s2c(&io);
-				dssh_session_cleanup(server);
-				dssh_session_cleanup(client);
-				mock_io_free(&io);
-				dssh_test_reset_global_config();
-				continue;
-			}
-		}
-
-		/* Arm ossl injection on THIS thread (main).
-		 * The server thread will exclude itself. */
-		dssh_test_ossl_fail_after(n);
-
-		/* Run KEX: server in excluded thread, client on main thread */
-		struct kex_excluded_ctx sctx = {
-			.io = &io, .sess = server
-		};
-		thrd_t st;
-		ASSERT_THRD_CREATE(&st, kex_excluded_thread, &sctx);
-		int cres = kex(client);
-		/* Close client's write pipe so server unblocks on read */
-		mock_io_close_c2s(&io);
-		thrd_join(st, NULL);
-
-		int cur_count = dssh_test_ossl_count();
-		dssh_test_ossl_reset();
-
-		mock_io_close_c2s(&io);
-		mock_io_close_s2c(&io);
-		dssh_session_cleanup(server);
-		dssh_session_cleanup(client);
-		mock_io_free(&io);
-		dssh_test_reset_global_config();
-
-		if (cres == 0 && sctx.result == 0) {
-			ASSERT_TRUE(n > 0);
-			return TEST_PASS;
-		}
-		prev_count = cur_count;
-	}
-
-	fprintf(stderr, "  ossl/kex_client: still incrementing at n=%d "
-	    "(count=%d), raise limit\n", limit, prev_count);
-	return TEST_FAIL;
+	return allocation_kex_sweep(true, true);
 }
 #endif /* DSSH_CRYPTO_OPENSSL -- ossl iterate tests */
 
@@ -2703,193 +2623,7 @@ test_ossl_kex_client_no_verify(void)
 static int
 test_alloc_kex_server_iterate(void)
 {
-	int limit = test_using_sntrup() ? 100000 : 200;
-
-	/* === ONE-TIME SETUP (same as ossl/kex_server) === */
-	dssh_test_reset_global_config();
-	dssh_test_alloc_reset();
-	dssh_test_ossl_reset();
-	mock_alloc_reset();
-
-	if (register_all() < 0)
-		return TEST_FAIL;
-	if (test_generate_host_key() < 0)
-		return TEST_FAIL;
-
-	struct mock_io_state setup_io;
-	if (mock_io_init(&setup_io, 0) < 0)
-		return TEST_FAIL;
-
-	dssh_transport_set_callbacks(mock_tx_dispatch, mock_rx_dispatch,
-	    mock_rxline_dispatch, mock_extra_line_cb);
-
-	dssh_session client = dssh_session_init(true, 0);
-	if (client == NULL) {
-		mock_io_free(&setup_io);
-		return TEST_FAIL;
-	}
-	dssh_session_set_cbdata(client, &setup_io, &setup_io,
-	    &setup_io, &setup_io);
-	dssh_session_set_hostkey_verify_cb(client, dssh_test_accept_hostkey, NULL);
-
-	dssh_session server = init_server_session();
-	if (server == NULL) {
-		dssh_session_cleanup(client);
-		mock_io_free(&setup_io);
-		return TEST_FAIL;
-	}
-	dssh_session_set_cbdata(server, &setup_io, &setup_io,
-	    &setup_io, &setup_io);
-
-	/* Two-threaded version_exchange + kexinit */
-	{
-		struct ve_ki_ctx ca = { .io = &setup_io, .sess = client };
-		struct ve_ki_ctx sa = { .io = &setup_io, .sess = server };
-		thrd_t ct, st;
-		ASSERT_THRD_CREATE(&ct, ve_ki_thread, &ca);
-		ASSERT_THRD_CREATE(&st, ve_ki_thread, &sa);
-		thrd_join(ct, NULL);
-		thrd_join(st, NULL);
-		if (ca.result != 0 || sa.result != 0) {
-			mock_io_close_c2s(&setup_io);
-			mock_io_close_s2c(&setup_io);
-			dssh_session_cleanup(server);
-			dssh_session_cleanup(client);
-			mock_io_free(&setup_io);
-			dssh_test_reset_global_config();
-			return TEST_FAIL;
-		}
-	}
-
-	dssh_session_cleanup(client);
-	mock_io_close_c2s(&setup_io);
-	mock_io_close_s2c(&setup_io);
-	mock_io_free(&setup_io);
-
-	/* Build client KEX packets */
-	uint8_t wire_pkts[8192];
-	size_t wire_total = 0;
-
-	if (test_using_dhgex()) {
-		/* DH-GEX: GEX_REQUEST + GEX_INIT */
-		uint8_t req[16];
-		size_t rp = 0;
-		req[rp++] = 34;
-		dssh_serialize_uint32(2048, req, sizeof(req), &rp);
-		dssh_serialize_uint32(4096, req, sizeof(req), &rp);
-		dssh_serialize_uint32(8192, req, sizeof(req), &rp);
-		wire_total += build_plaintext_packet(req, rp,
-		    &wire_pkts[wire_total], sizeof(wire_pkts) - wire_total);
-
-		uint8_t init[16];
-		size_t ip = 0;
-		init[ip++] = 32;
-		dssh_serialize_uint32(1, init, sizeof(init), &ip);
-		init[ip++] = 0x02;
-		wire_total += build_plaintext_packet(init, ip,
-		    &wire_pkts[wire_total], sizeof(wire_pkts) - wire_total);
-	}
-	else if (test_using_sntrup()) {
-		/* sntrup761x25519: ECDH_INIT with Q_C = pk(1158) || x25519(32) */
-		uint8_t sntrup_pk[1158], sntrup_sk[1763];
-		crypto_kem_sntrup761_keypair(sntrup_pk, sntrup_sk);
-		uint8_t x25519_pk[32];
-		dssh_random(x25519_pk, sizeof(x25519_pk));
-
-		uint8_t init[1 + 4 + 1190];
-		size_t ip = 0;
-		init[ip++] = SSH_MSG_KEX_ECDH_INIT;
-		dssh_serialize_uint32(1190, init, sizeof(init), &ip);
-		memcpy(&init[ip], sntrup_pk, 1158);
-		ip += 1158;
-		memcpy(&init[ip], x25519_pk, 32);
-		ip += 32;
-		wire_total += build_plaintext_packet(init, ip,
-		    &wire_pkts[wire_total], sizeof(wire_pkts) - wire_total);
-	}
-	else if (test_using_mlkem()) {
-		/* mlkem768x25519: ECDH_INIT with Q_C = pk(1184) || x25519(32) */
-		uint8_t mlkem_pk[1184];
-		if (dssh_test_mlkem768_public_key(mlkem_pk, sizeof(mlkem_pk)) < 0) {
-			dssh_session_cleanup(server);
-			dssh_test_reset_global_config();
-			return TEST_FAIL;
-		}
-		uint8_t x25519_pk[32];
-		dssh_random(x25519_pk, sizeof(x25519_pk));
-
-		uint8_t init[1 + 4 + 1216];
-		size_t ip = 0;
-		init[ip++] = SSH_MSG_KEX_ECDH_INIT;
-		dssh_serialize_uint32(1216, init, sizeof(init), &ip);
-		memcpy(&init[ip], mlkem_pk, 1184);
-		ip += 1184;
-		memcpy(&init[ip], x25519_pk, 32);
-		ip += 32;
-		wire_total += build_plaintext_packet(init, ip,
-		    &wire_pkts[wire_total], sizeof(wire_pkts) - wire_total);
-	}
-	else {
-		/* Curve25519: ECDH_INIT(Q_C) */
-		uint8_t qc[32];
-		dssh_random(qc, sizeof(qc));
-
-		uint8_t init[1 + 4 + 32];
-		size_t ip = 0;
-		init[ip++] = SSH_MSG_KEX_ECDH_INIT;
-		dssh_serialize_uint32(32, init, sizeof(init), &ip);
-		memcpy(&init[ip], qc, 32);
-		ip += 32;
-		wire_total += build_plaintext_packet(init, ip,
-		    &wire_pkts[wire_total], sizeof(wire_pkts) - wire_total);
-	}
-
-	uint32_t saved_rx_seq = server->trans.rx_seq;
-	uint32_t saved_tx_seq = server->trans.tx_seq;
-
-	/* === ITERATE === */
-	for (int n = 0; n < limit; n++) {
-		struct mock_io_state iter_io;
-		if (mock_io_init(&iter_io, 0) < 0)
-			break;
-		dssh_session_set_cbdata(server, &iter_io, &iter_io,
-		    &iter_io, &iter_io);
-
-		mock_io_inject(&iter_io.c2s, wire_pkts, wire_total);
-
-		dssh_result_release(&server->trans.kex_result.lease);
-		server->trans.kex_result = (struct dssh_kex_result){0};
-		server->trans.rx_seq = saved_rx_seq;
-		server->trans.tx_seq = saved_tx_seq;
-		server->trans.rx_since_rekey = 0;
-		server->trans.tx_since_rekey = 0;
-		server->trans.tx_bytes_since_rekey = 0;
-		server->trans.rx_bytes_since_rekey = 0;
-		server->terminate = false;
-
-		dssh_test_alloc_fail_after(n);
-		int res = kex(server);
-		dssh_test_alloc_reset();
-
-		uint8_t drain[16384];
-		mock_io_drain(&iter_io.s2c, drain, sizeof(drain));
-
-		mock_io_close_c2s(&iter_io);
-		mock_io_close_s2c(&iter_io);
-		mock_io_free(&iter_io);
-
-		if (res == 0) {
-			dssh_session_cleanup(server);
-			dssh_test_reset_global_config();
-			ASSERT_TRUE(n > 0);
-			return TEST_PASS;
-		}
-	}
-
-	fprintf(stderr, "  alloc/kex_server: never succeeded within limit\n");
-	dssh_session_cleanup(server);
-	dssh_test_reset_global_config();
-	return TEST_FAIL;
+	return allocation_kex_sweep(false, false);
 }
 
 /*
@@ -2897,102 +2631,11 @@ test_alloc_kex_server_iterate(void)
  * a two-threaded DH-GEX handshake.  The server thread excludes
  * itself from alloc injection via dssh_test_alloc_exclude_thread().
  */
-static int
-alloc_kex_excluded_thread(void *arg)
-{
-	struct kex_excluded_ctx *ctx = arg;
-	dssh_test_ossl_exclude_thread();
-	dssh_test_alloc_exclude_thread();
-	ctx->result = kex(ctx->sess);
-	if (ctx->result < 0)
-		mock_io_close_s2c(ctx->io);
-	return 0;
-}
 
 static int
 test_alloc_kex_client_iterate(void)
 {
-	int limit = test_using_sntrup() ? 100000 : 200;
-	for (int n = 0; n < limit; n++) {
-		dssh_test_reset_global_config();
-		dssh_test_alloc_reset();
-		dssh_test_ossl_reset();
-		mock_alloc_reset();
-
-		if (register_all() < 0)
-			return TEST_FAIL;
-		if (test_generate_host_key() < 0)
-			return TEST_FAIL;
-
-		struct mock_io_state io;
-		if (mock_io_init(&io, 0) < 0)
-			return TEST_FAIL;
-
-		dssh_transport_set_callbacks(mock_tx_dispatch, mock_rx_dispatch,
-		    mock_rxline_dispatch, mock_extra_line_cb);
-
-		dssh_session client = dssh_session_init(true, 0);
-		if (client == NULL) {
-			mock_io_free(&io);
-			continue;
-		}
-		dssh_session_set_cbdata(client, &io, &io, &io, &io);
-		dssh_session_set_hostkey_verify_cb(client, dssh_test_accept_hostkey, NULL);
-
-		dssh_session server = init_server_session();
-		if (server == NULL) {
-			dssh_session_cleanup(client);
-			mock_io_free(&io);
-			continue;
-		}
-		dssh_session_set_cbdata(server, &io, &io, &io, &io);
-
-		{
-			struct ve_ki_ctx ca = { .io = &io, .sess = client };
-			struct ve_ki_ctx sa = { .io = &io, .sess = server };
-			thrd_t ct, st;
-			ASSERT_THRD_CREATE(&ct, ve_ki_thread, &ca);
-			ASSERT_THRD_CREATE(&st, ve_ki_thread, &sa);
-			thrd_join(ct, NULL);
-			thrd_join(st, NULL);
-			if (ca.result != 0 || sa.result != 0) {
-				mock_io_close_c2s(&io);
-				mock_io_close_s2c(&io);
-				dssh_session_cleanup(server);
-				dssh_session_cleanup(client);
-				mock_io_free(&io);
-				dssh_test_reset_global_config();
-				continue;
-			}
-		}
-
-		dssh_test_alloc_fail_after(n);
-
-		struct kex_excluded_ctx sctx = {
-			.io = &io, .sess = server
-		};
-		thrd_t st;
-		ASSERT_THRD_CREATE(&st, alloc_kex_excluded_thread, &sctx);
-		int cres = kex(client);
-		mock_io_close_c2s(&io);
-		thrd_join(st, NULL);
-
-		dssh_test_alloc_reset();
-
-		mock_io_close_s2c(&io);
-		dssh_session_cleanup(server);
-		dssh_session_cleanup(client);
-		mock_io_free(&io);
-		dssh_test_reset_global_config();
-
-		if (cres == 0 && sctx.result == 0) {
-			ASSERT_TRUE(n > 0);
-			return TEST_PASS;
-		}
-	}
-
-	fprintf(stderr, "  alloc/kex_client: never succeeded within limit\n");
-	return TEST_FAIL;
+	return allocation_kex_sweep(true, false);
 }
 
 /* ================================================================
@@ -3316,6 +2959,14 @@ DSSH_TEST_MAIN(tests)
 int
 main(int argc, char **argv)
 {
+	if (argc == 2 && strcmp(argv[1], "--allocation-direct-owner") == 0)
+		return allocation_direct_owner_control();
+	if (argc == 3 && strcmp(argv[1], "--allocation-direct-assert") == 0) {
+		if (strlen(argv[2]) != 1 || argv[2][0] < '0' || argv[2][0] > '3')
+			return 2;
+		unsigned phase = (unsigned)(argv[2][0] - '0');
+		return allocation_direct_assertion_control(phase);
+	}
 	if (argc == 3 && strcmp(argv[1], "--allocation-assert") == 0) {
 		if (strlen(argv[2]) != 1 || argv[2][0] < '0' || argv[2][0] > '3')
 			return 2;

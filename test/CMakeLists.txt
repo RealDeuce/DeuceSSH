@@ -1985,6 +1985,24 @@ foreach(allocation_key_mode IN ITEMS ed25519 rsa rsa512)
 	endforeach()
 endforeach()
 
+# Direct method sweeps prepare negotiation before injection and require both
+# actual KEX results to agree. Setup failures never count as injected coverage.
+set(ALLOCATION_DIRECT_TESTS alloc/kex_server alloc/kex_client)
+if(DEUCESSH_CRYPTO_BACKEND STREQUAL "OpenSSL")
+	list(APPEND ALLOCATION_DIRECT_TESTS ossl/kex_server ossl/kex_client)
+endif()
+foreach(allocation_kex IN ITEMS curve25519 dh-gex sntrup mlkem group14 group16)
+	foreach(allocation_key_mode IN ITEMS ed25519 rsa rsa512)
+		foreach(allocation_group IN LISTS ALLOCATION_DIRECT_TESTS)
+			dssh_add_output_test(dssh_alloc_direct_${allocation_kex}_${allocation_key_mode}_${allocation_group}
+				dssh_test_alloc "1 tests: 1 passed, 0 failed, 0 skipped" --exact ${allocation_group})
+			set_tests_properties(dssh_alloc_direct_${allocation_kex}_${allocation_key_mode}_${allocation_group}
+				PROPERTIES FIXTURES_REQUIRED dssh_cached_keys
+				ENVIRONMENT "DSSH_TEST_KEY=${allocation_key_mode};DSSH_TEST_KEX=${allocation_kex};${DSSH_TEST_KEY_ENV}")
+		endforeach()
+	endforeach()
+endforeach()
+
 # Explicit allocation owners cover every supported KEX/key selection. Native
 # controls operate in fresh children and never fabricate native thread handles.
 set(ALLOCATION_THREADED_TESTS alloc/handshake_iterate alloc/auth_iterate alloc/conn_iterate)
@@ -2021,6 +2039,17 @@ if(Python3_Interpreter_FOUND AND UNIX)
 	endif()
 	target_link_options(dssh_test_allocation_owner PRIVATE ${DSSH_WRAP_FLAGS}
 		"-Wl,--wrap=${allocation_create_symbol},--wrap=${allocation_join_symbol},--wrap=mock_tx_client")
+	set(allocation_direct_modes plain tx create-0 create-1 create-2 assert-0 assert-1 assert-2 assert-3)
+	foreach(index RANGE 0 2)
+		list(APPEND allocation_direct_modes join-${index}-retained join-${index}-released)
+	endforeach()
+	foreach(mode IN LISTS allocation_direct_modes)
+		dssh_add_output_test(dssh_alloc_direct_owner_${mode} Python3::Interpreter
+			"allocation_direct_observed mode=${mode} valid=1"
+			${CMAKE_CURRENT_SOURCE_DIR}/allocation_direct_controls.py $<TARGET_FILE:dssh_test_allocation_owner> ${mode})
+		set_tests_properties(dssh_alloc_direct_owner_${mode} PROPERTIES FIXTURES_REQUIRED dssh_cached_keys
+			ENVIRONMENT "DSSH_TEST_KEY=ed25519;DSSH_TEST_KEX=curve25519;${DSSH_TEST_KEY_ENV}")
+	endforeach()
 	set(allocation_owner_modes plain tx create-0 create-1 create-2 assert-0 assert-1 assert-2 assert-3)
 	foreach(index RANGE 0 2)
 		list(APPEND allocation_owner_modes join-${index}-retained join-${index}-released)

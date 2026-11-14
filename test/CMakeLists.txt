@@ -2453,33 +2453,33 @@ if(DEUCESSH_BREAK_SSH_PEER AND Python3_Interpreter_FOUND
 	endif()
 	foreach(form IN ITEMS static shared)
 		set(name dssh_break_independent_${form})
-		add_test(NAME ${name} COMMAND ${Python3_EXECUTABLE}
+		dssh_add_output_test(${name} Python3::Interpreter
+			"independent_break status=PASSED cases=14"
 			${CMAKE_CURRENT_SOURCE_DIR}/break_ssh_interop.py
 			--peer $<TARGET_FILE:dssh_openssh_${form}>
 			--foreign "${DEUCESSH_BREAK_SSH_PEER}"
 			--evidence ${CMAKE_CURRENT_BINARY_DIR}/break-evidence/${name})
 		set_tests_properties(${name} PROPERTIES TIMEOUT 90 LABELS "interop;break"
-			PASS_REGULAR_EXPRESSION "independent_break status=PASSED cases=14"
-			FAIL_REGULAR_EXPRESSION "independent_break status=FAILED;AddressSanitizer;ThreadSanitizer;runtime error:")
+			FAIL_REGULAR_EXPRESSION "independent_break status=FAILED;AddressSanitizer;LeakSanitizer;ThreadSanitizer;UndefinedBehaviorSanitizer;runtime error:")
 		set(notification_name dssh_notification_flags_independent_${form})
-		add_test(NAME ${notification_name} COMMAND ${Python3_EXECUTABLE}
+		dssh_add_output_test(${notification_name} Python3::Interpreter
+			"independent_break status=PASSED cases=14"
 			${CMAKE_CURRENT_SOURCE_DIR}/break_ssh_interop.py
 			--peer $<TARGET_FILE:dssh_openssh_${form}>
 			--foreign "${DEUCESSH_BREAK_SSH_PEER}" --notification-flags
 			--evidence ${CMAKE_CURRENT_BINARY_DIR}/break-evidence/${notification_name})
 		set_tests_properties(${notification_name} PROPERTIES TIMEOUT 90 LABELS "interop;notifications"
-			PASS_REGULAR_EXPRESSION "independent_break status=PASSED cases=14"
-			FAIL_REGULAR_EXPRESSION "independent_break status=FAILED;AddressSanitizer;ThreadSanitizer;runtime error:")
+			FAIL_REGULAR_EXPRESSION "independent_break status=FAILED;AddressSanitizer;LeakSanitizer;ThreadSanitizer;UndefinedBehaviorSanitizer;runtime error:")
 		foreach(mode IN ITEMS none 0 1)
 			set(mode_name dssh_terminal_mode_independent_${form}_${mode})
-			add_test(NAME ${mode_name} COMMAND ${Python3_EXECUTABLE}
+			dssh_add_output_test(${mode_name} Python3::Interpreter
+				"independent_break status=PASSED cases=14"
 				${CMAKE_CURRENT_SOURCE_DIR}/break_ssh_interop.py
 				--peer $<TARGET_FILE:dssh_openssh_${form}>
 				--foreign "${DEUCESSH_BREAK_SSH_PEER}" --terminal-mode ${mode}
 				--evidence ${CMAKE_CURRENT_BINARY_DIR}/break-evidence/${mode_name})
 			set_tests_properties(${mode_name} PROPERTIES TIMEOUT 90 LABELS "interop;terminal-modes"
-				PASS_REGULAR_EXPRESSION "independent_break status=PASSED cases=14"
-				FAIL_REGULAR_EXPRESSION "independent_break status=FAILED;AddressSanitizer;ThreadSanitizer;runtime error:")
+				FAIL_REGULAR_EXPRESSION "independent_break status=FAILED;AddressSanitizer;LeakSanitizer;ThreadSanitizer;UndefinedBehaviorSanitizer;runtime error:")
 		endforeach()
 	endforeach()
 endif()

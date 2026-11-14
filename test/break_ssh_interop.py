@@ -136,7 +136,7 @@ def run(args):
                     or observed.get("stdout_bytes") != 262144 or observed.get("remote_exit_status") != 23 \
                     or observed.get("host_checks", 0) < 2:
                 raise RuntimeError("independent reply/transfer/rekey oracle mismatch")
-            if re.search(r"ERROR: AddressSanitizer|runtime error:|WARNING: ThreadSanitizer", text):
+            if re.search(r"AddressSanitizer|LeakSanitizer|ThreadSanitizer|UndefinedBehaviorSanitizer|runtime error:", text):
                 raise RuntimeError("native sanitizer diagnostic")
             result.update(status="PASSED", independent=observed,
                           files_sha256={str(native_log): digest(native_log), str(foreign_log): digest(foreign_log)})

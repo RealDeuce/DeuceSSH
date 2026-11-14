@@ -62,7 +62,7 @@ test_contract_hash_binary(void)
 		dssh_hash_ctx *ctx = NULL;
 		size_t length = 0;
 		bool matched = dssh_hash_init(&ctx, crypto_answers[a].name, &length) == 0
-		    && length == crypto_answers[a].length;
+		    && ctx != NULL && length == crypto_answers[a].length;
 		for (size_t n = 0; matched && n < sizeof(cuts) / sizeof(cuts[0]); n++) {
 			uint8_t frame[96];
 			memset(frame, 0xa5, sizeof(frame));
@@ -97,7 +97,8 @@ test_contract_hash_million(void)
 	for (size_t a = 0; a < sizeof(crypto_answers) / sizeof(crypto_answers[0]); a++) {
 		dssh_hash_ctx *ctx = NULL;
 		size_t length = 0;
-		bool matched = dssh_hash_init(&ctx, crypto_answers[a].name, &length) == 0;
+		bool matched = dssh_hash_init(&ctx, crypto_answers[a].name, &length) == 0
+		    && ctx != NULL && length == crypto_answers[a].length;
 		for (unsigned n = 0; n < 976 && matched; n++)
 			matched = dssh_hash_update(ctx, input, sizeof(input)) == 0;
 		uint8_t frame[96];
@@ -123,7 +124,8 @@ test_contract_hash_rejections(void)
 	for (size_t a = 0; a < sizeof(crypto_answers) / sizeof(crypto_answers[0]); a++) {
 		dssh_hash_ctx *ctx = NULL;
 		size_t length = 0;
-		bool matched = dssh_hash_init(&ctx, crypto_answers[a].name, &length) == 0;
+		bool matched = dssh_hash_init(&ctx, crypto_answers[a].name, &length) == 0
+		    && ctx != NULL && length == crypto_answers[a].length;
 		for (unsigned repeat = 0; repeat < 4 && matched; repeat++) {
 			uint8_t out[96];
 			memset(out, 0xa5, sizeof(out));
@@ -177,7 +179,8 @@ test_contract_zero_lengths(void)
 {
 	dssh_hash_ctx *ctx = NULL;
 	size_t length = 0;
-	bool valid = dssh_hash_init(&ctx, "SHA-256", &length) == 0;
+	bool valid = dssh_hash_init(&ctx, "SHA-256", &length) == 0
+	    && ctx != NULL && length == sizeof(sha256_empty);
 #ifdef DSSH_CRYPTO_OPENSSL
 	dssh_test_ossl_fail_after(0);
 #endif
@@ -238,7 +241,8 @@ test_contract_hash_failures(void)
 	for (unsigned stage = 0; stage < 4; stage++) {
 		dssh_hash_ctx *ctx = NULL;
 		size_t length = 0;
-		bool matched = dssh_hash_init(&ctx, "SHA-256", &length) == 0;
+		bool matched = dssh_hash_init(&ctx, "SHA-256", &length) == 0
+		    && ctx != NULL && length == sizeof(sha256_empty);
 		uint8_t out[64];
 		unsigned failure = stage > 1 ? stage - 1 : 0;
 		int failure_int = (int)failure; /* Proven at most two. */
@@ -263,7 +267,8 @@ test_contract_hash_reported_lengths(void)
 	for (size_t i = 0; i < sizeof(reports) / sizeof(reports[0]); i++) {
 		dssh_hash_ctx *ctx = NULL;
 		size_t length = 0;
-		bool matched = dssh_hash_init(&ctx, "SHA-256", &length) == 0;
+		bool matched = dssh_hash_init(&ctx, "SHA-256", &length) == 0
+		    && ctx != NULL && length == sizeof(sha256_empty);
 		uint8_t frame[64];
 		memset(frame, 0xa5, sizeof(frame));
 		dssh_test_ossl_digest_length(reports[i]);
@@ -290,7 +295,8 @@ test_contract_hash_publication(void)
 	for (unsigned mode = 0; mode < 6; mode++) {
 		dssh_hash_ctx *original = NULL;
 		size_t length = 0;
-		bool matched = dssh_hash_init(&original, "SHA-256", &length) == 0;
+		bool matched = dssh_hash_init(&original, "SHA-256", &length) == 0
+		    && original != NULL && length == sizeof(sha256_empty);
 		dssh_hash_ctx *candidate = original;
 		size_t sentinel = 17;
 		if (mode < 3) {

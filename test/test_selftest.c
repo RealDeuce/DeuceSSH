@@ -224,6 +224,12 @@ struct selftest_ctx {
 	int server_fd;
 	dssh_session client;
 	dssh_session server;
+	/* Main owns the client slot and params; the server worker owns its slot.
+	 * Cleanup may inspect the server slot only after joining that worker. */
+	dssh_channel client_channel;
+	dssh_channel server_channel;
+	struct dssh_chan_params params;
+	bool params_active;
 	int client_hs_result;
 	int server_hs_result;
 	int client_auth_result;
@@ -236,6 +242,66 @@ struct selftest_ctx {
 };
 
 static struct selftest_ctx *g_active_ctx;
+
+static int
+selftest_params_init(struct selftest_ctx *ctx, enum dssh_chan_type type)
+{
+	if (ctx->params_active)
+		abort();
+	ctx->params_active = true;
+	return dssh_chan_params_init(&ctx->params, type);
+}
+
+static void
+selftest_params_free(struct selftest_ctx *ctx)
+{
+	if (!ctx->params_active)
+		return;
+	ctx->params_active = false;
+	dssh_chan_params_free(&ctx->params);
+}
+
+static dssh_channel
+selftest_open(struct selftest_ctx *ctx, const struct dssh_chan_params *params)
+{
+	if (ctx->client_channel != NULL)
+		abort();
+	ctx->client_channel = dssh_chan_open(ctx->client, params);
+	return ctx->client_channel;
+}
+
+static dssh_channel
+selftest_accept(struct selftest_ctx *ctx, const struct dssh_chan_accept_cbs *cbs,
+    int timeout_ms)
+{
+	if (ctx->server_channel != NULL)
+		abort();
+	ctx->server_channel = dssh_chan_accept(ctx->server, cbs, timeout_ms);
+	return ctx->server_channel;
+}
+
+static int
+selftest_channel_close(struct selftest_ctx *ctx, bool client,
+    dssh_channel ch, int64_t exit_code)
+{
+	dssh_channel *owner = client ? &ctx->client_channel : &ctx->server_channel;
+	if (ch == NULL || *owner != ch)
+		abort();
+	/* Ordinary close consumes the handle on every return. */
+	*owner = NULL;
+	return dssh_chan_close(ch, exit_code);
+}
+
+static void
+selftest_channel_cleanup(struct selftest_ctx *ctx, bool client)
+{
+	dssh_channel ch = client ? ctx->client_channel : ctx->server_channel;
+	if (ch == NULL)
+		return;
+	int ret = selftest_channel_close(ctx, client, ch, -1);
+	if (ret != 0 && ret != DSSH_ERROR_TERMINATED)
+		abort();
+}
 
 static void
 selftest_shutdown(int fd)
@@ -279,6 +345,9 @@ selftest_cleanup(struct selftest_ctx *ctx)
 	for (unsigned i = 0; i < 2; i++)
 		selftest_join(&ctx->setup_thread[i], &ctx->setup_thread_active[i]);
 	selftest_join(&ctx->server_thread, &ctx->server_thread_active);
+	selftest_channel_cleanup(ctx, false);
+	selftest_channel_cleanup(ctx, true);
+	selftest_params_free(ctx);
 	dssh_session server = ctx->server;
 	dssh_session client = ctx->client;
 	ctx->server = NULL;
@@ -506,7 +575,7 @@ fail:
 }
 
 /* ================================================================
- * Server accept callbacks (new dssh_chan_accept API)
+ * Server accept callbacks
  * ================================================================ */
 
 static int
@@ -530,6 +599,122 @@ static struct dssh_chan_accept_cbs selftest_accept_cbs = {
 	.exec = selftest_accept_exec,
 };
 
+/* Validate the native API extent before narrowing or advancing a buffer. */
+static bool
+selftest_io_count(int64_t value, size_t capacity, size_t *count)
+{
+	if (value < 0)
+		return false;
+	uintmax_t magnitude = (uintmax_t)value;
+	if (magnitude > capacity)
+		return false;
+	size_t bounded = (size_t)magnitude;
+	*count = bounded;
+	return true;
+}
+
+static bool
+selftest_write_all(dssh_channel ch, const uint8_t *buf, size_t length,
+    int timeout_ms)
+{
+	if (length != 0 && buf == NULL)
+		return false;
+	size_t offset = 0;
+	while (offset < length) {
+		if (dssh_chan_poll(ch, DSSH_POLL_WRITE, timeout_ms) != DSSH_POLL_WRITE)
+			return false;
+		int64_t value = dssh_chan_write(ch, 0, buf + offset, length - offset);
+		size_t count;
+		if (!selftest_io_count(value, length - offset, &count) || count == 0)
+			return false;
+		offset += count;
+	}
+	return true;
+}
+
+static bool
+selftest_read_some(dssh_channel ch, uint8_t *buf, size_t capacity,
+    size_t *count, int timeout_ms)
+{
+	if (capacity == 0 || buf == NULL)
+		return false;
+	if (dssh_chan_poll(ch, DSSH_POLL_READ, timeout_ms) != DSSH_POLL_READ)
+		return false;
+	int64_t value = dssh_chan_read(ch, 0, buf, capacity);
+	return selftest_io_count(value, capacity, count);
+}
+
+static bool
+selftest_read_exact(dssh_channel ch, uint8_t *buf, size_t length,
+    int timeout_ms)
+{
+	if (length != 0 && buf == NULL)
+		return false;
+	size_t offset = 0;
+	while (offset < length) {
+		size_t count;
+		if (!selftest_read_some(ch, buf + offset, length - offset, &count,
+		        timeout_ms) || count == 0)
+			return false;
+		offset += count;
+	}
+	return true;
+}
+
+static bool
+selftest_read_eof(dssh_channel ch, int timeout_ms)
+{
+	uint8_t byte;
+	size_t count;
+	return selftest_read_some(ch, &byte, sizeof(byte), &count, timeout_ms)
+	    && count == 0;
+}
+
+static bool
+selftest_echo(dssh_channel ch)
+{
+	uint8_t buf[4096];
+	for (;;) {
+		size_t count;
+		if (!selftest_read_some(ch, buf, sizeof(buf), &count, 30000))
+			return false;
+		if (count == 0)
+			return true;
+		if (!selftest_write_all(ch, buf, count, 30000))
+			return false;
+	}
+}
+
+static bool
+selftest_pattern_roundtrip(dssh_channel ch, uint32_t total, uint32_t *completed)
+{
+	/* Each object fits 16-bit size_t; the cumulative workload is never narrowed.
+	 * Retain both buffers for all chunks and compare every received byte. */
+	uint8_t sent[4096];
+	uint8_t received[4096];
+	*completed = 0;
+	while (*completed < total) {
+		uint32_t remaining = total - *completed;
+		size_t length = sizeof(sent);
+		if (remaining < length) {
+			size_t tail = (size_t)remaining;
+			length = tail;
+		}
+		for (size_t i = 0; i < length; i++) {
+			uint32_t offset = (uint32_t)i;
+			uint8_t byte = (uint8_t)((*completed + offset) & UINT32_C(255));
+			sent[i] = byte;
+		}
+		if (!selftest_write_all(ch, sent, length, 30000)
+		    || !selftest_read_exact(ch, received, length, 30000)
+		    || memcmp(sent, received, length) != 0)
+			return false;
+		uint32_t step = (uint32_t)length; /* length <= 4096 and remaining */
+		*completed += step;
+	}
+	return true;
+}
+
 /* ================================================================
  * Server-side thread helpers
  * ================================================================ */
@@ -547,47 +732,16 @@ server_echo_thread(void *arg)
 	struct selftest_ctx *ctx = a->ctx;
 	a->result = -1;
 
-	dssh_channel ch = dssh_chan_accept(ctx->server,
+	dssh_channel ch = selftest_accept(ctx,
 	    &selftest_accept_cbs, 30000);
 
 	if (ch == NULL)
 		return 0;
 
-	uint8_t buf[4096];
-
-	for (;;) {
-		int ev = dssh_chan_poll(ch, DSSH_POLL_READ, 30000);
-
-		if (ev <= 0)
-			break;
-
-		int64_t n = dssh_chan_read(ch, 0, buf, sizeof(buf));
-
-		if (n <= 0)
-			break;
-
-		/* Write all read data, polling for window if needed */
-		size_t off = 0;
-
-		while (off < (size_t)n) {
-			int wev = dssh_chan_poll(ch,
-			    DSSH_POLL_WRITE, 30000);
-
-			if (wev <= 0)
-				goto done;
-
-			int64_t w = dssh_chan_write(ch, 0,
-			    buf + off, (size_t)n - off);
-
-			if (w < 0)
-				goto done;
-			off += (size_t)w;
-		}
-	}
-done:
-
-	dssh_chan_close(ch, 0);
-	a->result = 0;
+	bool complete = selftest_echo(ch) && !dssh_session_is_terminated(ctx->server);
+	int ret = selftest_channel_close(ctx, false, ch, 0);
+	if (complete && ret == 0)
+		a->result = 0;
 	return 0;
 }
 
@@ -630,14 +784,14 @@ server_exit_thread(void *arg)
 	struct selftest_ctx *ctx = a->ctx;
 	a->result = -1;
 
-	dssh_channel ch = dssh_chan_accept(ctx->server,
+	dssh_channel ch = selftest_accept(ctx,
 	    &selftest_accept_cbs, 30000);
 
 	if (ch == NULL)
 		return 0;
 
-	dssh_chan_close(ch, (int64_t)a->exit_code);
-	a->result = 0;
+	int64_t exit_code = (int64_t)a->exit_code;
+	a->result = selftest_channel_close(ctx, false, ch, exit_code);
 	return 0;
 }
 
@@ -654,28 +808,20 @@ server_signal_thread(void *arg)
 	struct server_signal_arg *a = arg;
 	struct selftest_ctx *ctx = a->ctx;
 	a->result = -1;
-
-	dssh_channel ch = dssh_chan_accept(ctx->server,
-	    &selftest_accept_cbs, 30000);
-
+	dssh_channel ch = selftest_accept(ctx, &selftest_accept_cbs, 30000);
 	if (ch == NULL)
 		return 0;
-
-	/* Wait for peer's WINDOW_ADJUST before writing */
-	dssh_chan_poll(ch, DSSH_POLL_WRITE, 30000);
-
-	const uint8_t msg[] = "before-signal";
-
-	dssh_chan_write(ch, 0, msg, sizeof(msg) - 1);
-	dssh_chan_send_signal(ch, a->signal_name);
-
-	const uint8_t msg2[] = "after-signal";
-
-	dssh_chan_write(ch, 0, msg2, sizeof(msg2) - 1);
-	dssh_chan_close(ch, 0);
-	a->result = 0;
+	const uint8_t before[] = "before-signal";
+	const uint8_t after[] = "after-signal";
+	bool complete = selftest_write_all(ch, before, sizeof(before) - 1, 30000)
+	    && dssh_chan_send_signal(ch, a->signal_name) == 0
+	    && selftest_write_all(ch, after, sizeof(after) - 1, 30000);
+	int ret = selftest_channel_close(ctx, false, ch, 0);
+	if (complete && ret == 0)
+		a->result = 0;
 	return 0;
 }
+
 
 /* Server: accept channel, poll for window-change event, read until EOF */
 struct server_wc_arg {
@@ -693,13 +839,14 @@ server_wc_thread(void *arg)
 	a->result = -1;
 	a->wc_received = false;
 
-	dssh_channel ch = dssh_chan_accept(ctx->server,
+	dssh_channel ch = selftest_accept(ctx,
 	    &selftest_accept_cbs, 30000);
 
 	if (ch == NULL)
 		return 0;
 
 	uint8_t buf[256];
+	bool complete = false;
 
 	for (;;) {
 		int ev = dssh_chan_poll(ch,
@@ -711,8 +858,9 @@ server_wc_thread(void *arg)
 		if (ev & DSSH_POLL_EVENT) {
 			struct dssh_chan_event event;
 
-			if (dssh_chan_read_event(ch, &event) == 0
-			    && event.type == DSSH_EVENT_WINDOW_CHANGE) {
+			if (dssh_chan_read_event(ch, &event) != 0)
+				break;
+			if (event.type == DSSH_EVENT_WINDOW_CHANGE) {
 				a->wc_received = true;
 				a->wc_cols = event.window_change.cols;
 				a->wc_rows = event.window_change.rows;
@@ -726,13 +874,15 @@ server_wc_thread(void *arg)
 			int64_t n = dssh_chan_read(ch, 0,
 			    buf, sizeof(buf));
 
-			if (n <= 0)
-				break;
+			/* This scenario sends no channel data. Only real EOF completes it. */
+			complete = n == 0 && !dssh_session_is_terminated(ctx->server);
+			break;
 		}
 	}
 
-	dssh_chan_close(ch, 0);
-	a->result = 0;
+	int ret = selftest_channel_close(ctx, false, ch, 0);
+	if (complete && a->wc_received && ret == 0)
+		a->result = 0;
 	return 0;
 }
 
@@ -750,32 +900,24 @@ server_multi_thread(void *arg)
 	struct selftest_ctx *ctx = a->ctx;
 	a->result = -1;
 	a->channels_handled = 0;
-
 	for (int i = 0; i < 2; i++) {
-		dssh_channel ch = dssh_chan_accept(ctx->server,
-		    &selftest_accept_cbs, 30000);
-
+		dssh_channel ch = selftest_accept(ctx, &selftest_accept_cbs, 30000);
 		if (ch == NULL)
 			return 0;
-
-		uint8_t buf[256];
-		int ev = dssh_chan_poll(ch, DSSH_POLL_READ, 30000);
-
-		if (ev > 0) {
-			int64_t n = dssh_chan_read(ch, 0,
-			    buf, sizeof(buf));
-
-			if (n > 0)
-				dssh_chan_write(ch, 0, buf, (size_t)n);
-		}
-
-		dssh_chan_close(ch, 0);
+		const char *expected = i == 0 ? "channel-one" : "channel-two";
+		uint8_t buf[sizeof("channel-one") - 1];
+		bool complete = selftest_read_exact(ch, buf, sizeof(buf), 30000)
+		    && memcmp(buf, expected, sizeof(buf)) == 0
+		    && selftest_write_all(ch, buf, sizeof(buf), 30000);
+		int ret = selftest_channel_close(ctx, false, ch, 0);
+		if (!complete || ret != 0)
+			return 0;
 		a->channels_handled++;
 	}
-
 	a->result = 0;
 	return 0;
 }
+
 
 /* Server: accept channel, wait for disconnect */
 struct server_disconnect_arg {
@@ -790,7 +932,7 @@ server_disconnect_thread(void *arg)
 	struct selftest_ctx *ctx = a->ctx;
 	a->result = -1;
 
-	dssh_channel ch = dssh_chan_accept(ctx->server,
+	dssh_channel ch = selftest_accept(ctx,
 	    &selftest_accept_cbs, 30000);
 
 	if (ch == NULL) {
@@ -802,8 +944,7 @@ server_disconnect_thread(void *arg)
 
 	dssh_chan_poll(ch, DSSH_POLL_READ, 30000);
 	dssh_chan_read(ch, 0, buf, sizeof(buf));
-	dssh_chan_close(ch, 0);
-	a->result = 0;
+	a->result = selftest_channel_close(ctx, false, ch, 0);
 	return 0;
 }
 
@@ -819,67 +960,58 @@ server_halfclose_thread(void *arg)
 	struct server_halfclose_arg *a = arg;
 	struct selftest_ctx *ctx = a->ctx;
 	a->result = -1;
-
-	dssh_channel ch = dssh_chan_accept(ctx->server,
-	    &selftest_accept_cbs, 30000);
-
+	dssh_channel ch = selftest_accept(ctx, &selftest_accept_cbs, 30000);
 	if (ch == NULL)
 		return 0;
-
-	uint8_t buf[256];
-
-	for (;;) {
-		int ev = dssh_chan_poll(ch, DSSH_POLL_READ, 30000);
-
-		if (ev <= 0)
-			break;
-
-		int64_t n = dssh_chan_read(ch, 0, buf, sizeof(buf));
-
-		if (n <= 0)
-			break;
-	}
-
+	const uint8_t expected[] = "client-data";
 	const uint8_t reply[] = "server-reply-after-eof";
-
-	dssh_chan_write(ch, 0, reply, sizeof(reply) - 1);
-	dssh_chan_close(ch, 0);
-	a->result = 0;
+	uint8_t input[sizeof(expected) - 1];
+	bool complete = selftest_read_exact(ch, input, sizeof(input), 30000)
+	    && memcmp(input, expected, sizeof(input)) == 0
+	    && selftest_read_eof(ch, 30000)
+	    && !dssh_session_is_terminated(ctx->server)
+	    && selftest_write_all(ch, reply, sizeof(reply) - 1, 30000);
+	int ret = selftest_channel_close(ctx, false, ch, 0);
+	if (complete && ret == 0)
+		a->result = 0;
 	return 0;
 }
 
+
 /* ================================================================
- * Helpers for opening channels with the new API
+ * Helpers for opening channels
  * ================================================================ */
 
 static dssh_channel
-open_exec(dssh_session sess, const char *cmd)
+open_exec(struct selftest_ctx *ctx, const char *cmd)
 {
-	struct dssh_chan_params p;
-
-	dssh_chan_params_init(&p, DSSH_CHAN_EXEC);
-	dssh_chan_params_set_command(&p, cmd);
-	dssh_chan_params_set_pty(&p, false);
-
-	dssh_channel ch = dssh_chan_open(sess, &p);
-
-	dssh_chan_params_free(&p);
+	struct dssh_chan_params *p = &ctx->params;
+	int ret = selftest_params_init(ctx, DSSH_CHAN_EXEC);
+	if (ret == 0)
+		ret = dssh_chan_params_set_command(p, cmd);
+	if (ret == 0)
+		ret = dssh_chan_params_set_pty(p, false);
+	dssh_channel ch = NULL;
+	if (ret == 0)
+		ch = selftest_open(ctx, p);
+	selftest_params_free(ctx);
 	return ch;
 }
 
 static dssh_channel
-open_shell(dssh_session sess, const char *term,
+open_shell(struct selftest_ctx *ctx, const char *term,
     uint32_t cols, uint32_t rows)
 {
-	struct dssh_chan_params p;
-
-	dssh_chan_params_init(&p, DSSH_CHAN_SHELL);
-	dssh_chan_params_set_term(&p, term);
-	dssh_chan_params_set_size(&p, cols, rows, 0, 0);
-
-	dssh_channel ch = dssh_chan_open(sess, &p);
-
-	dssh_chan_params_free(&p);
+	struct dssh_chan_params *p = &ctx->params;
+	int ret = selftest_params_init(ctx, DSSH_CHAN_SHELL);
+	if (ret == 0)
+		ret = dssh_chan_params_set_term(p, term);
+	if (ret == 0)
+		ret = dssh_chan_params_set_size(p, cols, rows, 0, 0);
+	dssh_channel ch = NULL;
+	if (ret == 0)
+		ch = selftest_open(ctx, p);
+	selftest_params_free(ctx);
 	return ch;
 }
 
@@ -947,7 +1079,7 @@ test_self_exec_echo(void)
 
 	ASSERT_OK(selftest_start_thread(&ctx, server_echo_thread, &sarg));
 
-	dssh_channel ch = open_exec(ctx.client,"echo");
+	dssh_channel ch = open_exec(&ctx,"echo");
 	ASSERT_NOT_NULL(ch);
 
 	/* Wait for server's WINDOW_ADJUST (remote_window starts at 0) */
@@ -972,14 +1104,16 @@ test_self_exec_echo(void)
 		    buf + recvd, sizeof(buf) - recvd);
 		if (n <= 0)
 			break;
-		recvd += (size_t)n;
+		size_t count;
+		ASSERT_TRUE(selftest_io_count(n, sizeof(buf) - recvd, &count));
+		recvd += count;
 		if (recvd >= sizeof(data) - 1)
 			break;
 	}
 	ASSERT_EQ_U(recvd, sizeof(data) - 1);
 	ASSERT_MEM_EQ(buf, data, sizeof(data) - 1);
 
-	dssh_chan_close(ch, 0);
+	ASSERT_EQ(selftest_channel_close(&ctx, true, ch, 0), 0);
 	selftest_join(&ctx.server_thread, &ctx.server_thread_active);
 	ASSERT_EQ(sarg.result, 0);
 
@@ -1011,7 +1145,7 @@ test_self_window_adjust_race(void)
 
 	ASSERT_OK(selftest_start_thread(&ctx, server_echo_thread, &sarg));
 
-	dssh_channel ch = open_exec(ctx.client, "window-race");
+	dssh_channel ch = open_exec(&ctx, "window-race");
 
 	ASSERT_NOT_NULL(ch);
 	int wev = dssh_chan_poll(ch, DSSH_POLL_WRITE, 5000);
@@ -1033,7 +1167,7 @@ test_self_window_adjust_race(void)
 	ASSERT_MEM_EQ(buf, data, sizeof(data) - 1);
 	ASSERT_TRUE(dssh_test_wait_bool(&delayed_tx_seen, true));
 
-	dssh_chan_close(ch, 0);
+	ASSERT_EQ(selftest_channel_close(&ctx, true, ch, 0), 0);
 	selftest_join(&ctx.server_thread, &ctx.server_thread_active);
 	ASSERT_EQ(sarg.result, 0);
 
@@ -1058,7 +1192,7 @@ test_self_exec_exit_code(void)
 	struct server_exit_arg sarg = { .ctx = &ctx, .exit_code = 42 };
 	ASSERT_OK(selftest_start_thread(&ctx, server_exit_thread, &sarg));
 
-	dssh_channel ch = open_exec(ctx.client,"exit42");
+	dssh_channel ch = open_exec(&ctx,"exit42");
 	ASSERT_NOT_NULL(ch);
 
 	/* Drain channel until closed */
@@ -1076,7 +1210,7 @@ test_self_exec_exit_code(void)
 			break;
 	}
 
-	dssh_chan_close(ch, 0);
+	ASSERT_EQ(selftest_channel_close(&ctx, true, ch, 0), 0);
 	selftest_join(&ctx.server_thread, &ctx.server_thread_active);
 	ASSERT_EQ(sarg.result, 0);
 
@@ -1101,7 +1235,7 @@ test_self_shell_echo(void)
 	struct server_echo_arg sarg = { .ctx = &ctx };
 	ASSERT_OK(selftest_start_thread(&ctx, server_echo_thread, &sarg));
 
-	dssh_channel ch = open_shell(ctx.client, "xterm", 80, 24);
+	dssh_channel ch = open_shell(&ctx, "xterm", 80, 24);
 	ASSERT_NOT_NULL(ch);
 
 	/* Wait for server's WINDOW_ADJUST (remote_window starts at 0) */
@@ -1123,14 +1257,16 @@ test_self_shell_echo(void)
 		    buf + recvd, sizeof(buf) - recvd);
 		if (n <= 0)
 			break;
-		recvd += (size_t)n;
+		size_t count;
+		ASSERT_TRUE(selftest_io_count(n, sizeof(buf) - recvd, &count));
+		recvd += count;
 		if (recvd >= sizeof(data) - 1)
 			break;
 	}
 	ASSERT_EQ_U(recvd, sizeof(data) - 1);
 	ASSERT_MEM_EQ(buf, data, sizeof(data) - 1);
 
-	dssh_chan_close(ch, 0);
+	ASSERT_EQ(selftest_channel_close(&ctx, true, ch, 0), 0);
 	selftest_join(&ctx.server_thread, &ctx.server_thread_active);
 	ASSERT_EQ(sarg.result, 0);
 
@@ -1148,69 +1284,22 @@ test_self_shell_large_data(void)
 	struct selftest_ctx ctx;
 	if (selftest_setup(&ctx) < 0)
 		return TEST_FAIL;
-
-	ASSERT_OK(dssh_session_start(ctx.client));
-	ASSERT_OK(dssh_session_start(ctx.server));
-
+	ASSERT_EQ(dssh_session_start(ctx.client), 0);
+	ASSERT_EQ(dssh_session_start(ctx.server), 0);
 	struct server_echo_arg sarg = { .ctx = &ctx };
-	ASSERT_OK(selftest_start_thread(&ctx, server_echo_thread, &sarg));
-
-	dssh_channel ch = open_shell(ctx.client, "xterm", 80, 24);
+	ASSERT_EQ(selftest_start_thread(&ctx, server_echo_thread, &sarg), 0);
+	dssh_channel ch = open_shell(&ctx, "xterm", 80, 24);
 	ASSERT_NOT_NULL(ch);
-
-	/* Build 64KB test pattern */
-	size_t total = 65536;
-	uint8_t *send_buf = malloc(total);
-	uint8_t *recv_buf = malloc(total);
-	ASSERT_NOT_NULL(send_buf);
-	ASSERT_NOT_NULL(recv_buf);
-	for (size_t i = 0; i < total; i++)
-		send_buf[i] = (uint8_t)(i & 0xFF);
-
-	/* Send all data in chunks */
-	size_t sent = 0;
-	while (sent < total) {
-		int ev = dssh_chan_poll(ch,
-		    DSSH_POLL_WRITE, 30000);
-		if (ev <= 0)
-			break;
-		size_t chunk = total - sent;
-		if (chunk > 4096)
-			chunk = 4096;
-		int64_t w = dssh_chan_write(ch, 0,
-		    send_buf + sent, chunk);
-		if (w <= 0)
-			break;
-		sent += (size_t)w;
-	}
-	ASSERT_EQ_U(sent, total);
-
-	/* Receive all echoed data */
-	size_t recvd = 0;
-	while (recvd < total) {
-		int ev = dssh_chan_poll(ch,
-		    DSSH_POLL_READ, 30000);
-		if (ev <= 0)
-			break;
-		int64_t n = dssh_chan_read(ch, 0,
-		    recv_buf + recvd, total - recvd);
-		if (n <= 0)
-			break;
-		recvd += (size_t)n;
-	}
-	ASSERT_EQ_U(recvd, total);
-	ASSERT_MEM_EQ(send_buf, recv_buf, total);
-
-	free(send_buf);
-	free(recv_buf);
-
-	dssh_chan_close(ch, 0);
+	uint32_t completed;
+	ASSERT_TRUE(selftest_pattern_roundtrip(ch, UINT32_C(65536), &completed));
+	ASSERT_EQ_U(completed, UINT32_C(65536));
+	ASSERT_EQ(selftest_channel_close(&ctx, true, ch, 0), 0);
 	selftest_join(&ctx.server_thread, &ctx.server_thread_active);
 	ASSERT_EQ(sarg.result, 0);
-
 	selftest_cleanup(&ctx);
 	return TEST_PASS;
 }
+
 
 /* ================================================================
  * Test: signal -- server sends signal, client receives after drain
@@ -1232,7 +1321,7 @@ test_self_signal(void)
 	};
 	ASSERT_OK(selftest_start_thread(&ctx, server_signal_thread, &sarg));
 
-	dssh_channel ch = open_exec(ctx.client,"signal-test");
+	dssh_channel ch = open_exec(&ctx,"signal-test");
 	ASSERT_NOT_NULL(ch);
 
 	/* Read stdout and poll for signal event */
@@ -1271,7 +1360,7 @@ test_self_signal(void)
 	ASSERT_TRUE(total_read > 0);
 	ASSERT_TRUE(got_signal);
 
-	dssh_chan_close(ch, 0);
+	ASSERT_EQ(selftest_channel_close(&ctx, true, ch, 0), 0);
 	selftest_join(&ctx.server_thread, &ctx.server_thread_active);
 	ASSERT_EQ(sarg.result, 0);
 
@@ -1296,7 +1385,7 @@ test_self_window_change(void)
 	struct server_wc_arg sarg = { .ctx = &ctx };
 	ASSERT_OK(selftest_start_thread(&ctx, server_wc_thread, &sarg));
 
-	dssh_channel ch = open_shell(ctx.client, "xterm", 80, 24);
+	dssh_channel ch = open_shell(&ctx, "xterm", 80, 24);
 
 	ASSERT_NOT_NULL(ch);
 
@@ -1304,14 +1393,10 @@ test_self_window_change(void)
 	ASSERT_OK(dssh_chan_send_window_change(ch,
 	    132, 50, 1056, 800));
 
-	/* Give server time to process the event */
-	struct timespec ts = { .tv_nsec = 10000000 }; /* 10ms */
-
-	thrd_sleep(&ts, NULL);
-
-	dssh_chan_close(ch, 0);
+	ASSERT_EQ(selftest_channel_close(&ctx, true, ch, 0), 0);
 	selftest_join(&ctx.server_thread, &ctx.server_thread_active);
 
+	ASSERT_EQ(sarg.result, 0);
 	ASSERT_TRUE(sarg.wc_received);
 	ASSERT_EQ_U(sarg.wc_cols, 132);
 	ASSERT_EQ_U(sarg.wc_rows, 50);
@@ -1340,7 +1425,7 @@ test_self_multiple_channels(void)
 	ASSERT_OK(selftest_start_thread(&ctx, server_multi_thread, &sarg));
 
 	/* First channel */
-	dssh_channel ch1 = open_exec(ctx.client,"cmd1");
+	dssh_channel ch1 = open_exec(&ctx,"cmd1");
 	ASSERT_NOT_NULL(ch1);
 
 	dssh_chan_poll(ch1, DSSH_POLL_WRITE, 5000);
@@ -1358,17 +1443,19 @@ test_self_multiple_channels(void)
 		    buf + recvd, sizeof(buf) - recvd);
 		if (n <= 0)
 			break;
-		recvd += (size_t)n;
+		size_t count;
+		ASSERT_TRUE(selftest_io_count(n, sizeof(buf) - recvd, &count));
+		recvd += count;
 		if (recvd >= sizeof(data1) - 1)
 			break;
 	}
 	ASSERT_EQ_U(recvd, sizeof(data1) - 1);
 	ASSERT_MEM_EQ(buf, data1, sizeof(data1) - 1);
 
-	dssh_chan_close(ch1, 0);
+	ASSERT_EQ(selftest_channel_close(&ctx, true, ch1, 0), 0);
 
 	/* Second channel */
-	dssh_channel ch2 = open_exec(ctx.client,"cmd2");
+	dssh_channel ch2 = open_exec(&ctx,"cmd2");
 	ASSERT_NOT_NULL(ch2);
 
 	dssh_chan_poll(ch2, DSSH_POLL_WRITE, 5000);
@@ -1385,14 +1472,16 @@ test_self_multiple_channels(void)
 		    buf + recvd, sizeof(buf) - recvd);
 		if (n <= 0)
 			break;
-		recvd += (size_t)n;
+		size_t count;
+		ASSERT_TRUE(selftest_io_count(n, sizeof(buf) - recvd, &count));
+		recvd += count;
 		if (recvd >= sizeof(data2) - 1)
 			break;
 	}
 	ASSERT_EQ_U(recvd, sizeof(data2) - 1);
 	ASSERT_MEM_EQ(buf, data2, sizeof(data2) - 1);
 
-	dssh_chan_close(ch2, 0);
+	ASSERT_EQ(selftest_channel_close(&ctx, true, ch2, 0), 0);
 
 	selftest_join(&ctx.server_thread, &ctx.server_thread_active);
 	ASSERT_EQ(sarg.result, 0);
@@ -1419,7 +1508,7 @@ test_self_graceful_disconnect(void)
 	struct server_disconnect_arg sarg = { .ctx = &ctx };
 	ASSERT_OK(selftest_start_thread(&ctx, server_disconnect_thread, &sarg));
 
-	dssh_channel ch = open_exec(ctx.client,"wait");
+	dssh_channel ch = open_exec(&ctx,"wait");
 	ASSERT_NOT_NULL(ch);
 
 	/* Disconnect gracefully */
@@ -1435,7 +1524,7 @@ test_self_graceful_disconnect(void)
 }
 
 /* ================================================================
- * Test: EOF half-close -- client closes, server processes
+ * Test: EOF half-close -- client sends EOF, then reads the server reply
  * ================================================================ */
 
 static int
@@ -1444,28 +1533,29 @@ test_self_eof_half_close(void)
 	struct selftest_ctx ctx;
 	if (selftest_setup(&ctx) < 0)
 		return TEST_FAIL;
-
-	ASSERT_OK(dssh_session_start(ctx.client));
-	ASSERT_OK(dssh_session_start(ctx.server));
-
+	ASSERT_EQ(dssh_session_start(ctx.client), 0);
+	ASSERT_EQ(dssh_session_start(ctx.server), 0);
 	struct server_halfclose_arg sarg = { .ctx = &ctx };
-	ASSERT_OK(selftest_start_thread(&ctx, server_halfclose_thread, &sarg));
-
-	dssh_channel ch = open_exec(ctx.client,"halfclose");
+	ASSERT_EQ(selftest_start_thread(&ctx, server_halfclose_thread, &sarg), 0);
+	dssh_channel ch = open_exec(&ctx, "halfclose");
 	ASSERT_NOT_NULL(ch);
-
-	/* Write some data then close */
-	dssh_chan_poll(ch, DSSH_POLL_WRITE, 5000);
 	const uint8_t data[] = "client-data";
-	dssh_chan_write(ch, 0, data, sizeof(data) - 1);
-	dssh_chan_close(ch, 0);
-
+	ASSERT_TRUE(selftest_write_all(ch, data, sizeof(data) - 1, 5000));
+	ASSERT_EQ(dssh_chan_shutwr(ch), 0);
+	/* The handle remains owned and readable after sending EOF. */
+	const uint8_t expected[] = "server-reply-after-eof";
+	uint8_t reply[sizeof(expected) - 1];
+	ASSERT_TRUE(selftest_read_exact(ch, reply, sizeof(reply), 5000));
+	ASSERT_MEM_EQ(reply, expected, sizeof(reply));
+	ASSERT_TRUE(selftest_read_eof(ch, 5000));
+	ASSERT_FALSE(dssh_session_is_terminated(ctx.client));
+	ASSERT_EQ(selftest_channel_close(&ctx, true, ch, 0), 0);
 	selftest_join(&ctx.server_thread, &ctx.server_thread_active);
 	ASSERT_EQ(sarg.result, 0);
-
 	selftest_cleanup(&ctx);
 	return TEST_PASS;
 }
+
 
 /* ================================================================
  * Test: rekey during data -- send enough to trigger auto-rekey
@@ -1484,7 +1574,7 @@ test_self_rekey_during_data(void)
 	struct server_echo_arg sarg = { .ctx = &ctx };
 	ASSERT_OK(selftest_start_thread(&ctx, server_echo_thread, &sarg));
 
-	dssh_channel ch = open_shell(ctx.client, "xterm", 80, 24);
+	dssh_channel ch = open_shell(&ctx, "xterm", 80, 24);
 	ASSERT_NOT_NULL(ch);
 
 	/* Arm the exact threshold at the next client receive, independent of
@@ -1512,7 +1602,9 @@ test_self_rekey_during_data(void)
 		    buf + recvd, sizeof(buf) - recvd);
 		if (n <= 0)
 			break;
-		recvd += (size_t)n;
+		size_t count;
+		ASSERT_TRUE(selftest_io_count(n, sizeof(buf) - recvd, &count));
+		recvd += count;
 		if (recvd >= sizeof(data))
 			break;
 	}
@@ -1523,7 +1615,7 @@ test_self_rekey_during_data(void)
 	ASSERT_TRUE(compression_fixture_wait_reset(resets_before));
 	ASSERT_FALSE(dssh_session_is_terminated(ctx.client));
 
-	dssh_chan_close(ch, 0);
+	ASSERT_EQ(selftest_channel_close(&ctx, true, ch, 0), 0);
 	selftest_join(&ctx.server_thread, &ctx.server_thread_active);
 	ASSERT_EQ(sarg.result, 0);
 
@@ -1548,7 +1640,7 @@ test_self_rekey_manual(void)
 	struct server_echo_arg sarg = { .ctx = &ctx };
 	ASSERT_OK(selftest_start_thread(&ctx, server_echo_thread, &sarg));
 
-	dssh_channel ch = open_exec(ctx.client,"rekey");
+	dssh_channel ch = open_exec(&ctx,"rekey");
 	ASSERT_NOT_NULL(ch);
 
 	/* Count at the exact threshold: even a compressed small packet must
@@ -1574,7 +1666,9 @@ test_self_rekey_manual(void)
 		    buf + recvd, sizeof(buf) - recvd);
 		if (n <= 0)
 			break;
-		recvd += (size_t)n;
+		size_t count;
+		ASSERT_TRUE(selftest_io_count(n, sizeof(buf) - recvd, &count));
+		recvd += count;
 		if (recvd >= sizeof(data) - 1)
 			break;
 	}
@@ -1585,7 +1679,7 @@ test_self_rekey_manual(void)
 	ASSERT_TRUE(compression_fixture_wait_reset(resets_before));
 	ASSERT_FALSE(dssh_session_is_terminated(ctx.client));
 
-	dssh_chan_close(ch, 0);
+	ASSERT_EQ(selftest_channel_close(&ctx, true, ch, 0), 0);
 	selftest_join(&ctx.server_thread, &ctx.server_thread_active);
 
 	selftest_cleanup(&ctx);
@@ -1609,7 +1703,7 @@ test_self_rekey_preserves_channels(void)
 	struct server_echo_arg sarg = { .ctx = &ctx };
 	ASSERT_OK(selftest_start_thread(&ctx, server_echo_thread, &sarg));
 
-	dssh_channel ch = open_shell(ctx.client, "xterm", 80, 24);
+	dssh_channel ch = open_shell(&ctx, "xterm", 80, 24);
 	ASSERT_NOT_NULL(ch);
 
 	/* Send data before rekey */
@@ -1631,7 +1725,9 @@ test_self_rekey_preserves_channels(void)
 		    buf + recvd, sizeof(buf) - recvd);
 		if (n <= 0)
 			break;
-		recvd += (size_t)n;
+		size_t count;
+		ASSERT_TRUE(selftest_io_count(n, sizeof(buf) - recvd, &count));
+		recvd += count;
 		if (recvd >= sizeof(before) - 1)
 			break;
 	}
@@ -1667,7 +1763,9 @@ test_self_rekey_preserves_channels(void)
 		    buf + recvd, sizeof(buf) - recvd);
 		if (n <= 0)
 			break;
-		recvd += (size_t)n;
+		size_t count;
+		ASSERT_TRUE(selftest_io_count(n, sizeof(buf) - recvd, &count));
+		recvd += count;
 		if (recvd >= sizeof(after) - 1)
 			break;
 	}
@@ -1680,7 +1778,7 @@ test_self_rekey_preserves_channels(void)
 	ASSERT_EQ_U(ctx.client->trans.session_id_sz, sid_sz);
 	ASSERT_MEM_EQ(ctx.client->trans.session_id, sid_before, sid_sz);
 
-	dssh_chan_close(ch, 0);
+	ASSERT_EQ(selftest_channel_close(&ctx, true, ch, 0), 0);
 	selftest_join(&ctx.server_thread, &ctx.server_thread_active);
 	ASSERT_EQ(sarg.result, 0);
 
@@ -1707,7 +1805,7 @@ server_burst_thread(void *arg)
 	struct selftest_ctx *ctx = a->ctx;
 	a->result = -1;
 
-	dssh_channel ch = dssh_chan_accept(ctx->server,
+	dssh_channel ch = selftest_accept(ctx,
 	    &selftest_accept_cbs, 30000);
 
 	if (ch == NULL)
@@ -1719,25 +1817,19 @@ server_burst_thread(void *arg)
 		thrd_yield();
 	}
 
-	/* Wait for peer's WINDOW_ADJUST */
-	dssh_chan_poll(ch, DSSH_POLL_WRITE, 30000);
-
-	/* Send 10 chunks of 50 bytes each as fast as possible.
-	 * Some will be in the socket buffer when the client
-	 * starts its self-initiated rekey. */
+	/* Send all ten spans, including any short writes. */
 	uint8_t chunk[50];
-
 	memset(chunk, 'D', sizeof(chunk));
+	bool complete = true;
 	for (int i = 0; i < 10; i++) {
-		int64_t w = dssh_chan_write(ch, 0,
-		    chunk, sizeof(chunk));
-
-		if (w <= 0)
+		if (!selftest_write_all(ch, chunk, sizeof(chunk), 30000)) {
+			complete = false;
 			break;
+		}
 	}
-
-	dssh_chan_close(ch, 0);
-	a->result = 0;
+	int ret = selftest_channel_close(ctx, false, ch, 0);
+	if (complete && ret == 0)
+		a->result = 0;
 	return 0;
 }
 
@@ -1755,7 +1847,7 @@ test_self_rekey_inflight_data(void)
 	atomic_init(&sarg.start, false);
 	ASSERT_OK(selftest_start_thread(&ctx, server_burst_thread, &sarg));
 
-	dssh_channel ch = open_exec(ctx.client,"burst");
+	dssh_channel ch = open_exec(&ctx,"burst");
 	ASSERT_NOT_NULL(ch);
 
 	/* Arm the threshold so the FIRST received packet triggers
@@ -1781,7 +1873,9 @@ test_self_rekey_inflight_data(void)
 		    buf + recvd, sizeof(buf) - recvd);
 		if (n <= 0)
 			break;
-		recvd += (size_t)n;
+		size_t count;
+		ASSERT_TRUE(selftest_io_count(n, sizeof(buf) - recvd, &count));
+		recvd += count;
 		if (recvd >= expected)
 			break;
 	}
@@ -1794,7 +1888,7 @@ test_self_rekey_inflight_data(void)
 	ASSERT_TRUE(compression_fixture_wait_reset(resets_before));
 	ASSERT_FALSE(dssh_session_is_terminated(ctx.client));
 
-	dssh_chan_close(ch, 0);
+	ASSERT_EQ(selftest_channel_close(&ctx, true, ch, 0), 0);
 	selftest_join(&ctx.server_thread, &ctx.server_thread_active);
 	ASSERT_EQ(sarg.result, 0);
 
@@ -1819,7 +1913,7 @@ test_self_connection_drop(void)
 	struct server_echo_arg sarg = { .ctx = &ctx };
 	ASSERT_OK(selftest_start_thread(&ctx, server_echo_thread, &sarg));
 
-	dssh_channel ch = open_exec(ctx.client,"drop");
+	dssh_channel ch = open_exec(&ctx,"drop");
 	ASSERT_NOT_NULL(ch);
 
 	/* Write some data to confirm the channel works */
@@ -1840,7 +1934,9 @@ test_self_connection_drop(void)
 		    buf + recvd, sizeof(buf) - recvd);
 		if (n <= 0)
 			break;
-		recvd += (size_t)n;
+		size_t count;
+		ASSERT_TRUE(selftest_io_count(n, sizeof(buf) - recvd, &count));
+		recvd += count;
 		if (recvd >= sizeof(data) - 1)
 			break;
 	}
@@ -2091,7 +2187,7 @@ test_open_channel_timeout(void)
 	timespec_get(&t0, TIME_UTC);
 
 	/* Server never calls accept, so no CONFIRMATION is sent */
-	dssh_channel ch = open_exec(ctx.client,"cmd");
+	dssh_channel ch = open_exec(&ctx,"cmd");
 	ASSERT_NULL(ch);
 
 	struct timespec t1;
@@ -2124,7 +2220,7 @@ setup_timeout_server_thread(void *arg)
 	struct selftest_ctx *ctx = a->ctx;
 	a->ch = NULL;
 
-	a->ch = dssh_chan_accept(ctx->server,
+	a->ch = selftest_accept(ctx,
 	    &selftest_accept_cbs, 30000);
 	a->result = (a->ch == NULL) ? 0 : -1;
 	return 0;
@@ -2238,12 +2334,11 @@ test_rekey_send_timeout(void)
 }
 
 /* ================================================================
- * New dssh_chan_* API tests
+ * Channel API integration tests
  * ================================================================ */
 
 /*
- * Test: exec echo using the new dssh_chan_* API on the client side.
- * Server uses old API (will be migrated in Phase 4/6).
+ * Test: exec echo using the channel API on both sides.
  */
 static int
 test_self_chan_exec_echo(void)
@@ -2259,16 +2354,16 @@ test_self_chan_exec_echo(void)
 	struct server_echo_arg sarg = { .ctx = &ctx };
 	ASSERT_OK(selftest_start_thread(&ctx, server_echo_thread, &sarg));
 
-	/* Open exec channel using new params builder + dssh_chan_open */
-	struct dssh_chan_params p;
+	/* Open exec channel using the params builder */
+	struct dssh_chan_params *p = &ctx.params;
 
-	ASSERT_OK(dssh_chan_params_init(&p, DSSH_CHAN_EXEC));
-	ASSERT_OK(dssh_chan_params_set_command(&p, "echo"));
-	ASSERT_OK(dssh_chan_params_set_pty(&p, false));
+	ASSERT_EQ(selftest_params_init(&ctx, DSSH_CHAN_EXEC), 0);
+	ASSERT_EQ(dssh_chan_params_set_command(p, "echo"), 0);
+	ASSERT_EQ(dssh_chan_params_set_pty(p, false), 0);
 
-	dssh_channel ch = dssh_chan_open(ctx.client, &p);
+	dssh_channel ch = selftest_open(&ctx, p);
 
-	dssh_chan_params_free(&p);
+	selftest_params_free(&ctx);
 	ASSERT_NOT_NULL(ch);
 
 	/* Verify getters */
@@ -2299,14 +2394,16 @@ test_self_chan_exec_echo(void)
 
 		if (n <= 0)
 			break;
-		recvd += (size_t)n;
+		size_t count;
+		ASSERT_TRUE(selftest_io_count(n, sizeof(buf) - recvd, &count));
+		recvd += count;
 		if (recvd >= sizeof(data) - 1)
 			break;
 	}
 	ASSERT_EQ_U(recvd, sizeof(data) - 1);
 	ASSERT_MEM_EQ(buf, data, sizeof(data) - 1);
 
-	dssh_chan_close(ch, -1);
+	ASSERT_EQ(selftest_channel_close(&ctx, true, ch, -1), 0);
 	selftest_join(&ctx.server_thread, &ctx.server_thread_active);
 	ASSERT_EQ(sarg.result, 0);
 
@@ -2332,15 +2429,15 @@ test_self_chan_shell_pty(void)
 	ASSERT_OK(selftest_start_thread(&ctx, server_echo_thread, &sarg));
 
 	/* Open shell with pty using params builder */
-	struct dssh_chan_params p;
+	struct dssh_chan_params *p = &ctx.params;
 
-	ASSERT_OK(dssh_chan_params_init(&p, DSSH_CHAN_SHELL));
-	ASSERT_OK(dssh_chan_params_set_term(&p, "xterm-256color"));
-	ASSERT_OK(dssh_chan_params_set_size(&p, 80, 24, 0, 0));
+	ASSERT_EQ(selftest_params_init(&ctx, DSSH_CHAN_SHELL), 0);
+	ASSERT_EQ(dssh_chan_params_set_term(p, "xterm-256color"), 0);
+	ASSERT_EQ(dssh_chan_params_set_size(p, 80, 24, 0, 0), 0);
 
-	dssh_channel ch = dssh_chan_open(ctx.client, &p);
+	dssh_channel ch = selftest_open(&ctx, p);
 
-	dssh_chan_params_free(&p);
+	selftest_params_free(&ctx);
 	ASSERT_NOT_NULL(ch);
 
 	/* Verify getters */
@@ -2369,14 +2466,16 @@ test_self_chan_shell_pty(void)
 
 		if (n <= 0)
 			break;
-		recvd += (size_t)n;
+		size_t count;
+		ASSERT_TRUE(selftest_io_count(n, sizeof(buf) - recvd, &count));
+		recvd += count;
 		if (recvd >= sizeof(data) - 1)
 			break;
 	}
 	ASSERT_EQ_U(recvd, sizeof(data) - 1);
 	ASSERT_MEM_EQ(buf, data, sizeof(data) - 1);
 
-	dssh_chan_close(ch, 0);
+	ASSERT_EQ(selftest_channel_close(&ctx, true, ch, 0), 0);
 	selftest_join(&ctx.server_thread, &ctx.server_thread_active);
 	ASSERT_EQ(sarg.result, 0);
 
@@ -2385,11 +2484,10 @@ test_self_chan_shell_pty(void)
 }
 
 /*
- * Test: new dssh_chan_accept on server side, new dssh_chan_open on client.
- * Full round-trip using only the new API on both sides.
+ * Test: server accept and client open, with a complete roundtrip.
  */
 
-/* Accept callbacks for new API tests */
+/* Accept callbacks for channel API tests */
 static int
 test_accept_shell_cb(dssh_channel ch,
     const struct dssh_chan_params *p,
@@ -2423,61 +2521,21 @@ server_chan_echo_thread(void *arg)
 	struct server_chan_echo_arg *a = arg;
 	struct selftest_ctx *ctx = a->ctx;
 	a->result = -1;
-
 	struct dssh_chan_accept_cbs cbs = {
 		.shell = test_accept_shell_cb,
 		.exec = test_accept_exec_cb,
 	};
-
-	dssh_channel ch = dssh_chan_accept(ctx->server, &cbs, 30000);
-
+	dssh_channel ch = selftest_accept(ctx, &cbs, 30000);
 	if (ch == NULL)
 		return 0;
-
-	/* Verify type */
-	if (dssh_chan_get_type(ch) != a->expected_type) {
-		dssh_chan_close(ch, -1);
-		return 0;
-	}
-
-	/* Echo loop */
-	uint8_t buf[4096];
-
-	for (;;) {
-		int ev = dssh_chan_poll(ch, DSSH_POLL_READ, 30000);
-
-		if (ev <= 0)
-			break;
-
-		int64_t n = dssh_chan_read(ch, 0, buf, sizeof(buf));
-
-		if (n <= 0)
-			break;
-
-		/* Write all read data, polling for window if needed */
-		size_t off = 0;
-
-		while (off < (size_t)n) {
-			int wev = dssh_chan_poll(ch,
-			    DSSH_POLL_WRITE, 30000);
-
-			if (wev <= 0)
-				goto done;
-
-			int64_t w = dssh_chan_write(ch, 0,
-			    buf + off, (size_t)n - off);
-
-			if (w < 0)
-				goto done;
-			off += (size_t)w;
-		}
-	}
-done:
-
-	dssh_chan_close(ch, 0);
-	a->result = 0;
+	bool complete = dssh_chan_get_type(ch) == a->expected_type && selftest_echo(ch)
+	    && !dssh_session_is_terminated(ctx->server);
+	int ret = selftest_channel_close(ctx, false, ch, 0);
+	if (complete && ret == 0)
+		a->result = 0;
 	return 0;
 }
+
 
 static int
 test_self_chan_accept_exec(void)
@@ -2496,16 +2554,16 @@ test_self_chan_accept_exec(void)
 	};
 	ASSERT_OK(selftest_start_thread(&ctx, server_chan_echo_thread, &sarg));
 
-	/* Client: open exec with new API */
-	struct dssh_chan_params p;
+	/* Client: open exec */
+	struct dssh_chan_params *p = &ctx.params;
 
-	ASSERT_OK(dssh_chan_params_init(&p, DSSH_CHAN_EXEC));
-	ASSERT_OK(dssh_chan_params_set_command(&p, "test-cmd"));
-	ASSERT_OK(dssh_chan_params_set_pty(&p, false));
+	ASSERT_EQ(selftest_params_init(&ctx, DSSH_CHAN_EXEC), 0);
+	ASSERT_EQ(dssh_chan_params_set_command(p, "test-cmd"), 0);
+	ASSERT_EQ(dssh_chan_params_set_pty(p, false), 0);
 
-	dssh_channel ch = dssh_chan_open(ctx.client, &p);
+	dssh_channel ch = selftest_open(&ctx, p);
 
-	dssh_chan_params_free(&p);
+	selftest_params_free(&ctx);
 	ASSERT_NOT_NULL(ch);
 
 	/* Write and read echo */
@@ -2529,14 +2587,16 @@ test_self_chan_accept_exec(void)
 
 		if (n <= 0)
 			break;
-		recvd += (size_t)n;
+		size_t count;
+		ASSERT_TRUE(selftest_io_count(n, sizeof(buf) - recvd, &count));
+		recvd += count;
 		if (recvd >= sizeof(data) - 1)
 			break;
 	}
 	ASSERT_EQ_U(recvd, sizeof(data) - 1);
 	ASSERT_MEM_EQ(buf, data, sizeof(data) - 1);
 
-	dssh_chan_close(ch, -1);
+	ASSERT_EQ(selftest_channel_close(&ctx, true, ch, -1), 0);
 	selftest_join(&ctx.server_thread, &ctx.server_thread_active);
 	ASSERT_EQ(sarg.result, 0);
 
@@ -2545,7 +2605,7 @@ test_self_chan_accept_exec(void)
 }
 
 /*
- * Test: shell with pty, both sides using new API.
+ * Test: shell with pty.
  * Verify server sees pty state via getters.
  */
 struct server_chan_pty_arg {
@@ -2571,33 +2631,25 @@ server_chan_pty_thread(void *arg)
 	struct selftest_ctx *ctx = a->ctx;
 	a->result = -1;
 	a->has_pty = false;
-
 	struct dssh_chan_accept_cbs cbs = {
 		.pty_req = test_accept_pty_cb,
 		.shell = test_accept_shell_cb,
 		.cbdata = &a->has_pty,
 	};
-
-	dssh_channel ch = dssh_chan_accept(ctx->server, &cbs, 30000);
-
+	dssh_channel ch = selftest_accept(ctx, &cbs, 30000);
 	if (ch == NULL)
 		return 0;
-
-	/* Echo one message then close */
-	uint8_t buf[256];
-	int ev = dssh_chan_poll(ch, DSSH_POLL_READ, 30000);
-
-	if (ev > 0) {
-		int64_t n = dssh_chan_read(ch, 0, buf, sizeof(buf));
-
-		if (n > 0)
-			dssh_chan_write(ch, 0, buf, (size_t)n);
-	}
-
-	dssh_chan_close(ch, 0);
-	a->result = 0;
+	const uint8_t expected[] = "ping";
+	uint8_t buf[sizeof(expected) - 1];
+	bool complete = selftest_read_exact(ch, buf, sizeof(buf), 30000)
+	    && memcmp(buf, expected, sizeof(buf)) == 0
+	    && selftest_write_all(ch, buf, sizeof(buf), 30000);
+	int ret = selftest_channel_close(ctx, false, ch, 0);
+	if (complete && ret == 0)
+		a->result = 0;
 	return 0;
 }
+
 
 static int
 test_self_chan_accept_shell_pty(void)
@@ -2614,15 +2666,15 @@ test_self_chan_accept_shell_pty(void)
 	ASSERT_OK(selftest_start_thread(&ctx, server_chan_pty_thread, &sarg));
 
 	/* Client: open shell with pty */
-	struct dssh_chan_params p;
+	struct dssh_chan_params *p = &ctx.params;
 
-	ASSERT_OK(dssh_chan_params_init(&p, DSSH_CHAN_SHELL));
-	ASSERT_OK(dssh_chan_params_set_term(&p, "vt100"));
-	ASSERT_OK(dssh_chan_params_set_size(&p, 132, 50, 0, 0));
+	ASSERT_EQ(selftest_params_init(&ctx, DSSH_CHAN_SHELL), 0);
+	ASSERT_EQ(dssh_chan_params_set_term(p, "vt100"), 0);
+	ASSERT_EQ(dssh_chan_params_set_size(p, 132, 50, 0, 0), 0);
 
-	dssh_channel ch = dssh_chan_open(ctx.client, &p);
+	dssh_channel ch = selftest_open(&ctx, p);
 
-	dssh_chan_params_free(&p);
+	selftest_params_free(&ctx);
 	ASSERT_NOT_NULL(ch);
 
 	const uint8_t data[] = "ping";
@@ -2644,13 +2696,15 @@ test_self_chan_accept_shell_pty(void)
 
 		if (n <= 0)
 			break;
-		recvd += (size_t)n;
+		size_t count;
+		ASSERT_TRUE(selftest_io_count(n, sizeof(buf) - recvd, &count));
+		recvd += count;
 		if (recvd >= sizeof(data) - 1)
 			break;
 	}
 	ASSERT_EQ_U(recvd, sizeof(data) - 1);
 
-	dssh_chan_close(ch, 0);
+	ASSERT_EQ(selftest_channel_close(&ctx, true, ch, 0), 0);
 	selftest_join(&ctx.server_thread, &ctx.server_thread_active);
 	ASSERT_EQ(sarg.result, 0);
 	ASSERT_TRUE(sarg.has_pty);
@@ -2660,7 +2714,7 @@ test_self_chan_accept_shell_pty(void)
 }
 
 /*
- * Test: exit-status event via new dssh_chan_* API.
+ * Test: exit-status event via the channel API.
  * Server sends data, then closes with exit_code=42.
  * Client reads data, then reads exit-status event.
  */
@@ -2670,26 +2724,21 @@ server_chan_exit_thread(void *arg)
 	struct server_chan_echo_arg *a = arg;
 	struct selftest_ctx *ctx = a->ctx;
 	a->result = -1;
-
 	struct dssh_chan_accept_cbs cbs = {
 		.shell = test_accept_shell_cb,
 		.exec = test_accept_exec_cb,
 	};
-
-	dssh_channel ch = dssh_chan_accept(ctx->server, &cbs, 30000);
-
+	dssh_channel ch = selftest_accept(ctx, &cbs, 30000);
 	if (ch == NULL)
 		return 0;
-
-	dssh_chan_poll(ch, DSSH_POLL_WRITE, 30000);
-
 	const uint8_t msg[] = "hello";
-
-	dssh_chan_write(ch, 0, msg, sizeof(msg) - 1);
-	dssh_chan_close(ch, 42);
-	a->result = 0;
+	bool complete = selftest_write_all(ch, msg, sizeof(msg) - 1, 30000);
+	int ret = selftest_channel_close(ctx, false, ch, 42);
+	if (complete && ret == 0)
+		a->result = 0;
 	return 0;
 }
+
 
 static int
 test_self_chan_event_exit_status(void)
@@ -2708,15 +2757,15 @@ test_self_chan_event_exit_status(void)
 	};
 	ASSERT_OK(selftest_start_thread(&ctx, server_chan_exit_thread, &sarg));
 
-	struct dssh_chan_params p;
+	struct dssh_chan_params *p = &ctx.params;
 
-	ASSERT_OK(dssh_chan_params_init(&p, DSSH_CHAN_EXEC));
-	ASSERT_OK(dssh_chan_params_set_command(&p, "test"));
-	ASSERT_OK(dssh_chan_params_set_pty(&p, false));
+	ASSERT_EQ(selftest_params_init(&ctx, DSSH_CHAN_EXEC), 0);
+	ASSERT_EQ(dssh_chan_params_set_command(p, "test"), 0);
+	ASSERT_EQ(dssh_chan_params_set_pty(p, false), 0);
 
-	dssh_channel ch = dssh_chan_open(ctx.client, &p);
+	dssh_channel ch = selftest_open(&ctx, p);
 
-	dssh_chan_params_free(&p);
+	selftest_params_free(&ctx);
 	ASSERT_NOT_NULL(ch);
 
 	/* Drain data and look for events */
@@ -2763,7 +2812,7 @@ test_self_chan_event_exit_status(void)
 	ASSERT_EQ_U(exit_code, 42);
 	ASSERT_TRUE(got_eof);
 
-	dssh_chan_close(ch, -1);
+	ASSERT_EQ(selftest_channel_close(&ctx, true, ch, -1), 0);
 	selftest_join(&ctx.server_thread, &ctx.server_thread_active);
 	ASSERT_EQ(sarg.result, 0);
 
@@ -2790,7 +2839,7 @@ test_self_chan_read_peek(void)
 	struct server_echo_arg sarg = { .ctx = &ctx };
 	ASSERT_OK(selftest_start_thread(&ctx, server_echo_thread, &sarg));
 
-	dssh_channel ch = open_exec(ctx.client, "peek-test");
+	dssh_channel ch = open_exec(&ctx, "peek-test");
 
 	ASSERT_NOT_NULL(ch);
 
@@ -2819,7 +2868,7 @@ test_self_chan_read_peek(void)
 
 	ASSERT_EQ(n, avail);
 
-	dssh_chan_close(ch, -1);
+	ASSERT_EQ(selftest_channel_close(&ctx, true, ch, -1), 0);
 	selftest_join(&ctx.server_thread, &ctx.server_thread_active);
 	selftest_cleanup(&ctx);
 	return TEST_PASS;
@@ -2840,7 +2889,7 @@ test_self_chan_shutwr_then_close(void)
 	struct server_echo_arg sarg = { .ctx = &ctx };
 	ASSERT_OK(selftest_start_thread(&ctx, server_echo_thread, &sarg));
 
-	dssh_channel ch = open_exec(ctx.client, "shutwr-test");
+	dssh_channel ch = open_exec(&ctx, "shutwr-test");
 
 	ASSERT_NOT_NULL(ch);
 
@@ -2848,7 +2897,7 @@ test_self_chan_shutwr_then_close(void)
 	ASSERT_OK(dssh_chan_shutwr(ch));
 
 	/* close should not fail even though EOF already sent */
-	ASSERT_OK(dssh_chan_close(ch, 0));
+	ASSERT_EQ(selftest_channel_close(&ctx, true, ch, 0), 0);
 
 	selftest_join(&ctx.server_thread, &ctx.server_thread_active);
 	ASSERT_EQ(sarg.result, 0);
@@ -2876,12 +2925,12 @@ test_self_chan_close_exit_code(void)
 	};
 	ASSERT_OK(selftest_start_thread(&ctx, server_chan_echo_thread, &server_arg));
 
-	dssh_channel ch = open_exec(ctx.client, "exit42");
+	dssh_channel ch = open_exec(&ctx, "exit42");
 
 	ASSERT_NOT_NULL(ch);
 
 	/* Close with exit_code=42 */
-	dssh_chan_close(ch, 42);
+	ASSERT_EQ(selftest_channel_close(&ctx, true, ch, 42), 0);
 	selftest_join(&ctx.server_thread, &ctx.server_thread_active);
 
 	selftest_cleanup(&ctx);
@@ -2903,12 +2952,12 @@ test_self_chan_close_no_exit_code(void)
 	struct server_echo_arg sarg = { .ctx = &ctx };
 	ASSERT_OK(selftest_start_thread(&ctx, server_echo_thread, &sarg));
 
-	dssh_channel ch = open_exec(ctx.client, "no-exit");
+	dssh_channel ch = open_exec(&ctx, "no-exit");
 
 	ASSERT_NOT_NULL(ch);
 
 	/* Close with negative = no exit-status sent */
-	dssh_chan_close(ch, -1);
+	ASSERT_EQ(selftest_channel_close(&ctx, true, ch, -1), 0);
 	selftest_join(&ctx.server_thread, &ctx.server_thread_active);
 
 	selftest_cleanup(&ctx);
@@ -2936,7 +2985,7 @@ test_self_chan_send_break(void)
 	 * the setup reply is still unwinding. */
 	atomic_store(&delayed_tx_countdown, 2);
 
-	dssh_channel ch = open_exec(ctx.client, "break-test");
+	dssh_channel ch = open_exec(&ctx, "break-test");
 
 	ASSERT_NOT_NULL(ch);
 
@@ -2944,7 +2993,7 @@ test_self_chan_send_break(void)
 	ASSERT_OK(dssh_chan_send_break(ch, 500));
 	ASSERT_TRUE(dssh_test_wait_bool(&delayed_tx_seen, true));
 
-	dssh_chan_close(ch, -1);
+	ASSERT_EQ(selftest_channel_close(&ctx, true, ch, -1), 0);
 	selftest_join(&ctx.server_thread, &ctx.server_thread_active);
 	selftest_cleanup(&ctx);
 	return TEST_PASS;
@@ -2971,7 +3020,7 @@ server_getter_thread(void *arg)
 		.exec = test_accept_exec_cb,
 	};
 
-	dssh_channel ch = dssh_chan_accept(ctx->server, &cbs, 30000);
+	dssh_channel ch = selftest_accept(ctx, &cbs, 30000);
 
 	if (ch == NULL)
 		return 0;
@@ -2981,8 +3030,7 @@ server_getter_thread(void *arg)
 	a->command_matches = command != NULL && strcmp(command, "my-command") == 0;
 	a->has_pty = dssh_chan_has_pty(ch);
 
-	dssh_chan_close(ch, 0);
-	a->result = 0;
+	a->result = selftest_channel_close(ctx, false, ch, 0);
 	return 0;
 }
 
@@ -3000,18 +3048,18 @@ test_self_chan_getters_after_accept(void)
 	struct server_getter_arg sarg = { .ctx = &ctx };
 	ASSERT_OK(selftest_start_thread(&ctx, server_getter_thread, &sarg));
 
-	struct dssh_chan_params p;
+	struct dssh_chan_params *p = &ctx.params;
 
-	dssh_chan_params_init(&p, DSSH_CHAN_EXEC);
-	dssh_chan_params_set_command(&p, "my-command");
-	dssh_chan_params_set_pty(&p, false);
+	ASSERT_EQ(selftest_params_init(&ctx, DSSH_CHAN_EXEC), 0);
+	ASSERT_EQ(dssh_chan_params_set_command(p, "my-command"), 0);
+	ASSERT_EQ(dssh_chan_params_set_pty(p, false), 0);
 
-	dssh_channel ch = dssh_chan_open(ctx.client, &p);
+	dssh_channel ch = selftest_open(&ctx, p);
 
-	dssh_chan_params_free(&p);
+	selftest_params_free(&ctx);
 	ASSERT_NOT_NULL(ch);
 
-	dssh_chan_close(ch, -1);
+	ASSERT_EQ(selftest_channel_close(&ctx, true, ch, -1), 0);
 	selftest_join(&ctx.server_thread, &ctx.server_thread_active);
 
 	ASSERT_EQ(sarg.result, 0);
@@ -3041,14 +3089,13 @@ server_env_reject_thread(void *arg)
 		.exec = test_accept_exec_cb,
 	};
 
-	dssh_channel ch = dssh_chan_accept(ctx->server, &cbs, 30000);
+	dssh_channel ch = selftest_accept(ctx, &cbs, 30000);
 
 	if (ch == NULL)
 		return 0;
 
 	/* Channel should open successfully despite env rejection */
-	dssh_chan_close(ch, 0);
-	a->result = 0;
+	a->result = selftest_channel_close(ctx, false, ch, 0);
 	return 0;
 }
 
@@ -3067,20 +3114,20 @@ test_self_chan_accept_env_reject(void)
 	ASSERT_OK(selftest_start_thread(&ctx, server_env_reject_thread, &sarg));
 
 	/* Client sends env vars which server will reject */
-	struct dssh_chan_params p;
+	struct dssh_chan_params *p = &ctx.params;
 
-	dssh_chan_params_init(&p, DSSH_CHAN_EXEC);
-	dssh_chan_params_set_command(&p, "env-test");
-	dssh_chan_params_set_pty(&p, false);
-	dssh_chan_params_add_env(&p, "LANG", "en_US.UTF-8");
-	dssh_chan_params_add_env(&p, "TERM", "xterm");
+	ASSERT_EQ(selftest_params_init(&ctx, DSSH_CHAN_EXEC), 0);
+	ASSERT_EQ(dssh_chan_params_set_command(p, "env-test"), 0);
+	ASSERT_EQ(dssh_chan_params_set_pty(p, false), 0);
+	ASSERT_EQ(dssh_chan_params_add_env(p, "LANG", "en_US.UTF-8"), 0);
+	ASSERT_EQ(dssh_chan_params_add_env(p, "TERM", "xterm"), 0);
 
-	dssh_channel ch = dssh_chan_open(ctx.client, &p);
+	dssh_channel ch = selftest_open(&ctx, p);
 
-	dssh_chan_params_free(&p);
+	selftest_params_free(&ctx);
 	ASSERT_NOT_NULL(ch);
 
-	dssh_chan_close(ch, -1);
+	ASSERT_EQ(selftest_channel_close(&ctx, true, ch, -1), 0);
 	selftest_join(&ctx.server_thread, &ctx.server_thread_active);
 	ASSERT_EQ(sarg.result, 0);
 

@@ -1,6 +1,7 @@
 /* Exercise the actual self-test owner with private, caller-only controls.
  * Include its source once; library and provider calls retain their real paths. */
 #include <errno.h>
+#include <limits.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -16,6 +17,18 @@ static int owner_trust(dssh_session, dssh_hostkey_verify_cb, void *);
 static dssh_session owner_session(bool, size_t);
 static void owner_cleanup(dssh_session);
 static int owner_close(int);
+static int owner_param_init(struct dssh_chan_params *, enum dssh_chan_type);
+static void owner_param_free(struct dssh_chan_params *);
+static int owner_command(struct dssh_chan_params *, const char *);
+static int owner_term(struct dssh_chan_params *, const char *);
+static int owner_pty(struct dssh_chan_params *, bool);
+static int owner_size(struct dssh_chan_params *, uint32_t, uint32_t, uint32_t, uint32_t);
+static dssh_channel owner_channel_open(dssh_session, const struct dssh_chan_params *);
+static dssh_channel owner_channel_accept(dssh_session, const struct dssh_chan_accept_cbs *, int);
+static int owner_channel_close(dssh_channel, int64_t);
+static int owner_poll(dssh_channel, int, int);
+static int64_t owner_write(dssh_channel, int, const uint8_t *, size_t);
+static int64_t owner_read(dssh_channel, int, uint8_t *, size_t);
 
 /* Capture the existing native/test redirections before overriding only calls
  * in the included fixture. No library demux create/join is intercepted. */
@@ -38,10 +51,34 @@ static int native_join(thrd_t t, int *r)
 #define dssh_session_init owner_session
 #define dssh_session_cleanup owner_cleanup
 #define close owner_close
+#define dssh_chan_params_init owner_param_init
+#define dssh_chan_params_free owner_param_free
+#define dssh_chan_params_set_command owner_command
+#define dssh_chan_params_set_term owner_term
+#define dssh_chan_params_set_pty owner_pty
+#define dssh_chan_params_set_size owner_size
+#define dssh_chan_open owner_channel_open
+#define dssh_chan_accept owner_channel_accept
+#define dssh_chan_close owner_channel_close
+#define dssh_chan_poll owner_poll
+#define dssh_chan_write owner_write
+#define dssh_chan_read owner_read
 #define main selftest_suite_main
 #include "test_selftest.c"
 #undef main
 #undef close
+#undef dssh_chan_params_init
+#undef dssh_chan_params_free
+#undef dssh_chan_params_set_command
+#undef dssh_chan_params_set_term
+#undef dssh_chan_params_set_pty
+#undef dssh_chan_params_set_size
+#undef dssh_chan_open
+#undef dssh_chan_accept
+#undef dssh_chan_close
+#undef dssh_chan_poll
+#undef dssh_chan_write
+#undef dssh_chan_read
 #undef dssh_session_cleanup
 #undef dssh_session_init
 #undef dssh_session_set_hostkey_verify_cb
@@ -59,6 +96,20 @@ static unsigned owner_setters;
 static unsigned owner_sessions;
 static unsigned owner_released;
 static unsigned owner_closed;
+static unsigned owner_param_calls;
+static unsigned owner_param_native;
+static unsigned owner_param_frees;
+static unsigned owner_open_attempts;
+static bool owner_param_clean = true;
+static bool owner_param_fired;
+static atomic_uint owner_channels_created;
+static atomic_uint owner_channels_closed;
+static atomic_bool owner_channel_ready;
+static _Thread_local bool owner_main;
+static bool owner_io_armed;
+static bool owner_io_fired;
+static unsigned owner_write_calls;
+static unsigned owner_read_calls;
 
 #define owner_note(...) do { \
 	if (fprintf(stderr, __VA_ARGS__) < 0 || fflush(stderr) != 0) \
@@ -72,6 +123,211 @@ owner_selected(const char *prefix, unsigned index, const char *suffix)
 	return index < 6 && strncmp(owner_mode, prefix, length) == 0
 	    && owner_mode[length] == '0' + index
 	    && strcmp(owner_mode + length + 1, suffix) == 0;
+}
+
+static bool
+owner_parameter_fault(unsigned index, const char *suffix)
+{
+	const char *prefix = strncmp(owner_mode, "builder-shell-", 14) == 0
+	    ? "builder-shell-" : "builder-exec-";
+	if (!owner_selected(prefix, index, suffix))
+		return false;
+	owner_param_fired = true;
+	owner_note("SELFTEST_PARAMETER_FAILURE mode=%s index=%u phase=%s\n",
+	    owner_mode, index, suffix);
+	return true;
+}
+
+static unsigned
+owner_parameter_index(void)
+{
+	if (owner_param_calls >= 3)
+		abort();
+	return owner_param_calls++;
+}
+
+static int
+owner_parameter_finish(unsigned index, int ret)
+{
+	if (ret == 0 && owner_parameter_fault(index, "-after"))
+		return DSSH_ERROR_ALLOC;
+	return ret;
+}
+
+static int
+owner_param_init(struct dssh_chan_params *params, enum dssh_chan_type type)
+{
+	unsigned index = owner_parameter_index();
+	if (owner_parameter_fault(index, "-before"))
+		return DSSH_ERROR_ALLOC;
+	owner_param_native++;
+	return owner_parameter_finish(index, dssh_chan_params_init(params, type));
+}
+
+static int
+owner_command(struct dssh_chan_params *params, const char *command)
+{
+	unsigned index = owner_parameter_index();
+	if (owner_parameter_fault(index, "-before"))
+		return DSSH_ERROR_ALLOC;
+	owner_param_native++;
+	return owner_parameter_finish(index, dssh_chan_params_set_command(params, command));
+}
+
+static int
+owner_term(struct dssh_chan_params *params, const char *term)
+{
+	unsigned index = owner_parameter_index();
+	if (owner_parameter_fault(index, "-before"))
+		return DSSH_ERROR_ALLOC;
+	owner_param_native++;
+	return owner_parameter_finish(index, dssh_chan_params_set_term(params, term));
+}
+
+static int
+owner_pty(struct dssh_chan_params *params, bool enable)
+{
+	unsigned index = owner_parameter_index();
+	if (owner_parameter_fault(index, "-before"))
+		return DSSH_ERROR_ALLOC;
+	owner_param_native++;
+	return owner_parameter_finish(index, dssh_chan_params_set_pty(params, enable));
+}
+
+static int
+owner_size(struct dssh_chan_params *params, uint32_t cols, uint32_t rows,
+    uint32_t wpx, uint32_t hpx)
+{
+	unsigned index = owner_parameter_index();
+	if (owner_parameter_fault(index, "-before"))
+		return DSSH_ERROR_ALLOC;
+	owner_param_native++;
+	return owner_parameter_finish(index, dssh_chan_params_set_size(params, cols, rows, wpx, hpx));
+}
+
+static bool
+owner_parameters_empty(const struct dssh_chan_params *params)
+{
+	return params->term == NULL && params->command == NULL && params->subsystem == NULL
+	    && params->env == NULL && params->env_count == 0 && params->env_capacity == 0
+	    && params->modes == NULL && params->mode_count == 0 && params->mode_capacity == 0;
+}
+
+static void
+owner_param_free(struct dssh_chan_params *params)
+{
+	dssh_chan_params_free(params);
+	if (owner_param_frees >= 2)
+		abort();
+	owner_param_frees++;
+	owner_param_clean &= owner_parameters_empty(params);
+}
+
+static dssh_channel
+owner_channel_open(dssh_session session, const struct dssh_chan_params *params)
+{
+	if (owner_open_attempts >= 1)
+		abort();
+	owner_open_attempts++;
+	dssh_channel ch = dssh_chan_open(session, params);
+	if (ch != NULL)
+		atomic_fetch_add(&owner_channels_created, 1);
+	return ch;
+}
+
+static dssh_channel
+owner_channel_accept(dssh_session session, const struct dssh_chan_accept_cbs *cbs, int timeout_ms)
+{
+	dssh_channel ch = dssh_chan_accept(session, cbs, timeout_ms);
+	if (ch != NULL)
+		atomic_fetch_add(&owner_channels_created, 1);
+	return ch;
+}
+
+static int
+owner_channel_close(dssh_channel ch, int64_t code)
+{
+	int ret = dssh_chan_close(ch, code);
+	if (ret == 0 || ret == DSSH_ERROR_TERMINATED)
+		atomic_fetch_add(&owner_channels_closed, 1);
+	return ret;
+}
+
+static int
+owner_poll(dssh_channel ch, int events, int timeout_ms)
+{
+	if (owner_main && owner_io_armed && !owner_io_fired) {
+		const char *prefix = events == DSSH_POLL_WRITE ? "stream-write-poll-" : "stream-read-poll-";
+		size_t length = strlen(prefix);
+		if (strncmp(owner_mode, prefix, length) == 0) {
+			const char *kind = owner_mode + length;
+			owner_io_fired = true;
+			if (strcmp(kind, "zero") == 0)
+				return 0;
+			if (strcmp(kind, "negative") == 0)
+				return DSSH_ERROR_INVALID;
+			if (strcmp(kind, "wrong") == 0)
+				return events == DSSH_POLL_WRITE ? DSSH_POLL_READ : DSSH_POLL_WRITE;
+			abort();
+		}
+	}
+	return dssh_chan_poll(ch, events, timeout_ms);
+}
+
+static int64_t
+owner_write(dssh_channel ch, int stream, const uint8_t *buf, size_t length)
+{
+	if (!owner_main || !owner_io_armed)
+		return dssh_chan_write(ch, stream, buf, length);
+	if (owner_write_calls == UINT_MAX)
+		abort();
+	owner_write_calls++;
+	if (!owner_io_fired && strncmp(owner_mode, "stream-write-", 13) == 0) {
+		owner_io_fired = true;
+		if (strcmp(owner_mode, "stream-write-zero") == 0)
+			return 0;
+		if (strcmp(owner_mode, "stream-write-negative") == 0)
+			return DSSH_ERROR_TERMINATED;
+		if (strcmp(owner_mode, "stream-write-oversize") == 0)
+			return INT64_MAX;
+		abort();
+	}
+	if (strcmp(owner_mode, "stream-partial") == 0 && length > 3) {
+		length = 3;
+		owner_io_fired = true;
+	}
+	return dssh_chan_write(ch, stream, buf, length);
+}
+
+static int64_t
+owner_read(dssh_channel ch, int stream, uint8_t *buf, size_t length)
+{
+	if (!owner_main || !owner_io_armed)
+		return dssh_chan_read(ch, stream, buf, length);
+	if (owner_read_calls == UINT_MAX)
+		abort();
+	owner_read_calls++;
+	if (!owner_io_fired && strncmp(owner_mode, "stream-read-", 12) == 0) {
+		owner_io_fired = true;
+		if (strcmp(owner_mode, "stream-read-eof") == 0)
+			return 0;
+		if (strcmp(owner_mode, "stream-read-negative") == 0)
+			return DSSH_ERROR_TERMINATED;
+		if (strcmp(owner_mode, "stream-read-oversize") == 0)
+			return INT64_MAX;
+		abort();
+	}
+	if (strcmp(owner_mode, "stream-partial") == 0 && length > 3) {
+		length = 3;
+		owner_io_fired = true;
+	}
+	int64_t ret = dssh_chan_read(ch, stream, buf, length);
+	if (!owner_io_fired && strcmp(owner_mode, "stream-corrupt") == 0
+	    && ret > 0 && length != 0 && buf != NULL) {
+		buf[0] ^= 1;
+		owner_io_fired = true;
+	}
+	return ret;
 }
 
 static int
@@ -174,7 +430,9 @@ owner_session(bool client, size_t extra)
 static void
 owner_cleanup(dssh_session sess)
 {
-	if (owner_joined != owner_created) {
+	if (owner_joined != owner_created
+	    || atomic_load(&owner_channels_created) != atomic_load(&owner_channels_closed)
+	    || !owner_param_clean) {
 		owner_note("SELFTEST_PREMATURE_RETIRE\n");
 		abort();
 	}
@@ -211,7 +469,10 @@ owner_retired(const struct selftest_ctx *ctx)
 	    && !ctx->server_thread_active && ctx->client == NULL && ctx->server == NULL
 	    && ctx->client_fd == -1 && ctx->server_fd == -1
 	    && owner_joined == owner_created && owner_released == owner_sessions
-	    && owner_closed == 2;
+	    && owner_closed == 2 && !ctx->params_active && owner_parameters_empty(&ctx->params)
+	    && ctx->client_channel == NULL && ctx->server_channel == NULL
+	    && owner_param_clean
+	    && atomic_load(&owner_channels_created) == atomic_load(&owner_channels_closed);
 }
 
 static int
@@ -236,10 +497,124 @@ owner_finish(struct selftest_ctx *ctx, bool valid)
 	selftest_cleanup(ctx);
 	selftest_cleanup(ctx);
 	valid &= owner_retired(ctx);
+	owner_note("SELFTEST_RESOURCES mode=%s params_calls=%u params_native=%u params_frees=%u params_clean=%u open_attempts=%u channels=%u closed=%u\n",
+	    owner_mode, owner_param_calls, owner_param_native, owner_param_frees,
+	    owner_param_clean ? 1U : 0U, owner_open_attempts,
+	    atomic_load(&owner_channels_created), atomic_load(&owner_channels_closed));
 	owner_note("SELFTEST_OWNER mode=%s created=%u joined=%u sessions=%u released=%u closed=%u valid=%u\n",
 	    owner_mode, owner_created, owner_joined, owner_sessions, owner_released,
 	    owner_closed, valid ? 1U : 0U);
 	return valid ? 0 : 2;
+}
+
+static int
+owner_channel_body(void *argument)
+{
+	struct selftest_ctx *ctx = argument;
+	dssh_channel ch = selftest_accept(ctx, &selftest_accept_cbs, 30000);
+	atomic_store(&owner_channel_ready, true);
+	if (ch == NULL)
+		return -1;
+	bool complete = selftest_echo(ch);
+	int ret = selftest_channel_close(ctx, false, ch, 0);
+	return complete && ret == 0 ? 0 : -1;
+}
+
+static bool
+owner_extent_boundaries(void)
+{
+	static const struct {
+		int64_t value;
+		size_t capacity;
+		bool accepted;
+		size_t expected;
+	} cases[] = {
+		{ -1, 8, false, 0 }, { 0, 0, true, 0 }, { 0, 8, true, 0 },
+		{ 1, 0, false, 0 }, { 1, 1, true, 1 }, { 4096, 4095, false, 0 },
+		{ 4096, 4096, true, 4096 }, { 4097, 4096, false, 0 },
+		{ INT64_MAX, 4096, false, 0 },
+	};
+	for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+		size_t count = 42;
+		bool accepted = selftest_io_count(cases[i].value, cases[i].capacity, &count);
+		if (accepted != cases[i].accepted
+		    || count != (accepted ? cases[i].expected : 42))
+			return false;
+	}
+	owner_note("SELFTEST_EXTENTS cases=9 valid=1\n");
+	return true;
+}
+
+/* Return 3 only for the older setup/worker-only modes below. */
+static int
+owner_extra_control(struct selftest_ctx *ctx)
+{
+	bool builder = strncmp(owner_mode, "builder-", 8) == 0;
+	bool parameters = strcmp(owner_mode, "assert-params") == 0;
+	bool extents = strcmp(owner_mode, "extent-boundaries") == 0;
+	if (builder || parameters || extents) {
+		if (selftest_prepare(ctx) != 0)
+			return 2;
+		if (extents)
+			return owner_finish(ctx, owner_extent_boundaries());
+		if (builder) {
+			dssh_channel ch = strncmp(owner_mode, "builder-shell-", 14) == 0
+			    ? open_shell(ctx, "xterm", 80, 24) : open_exec(ctx, "command");
+			return owner_finish(ctx, ch == NULL && owner_param_fired
+			    && owner_open_attempts == 0 && !ctx->params_active);
+		}
+		if (selftest_params_init(ctx, DSSH_CHAN_EXEC) != 0
+		    || dssh_chan_params_set_command(&ctx->params, "pending-command") != 0
+		    || dssh_chan_params_set_term(&ctx->params, "pending-term") != 0
+		    || dssh_chan_params_add_env(&ctx->params, "LANG", "C") != 0
+		    || dssh_chan_params_set_mode(&ctx->params, 1, 3) != 0)
+			return owner_finish(ctx, false);
+		bool allocated = ctx->params.command != NULL && ctx->params.term != NULL
+		    && ctx->params.env_count == 1 && ctx->params.mode_count == 1;
+		int result = owner_assertion();
+		return owner_finish(ctx, allocated && result == TEST_FAIL && owner_retired(ctx));
+	}
+	bool channel = strcmp(owner_mode, "assert-channel") == 0;
+	bool tail = strcmp(owner_mode, "pattern-tail") == 0;
+	bool stream = strncmp(owner_mode, "stream-", 7) == 0;
+	if (!channel && !tail && !stream)
+		return 3;
+	if (selftest_setup(ctx) != 0)
+		return 2;
+	if (dssh_session_start(ctx->client) != 0 || dssh_session_start(ctx->server) != 0
+	    || selftest_start_thread(ctx, owner_channel_body, ctx) != 0)
+		return owner_finish(ctx, false);
+	dssh_channel ch = open_exec(ctx, "stream-control");
+	if (ch == NULL || !dssh_test_wait_bool(&owner_channel_ready, true)
+	    || atomic_load(&owner_channels_created) != 2)
+		return owner_finish(ctx, false);
+	if (channel) {
+		int result = owner_assertion();
+		return owner_finish(ctx, result == TEST_FAIL && owner_retired(ctx));
+	}
+	owner_io_armed = true;
+	uint32_t completed = 0;
+	bool complete;
+	if (tail || strcmp(owner_mode, "stream-corrupt") == 0) {
+		uint32_t total = tail ? UINT32_C(4097) : UINT32_C(65536);
+		complete = selftest_pattern_roundtrip(ch, total, &completed);
+	}
+	else {
+		const uint8_t payload[] = "partial-transfer-payload";
+		uint8_t received[sizeof(payload) - 1];
+		complete = selftest_write_all(ch, payload, sizeof(payload) - 1, 5000)
+		    && selftest_read_exact(ch, received, sizeof(received), 5000)
+		    && memcmp(payload, received, sizeof(received)) == 0;
+		if (complete)
+			completed = sizeof(payload) - 1;
+	}
+	owner_io_armed = false;
+	bool expected_success = tail || strcmp(owner_mode, "stream-partial") == 0;
+	bool valid = expected_success ? complete : !complete && owner_io_fired;
+	owner_note("SELFTEST_STREAM mode=%s fired=%u writes=%u reads=%u completed=%" PRIu32 " result=%u\n",
+	    owner_mode, owner_io_fired ? 1U : 0U, owner_write_calls, owner_read_calls,
+	    completed, complete ? 1U : 0U);
+	return owner_finish(ctx, valid);
 }
 
 int
@@ -248,7 +623,14 @@ main(int argc, char **argv)
 	if (argc != 2 || signal(SIGPIPE, SIG_IGN) == SIG_ERR)
 		return 2;
 	owner_mode = argv[1];
+	owner_main = true;
+	atomic_init(&owner_channels_created, 0);
+	atomic_init(&owner_channels_closed, 0);
+	atomic_init(&owner_channel_ready, false);
 	struct selftest_ctx ctx;
+	int extra = owner_extra_control(&ctx);
+	if (extra != 3)
+		return extra;
 	if (strncmp(owner_mode, "assert-hs-", 10) == 0
 	    || strncmp(owner_mode, "assert-auth-", 12) == 0) {
 		bool auth = strncmp(owner_mode, "assert-auth-", 12) == 0;

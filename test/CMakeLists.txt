@@ -2403,6 +2403,28 @@ if(Python3_Interpreter_FOUND AND UNIX AND NOT APPLE)
 		set_tests_properties(dssh_selftest_owner_${mode} PROPERTIES
 			FIXTURES_REQUIRED dssh_cached_keys ENVIRONMENT "${DSSH_TEST_KEY_ENV}")
 	endforeach()
+	set(selftest_stream_modes assert-params assert-channel extent-boundaries
+		pattern-tail stream-partial stream-corrupt
+		stream-write-zero stream-write-negative stream-write-oversize
+		stream-read-eof stream-read-negative stream-read-oversize)
+	foreach(kind IN ITEMS exec shell)
+		foreach(index RANGE 0 2)
+			list(APPEND selftest_stream_modes builder-${kind}-${index}-before
+				builder-${kind}-${index}-after)
+		endforeach()
+	endforeach()
+	foreach(operation IN ITEMS read write)
+		foreach(kind IN ITEMS zero negative wrong)
+			list(APPEND selftest_stream_modes stream-${operation}-poll-${kind})
+		endforeach()
+	endforeach()
+	foreach(mode IN LISTS selftest_stream_modes)
+		add_test(NAME dssh_selftest_stream_${mode} COMMAND ${Python3_EXECUTABLE}
+			${CMAKE_CURRENT_SOURCE_DIR}/selftest_stream_controls.py
+			$<TARGET_FILE:dssh_test_selftest_owner> ${mode})
+		set_tests_properties(dssh_selftest_stream_${mode} PROPERTIES
+			FIXTURES_REQUIRED dssh_cached_keys ENVIRONMENT "${DSSH_TEST_KEY_ENV}")
+	endforeach()
 endif()
 foreach(provider IN ITEMS test-growth zlib)
 	if(provider STREQUAL "zlib" AND NOT ZLIB_FOUND)

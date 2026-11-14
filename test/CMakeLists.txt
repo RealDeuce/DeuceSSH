@@ -1837,6 +1837,30 @@ foreach(part IN ITEMS setup no_start)
 	set_tests_properties(dssh_conn_${part}_ownership PROPERTIES TIMEOUT 120
 		ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys)
 endforeach()
+set(DSSH_CHANNEL_PAIR_CASES
+	chan_get_pty
+	channel_close_subsys
+	env_callback_rejection
+	env_roundtrip
+	open_shell
+	open_subsystem
+	subsys_large_write
+	subsys_multiple_writes
+	subsys_poll
+	subsys_poll_timeout_zero
+	subsys_poll_write
+	subsys_write_after_close
+	subsys_write_read
+	subsys_write_zero
+	subsystem_roundtrip
+	window_change
+)
+foreach(consumer IN LISTS DSSH_CHANNEL_PAIR_CASES)
+	dssh_add_output_test(dssh_conn_pair_${consumer} dssh_test_conn
+		"1 tests: 1 passed, 0 failed, 0 skipped" --exact release/pair_${consumer})
+	set_tests_properties(dssh_conn_pair_${consumer} PROPERTIES TIMEOUT 120
+		ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys)
+endforeach()
 target_link_libraries(dssh_test_conn PRIVATE dssh_mock_io dssh_mock_comp)
 
 # Exercise actual auth/channel fixtures with external compression. Exact-test
@@ -2020,6 +2044,15 @@ if(UNIX)
 				$<TARGET_FILE:dssh_test_threads_shim_posix> ${operation})
 		endforeach()
 	endif()
+	foreach(consumer IN LISTS DSSH_CHANNEL_PAIR_CASES ITEMS chan_get_pty_second)
+		foreach(mode IN ITEMS retained released)
+			set(name dssh_channel_pair_fatal_${consumer}_${mode})
+			dssh_add_output_test(${name} dssh_test_fatal_driver "channel_join_fatal=1"
+				$<TARGET_FILE:dssh_test_conn> --channel-fatal pair-${consumer} ${mode})
+			set_tests_properties(${name} PROPERTIES FIXTURES_REQUIRED dssh_cached_keys
+				ENVIRONMENT "${DSSH_TEST_KEY_ENV}" TIMEOUT 120)
+		endforeach()
+	endforeach()
 	foreach(operation IN ITEMS open exec shell subsystem accept)
 		foreach(mode IN ITEMS retained released)
 			set(name dssh_channel_worker_fatal_${operation}_${mode})

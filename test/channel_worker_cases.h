@@ -15,7 +15,7 @@ struct channel_worker_probe {
 	bool creation_failed;
 	unsigned fatal_join;
 	bool fatal_released;
-	struct channel_worker_job jobs[2];
+	struct channel_worker_job jobs[4];
 };
 static struct channel_worker_probe *channel_worker_probe;
 
@@ -32,12 +32,14 @@ static int
 channel_worker_probe_create(thrd_t *thread, thrd_start_t function, void *data)
 {
 	struct channel_worker_probe *probe = channel_worker_probe;
+	if (probe->calls >= 4)
+		abort();
 	unsigned index = probe->calls++;
 	if (index == probe->fail_at) {
 		probe->creation_failed = true;
 		return thrd_error;
 	}
-	if (index >= 2)
+	if (index >= 4)
 		abort();
 	struct channel_worker_job *job = &probe->jobs[index];
 	job->function = function;
@@ -66,14 +68,19 @@ channel_worker_probe_join(thrd_t thread, int *result)
 			mock_io_close_s2c(&owner->io);
 		}
 	}
-	if (probe->fatal_join != 0 && !probe->fatal_released) {
+	if (probe->fatal_join != 0 && !probe->fatal_released
+	    && probe->joined < UINT_MAX && probe->joined + 1 == probe->fatal_join) {
 		fputs("DSSH_TEST_CHANNEL_JOIN_FAILURE\n", stderr);
 		return thrd_error;
 	}
 	int ret = thrd_join(thread, result);
-	if (ret == thrd_success)
+	if (ret == thrd_success) {
+		if (probe->joined >= probe->created)
+			abort();
 		probe->joined++;
-	if (ret == thrd_success && probe->fatal_join != 0) {
+	}
+	if (ret == thrd_success && probe->fatal_join != 0
+	    && probe->joined == probe->fatal_join) {
 		fputs("DSSH_TEST_CHANNEL_JOIN_FAILURE\n", stderr);
 		return thrd_error;
 	}
@@ -83,7 +90,7 @@ channel_worker_probe_join(thrd_t thread, int *result)
 static void
 channel_worker_probe_begin(struct channel_worker_probe *probe)
 {
-	for (size_t i = 0; i < 2; i++)
+	for (size_t i = 0; i < 4; i++)
 		atomic_init(&probe->jobs[i].done, false);
 	channel_worker_probe = probe;
 	channel_fixture_thread_create = channel_worker_probe_create;

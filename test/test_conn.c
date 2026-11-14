@@ -5,9 +5,10 @@
  * channel open/accept, stream and subsystem channel I/O, signals,
  * window change, close/exit, multiple channels, and thread safety.
  *
- * Uses the new dssh_chan_* API throughout.
+ * Uses the dssh_chan_* API throughout.
  */
 
+#include <limits.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
@@ -192,7 +193,7 @@ static struct dssh_auth_server_cbs auth_cbs = {
 };
 
 /* ================================================================
- * Server accept callbacks (new dssh_chan_accept_cbs)
+ * Server accept callbacks (dssh_chan_accept_cbs)
  * ================================================================ */
 
 static int pty_received;
@@ -486,15 +487,17 @@ test_assertion_cleanup(void)
 /* Channel setup starts with a zero receive window on both sides.  Each side
  * opens its window asynchronously after setup, so a completed open/accept
  * does not by itself guarantee that an immediate non-blocking write works. */
+static int (*channel_fixture_poll)(dssh_channel, int, int) = dssh_chan_poll;
+
 static int
 wait_stream_writable(dssh_channel ch)
 {
-	if (ch == NULL || ch->io_model != DSSH_IO_STREAM)
-		return 0;
-	int ev = dssh_chan_poll(ch, DSSH_POLL_WRITE, 5000);
-	if ((ev & DSSH_POLL_WRITE) == 0)
+	if (ch == NULL)
 		return -1;
-	return 0;
+	if (ch->io_model != DSSH_IO_STREAM)
+		return 0;
+	int ev = channel_fixture_poll(ch, DSSH_POLL_WRITE, 5000);
+	return ev == DSSH_POLL_WRITE ? 0 : -1;
 }
 
 struct open_exec_ctx {
@@ -624,29 +627,39 @@ channel_workers_finish(struct channel_workers *workers)
 	channel_fixture_owner = NULL;
 }
 
+/* Both worker argument objects and output slots stay live through finish. */
+static int
+open_channel_pair(struct conn_ctx *owner,
+    thrd_start_t client_function, void *client_data, dssh_channel *client_ch,
+    thrd_start_t server_function, void *server_data, dssh_channel *server_ch)
+{
+	*client_ch = NULL;
+	*server_ch = NULL;
+	struct channel_workers workers;
+	channel_workers_init(&workers, owner);
+	if (channel_worker_start(&workers, 0, client_function, client_data) != 0
+	    || channel_worker_start(&workers, 1, server_function, server_data) != 0) {
+		channel_workers_finish(&workers);
+		return -1;
+	}
+	channel_worker_join(&workers, 0);
+	if (workers.results[0] != 0 || *client_ch == NULL)
+		channel_workers_cancel(&workers);
+	channel_workers_finish(&workers);
+	if (workers.results[0] != 0 || workers.results[1] != 0
+	    || *client_ch == NULL || *server_ch == NULL)
+		return -1;
+	return 0;
+}
+
 static int
 open_exec_channel(struct conn_ctx *owner, struct open_exec_ctx *ctx)
 {
 	if (owner == NULL || !owner->io_initialized || ctx->client != owner->client
 	    || ctx->server != owner->server)
 		return -1;
-	ctx->client_ch = NULL;
-	ctx->server_ch = NULL;
-	struct channel_workers workers;
-	channel_workers_init(&workers, owner);
-	if (channel_worker_start(&workers, 0, client_open_exec_thread, ctx) != 0
-	    || channel_worker_start(&workers, 1, server_accept_exec_thread, ctx) != 0) {
-		channel_workers_finish(&workers);
-		return -1;
-	}
-	channel_worker_join(&workers, 0);
-	if (workers.results[0] != 0 || ctx->client_ch == NULL)
-		channel_workers_cancel(&workers);
-	channel_workers_finish(&workers);
-	if (workers.results[0] != 0 || workers.results[1] != 0
-	    || ctx->client_ch == NULL || ctx->server_ch == NULL)
-		return -1;
-	return 0;
+	return open_channel_pair(owner, client_open_exec_thread, ctx, &ctx->client_ch,
+	    server_accept_exec_thread, ctx, &ctx->server_ch);
 }
 
 /* ================================================================
@@ -668,12 +681,16 @@ client_open_shell_thread(void *arg)
 {
 	struct open_shell_ctx *ctx = arg;
 	struct dssh_chan_params p;
-	dssh_chan_params_init(&p, DSSH_CHAN_SHELL);
-	dssh_chan_params_set_term(&p, ctx->term);
-	dssh_chan_params_set_size(&p, ctx->cols, ctx->rows, ctx->wpx, ctx->hpx);
-	ctx->client_ch = dssh_chan_open(ctx->client, &p);
+	int ret = dssh_chan_params_init(&p, DSSH_CHAN_SHELL);
+	if (ret != 0)
+		return ret;
+	ret = dssh_chan_params_set_term(&p, ctx->term);
+	if (ret == 0)
+		ret = dssh_chan_params_set_size(&p, ctx->cols, ctx->rows, ctx->wpx, ctx->hpx);
+	if (ret == 0)
+		ctx->client_ch = dssh_chan_open(ctx->client, &p);
 	dssh_chan_params_free(&p);
-	return wait_stream_writable(ctx->client_ch);
+	return ret == 0 ? wait_stream_writable(ctx->client_ch) : ret;
 }
 
 static int
@@ -701,12 +718,16 @@ client_open_subsys_thread(void *arg)
 {
 	struct open_subsys_ctx *ctx = arg;
 	struct dssh_chan_params p;
-	dssh_chan_params_init(&p, DSSH_CHAN_SUBSYSTEM);
-	dssh_chan_params_set_subsystem(&p, ctx->subsystem);
-	dssh_chan_params_set_pty(&p, false);
-	ctx->client_ch = dssh_chan_open(ctx->client, &p);
+	int ret = dssh_chan_params_init(&p, DSSH_CHAN_SUBSYSTEM);
+	if (ret != 0)
+		return ret;
+	ret = dssh_chan_params_set_subsystem(&p, ctx->subsystem);
+	if (ret == 0)
+		ret = dssh_chan_params_set_pty(&p, false);
+	if (ret == 0)
+		ctx->client_ch = dssh_chan_open(ctx->client, &p);
 	dssh_chan_params_free(&p);
-	return wait_stream_writable(ctx->client_ch);
+	return ret == 0 ? wait_stream_writable(ctx->client_ch) : ret;
 }
 
 static int
@@ -950,11 +971,9 @@ test_open_shell(void)
 		.cbs = &accept_cbs_all,
 	};
 
-	thrd_t ct, st;
-	ASSERT_THRD_CREATE(&ct, client_open_shell_thread, &oc);
-	ASSERT_THRD_CREATE(&st, server_accept_shell_thread, &oc);
-	thrd_join(ct, NULL);
-	thrd_join(st, NULL);
+	ASSERT_EQ(open_channel_pair(&ctx, client_open_shell_thread, &oc,
+	    &oc.client_ch, server_accept_shell_thread, &oc,
+	    &oc.server_ch), 0);
 
 	ASSERT_NOT_NULL(oc.client_ch);
 	ASSERT_NOT_NULL(oc.server_ch);
@@ -983,11 +1002,9 @@ test_open_subsystem(void)
 		.subsystem = "sftp",
 	};
 
-	thrd_t ct, st;
-	ASSERT_THRD_CREATE(&ct, client_open_subsys_thread, &oc);
-	ASSERT_THRD_CREATE(&st, server_accept_subsys_thread, &oc);
-	thrd_join(ct, NULL);
-	thrd_join(st, NULL);
+	ASSERT_EQ(open_channel_pair(&ctx, client_open_subsys_thread, &oc,
+	    &oc.client_ch, server_accept_subsys_thread, &oc,
+	    &oc.server_ch), 0);
 
 	ASSERT_NOT_NULL(oc.client_ch);
 	ASSERT_NOT_NULL(oc.server_ch);
@@ -1349,15 +1366,13 @@ test_subsys_write_read(void)
 		.subsystem = "test-sub",
 	};
 
-	thrd_t ct, st;
-	ASSERT_THRD_CREATE(&ct, client_open_subsys_thread, &oc);
-	ASSERT_THRD_CREATE(&st, server_accept_subsys_thread, &oc);
-	thrd_join(ct, NULL);
-	thrd_join(st, NULL);
+	ASSERT_EQ(open_channel_pair(&ctx, client_open_subsys_thread, &oc,
+	    &oc.client_ch, server_accept_subsys_thread, &oc,
+	    &oc.server_ch), 0);
 
 	if (oc.client_ch == NULL || oc.server_ch == NULL) {
 		conn_cleanup(&ctx);
-		return TEST_SKIP;
+		return TEST_FAIL;
 	}
 
 	/* Verify subsystem name arrived */
@@ -1398,15 +1413,13 @@ test_subsys_multiple_writes(void)
 		.subsystem = "test-sub",
 	};
 
-	thrd_t ct, st;
-	ASSERT_THRD_CREATE(&ct, client_open_subsys_thread, &oc);
-	ASSERT_THRD_CREATE(&st, server_accept_subsys_thread, &oc);
-	thrd_join(ct, NULL);
-	thrd_join(st, NULL);
+	ASSERT_EQ(open_channel_pair(&ctx, client_open_subsys_thread, &oc,
+	    &oc.client_ch, server_accept_subsys_thread, &oc,
+	    &oc.server_ch), 0);
 
 	if (oc.client_ch == NULL || oc.server_ch == NULL) {
 		conn_cleanup(&ctx);
-		return TEST_SKIP;
+		return TEST_FAIL;
 	}
 
 	/* Stream API: writes are concatenated, not message-delimited */
@@ -1452,15 +1465,13 @@ test_subsys_poll(void)
 		.subsystem = "test-sub",
 	};
 
-	thrd_t ct, st;
-	ASSERT_THRD_CREATE(&ct, client_open_subsys_thread, &oc);
-	ASSERT_THRD_CREATE(&st, server_accept_subsys_thread, &oc);
-	thrd_join(ct, NULL);
-	thrd_join(st, NULL);
+	ASSERT_EQ(open_channel_pair(&ctx, client_open_subsys_thread, &oc,
+	    &oc.client_ch, server_accept_subsys_thread, &oc,
+	    &oc.server_ch), 0);
 
 	if (oc.client_ch == NULL || oc.server_ch == NULL) {
 		conn_cleanup(&ctx);
-		return TEST_SKIP;
+		return TEST_FAIL;
 	}
 
 	/* No data yet -- poll should timeout */
@@ -1495,15 +1506,13 @@ test_subsys_large_write(void)
 		.subsystem = "test-sub",
 	};
 
-	thrd_t ct, st;
-	ASSERT_THRD_CREATE(&ct, client_open_subsys_thread, &oc);
-	ASSERT_THRD_CREATE(&st, server_accept_subsys_thread, &oc);
-	thrd_join(ct, NULL);
-	thrd_join(st, NULL);
+	ASSERT_EQ(open_channel_pair(&ctx, client_open_subsys_thread, &oc,
+	    &oc.client_ch, server_accept_subsys_thread, &oc,
+	    &oc.server_ch), 0);
 
 	if (oc.client_ch == NULL || oc.server_ch == NULL) {
 		conn_cleanup(&ctx);
-		return TEST_SKIP;
+		return TEST_FAIL;
 	}
 
 	size_t msglen = 16384;
@@ -1657,15 +1666,13 @@ test_window_change(void)
 		.cbs = &accept_cbs_all,
 	};
 
-	thrd_t ct, st;
-	ASSERT_THRD_CREATE(&ct, client_open_shell_thread, &oc);
-	ASSERT_THRD_CREATE(&st, server_accept_shell_thread, &oc);
-	thrd_join(ct, NULL);
-	thrd_join(st, NULL);
+	ASSERT_EQ(open_channel_pair(&ctx, client_open_shell_thread, &oc,
+	    &oc.client_ch, server_accept_shell_thread, &oc,
+	    &oc.server_ch), 0);
 
 	if (oc.client_ch == NULL || oc.server_ch == NULL) {
 		conn_cleanup(&ctx);
-		return TEST_SKIP;
+		return TEST_FAIL;
 	}
 
 	int res = dssh_chan_send_window_change(oc.client_ch,
@@ -1751,15 +1758,13 @@ test_channel_close_subsys(void)
 		.subsystem = "test-raw",
 	};
 
-	thrd_t ct, st;
-	ASSERT_THRD_CREATE(&ct, client_open_subsys_thread, &oc);
-	ASSERT_THRD_CREATE(&st, server_accept_subsys_thread, &oc);
-	thrd_join(ct, NULL);
-	thrd_join(st, NULL);
+	ASSERT_EQ(open_channel_pair(&ctx, client_open_subsys_thread, &oc,
+	    &oc.client_ch, server_accept_subsys_thread, &oc,
+	    &oc.server_ch), 0);
 
 	if (oc.client_ch == NULL || oc.server_ch == NULL) {
 		conn_cleanup(&ctx);
-		return TEST_SKIP;
+		return TEST_FAIL;
 	}
 
 	int res = dssh_chan_close(oc.client_ch, -1);
@@ -3734,15 +3739,13 @@ test_subsys_write_after_close(void)
 		.server = ctx.server,
 		.subsystem = "test-sub",
 	};
-	thrd_t ct, st;
-	ASSERT_THRD_CREATE(&ct, client_open_subsys_thread, &oc);
-	ASSERT_THRD_CREATE(&st, server_accept_subsys_thread, &oc);
-	thrd_join(ct, NULL);
-	thrd_join(st, NULL);
+	ASSERT_EQ(open_channel_pair(&ctx, client_open_subsys_thread, &oc,
+	    &oc.client_ch, server_accept_subsys_thread, &oc,
+	    &oc.server_ch), 0);
 
 	if (oc.client_ch == NULL || oc.server_ch == NULL) {
 		conn_cleanup(&ctx);
-		return TEST_SKIP;
+		return TEST_FAIL;
 	}
 
 	oc.server_ch->eof_sent = true;
@@ -3773,15 +3776,13 @@ test_subsys_poll_write(void)
 		.server = ctx.server,
 		.subsystem = "test-sub",
 	};
-	thrd_t ct, st;
-	ASSERT_THRD_CREATE(&ct, client_open_subsys_thread, &oc);
-	ASSERT_THRD_CREATE(&st, server_accept_subsys_thread, &oc);
-	thrd_join(ct, NULL);
-	thrd_join(st, NULL);
+	ASSERT_EQ(open_channel_pair(&ctx, client_open_subsys_thread, &oc,
+	    &oc.client_ch, server_accept_subsys_thread, &oc,
+	    &oc.server_ch), 0);
 
 	if (oc.client_ch == NULL || oc.server_ch == NULL) {
 		conn_cleanup(&ctx);
-		return TEST_SKIP;
+		return TEST_FAIL;
 	}
 
 	int ev = dssh_chan_poll(oc.client_ch, DSSH_POLL_WRITE, 0);
@@ -3808,15 +3809,13 @@ test_subsys_poll_timeout_zero(void)
 		.server = ctx.server,
 		.subsystem = "test-sub",
 	};
-	thrd_t ct, st;
-	ASSERT_THRD_CREATE(&ct, client_open_subsys_thread, &oc);
-	ASSERT_THRD_CREATE(&st, server_accept_subsys_thread, &oc);
-	thrd_join(ct, NULL);
-	thrd_join(st, NULL);
+	ASSERT_EQ(open_channel_pair(&ctx, client_open_subsys_thread, &oc,
+	    &oc.client_ch, server_accept_subsys_thread, &oc,
+	    &oc.server_ch), 0);
 
 	if (oc.client_ch == NULL || oc.server_ch == NULL) {
 		conn_cleanup(&ctx);
-		return TEST_SKIP;
+		return TEST_FAIL;
 	}
 
 	int ev = dssh_chan_poll(oc.server_ch, DSSH_POLL_READ, 0);
@@ -5138,12 +5137,9 @@ test_subsystem_roundtrip(void)
 		.subsystem = "test-echo",
 	};
 
-	thrd_t ct, st;
-
-	ASSERT_THRD_CREATE(&ct, client_open_subsys_thread, &oc);
-	ASSERT_THRD_CREATE(&st, server_accept_subsys_thread, &oc);
-	thrd_join(ct, NULL);
-	thrd_join(st, NULL);
+	ASSERT_EQ(open_channel_pair(&ctx, client_open_subsys_thread, &oc,
+	    &oc.client_ch, server_accept_subsys_thread, &oc,
+	    &oc.server_ch), 0);
 
 	if (oc.client_ch == NULL || oc.server_ch == NULL) {
 		if (oc.client_ch != NULL)
@@ -5151,7 +5147,7 @@ test_subsystem_roundtrip(void)
 		if (oc.server_ch != NULL)
 			dssh_chan_close(oc.server_ch, -1);
 		conn_cleanup(&ctx);
-		return TEST_SKIP;
+		return TEST_FAIL;
 	}
 
 	ASSERT_EQ(dssh_chan_get_type(oc.server_ch), DSSH_CHAN_SUBSYSTEM);
@@ -6579,15 +6575,13 @@ test_subsys_write_zero(void)
 		.server = ctx.server,
 		.subsystem = "test-sub",
 	};
-	thrd_t ct, st;
-	ASSERT_THRD_CREATE(&ct, client_open_subsys_thread, &oc);
-	ASSERT_THRD_CREATE(&st, server_accept_subsys_thread, &oc);
-	thrd_join(ct, NULL);
-	thrd_join(st, NULL);
+	ASSERT_EQ(open_channel_pair(&ctx, client_open_subsys_thread, &oc,
+	    &oc.client_ch, server_accept_subsys_thread, &oc,
+	    &oc.server_ch), 0);
 
 	if (oc.server_ch == NULL || oc.client_ch == NULL) {
 		conn_cleanup(&ctx);
-		return TEST_SKIP;
+		return TEST_FAIL;
 	}
 
 	/* Write zero bytes should return 0 (no-op) */
@@ -7443,11 +7437,9 @@ test_chan_get_pty(void)
 		.cbs = &accept_cbs_all,
 	};
 
-	thrd_t ct, st;
-	ASSERT_THRD_CREATE(&ct, client_open_shell_thread, &oc);
-	ASSERT_THRD_CREATE(&st, server_accept_shell_thread, &oc);
-	thrd_join(ct, NULL);
-	thrd_join(st, NULL);
+	ASSERT_EQ(open_channel_pair(&ctx, client_open_shell_thread, &oc,
+	    &oc.client_ch, server_accept_shell_thread, &oc,
+	    &oc.server_ch), 0);
 
 	if (oc.client_ch == NULL || oc.server_ch == NULL) {
 		if (oc.client_ch != NULL)
@@ -7455,7 +7447,7 @@ test_chan_get_pty(void)
 		if (oc.server_ch != NULL)
 			dssh_chan_close(oc.server_ch, -1);
 		conn_cleanup(&ctx);
-		return TEST_SKIP;
+		return TEST_FAIL;
 	}
 
 	/* Server channel should have PTY info */
@@ -7479,17 +7471,14 @@ test_chan_get_pty(void)
 		.server = ctx.server,
 		.subsystem = "test-no-pty",
 	};
-	ASSERT_THRD_CREATE(&ct, client_open_subsys_thread, &sc);
-	ASSERT_THRD_CREATE(&st, server_accept_subsys_thread, &sc);
-	thrd_join(ct, NULL);
-	thrd_join(st, NULL);
+	ASSERT_EQ(open_channel_pair(&ctx, client_open_subsys_thread, &sc,
+	    &sc.client_ch, server_accept_subsys_thread, &sc,
+	    &sc.server_ch), 0);
 
-	if (sc.client_ch != NULL && sc.server_ch != NULL) {
-		ASSERT_FALSE(dssh_chan_has_pty(sc.server_ch));
-		ASSERT_NULL(dssh_chan_get_pty(sc.server_ch));
-		dssh_chan_close(sc.client_ch, -1);
-		dssh_chan_close(sc.server_ch, -1);
-	}
+	ASSERT_FALSE(dssh_chan_has_pty(sc.server_ch));
+	ASSERT_NULL(dssh_chan_get_pty(sc.server_ch));
+	dssh_chan_close(sc.client_ch, -1);
+	dssh_chan_close(sc.server_ch, -1);
 
 	dssh_chan_close(oc.client_ch, 0);
 	dssh_chan_close(oc.server_ch, 0);
@@ -7527,18 +7516,20 @@ client_open_exec_with_env_thread(void *arg)
 	struct open_exec_ctx *ctx = arg;
 	struct dssh_chan_params p;
 	int ret = dssh_chan_params_init(&p, DSSH_CHAN_EXEC);
-	if (ret >= 0)
+	if (ret != 0)
+		return ret;
+	if (ret == 0)
 		ret = dssh_chan_params_set_command(&p, ctx->command);
-	if (ret >= 0)
+	if (ret == 0)
 		ret = dssh_chan_params_set_pty(&p, false);
-	if (ret >= 0)
+	if (ret == 0)
 		ret = dssh_chan_params_add_env(&p, "LANG", "en_US.UTF-8");
-	if (ret >= 0)
+	if (ret == 0)
 		ret = dssh_chan_params_add_env(&p, "TERM", "xterm");
-	if (ret >= 0)
+	if (ret == 0)
 		ctx->client_ch = dssh_chan_open(ctx->client, &p);
 	dssh_chan_params_free(&p);
-	return ret;
+	return ret == 0 ? wait_stream_writable(ctx->client_ch) : ret;
 }
 
 static struct dssh_chan_accept_cbs accept_cbs_with_env = {
@@ -7564,11 +7555,9 @@ test_env_roundtrip(void)
 		.accept_timeout = 30000,
 	};
 
-	thrd_t ct, st;
-	ASSERT_THRD_CREATE(&ct, client_open_exec_with_env_thread, &oc);
-	ASSERT_THRD_CREATE(&st, server_accept_exec_thread, &oc);
-	thrd_join(ct, NULL);
-	thrd_join(st, NULL);
+	ASSERT_EQ(open_channel_pair(&ctx, client_open_exec_with_env_thread, &oc,
+	    &oc.client_ch, server_accept_exec_thread, &oc,
+	    &oc.server_ch), 0);
 
 	if (oc.client_ch == NULL || oc.server_ch == NULL) {
 		if (oc.client_ch != NULL)
@@ -7576,7 +7565,7 @@ test_env_roundtrip(void)
 		if (oc.server_ch != NULL)
 			dssh_chan_close(oc.server_ch, -1);
 		conn_cleanup(&ctx);
-		return TEST_SKIP;
+		return TEST_FAIL;
 	}
 
 	/* Server channel should have received the env vars */
@@ -7619,11 +7608,9 @@ test_env_callback_rejection(void)
 		.cbs = &cbs,
 		.accept_timeout = 30000,
 	};
-	thrd_t ct, st;
-	ASSERT_THRD_CREATE(&ct, client_open_exec_with_env_thread, &oc);
-	ASSERT_THRD_CREATE(&st, server_accept_exec_thread, &oc);
-	ASSERT_EQ(thrd_join(ct, NULL), thrd_success);
-	ASSERT_EQ(thrd_join(st, NULL), thrd_success);
+	ASSERT_EQ(open_channel_pair(&ctx, client_open_exec_with_env_thread, &oc,
+	    &oc.client_ch, server_accept_exec_thread, &oc,
+	    &oc.server_ch), 0);
 	ASSERT_NOT_NULL(oc.client_ch);
 	ASSERT_NOT_NULL(oc.server_ch);
 	ASSERT_EQ_U(oc.server_ch->params.env_count, 1);
@@ -8348,6 +8335,7 @@ test_compression_window_rekey(void)
 #include "event_text_cases.h"
 #include "conn_helper_cases.h"
 #include "channel_worker_cases.h"
+#include "channel_pair_cases.h"
 #include "channel_id_cases.h"
 #include "peer_channel_id_cases.h"
 #include "post_close_cases.h"
@@ -8417,6 +8405,22 @@ static struct dssh_test_entry tests[] = {
 	{ "release/post_close_queued", test_post_close_queued },
 	{ "release/post_close_buffered", test_post_close_buffered },
 	{ "release/channel_worker_ownership", test_channel_worker_ownership },
+	{ "release/pair_chan_get_pty", pair_chan_get_pty },
+	{ "release/pair_channel_close_subsys", pair_channel_close_subsys },
+	{ "release/pair_env_callback_rejection", pair_env_callback_rejection },
+	{ "release/pair_env_roundtrip", pair_env_roundtrip },
+	{ "release/pair_open_shell", pair_open_shell },
+	{ "release/pair_open_subsystem", pair_open_subsystem },
+	{ "release/pair_subsys_large_write", pair_subsys_large_write },
+	{ "release/pair_subsys_multiple_writes", pair_subsys_multiple_writes },
+	{ "release/pair_subsys_poll", pair_subsys_poll },
+	{ "release/pair_subsys_poll_timeout_zero", pair_subsys_poll_timeout_zero },
+	{ "release/pair_subsys_poll_write", pair_subsys_poll_write },
+	{ "release/pair_subsys_write_after_close", pair_subsys_write_after_close },
+	{ "release/pair_subsys_write_read", pair_subsys_write_read },
+	{ "release/pair_subsys_write_zero", pair_subsys_write_zero },
+	{ "release/pair_subsystem_roundtrip", pair_subsystem_roundtrip },
+	{ "release/pair_window_change", pair_window_change },
 	{ "release/conn_setup_ownership", test_conn_setup_ownership },
 	{ "release/conn_no_start_ownership", test_conn_no_start_ownership },
 	{ "queue_retry/packet_stream_callback", test_queue_retry_packet_stream_callback },
@@ -8954,6 +8958,9 @@ main(int argc, char *argv[])
 		return incoming_control_probe();
 	if (argc == 2 && strcmp(argv[1], "--audit-close-outcomes") == 0)
 		return close_outcome_probe();
+	if (argc == 4 && strcmp(argv[1], "--channel-fatal") == 0
+	    && strncmp(argv[2], "pair-", 5) == 0)
+		return channel_pair_fatal_child(argv[2] + 5, argv[3]);
 	if (argc == 4 && strcmp(argv[1], "--channel-fatal") == 0)
 		return channel_worker_fatal_child(argv[2], argv[3]);
 	if (argc == 3 && strcmp(argv[1], "--join-fatal") == 0)

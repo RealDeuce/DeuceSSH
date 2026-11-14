@@ -2386,6 +2386,42 @@ if(Python3_Interpreter_FOUND AND UNIX AND NOT APPLE)
 	target_link_libraries(dssh_test_selftest_owner PRIVATE dssh_mock_comp)
 	target_link_options(dssh_test_selftest_owner PRIVATE "-Wl,--wrap=send_commit"
 		"-Wl,--wrap=recv_packet")
+	set(selftest_constructor_mutex_destroy mtx_destroy)
+	set(selftest_constructor_condition_destroy cnd_destroy)
+	if(DSSH_THREADS_SHIM_INCLUDE)
+		set(selftest_constructor_mutex_destroy dssh_thread_mtx_destroy)
+		set(selftest_constructor_condition_destroy dssh_thread_cnd_destroy)
+	endif()
+	foreach(symbol IN ITEMS dssh_test_malloc dssh_test_realloc dssh_test_free
+		dssh_test_mtx_init dssh_test_cnd_init dssh_test_channel_observe_end
+		dssh_test_wait_observe_end ${selftest_constructor_mutex_destroy}
+		${selftest_constructor_condition_destroy})
+		target_link_options(dssh_test_selftest_owner PRIVATE "-Wl,--wrap=${symbol}")
+	endforeach()
+	foreach(side IN ITEMS open accept)
+		if(side STREQUAL "open")
+			set(selftest_constructor_malloc_last 6)
+		else()
+			set(selftest_constructor_malloc_last 2)
+		endif()
+		set(selftest_constructor_modes constructor-${side}-condition-0)
+		foreach(index RANGE 0 ${selftest_constructor_malloc_last})
+			list(APPEND selftest_constructor_modes constructor-${side}-malloc-${index})
+		endforeach()
+		foreach(index RANGE 0 2)
+			list(APPEND selftest_constructor_modes constructor-${side}-realloc-${index})
+		endforeach()
+		foreach(index RANGE 0 1)
+			list(APPEND selftest_constructor_modes constructor-${side}-mutex-${index})
+		endforeach()
+		foreach(mode IN LISTS selftest_constructor_modes)
+			add_test(NAME dssh_selftest_constructor_${mode} COMMAND ${Python3_EXECUTABLE}
+				${CMAKE_CURRENT_SOURCE_DIR}/selftest_constructor_controls.py
+				$<TARGET_FILE:dssh_test_selftest_owner> ${mode})
+			set_tests_properties(dssh_selftest_constructor_${mode} PROPERTIES
+				FIXTURES_REQUIRED dssh_cached_keys ENVIRONMENT "${DSSH_TEST_KEY_ENV}")
+		endforeach()
+	endforeach()
 	foreach(mode IN ITEMS wire-env-native wire-env-omitted wire-env-reply
 		wire-break-native wire-break-duplicate)
 		add_test(NAME dssh_selftest_wire_${mode} COMMAND ${Python3_EXECUTABLE}

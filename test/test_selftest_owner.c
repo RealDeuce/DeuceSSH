@@ -39,6 +39,8 @@ static int owner_callback_unlock(mtx_t *);
 static int owner_break(dssh_session, dssh_chan_break_cb, void *);
 static int owner_env(struct dssh_chan_params *, const char *, const char *);
 static void owner_wire_server_retired(void);
+static void owner_constructor_begin(bool);
+static void owner_constructor_end(dssh_channel);
 
 /* Capture the existing native/test redirections before overriding only calls
  * in the included fixture. No library demux create/join is intercepted. */
@@ -337,7 +339,9 @@ owner_channel_open(dssh_session session, const struct dssh_chan_params *params)
 	if (owner_open_attempts >= 1)
 		abort();
 	owner_open_attempts++;
+	owner_constructor_begin(true);
 	dssh_channel ch = dssh_chan_open(session, params);
+	owner_constructor_end(ch);
 	if (ch != NULL)
 		atomic_fetch_add(&owner_channels_created, 1);
 	return ch;
@@ -346,7 +350,9 @@ owner_channel_open(dssh_session session, const struct dssh_chan_params *params)
 static dssh_channel
 owner_channel_accept(dssh_session session, const struct dssh_chan_accept_cbs *cbs, int timeout_ms)
 {
+	owner_constructor_begin(false);
 	dssh_channel ch = dssh_chan_accept(session, cbs, timeout_ms);
+	owner_constructor_end(ch);
 	if (ch != NULL)
 		atomic_fetch_add(&owner_channels_created, 1);
 	return ch;
@@ -639,6 +645,7 @@ owner_channel_body(void *argument)
 
 #include "selftest_socket_controls.h"
 #include "selftest_wire_controls.h"
+#include "selftest_constructor_controls.h"
 
 static bool
 owner_extent_boundaries(void)
@@ -747,6 +754,8 @@ main(int argc, char **argv)
 	atomic_init(&owner_channels_created, 0);
 	atomic_init(&owner_channels_closed, 0);
 	atomic_init(&owner_channel_ready, false);
+	if (strncmp(owner_mode, "constructor-", 12) == 0)
+		return owner_constructor_control();
 	if (strncmp(owner_mode, "wire-", 5) == 0)
 		return owner_wire_control();
 	if (strncmp(owner_mode, "socket-", 7) == 0

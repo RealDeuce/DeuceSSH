@@ -1837,6 +1837,15 @@ foreach(part IN ITEMS setup no_start)
 	set_tests_properties(dssh_conn_${part}_ownership PROPERTIES TIMEOUT 120
 		ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys)
 endforeach()
+dssh_add_output_test(dssh_conn_zc_fixture_bounds dssh_test_conn
+	"1 tests: 1 passed, 0 failed, 0 skipped" --exact release/zc_fixture_bounds)
+set_tests_properties(dssh_conn_zc_fixture_bounds PROPERTIES TIMEOUT 120)
+foreach(consumer IN ITEMS accept client cancel close)
+	dssh_add_output_test(dssh_conn_zc_owner_${consumer} dssh_test_conn
+		"1 tests: 1 passed, 0 failed, 0 skipped" --exact release/zc_owner_${consumer})
+	set_tests_properties(dssh_conn_zc_owner_${consumer} PROPERTIES TIMEOUT 120
+		ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys)
+endforeach()
 set(DSSH_CHANNEL_PAIR_CASES
 	chan_get_pty
 	channel_close_subsys
@@ -2044,6 +2053,14 @@ if(UNIX)
 				$<TARGET_FILE:dssh_test_threads_shim_posix> ${operation})
 		endforeach()
 	endif()
+	foreach(operation IN ITEMS accept-1 accept-2 client-1 client-2 cancel-1 cancel-2 close-1 close-2 close-3)
+		foreach(mode IN ITEMS retained released)
+			dssh_add_output_test(dssh_channel_zc_fatal_${operation}_${mode} dssh_test_fatal_driver
+				"channel_join_fatal=1" $<TARGET_FILE:dssh_test_conn> --channel-fatal zc-${operation} ${mode})
+			set_tests_properties(dssh_channel_zc_fatal_${operation}_${mode} PROPERTIES TIMEOUT 120
+				ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys)
+		endforeach()
+	endforeach()
 	foreach(consumer IN LISTS DSSH_CHANNEL_PAIR_CASES ITEMS chan_get_pty_second)
 		foreach(mode IN ITEMS retained released)
 			set(name dssh_channel_pair_fatal_${consumer}_${mode})

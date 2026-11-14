@@ -22,6 +22,16 @@ static _Thread_local bool in_zc_rx;
 static _Thread_local struct dssh_channel_s *zc_reserved_channel;
 static _Thread_local size_t zc_reserved_capacity;
 
+#ifdef DSSH_TESTING
+static _Thread_local atomic_bool *detach_wait_observer;
+
+DSSH_TESTABLE void
+dssh_test_detach_observe(atomic_bool *waiting)
+{
+	detach_wait_observer = waiting;
+}
+#endif
+
 static uint32_t stream_zc_cb(struct dssh_channel_s *ch, int stream, const uint8_t *data, size_t len, void *cbdata);
 
 DSSH_PRIVATE bool
@@ -2003,6 +2013,12 @@ detach_channel(struct dssh_session_s *sess, struct dssh_channel_s *ch)
 	int state;
 	do {
 		state = atomic_load_explicit(&ch->dispatch_state, memory_order_acquire);
+#ifdef DSSH_TESTING
+		if (state == DSSH_CHANNEL_DISPATCH_ACTIVE && detach_wait_observer != NULL) {
+			atomic_store_explicit(detach_wait_observer, true, memory_order_release);
+			detach_wait_observer = NULL;
+		}
+#endif
 		if (state == DSSH_CHANNEL_DISPATCH_ACTIVE
 		    || atomic_load_explicit(&ch->tx_refs, memory_order_acquire) != 0)
 			thrd_yield();

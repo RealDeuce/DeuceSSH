@@ -277,11 +277,13 @@ reset_callbacks(void)
  * Connection setup context -- handshake + auth + session_start
  * ================================================================ */
 
+struct conn_zc_fixture;
 struct conn_ctx {
 	struct mock_io_state io;
 	bool io_initialized;
 	dssh_session client;
 	dssh_session server;
+	struct conn_zc_fixture *zc_fixture;
 };
 
 /* The assertion hook cleans up before the owning stack frame returns. */
@@ -338,6 +340,9 @@ server_handshake_auth_thread(void *arg)
  * Returns 0 on success, -1 on failure.
  */
 static void conn_cleanup(struct conn_ctx *ctx);
+static void conn_zc_release(struct conn_ctx *ctx);
+static void conn_zc_join(struct conn_ctx *ctx);
+static void conn_zc_retire(struct conn_ctx *ctx);
 
 /* Overridden only by the controlled setup-ownership cases. */
 static int (*conn_fixture_thread_create)(thrd_t *, thrd_start_t, void *) = thrd_create;
@@ -350,6 +355,7 @@ conn_setup_mode(struct conn_ctx *ctx, bool start)
 	ctx->client = NULL;
 	ctx->server = NULL;
 	ctx->io_initialized = false;
+	ctx->zc_fixture = NULL;
 	reset_callbacks();
 	dssh_test_reset_global_config();
 
@@ -439,6 +445,7 @@ conn_cleanup(struct conn_ctx *ctx)
 {
 	if (g_active_ctx == ctx)
 		g_active_ctx = NULL;
+	conn_zc_release(ctx);
 
 	/* Shutdown precedes every demux join; free closes the descriptors only
 	 * after all session-owned workers have retired. */
@@ -446,6 +453,7 @@ conn_cleanup(struct conn_ctx *ctx)
 		mock_io_close_c2s(&ctx->io);
 		mock_io_close_s2c(&ctx->io);
 	}
+	conn_zc_join(ctx);
 	if (ctx->server != NULL) {
 		dssh_session_cleanup(ctx->server);
 		ctx->server = NULL;
@@ -454,6 +462,7 @@ conn_cleanup(struct conn_ctx *ctx)
 		dssh_session_cleanup(ctx->client);
 		ctx->client = NULL;
 	}
+	conn_zc_retire(ctx);
 	if (ctx->io_initialized) {
 		mock_io_free(&ctx->io);
 		ctx->io_initialized = false;
@@ -661,6 +670,8 @@ open_exec_channel(struct conn_ctx *owner, struct open_exec_ctx *ctx)
 	return open_channel_pair(owner, client_open_exec_thread, ctx, &ctx->client_ch,
 	    server_accept_exec_thread, ctx, &ctx->server_ch);
 }
+
+#include "conn_zc_fixture.h"
 
 /* ================================================================
  * Helper: open a shell channel concurrently
@@ -5208,32 +5219,6 @@ test_subsystem_roundtrip(void)
  * Audit item 13: ZC accept — server accepts a zero-copy channel
  * ================================================================ */
 
-struct zc_rx_state {
-	mtx_t    mtx;
-	cnd_t    cnd;
-	uint8_t  buf[256];
-	size_t   len;
-	bool     done;
-};
-
-static uint32_t
-test_zc_data_cb(dssh_channel ch, int stream,
-    const uint8_t *data, size_t len, void *cbdata)
-{
-	(void)ch;
-	(void)stream;
-	struct zc_rx_state *st = cbdata;
-	mtx_lock(&st->mtx);
-	size_t avail = sizeof(st->buf) - st->len;
-	size_t n = len < avail ? len : avail;
-	memcpy(&st->buf[st->len], data, n);
-	st->len += n;
-	st->done = true;
-	cnd_signal(&st->cnd);
-	mtx_unlock(&st->mtx);
-	uint32_t n_u32 = (uint32_t)n;
-	return n_u32;
-}
 
 static int
 accept_subsys_zc(dssh_channel ch, const struct dssh_chan_params *p,
@@ -5241,7 +5226,7 @@ accept_subsys_zc(dssh_channel ch, const struct dssh_chan_params *p,
 {
 	(void)ch;
 	(void)p;
-	result->zc_cb = test_zc_data_cb;
+	result->zc_cb = conn_zc_receive;
 	result->zc_cbdata = cbdata;
 	return 0;
 }
@@ -5257,151 +5242,58 @@ server_accept_zc_thread(void *arg)
 {
 	struct zc_accept_ctx *ctx = arg;
 	ctx->server_ch = dssh_chan_accept(ctx->server, ctx->cbs, 30000);
-	return 0;
+	return ctx->server_ch == NULL ? DSSH_ERROR_INIT : 0;
 }
 
 static int
 test_accept_zc(void)
 {
+	static const uint8_t input[] = "hello from client to zc";
+	static const uint8_t reply[] = "zc reply from server";
 	struct conn_ctx ctx;
-
-	if (conn_setup(&ctx) < 0)
+	if (conn_setup(&ctx) != 0)
 		return TEST_FAIL;
-
-	/* Set up ZC receive state for the server */
-	struct zc_rx_state zc_st;
-	memset(&zc_st, 0, sizeof(zc_st));
-	if (mtx_init(&zc_st.mtx, mtx_plain) != thrd_success) {
-		conn_cleanup(&ctx);
-		return TEST_SKIP;
-	}
-	if (cnd_init(&zc_st.cnd) != thrd_success) {
-		mtx_destroy(&zc_st.mtx);
-		conn_cleanup(&ctx);
-		return TEST_SKIP;
-	}
-
-	struct dssh_chan_accept_cbs zc_cbs = {
-		.subsystem = accept_subsys_zc,
-		.cbdata = &zc_st,
+	struct conn_zc_fixture fixture;
+	ASSERT_TRUE(conn_zc_init(&ctx, &fixture, sizeof(input), false));
+	struct dssh_chan_accept_cbs cbs = {
+		.subsystem = accept_subsys_zc, .cbdata = &fixture,
 	};
-
-	struct zc_accept_ctx sa = {
-		.server = ctx.server,
-		.cbs = &zc_cbs,
-		.server_ch = NULL,
+	struct zc_accept_ctx server = {.server = ctx.server, .cbs = &cbs};
+	struct open_subsys_ctx client = {
+		.client = ctx.client, .server = ctx.server, .subsystem = "test-zc",
 	};
+	ASSERT_EQ(open_channel_pair(&ctx, client_open_subsys_thread, &client,
+	    &client.client_ch, server_accept_zc_thread, &server, &server.server_ch), 0);
+	ASSERT_TRUE(conn_zc_checkpoint(CONN_ZC_OPENED));
+	ASSERT_EQ(server.server_ch->io_model, DSSH_IO_ZC);
+	ASSERT_EQ(dssh_chan_get_type(server.server_ch), DSSH_CHAN_SUBSYSTEM);
+	ASSERT_STR_EQ(dssh_chan_get_subsystem(server.server_ch), "test-zc");
+	ASSERT_TRUE(conn_zc_write_all(client.client_ch, input, sizeof(input), 5));
+	ASSERT_TRUE(conn_zc_wait_flag(&fixture, &fixture.complete, 1));
+	ASSERT_TRUE(conn_zc_checkpoint(CONN_ZC_RECEIVED));
+	ASSERT_EQ_U(fixture.used, sizeof(input));
+	ASSERT_MEM_EQ(fixture.data, input, sizeof(input));
 
-	/* Client opens a subsystem channel (stream mode) */
-	struct open_subsys_ctx oc = {
-		.client = ctx.client,
-		.server = ctx.server,
-		.subsystem = "test-zc",
-	};
-
-	thrd_t ct, st;
-	ASSERT_THRD_CREATE(&ct, client_open_subsys_thread, &oc);
-	ASSERT_THRD_CREATE(&st, server_accept_zc_thread, &sa);
-	thrd_join(ct, NULL);
-	thrd_join(st, NULL);
-
-	if (oc.client_ch == NULL || sa.server_ch == NULL) {
-		if (oc.client_ch != NULL)
-			dssh_chan_close(oc.client_ch, -1);
-		if (sa.server_ch != NULL)
-			dssh_chan_close(sa.server_ch, -1);
-		cnd_destroy(&zc_st.cnd);
-		mtx_destroy(&zc_st.mtx);
-		conn_cleanup(&ctx);
-		return TEST_SKIP;
-	}
-
-	/* Verify server channel is ZC mode */
-	ASSERT_EQ(sa.server_ch->io_model, DSSH_IO_ZC);
-	ASSERT_EQ(dssh_chan_get_type(sa.server_ch), DSSH_CHAN_SUBSYSTEM);
-	ASSERT_STR_EQ(dssh_chan_get_subsystem(sa.server_ch), "test-zc");
-
-	/* Client sends data (stream mode) */
-	static const uint8_t msg1[] = "hello from client to zc";
-	int64_t w = dssh_chan_write(oc.client_ch, 0,
-	    msg1, sizeof(msg1));
-	ASSERT_TRUE(w > 0);
-
-	/* Wait for ZC callback to fire on server */
-	mtx_lock(&zc_st.mtx);
-	struct timespec deadline;
-	timespec_get(&deadline, TIME_UTC);
-	deadline.tv_sec += 1;
-	while (!zc_st.done)
-		cnd_timedwait(&zc_st.cnd, &zc_st.mtx, &deadline);
-	ASSERT_TRUE(zc_st.done);
-	ASSERT_EQ_U(zc_st.len, sizeof(msg1));
-	ASSERT_TRUE(memcmp(zc_st.buf, msg1, sizeof(msg1)) == 0);
-	mtx_unlock(&zc_st.mtx);
-
-	/* Server sends reply via ZC getbuf/send */
-	static const uint8_t msg2[] = "zc reply from server";
-	uint8_t *txbuf;
-	size_t max_len;
-	int res = dssh_chan_zc_getbuf(sa.server_ch, 0, &txbuf, &max_len);
-	ASSERT_OK(res);
-	ASSERT_TRUE(max_len >= sizeof(msg2));
-	memcpy(txbuf, msg2, sizeof(msg2));
-	res = dssh_chan_zc_send(sa.server_ch, sizeof(msg2));
-	ASSERT_OK(res);
-
-	/* Client reads reply (stream mode) */
-	int ev = dssh_chan_poll(oc.client_ch, DSSH_POLL_READ, 1000);
-	ASSERT_TRUE(ev & DSSH_POLL_READ);
-
-	uint8_t rbuf[256];
-	size_t got = 0;
-	while (got < sizeof(msg2)) {
-		int64_t r = dssh_chan_read(oc.client_ch, 0,
-		    &rbuf[got], sizeof(rbuf) - got);
-		if (r <= 0)
-			break;
-		got += (size_t)r;
-	}
-	ASSERT_EQ_U(got, sizeof(msg2));
-	ASSERT_TRUE(memcmp(rbuf, msg2, sizeof(msg2)) == 0);
-
-	/* Clean close */
-	dssh_chan_close(oc.client_ch, -1);
-	dssh_chan_close(sa.server_ch, -1);
-	cnd_destroy(&zc_st.cnd);
-	mtx_destroy(&zc_st.mtx);
+	uint8_t *buffer;
+	size_t capacity;
+	ASSERT_EQ(conn_zc_reserve(&fixture, server.server_ch, &buffer, &capacity), 0);
+	ASSERT_NOT_NULL(buffer);
+	ASSERT_TRUE(capacity >= sizeof(reply));
+	memcpy(buffer, reply, sizeof(reply));
+	ASSERT_EQ(conn_zc_send(&fixture, sizeof(reply)), 0);
+	uint8_t received[sizeof(reply)];
+	ASSERT_TRUE(conn_zc_read_exact(client.client_ch, received, sizeof(received), 1));
+	ASSERT_MEM_EQ(received, reply, sizeof(reply));
+	ASSERT_EQ(dssh_chan_close(client.client_ch, -1), 0);
+	ASSERT_EQ(dssh_chan_close(server.server_ch, -1), 0);
 	conn_cleanup(&ctx);
+	ASSERT_TRUE(fixture.retired);
+	ASSERT_FALSE(atomic_load(&fixture.failed));
 	return TEST_PASS;
 }
 
 /* A channel close on another thread must wait while demux has dropped
  * buf_mtx to call a ZC consumer. */
-struct zc_close_race_state {
-	mtx_t mtx;
-	cnd_t cnd;
-	bool  entered;
-	bool  release;
-};
-
-static uint32_t
-blocking_zc_data_cb(dssh_channel ch, int stream, const uint8_t *data, size_t len, void *cbdata)
-{
-	(void)ch;
-	(void)stream;
-	(void)data;
-	struct zc_close_race_state *st = cbdata;
-
-	mtx_lock(&st->mtx);
-	st->entered = true;
-	cnd_broadcast(&st->cnd);
-	while (!st->release)
-		cnd_wait(&st->cnd, &st->mtx);
-	mtx_unlock(&st->mtx);
-	uint32_t consumed = len > UINT32_MAX ? UINT32_MAX : (uint32_t)len;
-
-	return consumed;
-}
 
 static int
 accept_subsys_blocking_zc(dssh_channel ch, const struct dssh_chan_params *p,
@@ -5409,7 +5301,7 @@ accept_subsys_blocking_zc(dssh_channel ch, const struct dssh_chan_params *p,
 {
 	(void)ch;
 	(void)p;
-	result->zc_cb = blocking_zc_data_cb;
+	result->zc_cb = conn_zc_receive;
 	result->zc_cbdata = cbdata;
 	return 0;
 }
@@ -5435,87 +5327,41 @@ close_channel_thread(void *arg)
 static int
 test_close_during_zc_callback(void)
 {
+	static const uint8_t input[] = "hold callback";
 	struct conn_ctx ctx;
-	if (conn_setup(&ctx) < 0)
+	if (conn_setup(&ctx) != 0)
 		return TEST_FAIL;
-
-	struct zc_close_race_state zc_st;
-	memset(&zc_st, 0, sizeof(zc_st));
-	if (mtx_init(&zc_st.mtx, mtx_plain) != thrd_success) {
-		conn_cleanup(&ctx);
-		return TEST_SKIP;
-	}
-	if (cnd_init(&zc_st.cnd) != thrd_success) {
-		mtx_destroy(&zc_st.mtx);
-		conn_cleanup(&ctx);
-		return TEST_SKIP;
-	}
-
-	struct dssh_chan_accept_cbs zc_cbs = {
-		.subsystem = accept_subsys_blocking_zc,
-		.cbdata = &zc_st,
+	struct conn_zc_fixture fixture;
+	ASSERT_TRUE(conn_zc_init(&ctx, &fixture, sizeof(input), true));
+	struct dssh_chan_accept_cbs cbs = {
+		.subsystem = accept_subsys_blocking_zc, .cbdata = &fixture,
 	};
-	struct zc_accept_ctx sa = {
-		.server = ctx.server,
-		.cbs = &zc_cbs,
+	struct zc_accept_ctx server = {.server = ctx.server, .cbs = &cbs};
+	struct open_subsys_ctx client = {
+		.client = ctx.client, .server = ctx.server, .subsystem = "close-during-zc",
 	};
-	struct open_subsys_ctx oc = {
-		.client = ctx.client,
-		.server = ctx.server,
-		.subsystem = "close-during-zc",
-	};
-
-	thrd_t ct, st;
-	ASSERT_THRD_CREATE(&ct, client_open_subsys_thread, &oc);
-	ASSERT_THRD_CREATE(&st, server_accept_zc_thread, &sa);
-	thrd_join(ct, NULL);
-	thrd_join(st, NULL);
-	if (oc.client_ch == NULL || sa.server_ch == NULL) {
-		if (oc.client_ch != NULL)
-			dssh_chan_close(oc.client_ch, -1);
-		if (sa.server_ch != NULL)
-			dssh_chan_close(sa.server_ch, -1);
-		cnd_destroy(&zc_st.cnd);
-		mtx_destroy(&zc_st.mtx);
-		conn_cleanup(&ctx);
-		return TEST_SKIP;
-	}
-
-	static const uint8_t msg[] = "hold callback";
-	ASSERT_TRUE(dssh_chan_write(oc.client_ch, 0, msg, sizeof(msg)) > 0);
-
-	mtx_lock(&zc_st.mtx);
-	while (!zc_st.entered)
-		cnd_wait(&zc_st.cnd, &zc_st.mtx);
-	mtx_unlock(&zc_st.mtx);
-
-	struct close_channel_ctx close_ctx = {
-		.ch = sa.server_ch,
-		.result = DSSH_ERROR_INVALID,
-	};
-	atomic_init(&close_ctx.started, false);
-	atomic_init(&close_ctx.done, false);
-	thrd_t close_thread;
-	ASSERT_THRD_CREATE(&close_thread, close_channel_thread, &close_ctx);
-	while (!atomic_load(&close_ctx.started))
-		thrd_yield();
-	while (!atomic_load(&close_ctx.done) && !atomic_load(&sa.server_ch->closing))
-		thrd_yield();
-	bool closed_early = atomic_load(&close_ctx.done);
-
-	mtx_lock(&zc_st.mtx);
-	zc_st.release = true;
-	cnd_broadcast(&zc_st.cnd);
-	mtx_unlock(&zc_st.mtx);
-	thrd_join(close_thread, NULL);
-
-	ASSERT_FALSE(closed_early);
-	ASSERT_OK(close_ctx.result);
+	ASSERT_EQ(open_channel_pair(&ctx, client_open_subsys_thread, &client,
+	    &client.client_ch, server_accept_zc_thread, &server, &server.server_ch), 0);
+	ASSERT_TRUE(conn_zc_checkpoint(CONN_ZC_OPENED));
+	ASSERT_TRUE(conn_zc_write_all(client.client_ch, input, sizeof(input), 5));
+	ASSERT_TRUE(conn_zc_wait_flag(&fixture, &fixture.entered, 5));
+	ASSERT_TRUE(conn_zc_checkpoint(CONN_ZC_BLOCKED));
+	ASSERT_EQ(conn_zc_start_close(&ctx, &server.server_ch), 0);
+	ASSERT_TRUE(conn_zc_wait_flag(&fixture, &fixture.close_waiting, 5));
+	ASSERT_FALSE(atomic_load(&fixture.close_done));
+	ASSERT_TRUE(conn_zc_checkpoint(CONN_ZC_CLOSING));
+	atomic_store_explicit(&fixture.release, true, memory_order_release);
+	conn_zc_join(&ctx);
+	ASSERT_TRUE(atomic_load(&fixture.close_done));
+	ASSERT_EQ(fixture.close_result, 0);
+	ASSERT_TRUE(atomic_load_explicit(&fixture.complete, memory_order_acquire));
+	ASSERT_EQ_U(fixture.used, sizeof(input));
+	ASSERT_MEM_EQ(fixture.data, input, sizeof(input));
 	ASSERT_FALSE(dssh_session_is_terminated(ctx.server));
-	dssh_chan_close(oc.client_ch, -1);
-	cnd_destroy(&zc_st.cnd);
-	mtx_destroy(&zc_st.mtx);
+	ASSERT_EQ(dssh_chan_close(client.client_ch, -1), 0);
 	conn_cleanup(&ctx);
+	ASSERT_TRUE(fixture.retired);
+	ASSERT_FALSE(atomic_load(&fixture.failed));
 	return TEST_PASS;
 }
 
@@ -6929,31 +6775,11 @@ conn_cleanup_no_start(struct conn_ctx *ctx)
  * ================================================================ */
 
 /* ZC RX state for client-side receive */
-struct client_zc_rx_state {
-	mtx_t    mtx;
-	cnd_t    cnd;
-	uint8_t  buf[4096];
-	size_t   len;
-	bool     done;
-};
-
 static uint32_t
-client_zc_data_cb(dssh_channel ch, int stream,
-    const uint8_t *data, size_t len, void *cbdata)
+client_zc_data_cb(dssh_channel channel, int stream,
+    const uint8_t *data, size_t length, void *opaque)
 {
-	(void)ch;
-	(void)stream;
-	struct client_zc_rx_state *st = cbdata;
-	mtx_lock(&st->mtx);
-	size_t avail = sizeof(st->buf) - st->len;
-	size_t n = len < avail ? len : avail;
-	memcpy(&st->buf[st->len], data, n);
-	st->len += n;
-	st->done = true;
-	cnd_signal(&st->cnd);
-	mtx_unlock(&st->mtx);
-	uint32_t n_u32 = (uint32_t)n;
-	return n_u32;
+	return conn_zc_receive(channel, stream, data, length, opaque);
 }
 
 struct client_zc_open_ctx {
@@ -6968,125 +6794,62 @@ client_zc_open_thread(void *arg)
 {
 	struct client_zc_open_ctx *ctx = arg;
 	struct dssh_chan_params p;
-	dssh_chan_params_init(&p, DSSH_CHAN_SUBSYSTEM);
-	dssh_chan_params_set_subsystem(&p, "test-zc-client");
-	dssh_chan_params_set_pty(&p, false);
-	ctx->client_ch = dssh_chan_zc_open(ctx->client, &p,
-	    ctx->zc_cb, ctx->zc_cbdata);
+	int ret = dssh_chan_params_init(&p, DSSH_CHAN_SUBSYSTEM);
+	if (ret != 0)
+		return ret;
+	ret = dssh_chan_params_set_subsystem(&p, "test-zc-client");
+	if (ret == 0)
+		ret = dssh_chan_params_set_pty(&p, false);
+	if (ret == 0)
+		ctx->client_ch = dssh_chan_zc_open(ctx->client, &p,
+		    ctx->zc_cb, ctx->zc_cbdata);
 	dssh_chan_params_free(&p);
-	return 0;
+	if (ret != 0)
+		return ret;
+	return ctx->client_ch == NULL ? DSSH_ERROR_INIT : 0;
 }
 
 static int
 test_zc_open_client(void)
 {
+	static const uint8_t input[] = "hello to zc client";
+	static const uint8_t reply[] = "zc reply from client";
 	struct conn_ctx ctx;
-	if (conn_setup(&ctx) < 0)
+	if (conn_setup(&ctx) != 0)
 		return TEST_FAIL;
-
-	/* Set up ZC receive state for the client */
-	struct client_zc_rx_state zc_st;
-	memset(&zc_st, 0, sizeof(zc_st));
-	if (mtx_init(&zc_st.mtx, mtx_plain) != thrd_success) {
-		conn_cleanup(&ctx);
-		return TEST_SKIP;
-	}
-	if (cnd_init(&zc_st.cnd) != thrd_success) {
-		mtx_destroy(&zc_st.mtx);
-		conn_cleanup(&ctx);
-		return TEST_SKIP;
-	}
-
-	/* Client opens ZC channel */
-	struct client_zc_open_ctx oc = {
-		.client = ctx.client,
-		.client_ch = NULL,
-		.zc_cb = client_zc_data_cb,
-		.zc_cbdata = &zc_st,
+	struct conn_zc_fixture fixture;
+	ASSERT_TRUE(conn_zc_init(&ctx, &fixture, sizeof(input), false));
+	struct client_zc_open_ctx client = {
+		.client = ctx.client, .zc_cb = client_zc_data_cb, .zc_cbdata = &fixture,
 	};
-
-	/* Server accepts with stream mode */
-	struct open_subsys_ctx sc = {
-		.client = ctx.client,
-		.server = ctx.server,
-		.subsystem = "test-zc-client",
+	struct open_subsys_ctx server = {
+		.client = ctx.client, .server = ctx.server, .subsystem = "test-zc-client",
 	};
+	ASSERT_EQ(open_channel_pair(&ctx, client_zc_open_thread, &client,
+	    &client.client_ch, server_accept_subsys_thread, &server, &server.server_ch), 0);
+	ASSERT_TRUE(conn_zc_checkpoint(CONN_ZC_OPENED));
+	ASSERT_EQ(client.client_ch->io_model, DSSH_IO_ZC);
+	ASSERT_TRUE(conn_zc_write_all(server.server_ch, input, sizeof(input), 5));
+	ASSERT_TRUE(conn_zc_wait_flag(&fixture, &fixture.complete, 5));
+	ASSERT_TRUE(conn_zc_checkpoint(CONN_ZC_RECEIVED));
+	ASSERT_EQ_U(fixture.used, sizeof(input));
+	ASSERT_MEM_EQ(fixture.data, input, sizeof(input));
 
-	thrd_t ct, st;
-	ASSERT_THRD_CREATE(&ct, client_zc_open_thread, &oc);
-	ASSERT_THRD_CREATE(&st, server_accept_subsys_thread, &sc);
-	thrd_join(ct, NULL);
-	thrd_join(st, NULL);
-
-	if (oc.client_ch == NULL || sc.server_ch == NULL) {
-		if (oc.client_ch != NULL)
-			dssh_chan_close(oc.client_ch, -1);
-		if (sc.server_ch != NULL)
-			dssh_chan_close(sc.server_ch, -1);
-		cnd_destroy(&zc_st.cnd);
-		mtx_destroy(&zc_st.mtx);
-		conn_cleanup(&ctx);
-		return TEST_SKIP;
-	}
-
-	/* Verify client channel is ZC mode */
-	ASSERT_EQ(oc.client_ch->io_model, DSSH_IO_ZC);
-
-	/* Server sends data (stream mode) -- should trigger client ZC callback */
-	int ev = dssh_chan_poll(sc.server_ch, DSSH_POLL_WRITE, 5000);
-	ASSERT_TRUE(ev & DSSH_POLL_WRITE);
-	static const uint8_t msg1[] = "hello to zc client";
-	int64_t w = dssh_chan_write(sc.server_ch, 0, msg1, sizeof(msg1));
-	ASSERT_TRUE(w > 0);
-
-	/* Wait for ZC callback to fire on client */
-	mtx_lock(&zc_st.mtx);
-	struct timespec deadline;
-	timespec_get(&deadline, TIME_UTC);
-	deadline.tv_sec += 5;
-	while (!zc_st.done) {
-		if (cnd_timedwait(&zc_st.cnd, &zc_st.mtx, &deadline)
-		    == thrd_timedout)
-			break;
-	}
-	ASSERT_TRUE(zc_st.done);
-	ASSERT_TRUE(zc_st.len >= sizeof(msg1));
-	ASSERT_TRUE(memcmp(zc_st.buf, msg1, sizeof(msg1)) == 0);
-	mtx_unlock(&zc_st.mtx);
-
-	/* Client sends data via ZC getbuf/send */
-	static const uint8_t msg2[] = "zc reply from client";
-	uint8_t *txbuf;
-	size_t max_len;
-	int res = dssh_chan_zc_getbuf(oc.client_ch, 0, &txbuf, &max_len);
-	ASSERT_OK(res);
-	ASSERT_TRUE(max_len >= sizeof(msg2));
-	memcpy(txbuf, msg2, sizeof(msg2));
-	res = dssh_chan_zc_send(oc.client_ch, sizeof(msg2));
-	ASSERT_OK(res);
-
-	/* Server reads reply (stream mode) */
-	ev = dssh_chan_poll(sc.server_ch, DSSH_POLL_READ, 5000);
-	ASSERT_TRUE(ev & DSSH_POLL_READ);
-
-	uint8_t rbuf[256];
-	size_t got = 0;
-	while (got < sizeof(msg2)) {
-		int64_t r = dssh_chan_read(sc.server_ch, 0,
-		    &rbuf[got], sizeof(rbuf) - got);
-		if (r <= 0)
-			break;
-		got += (size_t)r;
-	}
-	ASSERT_EQ_U(got, sizeof(msg2));
-	ASSERT_TRUE(memcmp(rbuf, msg2, sizeof(msg2)) == 0);
-
-	/* Clean close */
-	dssh_chan_close(oc.client_ch, -1);
-	dssh_chan_close(sc.server_ch, -1);
-	cnd_destroy(&zc_st.cnd);
-	mtx_destroy(&zc_st.mtx);
+	uint8_t *buffer;
+	size_t capacity;
+	ASSERT_EQ(conn_zc_reserve(&fixture, client.client_ch, &buffer, &capacity), 0);
+	ASSERT_NOT_NULL(buffer);
+	ASSERT_TRUE(capacity >= sizeof(reply));
+	memcpy(buffer, reply, sizeof(reply));
+	ASSERT_EQ(conn_zc_send(&fixture, sizeof(reply)), 0);
+	uint8_t received[sizeof(reply)];
+	ASSERT_TRUE(conn_zc_read_exact(server.server_ch, received, sizeof(received), 5));
+	ASSERT_MEM_EQ(received, reply, sizeof(reply));
+	ASSERT_EQ(dssh_chan_close(client.client_ch, -1), 0);
+	ASSERT_EQ(dssh_chan_close(server.server_ch, -1), 0);
 	conn_cleanup(&ctx);
+	ASSERT_TRUE(fixture.retired);
+	ASSERT_FALSE(atomic_load(&fixture.failed));
 	return TEST_PASS;
 }
 
@@ -7097,108 +6860,49 @@ test_zc_open_client(void)
 static int
 test_zc_cancel(void)
 {
+	static const uint8_t input[] = "after cancel";
 	struct conn_ctx ctx;
-	if (conn_setup(&ctx) < 0)
+	if (conn_setup(&ctx) != 0)
 		return TEST_FAIL;
-
-	struct client_zc_rx_state zc_st;
-	memset(&zc_st, 0, sizeof(zc_st));
-	if (mtx_init(&zc_st.mtx, mtx_plain) != thrd_success) {
-		conn_cleanup(&ctx);
-		return TEST_SKIP;
-	}
-	if (cnd_init(&zc_st.cnd) != thrd_success) {
-		mtx_destroy(&zc_st.mtx);
-		conn_cleanup(&ctx);
-		return TEST_SKIP;
-	}
-
-	struct client_zc_open_ctx oc = {
-		.client = ctx.client,
-		.client_ch = NULL,
-		.zc_cb = client_zc_data_cb,
-		.zc_cbdata = &zc_st,
+	struct conn_zc_fixture fixture;
+	ASSERT_TRUE(conn_zc_init(&ctx, &fixture, 0, false));
+	struct client_zc_open_ctx client = {
+		.client = ctx.client, .zc_cb = client_zc_data_cb, .zc_cbdata = &fixture,
 	};
-
-	struct open_subsys_ctx sc = {
-		.client = ctx.client,
-		.server = ctx.server,
-		.subsystem = "test-zc-cancel",
+	struct open_subsys_ctx server = {
+		.client = ctx.client, .server = ctx.server, .subsystem = "test-zc-cancel",
 	};
-
-	thrd_t ct, st;
-	ASSERT_THRD_CREATE(&ct, client_zc_open_thread, &oc);
-	ASSERT_THRD_CREATE(&st, server_accept_subsys_thread, &sc);
-	thrd_join(ct, NULL);
-	thrd_join(st, NULL);
-
-	if (oc.client_ch == NULL || sc.server_ch == NULL) {
-		if (oc.client_ch != NULL)
-			dssh_chan_close(oc.client_ch, -1);
-		if (sc.server_ch != NULL)
-			dssh_chan_close(sc.server_ch, -1);
-		cnd_destroy(&zc_st.cnd);
-		mtx_destroy(&zc_st.mtx);
-		conn_cleanup(&ctx);
-		return TEST_SKIP;
-	}
-
-	/* Get a TX buffer, then cancel without sending */
-	uint8_t *txbuf;
-	size_t max_len;
-	struct timespec window_start;
-	ASSERT_EQ(clock_gettime(CLOCK_MONOTONIC, &window_start), 0);
-	while (atomic_load(&oc.client_ch->remote_window) == 0)
-		ASSERT_TRUE(dssh_test_wait_tick(&window_start));
-	int res = dssh_chan_zc_getbuf(oc.client_ch, 0, &txbuf, &max_len);
-	ASSERT_OK(res);
-	ASSERT_NOT_NULL(txbuf);
-	ASSERT_TRUE(max_len > 0);
-
-	/* Cancel -- should release packet-engine ownership without sending */
-	res = dssh_chan_zc_cancel(oc.client_ch);
-	ASSERT_OK(res);
-	ASSERT_ERR(dssh_chan_zc_cancel(oc.client_ch), DSSH_ERROR_INVALID);
-
-	/* A rejected send must leave the channel ready for a new reservation. */
-	ASSERT_OK(dssh_chan_zc_getbuf(oc.client_ch, 0, &txbuf, &max_len));
-	ASSERT_ERR(dssh_chan_zc_send(oc.client_ch, max_len + 1), DSSH_ERROR_TOOLONG);
-	ASSERT_FALSE(ctx.client->trans.tx_owner_active);
+	ASSERT_EQ(open_channel_pair(&ctx, client_zc_open_thread, &client,
+	    &client.client_ch, server_accept_subsys_thread, &server, &server.server_ch), 0);
+	ASSERT_TRUE(conn_zc_checkpoint(CONN_ZC_OPENED));
+	uint8_t *buffer;
+	size_t capacity;
+	ASSERT_EQ(conn_zc_reserve(&fixture, client.client_ch, &buffer, &capacity), 0);
+	ASSERT_NOT_NULL(buffer);
+	ASSERT_TRUE(capacity > 0);
+	ASSERT_EQ(conn_zc_cancel(&fixture), 0);
+	ASSERT_ERR(dssh_chan_zc_cancel(client.client_ch), DSSH_ERROR_INVALID);
+	ASSERT_EQ(conn_zc_reserve(&fixture, client.client_ch, &buffer, &capacity), 0);
+	ASSERT_TRUE(capacity < SIZE_MAX);
+	ASSERT_ERR(conn_zc_send(&fixture, capacity + 1), DSSH_ERROR_TOOLONG);
+	ASSERT_FALSE(atomic_load(&ctx.client->trans.tx_owner_active));
 	ASSERT_FALSE(dssh_session_is_terminated(ctx.client));
-	ASSERT_OK(dssh_chan_zc_getbuf(oc.client_ch, 0, &txbuf, &max_len));
-	ASSERT_ERR(dssh_chan_zc_getbuf(oc.client_ch, 0, &txbuf, &max_len), DSSH_ERROR_INVALID);
-	ASSERT_OK(dssh_chan_zc_cancel(oc.client_ch));
-
-	/* Verify channel is still usable: getbuf/send should work */
-	static const uint8_t msg[] = "after cancel";
-	res = dssh_chan_zc_getbuf(oc.client_ch, 0, &txbuf, &max_len);
-	ASSERT_OK(res);
-	ASSERT_TRUE(max_len >= sizeof(msg));
-	memcpy(txbuf, msg, sizeof(msg));
-	res = dssh_chan_zc_send(oc.client_ch, sizeof(msg));
-	ASSERT_OK(res);
-
-	/* Server reads the data to confirm it arrived */
-	int ev = dssh_chan_poll(sc.server_ch, DSSH_POLL_READ, 5000);
-	ASSERT_TRUE(ev & DSSH_POLL_READ);
-
-	uint8_t rbuf[256];
-	size_t got = 0;
-	while (got < sizeof(msg)) {
-		int64_t r = dssh_chan_read(sc.server_ch, 0,
-		    &rbuf[got], sizeof(rbuf) - got);
-		if (r <= 0)
-			break;
-		got += (size_t)r;
-	}
-	ASSERT_EQ_U(got, sizeof(msg));
-	ASSERT_TRUE(memcmp(rbuf, msg, sizeof(msg)) == 0);
-
-	dssh_chan_close(oc.client_ch, -1);
-	dssh_chan_close(sc.server_ch, -1);
-	cnd_destroy(&zc_st.cnd);
-	mtx_destroy(&zc_st.mtx);
+	ASSERT_EQ(conn_zc_reserve(&fixture, client.client_ch, &buffer, &capacity), 0);
+	ASSERT_ERR(dssh_chan_zc_getbuf(client.client_ch, 0, &buffer, &capacity), DSSH_ERROR_INVALID);
+	ASSERT_EQ(conn_zc_cancel(&fixture), 0);
+	ASSERT_EQ(conn_zc_reserve(&fixture, client.client_ch, &buffer, &capacity), 0);
+	ASSERT_NOT_NULL(buffer);
+	ASSERT_TRUE(capacity >= sizeof(input));
+	memcpy(buffer, input, sizeof(input));
+	ASSERT_EQ(conn_zc_send(&fixture, sizeof(input)), 0);
+	uint8_t received[sizeof(input)];
+	ASSERT_TRUE(conn_zc_read_exact(server.server_ch, received, sizeof(received), 5));
+	ASSERT_MEM_EQ(received, input, sizeof(input));
+	ASSERT_EQ(dssh_chan_close(client.client_ch, -1), 0);
+	ASSERT_EQ(dssh_chan_close(server.server_ch, -1), 0);
 	conn_cleanup(&ctx);
+	ASSERT_TRUE(fixture.retired);
+	ASSERT_FALSE(atomic_load(&fixture.failed));
 	return TEST_PASS;
 }
 
@@ -8336,6 +8040,7 @@ test_compression_window_rekey(void)
 #include "conn_helper_cases.h"
 #include "channel_worker_cases.h"
 #include "channel_pair_cases.h"
+#include "conn_zc_cases.h"
 #include "channel_id_cases.h"
 #include "peer_channel_id_cases.h"
 #include "post_close_cases.h"
@@ -8405,6 +8110,11 @@ static struct dssh_test_entry tests[] = {
 	{ "release/post_close_queued", test_post_close_queued },
 	{ "release/post_close_buffered", test_post_close_buffered },
 	{ "release/channel_worker_ownership", test_channel_worker_ownership },
+	{ "release/zc_fixture_bounds", test_zc_fixture_bounds },
+	{ "release/zc_owner_accept", test_zc_owner_accept },
+	{ "release/zc_owner_client", test_zc_owner_client },
+	{ "release/zc_owner_cancel", test_zc_owner_cancel },
+	{ "release/zc_owner_close", test_zc_owner_close },
 	{ "release/pair_chan_get_pty", pair_chan_get_pty },
 	{ "release/pair_channel_close_subsys", pair_channel_close_subsys },
 	{ "release/pair_env_callback_rejection", pair_env_callback_rejection },
@@ -8958,6 +8668,9 @@ main(int argc, char *argv[])
 		return incoming_control_probe();
 	if (argc == 2 && strcmp(argv[1], "--audit-close-outcomes") == 0)
 		return close_outcome_probe();
+	if (argc == 4 && strcmp(argv[1], "--channel-fatal") == 0
+	    && strncmp(argv[2], "zc-", 3) == 0)
+		return conn_zc_fatal_child(argv[2] + 3, argv[3]);
 	if (argc == 4 && strcmp(argv[1], "--channel-fatal") == 0
 	    && strncmp(argv[2], "pair-", 5) == 0)
 		return channel_pair_fatal_child(argv[2] + 5, argv[3]);

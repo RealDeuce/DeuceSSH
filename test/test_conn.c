@@ -199,6 +199,7 @@ static struct dssh_auth_server_cbs auth_cbs = {
 static int pty_received;
 static char pty_term[64];
 static uint32_t pty_cols, pty_rows;
+static atomic_uint reject_exec_calls;
 static int wc_received;
 static uint32_t wc_cols, wc_rows, wc_wpx, wc_hpx;
 
@@ -262,6 +263,7 @@ static struct dssh_chan_accept_cbs accept_cbs_all = {
 static void
 reset_callbacks(void)
 {
+	atomic_store(&reject_exec_calls, 0);
 	pty_received = 0;
 	pty_term[0] = 0;
 	pty_cols = 0;
@@ -278,12 +280,14 @@ reset_callbacks(void)
  * ================================================================ */
 
 struct conn_zc_fixture;
+struct channel_workers;
 struct conn_ctx {
 	struct mock_io_state io;
 	bool io_initialized;
 	dssh_session client;
 	dssh_session server;
 	struct conn_zc_fixture *zc_fixture;
+	struct channel_workers *workers;
 };
 
 /* The assertion hook cleans up before the owning stack frame returns. */
@@ -343,6 +347,8 @@ static void conn_cleanup(struct conn_ctx *ctx);
 static void conn_zc_release(struct conn_ctx *ctx);
 static void conn_zc_join(struct conn_ctx *ctx);
 static void conn_zc_retire(struct conn_ctx *ctx);
+static void channel_workers_cleanup_cancel(struct conn_ctx *ctx);
+static void channel_workers_cleanup_join(struct conn_ctx *ctx);
 
 /* Overridden only by the controlled setup-ownership cases. */
 static int (*conn_fixture_thread_create)(thrd_t *, thrd_start_t, void *) = thrd_create;
@@ -356,6 +362,7 @@ conn_setup_mode(struct conn_ctx *ctx, bool start)
 	ctx->server = NULL;
 	ctx->io_initialized = false;
 	ctx->zc_fixture = NULL;
+	ctx->workers = NULL;
 	reset_callbacks();
 	dssh_test_reset_global_config();
 
@@ -446,6 +453,7 @@ conn_cleanup(struct conn_ctx *ctx)
 	if (g_active_ctx == ctx)
 		g_active_ctx = NULL;
 	conn_zc_release(ctx);
+	channel_workers_cleanup_cancel(ctx);
 
 	/* Shutdown precedes every demux join; free closes the descriptors only
 	 * after all session-owned workers have retired. */
@@ -454,6 +462,7 @@ conn_cleanup(struct conn_ctx *ctx)
 		mock_io_close_s2c(&ctx->io);
 	}
 	conn_zc_join(ctx);
+	channel_workers_cleanup_join(ctx);
 	if (ctx->server != NULL) {
 		dssh_session_cleanup(ctx->server);
 		ctx->server = NULL;
@@ -519,21 +528,48 @@ struct open_exec_ctx {
 	int accept_timeout;
 };
 
+/* A successful builder may produce a NULL handle when the peer rejects. */
+static int
+conn_client_open(dssh_session session, enum dssh_chan_type type,
+    const char *command, dssh_channel *channel)
+{
+	*channel = NULL;
+	struct dssh_chan_params params;
+	int ret = dssh_chan_params_init(&params, type);
+	if (ret != 0)
+		return ret;
+	if (type == DSSH_CHAN_EXEC)
+		ret = dssh_chan_params_set_command(&params, command);
+	if (ret == 0)
+		ret = dssh_chan_params_set_pty(&params, false);
+	if (ret == 0)
+		*channel = dssh_chan_open(session, &params);
+	dssh_chan_params_free(&params);
+	return ret;
+}
+
 static int
 client_open_exec_thread(void *arg)
 {
 	struct open_exec_ctx *ctx = arg;
-	struct dssh_chan_params p;
-	int ret = dssh_chan_params_init(&p, DSSH_CHAN_EXEC);
-	if (ret != 0)
-		return ret;
-	ret = dssh_chan_params_set_command(&p, ctx->command);
-	if (ret == 0)
-		ret = dssh_chan_params_set_pty(&p, false);
-	if (ret == 0)
-		ctx->client_ch = dssh_chan_open(ctx->client, &p);
-	dssh_chan_params_free(&p);
-	return ret < 0 ? ret : wait_stream_writable(ctx->client_ch);
+	int ret = conn_client_open(ctx->client, DSSH_CHAN_EXEC, ctx->command, &ctx->client_ch);
+	return ret == 0 ? wait_stream_writable(ctx->client_ch) : ret;
+}
+
+static int
+client_open_rejected_thread(void *arg)
+{
+	struct open_exec_ctx *ctx = arg;
+	int ret = conn_client_open(ctx->client, DSSH_CHAN_EXEC, ctx->command, &ctx->client_ch);
+	return ret == 0 && ctx->client_ch == NULL ? 0 : -1;
+}
+
+static int
+server_accept_cancelled_thread(void *arg)
+{
+	struct open_exec_ctx *ctx = arg;
+	ctx->server_ch = dssh_chan_accept(ctx->server, ctx->cbs, ctx->accept_timeout);
+	return ctx->server_ch == NULL && dssh_session_is_terminated(ctx->server) ? 0 : -1;
 }
 
 static int
@@ -565,7 +601,19 @@ struct channel_workers {
 	bool created[2];
 	int results[2];
 	struct channel_worker_call calls[2];
+	void (*release)(void *);
+	void (*retire)(void *);
+	void *resource;
 };
+
+static bool (*conn_actor_stage_control)(void);
+static void (*conn_actor_retirement_observer)(const struct channel_workers *);
+
+static bool
+conn_actor_checkpoint(void)
+{
+	return conn_actor_stage_control == NULL || conn_actor_stage_control();
+}
 
 static void
 channel_workers_cancel(struct channel_workers *workers)
@@ -589,7 +637,13 @@ channel_worker_run(void *data)
 static void
 channel_workers_init(struct channel_workers *workers, struct conn_ctx *owner)
 {
+	if (owner->workers != NULL)
+		abort();
 	workers->owner = owner;
+	workers->release = NULL;
+	workers->retire = NULL;
+	workers->resource = NULL;
+	owner->workers = workers;
 	for (size_t i = 0; i < 2; i++) {
 		workers->created[i] = false;
 		workers->results[i] = 0;
@@ -633,7 +687,52 @@ channel_workers_finish(struct channel_workers *workers)
 {
 	channel_worker_join(workers, 0);
 	channel_worker_join(workers, 1);
+	if (workers->owner->workers != workers)
+		abort();
+	workers->owner->workers = NULL;
+	if (workers->retire != NULL)
+		workers->retire(workers->resource);
+	if (conn_actor_retirement_observer != NULL)
+		conn_actor_retirement_observer(workers);
 	channel_fixture_owner = NULL;
+}
+
+/* An assertion failure runs this while the host's argument objects are live. */
+static void
+channel_workers_cleanup_cancel(struct conn_ctx *ctx)
+{
+	struct channel_workers *workers = ctx->workers;
+	if (workers == NULL)
+		return;
+	if (workers->release != NULL)
+		workers->release(workers->resource);
+	channel_workers_cancel(workers);
+}
+
+static void
+channel_workers_cleanup_join(struct conn_ctx *ctx)
+{
+	if (ctx->workers != NULL)
+		channel_workers_finish(ctx->workers);
+}
+
+static void
+conn_actor_unwatch(void *unused)
+{
+	(void)unused;
+	dssh_test_thrd_watch_condition(NULL);
+}
+
+/* The wait observation precedes the native wait while its mutex is owned.
+ * Acquiring that mutex proves the worker has released it before cancellation. */
+static bool
+conn_actor_waiting(const atomic_bool *entered, mtx_t *mutex)
+{
+	if (!dssh_test_wait_bool(entered, true) || mtx_lock(mutex) != thrd_success)
+		return false;
+	if (mtx_unlock(mutex) != thrd_success)
+		abort();
+	return true;
 }
 
 /* Both worker argument objects and output slots stay live through finish. */
@@ -924,6 +1023,7 @@ reject_exec_cb(dssh_channel ch, const struct dssh_chan_params *p,
 	(void)p;
 	(void)result;
 	(void)cbdata;
+	atomic_fetch_add(&reject_exec_calls, 1);
 	return -1;
 }
 
@@ -939,30 +1039,28 @@ test_open_exec_rejected(void)
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
 		return TEST_FAIL;
-
-	struct open_exec_ctx oc = {
-		.client = ctx.client,
-		.server = ctx.server,
-		.command = "rejected_cmd",
-		.cbs = &reject_exec_cbs,
-		.accept_timeout = 30000,
-	};
-
-	thrd_t ct, st;
-	ASSERT_THRD_CREATE(&ct, client_open_exec_thread, &oc);
-	ASSERT_THRD_CREATE(&st, server_accept_exec_thread, &oc);
-	thrd_join(ct, NULL);
-
-	/* After rejection, dssh_chan_accept loops back to wait for the
-	 * next CHANNEL_OPEN.  Terminate to unblock it. */
-	session_set_terminate(ctx.server);
-	thrd_join(st, NULL);
-
+	struct open_exec_ctx oc = {.client = ctx.client, .server = ctx.server,
+	    .command = "rejected_cmd", .cbs = &reject_exec_cbs, .accept_timeout = 30000};
+	struct channel_workers workers;
+	channel_workers_init(&workers, &ctx);
+	ASSERT_EQ(channel_worker_start(&workers, 0, client_open_rejected_thread, &oc), 0);
+	ASSERT_EQ(channel_worker_start(&workers, 1, server_accept_cancelled_thread, &oc), 0);
+	ASSERT_TRUE(conn_actor_checkpoint());
+	channel_worker_join(&workers, 0);
+	ASSERT_EQ(workers.results[0], 0);
 	ASSERT_NULL(oc.client_ch);
-
+	ASSERT_EQ_U(atomic_load(&reject_exec_calls), 1);
+	ASSERT_FALSE(dssh_session_is_terminated(ctx.client));
+	ASSERT_FALSE(dssh_session_is_terminated(ctx.server));
+	/* A rejecting accept resumes waiting for another channel. */
+	dssh_session_terminate(ctx.server);
+	channel_workers_finish(&workers);
+	ASSERT_EQ(workers.results[1], 0);
+	ASSERT_NULL(oc.server_ch);
 	conn_cleanup(&ctx);
 	return TEST_PASS;
 }
+
 
 static int
 test_open_shell(void)
@@ -2003,12 +2101,13 @@ static int
 server_accept_two_channels(void *arg)
 {
 	struct two_channel_server_ctx *sctx = arg;
-
 	sctx->ch1 = dssh_chan_accept(sctx->server, sctx->cbs, 30000);
+	if (wait_stream_writable(sctx->ch1) != 0)
+		return -1;
 	sctx->ch2 = dssh_chan_accept(sctx->server, sctx->cbs, 30000);
-
-	return 0;
+	return wait_stream_writable(sctx->ch2);
 }
+
 
 static int
 test_two_channels(void)
@@ -2016,77 +2115,38 @@ test_two_channels(void)
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
 		return TEST_FAIL;
-
-	struct two_channel_server_ctx sctx = {
-		.server = ctx.server,
-		.cbs = &accept_cbs_all,
-	};
-
-	thrd_t st;
-	ASSERT_THRD_CREATE(&st, server_accept_two_channels, &sctx);
-
-	struct dssh_chan_params p1;
-	dssh_chan_params_init(&p1, DSSH_CHAN_EXEC);
-	dssh_chan_params_set_command(&p1, "cmd1");
-	dssh_chan_params_set_pty(&p1, false);
-	dssh_channel c1 = dssh_chan_open(ctx.client, &p1);
-	dssh_chan_params_free(&p1);
-
-	struct dssh_chan_params p2;
-	dssh_chan_params_init(&p2, DSSH_CHAN_EXEC);
-	dssh_chan_params_set_command(&p2, "cmd2");
-	dssh_chan_params_set_pty(&p2, false);
-	dssh_channel c2 = dssh_chan_open(ctx.client, &p2);
-	dssh_chan_params_free(&p2);
-
-	thrd_join(st, NULL);
-
-	if (c1 == NULL || c2 == NULL || sctx.ch1 == NULL || sctx.ch2 == NULL) {
-		if (c1)
-			dssh_chan_close(c1, 0);
-		if (c2)
-			dssh_chan_close(c2, 0);
-		if (sctx.ch1)
-			dssh_chan_close(sctx.ch1, 0);
-		if (sctx.ch2)
-			dssh_chan_close(sctx.ch2, 0);
-		conn_cleanup(&ctx);
-		return TEST_FAIL;
-	}
-
-	/* Write on channel 1, read on channel 1 */
-	int ev = dssh_chan_poll(c1, DSSH_POLL_WRITE, 5000);
-	ASSERT_TRUE(ev & DSSH_POLL_WRITE);
-	const uint8_t m1[] = "chan1data";
-	dssh_chan_write(c1, 0, m1, 8);
-
-	/* Write on channel 2, read on channel 2 */
-	ev = dssh_chan_poll(c2, DSSH_POLL_WRITE, 5000);
-	ASSERT_TRUE(ev & DSSH_POLL_WRITE);
-	const uint8_t m2[] = "chan2data";
-	dssh_chan_write(c2, 0, m2, 8);
-
-	uint8_t buf[256];
-
-	ev = dssh_chan_poll(sctx.ch1, DSSH_POLL_READ, 5000);
-	ASSERT_TRUE(ev & DSSH_POLL_READ);
-	int64_t n = dssh_chan_read(sctx.ch1, 0, buf, sizeof(buf));
-	ASSERT_EQ(n, 8);
-	ASSERT_MEM_EQ(buf, "chan1data", 8);
-
-	ev = dssh_chan_poll(sctx.ch2, DSSH_POLL_READ, 5000);
-	ASSERT_TRUE(ev & DSSH_POLL_READ);
-	n = dssh_chan_read(sctx.ch2, 0, buf, sizeof(buf));
-	ASSERT_EQ(n, 8);
-	ASSERT_MEM_EQ(buf, "chan2data", 8);
-
-	dssh_chan_close(c1, 0);
-	dssh_chan_close(c2, 0);
-	dssh_chan_close(sctx.ch1, 0);
-	dssh_chan_close(sctx.ch2, 0);
+	struct two_channel_server_ctx sctx = {.server = ctx.server, .cbs = &accept_cbs_all};
+	struct channel_workers workers;
+	channel_workers_init(&workers, &ctx);
+	ASSERT_EQ(channel_worker_start(&workers, 0, server_accept_two_channels, &sctx), 0);
+	ASSERT_TRUE(conn_actor_checkpoint());
+	dssh_channel c1, c2;
+	ASSERT_EQ(conn_client_open(ctx.client, DSSH_CHAN_EXEC, "cmd1", &c1), 0);
+	ASSERT_NOT_NULL(c1);
+	ASSERT_EQ(conn_client_open(ctx.client, DSSH_CHAN_EXEC, "cmd2", &c2), 0);
+	ASSERT_NOT_NULL(c2);
+	channel_workers_finish(&workers);
+	ASSERT_EQ(workers.results[0], 0);
+	ASSERT_NOT_NULL(sctx.ch1);
+	ASSERT_NOT_NULL(sctx.ch2);
+	/* Each complete payload must arrive on its own channel. */
+	const uint8_t first[] = "chan1data";
+	const uint8_t second[] = "chan2data";
+	uint8_t received[sizeof(first)];
+	ASSERT_TRUE(conn_zc_write_all(c1, first, sizeof(first), 5));
+	ASSERT_TRUE(conn_zc_write_all(c2, second, sizeof(second), 5));
+	ASSERT_TRUE(conn_zc_read_exact(sctx.ch1, received, sizeof(received), 5));
+	ASSERT_MEM_EQ(received, first, sizeof(first));
+	ASSERT_TRUE(conn_zc_read_exact(sctx.ch2, received, sizeof(received), 5));
+	ASSERT_MEM_EQ(received, second, sizeof(second));
+	ASSERT_EQ(dssh_chan_close(c1, 0), 0);
+	ASSERT_EQ(dssh_chan_close(sctx.ch1, 0), 0);
+	ASSERT_EQ(dssh_chan_close(c2, 0), 0);
+	ASSERT_EQ(dssh_chan_close(sctx.ch2, 0), 0);
 	conn_cleanup(&ctx);
 	return TEST_PASS;
 }
+
 
 /*
  * Accept-reject test: server calls dssh_chan_accept once with
@@ -2103,13 +2163,10 @@ static int
 server_accept_loops_on_reject(void *arg)
 {
 	struct accept_reject_server_ctx *sctx = arg;
-
-	/* Single accept: loops past rejected exec, returns shell */
-	sctx->ch = dssh_chan_accept(sctx->server,
-	    &reject_exec_cbs, 30000);
-
-	return 0;
+	sctx->ch = dssh_chan_accept(sctx->server, &reject_exec_cbs, 30000);
+	return wait_stream_writable(sctx->ch);
 }
+
 
 static int
 test_accept_reject(void)
@@ -2117,41 +2174,28 @@ test_accept_reject(void)
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
 		return TEST_FAIL;
-
-	struct accept_reject_server_ctx sctx = {
-		.server = ctx.server,
-	};
-
-	thrd_t st;
-	ASSERT_THRD_CREATE(&st, server_accept_loops_on_reject, &sctx);
-
-	/* First channel: exec, rejected by server callback */
-	struct dssh_chan_params p1;
-	dssh_chan_params_init(&p1, DSSH_CHAN_EXEC);
-	dssh_chan_params_set_command(&p1, "rejected");
-	dssh_chan_params_set_pty(&p1, false);
-	dssh_channel c1 = dssh_chan_open(ctx.client, &p1);
-	dssh_chan_params_free(&p1);
-
-	/* Second channel: shell, accepted */
-	struct dssh_chan_params p2;
-	dssh_chan_params_init(&p2, DSSH_CHAN_SHELL);
-	dssh_chan_params_set_pty(&p2, false);
-	dssh_channel c2 = dssh_chan_open(ctx.client, &p2);
-	dssh_chan_params_free(&p2);
-
-	thrd_join(st, NULL);
-
-	ASSERT_NULL(c1);
-	ASSERT_NOT_NULL(c2);
+	struct accept_reject_server_ctx sctx = {.server = ctx.server};
+	struct channel_workers workers;
+	channel_workers_init(&workers, &ctx);
+	ASSERT_EQ(channel_worker_start(&workers, 0, server_accept_loops_on_reject, &sctx), 0);
+	ASSERT_TRUE(conn_actor_checkpoint());
+	dssh_channel rejected, accepted;
+	ASSERT_EQ(conn_client_open(ctx.client, DSSH_CHAN_EXEC, "rejected", &rejected), 0);
+	ASSERT_NULL(rejected);
+	ASSERT_EQ_U(atomic_load(&reject_exec_calls), 1);
+	ASSERT_FALSE(dssh_session_is_terminated(ctx.client));
+	ASSERT_EQ(conn_client_open(ctx.client, DSSH_CHAN_SHELL, NULL, &accepted), 0);
+	ASSERT_NOT_NULL(accepted);
+	channel_workers_finish(&workers);
+	ASSERT_EQ(workers.results[0], 0);
 	ASSERT_NOT_NULL(sctx.ch);
-	ASSERT_EQ(DSSH_CHAN_SHELL, dssh_chan_get_type(sctx.ch));
-
-	dssh_chan_close(c2, 0);
-	dssh_chan_close(sctx.ch, 0);
+	ASSERT_EQ(dssh_chan_get_type(sctx.ch), DSSH_CHAN_SHELL);
+	ASSERT_EQ(dssh_chan_close(accepted, 0), 0);
+	ASSERT_EQ(dssh_chan_close(sctx.ch, 0), 0);
 	conn_cleanup(&ctx);
 	return TEST_PASS;
 }
+
 
 static int
 test_channel_independence(void)
@@ -2159,66 +2203,34 @@ test_channel_independence(void)
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
 		return TEST_FAIL;
-
-	struct two_channel_server_ctx sctx = {
-		.server = ctx.server,
-		.cbs = &accept_cbs_all,
-	};
-
-	thrd_t st;
-	ASSERT_THRD_CREATE(&st, server_accept_two_channels, &sctx);
-
-	struct dssh_chan_params p1;
-	dssh_chan_params_init(&p1, DSSH_CHAN_EXEC);
-	dssh_chan_params_set_command(&p1, "cmd1");
-	dssh_chan_params_set_pty(&p1, false);
-	dssh_channel c1 = dssh_chan_open(ctx.client, &p1);
-	dssh_chan_params_free(&p1);
-
-	struct dssh_chan_params p2;
-	dssh_chan_params_init(&p2, DSSH_CHAN_EXEC);
-	dssh_chan_params_set_command(&p2, "cmd2");
-	dssh_chan_params_set_pty(&p2, false);
-	dssh_channel c2 = dssh_chan_open(ctx.client, &p2);
-	dssh_chan_params_free(&p2);
-
-	thrd_join(st, NULL);
-
-	if (c1 == NULL || c2 == NULL || sctx.ch1 == NULL || sctx.ch2 == NULL) {
-		if (c1)
-			dssh_chan_close(c1, 0);
-		if (c2)
-			dssh_chan_close(c2, 0);
-		if (sctx.ch1)
-			dssh_chan_close(sctx.ch1, 0);
-		if (sctx.ch2)
-			dssh_chan_close(sctx.ch2, 0);
-		conn_cleanup(&ctx);
-		return TEST_FAIL;
-	}
-
-	/* Close channel 1 */
-	dssh_chan_close(c1, 0);
-	dssh_chan_close(sctx.ch1, 0);
-
-	/* Channel 2 should still work */
-	const uint8_t msg[] = "still alive";
-	int write_ev = dssh_chan_poll(c2, DSSH_POLL_WRITE, 5000);
-	ASSERT_TRUE(write_ev & DSSH_POLL_WRITE);
-	ASSERT_EQ(dssh_chan_write(c2, 0, msg, sizeof(msg) - 1), sizeof(msg) - 1);
-
-	uint8_t buf[256];
-	int ev = dssh_chan_poll(sctx.ch2, DSSH_POLL_READ, 5000);
-	ASSERT_TRUE(ev & DSSH_POLL_READ);
-	int64_t n = dssh_chan_read(sctx.ch2, 0, buf, sizeof(buf));
-	ASSERT_TRUE(n > 0);
-	ASSERT_MEM_EQ(buf, "still alive", (size_t)n);
-
-	dssh_chan_close(c2, 0);
-	dssh_chan_close(sctx.ch2, 0);
+	struct two_channel_server_ctx sctx = {.server = ctx.server, .cbs = &accept_cbs_all};
+	struct channel_workers workers;
+	channel_workers_init(&workers, &ctx);
+	ASSERT_EQ(channel_worker_start(&workers, 0, server_accept_two_channels, &sctx), 0);
+	ASSERT_TRUE(conn_actor_checkpoint());
+	dssh_channel c1, c2;
+	ASSERT_EQ(conn_client_open(ctx.client, DSSH_CHAN_EXEC, "cmd1", &c1), 0);
+	ASSERT_NOT_NULL(c1);
+	ASSERT_EQ(conn_client_open(ctx.client, DSSH_CHAN_EXEC, "cmd2", &c2), 0);
+	ASSERT_NOT_NULL(c2);
+	channel_workers_finish(&workers);
+	ASSERT_EQ(workers.results[0], 0);
+	ASSERT_NOT_NULL(sctx.ch1);
+	ASSERT_NOT_NULL(sctx.ch2);
+	ASSERT_EQ(dssh_chan_close(c1, 0), 0);
+	ASSERT_EQ(dssh_chan_close(sctx.ch1, 0), 0);
+	/* Closing the first pair must leave the complete second payload usable. */
+	const uint8_t expected[] = "still alive";
+	uint8_t received[sizeof(expected)];
+	ASSERT_TRUE(conn_zc_write_all(c2, expected, sizeof(expected), 5));
+	ASSERT_TRUE(conn_zc_read_exact(sctx.ch2, received, sizeof(received), 5));
+	ASSERT_MEM_EQ(received, expected, sizeof(expected));
+	ASSERT_EQ(dssh_chan_close(c2, 0), 0);
+	ASSERT_EQ(dssh_chan_close(sctx.ch2, 0), 0);
 	conn_cleanup(&ctx);
 	return TEST_PASS;
 }
+
 
 /* ================================================================
  * Thread safety (~2 tests)
@@ -2227,63 +2239,60 @@ test_channel_independence(void)
 struct writer_ctx {
 	dssh_channel ch;
 	size_t total_written;
-	int result;
 };
 
 static int
 writer_thread_func(void *arg)
 {
 	struct writer_ctx *wc = arg;
-	uint8_t buf[128];
-	memset(buf, 'W', sizeof(buf));
+	uint8_t buffer[128];
+	memset(buffer, 'W', sizeof(buffer));
 	wc->total_written = 0;
-	wc->result = 0;
-
-	for (int i = 0; i < 100; i++) {
-		int ev = dssh_chan_poll(wc->ch, DSSH_POLL_WRITE, 5000);
-		if (ev < 0) {
-			wc->result = ev;
-			break;
-		}
-		if (!(ev & DSSH_POLL_WRITE))
-			continue;
-		int64_t w = dssh_chan_write(wc->ch, 0, buf, sizeof(buf));
-		if (w < 0) {
-			wc->result = (int)w;
-			break;
-		}
-		wc->total_written += (size_t)w;
+	for (unsigned i = 0; i < 100; i++) {
+		if (!conn_zc_write_all(wc->ch, buffer, sizeof(buffer), 5))
+			return -1;
+		/* Exactly 100 bounded complete writes; 12800 fits 16-bit size_t. */
+		wc->total_written += sizeof(buffer);
 	}
 	return 0;
 }
 
+
 struct reader_ctx {
 	dssh_channel ch;
 	size_t total_read;
-	int result;
+	bool eof;
 };
 
 static int
 reader_thread_func(void *arg)
 {
 	struct reader_ctx *rc = arg;
-	uint8_t buf[256];
+	uint8_t buffer[256];
 	rc->total_read = 0;
-	rc->result = 0;
-
+	rc->eof = false;
 	for (;;) {
-		int ev = dssh_chan_poll(rc->ch, DSSH_POLL_READ, 2000);
-		if (ev <= 0)
-			break;
-		if (!(ev & DSSH_POLL_READ))
+		if (dssh_chan_poll(rc->ch, DSSH_POLL_READ, 2000) != DSSH_POLL_READ)
+			return -1;
+		int64_t ret = conn_zc_read(rc->ch, 0, buffer, sizeof(buffer));
+		if (ret == DSSH_ERROR_NOMORE)
 			continue;
-		int64_t n = dssh_chan_read(rc->ch, 0, buf, sizeof(buf));
-		if (n <= 0)
-			break;
-		rc->total_read += (size_t)n;
+		size_t count;
+		if (!conn_zc_io_count(ret, sizeof(buffer), &count)
+		    || rc->total_read > 12800 || count > 12800 - rc->total_read)
+			return -1;
+		if (count == 0) {
+			rc->eof = true;
+			return 0;
+		}
+		for (size_t i = 0; i < count; i++) {
+			if (buffer[i] != 'W')
+				return -1;
+		}
+		rc->total_read += count;
 	}
-	return 0;
 }
+
 
 static int
 test_concurrent_write_read(void)
@@ -2291,46 +2300,31 @@ test_concurrent_write_read(void)
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
 		return TEST_FAIL;
-
-	struct open_exec_ctx oc = {
-		.client = ctx.client,
-		.server = ctx.server,
-		.command = "cmd",
-		.cbs = &accept_cbs_all,
-		.accept_timeout = 30000,
-	};
-	if (open_exec_channel(&ctx, &oc) < 0) {
-		conn_cleanup(&ctx);
-		return TEST_SKIP;
-	}
-
-	struct writer_ctx wc = {
-		.ch = oc.client_ch,
-	};
-	struct reader_ctx rc = {
-		.ch = oc.server_ch,
-	};
-
-	thrd_t wt, rt;
-	ASSERT_THRD_CREATE(&rt, reader_thread_func, &rc);
-	ASSERT_THRD_CREATE(&wt, writer_thread_func, &wc);
-
-	thrd_join(wt, NULL);
-
-	/* After writer finishes, close the channel so reader sees EOF */
-	dssh_chan_close(oc.client_ch, 0);
-
-	thrd_join(rt, NULL);
-
-	ASSERT_TRUE(wc.total_written > 0);
-	ASSERT_TRUE(rc.total_read > 0);
-	/* Reader should have received at least some of what was written */
-	ASSERT_TRUE(rc.total_read <= wc.total_written);
-
-	dssh_chan_close(oc.server_ch, 0);
+	struct open_exec_ctx oc = {.client = ctx.client, .server = ctx.server,
+	    .command = "cmd", .cbs = &accept_cbs_all, .accept_timeout = 30000};
+	ASSERT_EQ(open_exec_channel(&ctx, &oc), 0);
+	struct writer_ctx wc = {.ch = oc.client_ch};
+	struct reader_ctx rc = {.ch = oc.server_ch};
+	struct channel_workers workers;
+	channel_workers_init(&workers, &ctx);
+	ASSERT_EQ(channel_worker_start(&workers, 0, reader_thread_func, &rc), 0);
+	ASSERT_EQ(channel_worker_start(&workers, 1, writer_thread_func, &wc), 0);
+	ASSERT_TRUE(conn_actor_checkpoint());
+	channel_worker_join(&workers, 1);
+	ASSERT_EQ(workers.results[1], 0);
+	ASSERT_EQ_U(wc.total_written, 12800);
+	/* EOF follows the entire payload and leaves the reader's channel owned. */
+	ASSERT_EQ(dssh_chan_shutwr(oc.client_ch), 0);
+	channel_workers_finish(&workers);
+	ASSERT_EQ(workers.results[0], 0);
+	ASSERT_TRUE(rc.eof);
+	ASSERT_EQ_U(rc.total_read, wc.total_written);
+	ASSERT_EQ(dssh_chan_close(oc.client_ch, 0), 0);
+	ASSERT_EQ(dssh_chan_close(oc.server_ch, 0), 0);
 	conn_cleanup(&ctx);
 	return TEST_PASS;
 }
+
 
 static int
 test_terminate_during_io(void)
@@ -2338,40 +2332,27 @@ test_terminate_during_io(void)
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
 		return TEST_FAIL;
-
-	struct open_exec_ctx oc = {
-		.client = ctx.client,
-		.server = ctx.server,
-		.command = "cmd",
-		.cbs = &accept_cbs_all,
-		.accept_timeout = 30000,
-	};
-	if (open_exec_channel(&ctx, &oc) < 0) {
-		conn_cleanup(&ctx);
-		return TEST_SKIP;
-	}
-
-	/* Start a reader that will block on poll */
-	struct reader_ctx rc = {
-		.ch = oc.server_ch,
-	};
-	thrd_t rt;
-	ASSERT_THRD_CREATE(&rt, reader_thread_func, &rc);
-
-	/* Brief delay, then terminate */
-	struct timespec ts = { .tv_sec = 0, .tv_nsec = 10000000 };
-	thrd_sleep(&ts, NULL);
-
+	struct open_exec_ctx oc = {.client = ctx.client, .server = ctx.server,
+	    .command = "cmd", .cbs = &accept_cbs_all, .accept_timeout = 30000};
+	ASSERT_EQ(open_exec_channel(&ctx, &oc), 0);
+	struct reader_ctx rc = {.ch = oc.server_ch};
+	struct channel_workers workers;
+	channel_workers_init(&workers, &ctx);
+	workers.retire = conn_actor_unwatch;
+	atomic_bool *entered = dssh_test_thrd_watch_condition(&oc.server_ch->poll_cnd);
+	ASSERT_EQ(channel_worker_start(&workers, 0, reader_thread_func, &rc), 0);
+	ASSERT_TRUE(conn_actor_checkpoint());
+	ASSERT_TRUE(conn_actor_waiting(entered, &oc.server_ch->buf_mtx));
 	dssh_session_terminate(ctx.server);
-
-	thrd_join(rt, NULL);
-
-	/* Reader should have exited cleanly (no crash) */
+	channel_workers_finish(&workers);
+	ASSERT_EQ(workers.results[0], 0);
+	ASSERT_TRUE(rc.eof);
 	ASSERT_EQ_U(rc.total_read, 0);
-
+	ASSERT_TRUE(dssh_session_is_terminated(ctx.server));
 	conn_cleanup(&ctx);
 	return TEST_PASS;
 }
+
 
 
 /* ================================================================
@@ -2384,43 +2365,28 @@ test_connection_drop_during_read(void)
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
 		return TEST_FAIL;
-
-	struct open_exec_ctx oc = {
-		.client = ctx.client,
-		.server = ctx.server,
-		.command = "cmd",
-		.cbs = &accept_cbs_all,
-		.accept_timeout = 30000,
-	};
-	if (open_exec_channel(&ctx, &oc) < 0) {
-		conn_cleanup(&ctx);
-		return TEST_SKIP;
-	}
-
-	/* Start a reader blocked on poll */
-	struct reader_ctx rc = {
-		.ch = oc.server_ch,
-	};
-	thrd_t rt;
-	ASSERT_THRD_CREATE(&rt, reader_thread_func, &rc);
-
-	/* Brief delay to let reader block */
-	struct timespec ts = { .tv_sec = 0, .tv_nsec = 10000000 };
-	thrd_sleep(&ts, NULL);
-
-	/* Kill the connection */
+	struct open_exec_ctx oc = {.client = ctx.client, .server = ctx.server,
+	    .command = "cmd", .cbs = &accept_cbs_all, .accept_timeout = 30000};
+	ASSERT_EQ(open_exec_channel(&ctx, &oc), 0);
+	struct reader_ctx rc = {.ch = oc.server_ch};
+	struct channel_workers workers;
+	channel_workers_init(&workers, &ctx);
+	workers.retire = conn_actor_unwatch;
+	atomic_bool *entered = dssh_test_thrd_watch_condition(&oc.server_ch->poll_cnd);
+	ASSERT_EQ(channel_worker_start(&workers, 0, reader_thread_func, &rc), 0);
+	ASSERT_TRUE(conn_actor_checkpoint());
+	ASSERT_TRUE(conn_actor_waiting(entered, &oc.server_ch->buf_mtx));
 	mock_io_close_c2s(&ctx.io);
 	mock_io_close_s2c(&ctx.io);
-
-	thrd_join(rt, NULL);
-
-	/* Session should be terminated */
+	channel_workers_finish(&workers);
+	ASSERT_EQ(workers.results[0], 0);
+	ASSERT_TRUE(rc.eof);
+	ASSERT_EQ_U(rc.total_read, 0);
 	ASSERT_TRUE(dssh_session_is_terminated(ctx.server));
-
-	/* Cleanup must not crash */
 	conn_cleanup(&ctx);
 	return TEST_PASS;
 }
+
 
 static int
 test_connection_drop_during_write(void)
@@ -2870,7 +2836,7 @@ static int
 rejected_open_thread(void *arg)
 {
 	struct rejected_open_ctx *ctx = arg;
-	int ret = client_open_exec_thread(&ctx->open);
+	int ret = client_open_rejected_thread(&ctx->open);
 	atomic_store(&ctx->done, true);
 	return ret;
 }
@@ -2885,11 +2851,13 @@ test_open_failure_roundtrip(void)
 		.client = ctx.client, .command = "rejected-open",
 	} };
 	atomic_init(&rejected.done, false);
-	thrd_t thread;
-	ASSERT_THRD_CREATE(&thread, rejected_open_thread, &rejected);
+	struct channel_workers workers;
+	channel_workers_init(&workers, &ctx);
+	ASSERT_EQ(channel_worker_start(&workers, 0, rejected_open_thread, &rejected), 0);
+	ASSERT_TRUE(conn_actor_checkpoint());
 	struct dssh_incoming_open inc;
 	int ret = accept_incoming(ctx.server, &inc, 5000);
-	if (ret >= 0) {
+	if (ret == 0) {
 		uint8_t failure[17];
 		size_t pos = 0;
 		failure[pos++] = SSH_MSG_CHANNEL_OPEN_FAILURE;
@@ -2899,20 +2867,21 @@ test_open_failure_roundtrip(void)
 		DSSH_PUT_U32(0, failure, &pos);
 		ret = send_packet(ctx.server, failure, pos, NULL);
 	}
-	bool done = ret >= 0 && dssh_test_wait_bool(&rejected.done, true);
+	bool done = ret == 0 && dssh_test_wait_bool(&rejected.done, true);
 	if (!done) {
 		dssh_session_terminate(ctx.client);
 		mock_io_close_c2s(&ctx.io);
 		mock_io_close_s2c(&ctx.io);
 	}
-	int join_ret = thrd_join(thread, NULL);
-	ASSERT_EQ(join_ret, thrd_success);
+	channel_workers_finish(&workers);
+	ASSERT_EQ(workers.results[0], 0);
 	ASSERT_TRUE(done);
 	ASSERT_NULL(rejected.open.client_ch);
 	ASSERT_FALSE(dssh_session_is_terminated(ctx.client));
 	ASSERT_EQ(mtx_lock(&ctx.client->channel_mtx), thrd_success);
 	size_t remaining = ctx.client->channel_count;
-	ASSERT_EQ(mtx_unlock(&ctx.client->channel_mtx), thrd_success);
+	if (mtx_unlock(&ctx.client->channel_mtx) != thrd_success)
+		abort();
 	ASSERT_EQ_U(remaining, 0);
 	conn_cleanup(&ctx);
 	return TEST_PASS;
@@ -4323,17 +4292,17 @@ test_session_write_ext_window_zero(void)
 
 struct accept_blocking_ctx {
 	struct conn_ctx *ctx;
-	_Atomic bool entered;
+	dssh_channel channel;
 };
 
 static int
 accept_blocking_thread(void *arg)
 {
 	struct accept_blocking_ctx *bc = arg;
-	atomic_store(&bc->entered, true);
-	dssh_chan_accept(bc->ctx->server, &accept_cbs_all, -1);
-	return 0;
+	bc->channel = dssh_chan_accept(bc->ctx->server, &accept_cbs_all, -1);
+	return bc->channel == NULL && dssh_session_is_terminated(bc->ctx->server) ? 0 : -1;
 }
+
 
 static int
 test_accept_timeout_negative(void)
@@ -4341,27 +4310,23 @@ test_accept_timeout_negative(void)
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
 		return TEST_FAIL;
-
-	struct accept_blocking_ctx bc = {
-		.ctx = &ctx,
-	};
-	atomic_init(&bc.entered, false);
-
-	thrd_t at;
-	ASSERT_THRD_CREATE(&at, accept_blocking_thread, &bc);
-
-	/* Wait for the accept thread to enter dssh_chan_accept */
-	while (!atomic_load(&bc.entered))
-		thrd_yield();
-
-	/* Termination wakes accept; keep the session alive until its API
-	 * caller has returned, including when the worker was descheduled
-	 * immediately after publishing entered. */
+	struct accept_blocking_ctx bc = {.ctx = &ctx};
+	struct channel_workers workers;
+	channel_workers_init(&workers, &ctx);
+	workers.retire = conn_actor_unwatch;
+	atomic_bool *entered = dssh_test_thrd_watch_condition(&ctx.server->accept_cnd);
+	ASSERT_EQ(channel_worker_start(&workers, 0, accept_blocking_thread, &bc), 0);
+	ASSERT_TRUE(conn_actor_checkpoint());
+	ASSERT_TRUE(conn_actor_waiting(entered, &ctx.server->accept_mtx));
+	ASSERT_FALSE(dssh_session_is_terminated(ctx.server));
 	dssh_session_terminate(ctx.server);
-	thrd_join(at, NULL);
+	channel_workers_finish(&workers);
+	ASSERT_EQ(workers.results[0], 0);
+	ASSERT_NULL(bc.channel);
 	conn_cleanup(&ctx);
 	return TEST_PASS;
 }
+
 
 /* ================================================================
  * Coverage: server rejects exec request via callback
@@ -4373,31 +4338,28 @@ test_setup_exec_rejected_by_callback(void)
 	struct conn_ctx ctx;
 	if (conn_setup(&ctx) < 0)
 		return TEST_FAIL;
-
-	struct open_exec_ctx oc = {
-		.client = ctx.client,
-		.server = ctx.server,
-		.command = "rejected_exec",
-		.cbs = &reject_exec_cbs,
-		.accept_timeout = 30000,
-	};
-
-	thrd_t ct, st;
-	ASSERT_THRD_CREATE(&ct, client_open_exec_thread, &oc);
-	ASSERT_THRD_CREATE(&st, server_accept_exec_thread, &oc);
-	thrd_join(ct, NULL);
-
-	/* After rejection, dssh_chan_accept loops back to wait for the
-	 * next CHANNEL_OPEN.  Terminate to unblock it. */
-	session_set_terminate(ctx.server);
-	thrd_join(st, NULL);
-
+	struct open_exec_ctx oc = {.client = ctx.client, .server = ctx.server,
+	    .command = "rejected_exec", .cbs = &reject_exec_cbs, .accept_timeout = 30000};
+	struct channel_workers workers;
+	channel_workers_init(&workers, &ctx);
+	ASSERT_EQ(channel_worker_start(&workers, 0, client_open_rejected_thread, &oc), 0);
+	ASSERT_EQ(channel_worker_start(&workers, 1, server_accept_cancelled_thread, &oc), 0);
+	ASSERT_TRUE(conn_actor_checkpoint());
+	channel_worker_join(&workers, 0);
+	ASSERT_EQ(workers.results[0], 0);
 	ASSERT_NULL(oc.client_ch);
+	ASSERT_EQ_U(atomic_load(&reject_exec_calls), 1);
+	ASSERT_FALSE(dssh_session_is_terminated(ctx.client));
+	ASSERT_FALSE(dssh_session_is_terminated(ctx.server));
+	/* A rejecting accept resumes waiting for another channel. */
+	dssh_session_terminate(ctx.server);
+	channel_workers_finish(&workers);
+	ASSERT_EQ(workers.results[1], 0);
 	ASSERT_NULL(oc.server_ch);
-
 	conn_cleanup(&ctx);
 	return TEST_PASS;
 }
+
 
 /* ================================================================
  * Coverage: truncated OPEN_CONFIRMATION
@@ -4753,27 +4715,28 @@ test_maybe_replenish_low_window(void)
 
 struct tx_hold_state {
 	dssh_session sess;
-	mtx_t        mtx;
-	cnd_t        cnd;
-	bool         locked;
-	bool         release;
+	atomic_bool locked;
+	atomic_bool release;
 };
 
 static int
 hold_tx_until_released(void *arg)
 {
 	struct tx_hold_state *st = arg;
-
 	if (tx_acquire(st->sess, SSH_MSG_CHANNEL_DATA) < 0)
 		return -1;
-	mtx_lock(&st->mtx);
-	st->locked = true;
-	cnd_broadcast(&st->cnd);
-	while (!st->release)
-		cnd_wait(&st->cnd, &st->mtx);
-	mtx_unlock(&st->mtx);
+	atomic_store(&st->locked, true);
+	bool released = dssh_test_wait_bool(&st->release, true);
 	tx_unlock_with_slots(st->sess);
-	return 0;
+	return released ? 0 : -1;
+}
+
+
+static void
+conn_actor_release_tx(void *arg)
+{
+	struct tx_hold_state *st = arg;
+	atomic_store(&st->release, true);
 }
 
 static int
@@ -4788,43 +4751,42 @@ test_replenish_queued_accounting(void)
 		.command = "echo repqueue", .cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	if (open_exec_channel(&ctx, &oc) < 0 || !oc.client_ch || !oc.server_ch) {
-		conn_cleanup(&ctx);
-		return TEST_FAIL;
-	}
+	ASSERT_EQ(open_exec_channel(&ctx, &oc), 0);
 
-	struct tx_hold_state st = { .sess = ctx.server };
-	ASSERT_EQ(mtx_init(&st.mtx, mtx_plain), thrd_success);
-	ASSERT_EQ(cnd_init(&st.cnd), thrd_success);
-	thrd_t holder;
-	ASSERT_THRD_CREATE(&holder, hold_tx_until_released, &st);
+	struct tx_hold_state st = {.sess = ctx.server};
+	atomic_init(&st.locked, false);
+	atomic_init(&st.release, false);
+	struct channel_workers workers;
+	channel_workers_init(&workers, &ctx);
+	workers.release = conn_actor_release_tx;
+	workers.resource = &st;
+	ASSERT_EQ(channel_worker_start(&workers, 0, hold_tx_until_released, &st), 0);
+	ASSERT_TRUE(dssh_test_wait_bool(&st.locked, true));
+	ASSERT_TRUE(conn_actor_checkpoint());
 
-	mtx_lock(&st.mtx);
-	while (!st.locked)
-		cnd_wait(&st.cnd, &st.mtx);
-	mtx_unlock(&st.mtx);
-
-	mtx_lock(&oc.server_ch->buf_mtx);
+	ASSERT_EQ(mtx_lock(&oc.server_ch->buf_mtx), thrd_success);
 	oc.server_ch->window_max = 32;
 	oc.server_ch->local_window = 1;
 	oc.server_ch->window_adjust_pending = 0;
 	oc.server_ch->window_adjust_inflight = 0;
-	mtx_unlock(&oc.server_ch->buf_mtx);
+	if (mtx_unlock(&oc.server_ch->buf_mtx) != thrd_success)
+		abort();
 
-	ASSERT_OK(maybe_replenish_window(ctx.server, oc.server_ch));
+	ASSERT_EQ(maybe_replenish_window(ctx.server, oc.server_ch), 0);
 	uint8_t fail[8];
 	size_t fail_pos = 0;
 
 	fail[fail_pos++] = SSH_MSG_CHANNEL_FAILURE;
 	DSSH_PUT_U32(oc.server_ch->remote_id, fail, &fail_pos);
-	ASSERT_OK(send_to_slot(ctx.server, &oc.server_ch->chan_reply_slot, fail, fail_pos));
-	mtx_lock(&oc.server_ch->buf_mtx);
+	ASSERT_EQ(send_to_slot(ctx.server, &oc.server_ch->chan_reply_slot, fail, fail_pos), 0);
+	ASSERT_EQ(mtx_lock(&oc.server_ch->buf_mtx), thrd_success);
 	uint32_t local = oc.server_ch->local_window;
 	uint32_t pending = oc.server_ch->window_adjust_pending;
 	uint32_t inflight = oc.server_ch->window_adjust_inflight;
 	bool wa_ready = atomic_load(&oc.server_ch->wa_slot.ready);
 	bool fail_ready = atomic_load(&oc.server_ch->chan_reply_slot.ready);
-	mtx_unlock(&oc.server_ch->buf_mtx);
+	if (mtx_unlock(&oc.server_ch->buf_mtx) != thrd_success)
+		abort();
 	ASSERT_EQ_U(local, 1);
 	ASSERT_EQ_U(pending, 31);
 	ASSERT_EQ_U(inflight, 0);
@@ -4833,35 +4795,33 @@ test_replenish_queued_accounting(void)
 
 	/* Pending credit participates in the threshold calculation, so a
 	 * second reader cannot queue a duplicate grant. */
-	ASSERT_OK(maybe_replenish_window(ctx.server, oc.server_ch));
-	mtx_lock(&oc.server_ch->buf_mtx);
+	ASSERT_EQ(maybe_replenish_window(ctx.server, oc.server_ch), 0);
+	ASSERT_EQ(mtx_lock(&oc.server_ch->buf_mtx), thrd_success);
 	pending = oc.server_ch->window_adjust_pending;
-	mtx_unlock(&oc.server_ch->buf_mtx);
+	if (mtx_unlock(&oc.server_ch->buf_mtx) != thrd_success)
+		abort();
 	ASSERT_EQ_U(pending, 31);
 
-	mtx_lock(&st.mtx);
-	st.release = true;
-	cnd_broadcast(&st.cnd);
-	mtx_unlock(&st.mtx);
-	thrd_join(holder, NULL);
+	conn_actor_release_tx(&st);
+	channel_workers_finish(&workers);
+	ASSERT_EQ(workers.results[0], 0);
 
-	mtx_lock(&oc.server_ch->buf_mtx);
+	ASSERT_EQ(mtx_lock(&oc.server_ch->buf_mtx), thrd_success);
 	local = oc.server_ch->local_window;
 	pending = oc.server_ch->window_adjust_pending;
 	inflight = oc.server_ch->window_adjust_inflight;
 	wa_ready = atomic_load(&oc.server_ch->wa_slot.ready);
 	fail_ready = atomic_load(&oc.server_ch->chan_reply_slot.ready);
-	mtx_unlock(&oc.server_ch->buf_mtx);
+	if (mtx_unlock(&oc.server_ch->buf_mtx) != thrd_success)
+		abort();
 	ASSERT_EQ_U(local, 32);
 	ASSERT_EQ_U(pending, 0);
 	ASSERT_EQ_U(inflight, 0);
 	ASSERT_FALSE(wa_ready);
 	ASSERT_FALSE(fail_ready);
 
-	cnd_destroy(&st.cnd);
-	mtx_destroy(&st.mtx);
-	dssh_chan_close(oc.server_ch, 0);
-	dssh_chan_close(oc.client_ch, 0);
+	ASSERT_EQ(dssh_chan_close(oc.server_ch, 0), 0);
+	ASSERT_EQ(dssh_chan_close(oc.client_ch, 0), 0);
 	conn_cleanup(&ctx);
 	return TEST_PASS;
 }
@@ -6450,86 +6410,77 @@ test_subsys_write_zero(void)
 
 struct spam_cnd_arg {
 	cnd_t *cnd;
-	mtx_t *mtx;
-	_Atomic bool stop;
+	atomic_bool stop;
+	atomic_uint signals;
 };
 
 static int
 spam_cnd_thread(void *arg)
 {
 	struct spam_cnd_arg *sa = arg;
-	const struct timespec dur = { .tv_sec = 0, .tv_nsec = 50000000L };
-
-	while (!sa->stop) {
-		thrd_sleep(&dur, NULL);
-
-		mtx_lock(sa->mtx);
-		cnd_broadcast(sa->cnd);
-		mtx_unlock(sa->mtx);
+	const struct timespec duration = {.tv_nsec = 50000000L};
+	while (!atomic_load(&sa->stop)) {
+		int ret = thrd_sleep(&duration, NULL);
+		if (ret != 0 && ret != -1)
+			return -1;
+		if (atomic_load(&sa->stop))
+			break;
+		if (cnd_broadcast(sa->cnd) != thrd_success)
+			return -1;
+		unsigned signals = atomic_load(&sa->signals);
+		if (signals < UINT_MAX)
+			atomic_store(&sa->signals, signals + 1);
 	}
-
 	return 0;
+}
+
+
+static void
+conn_actor_stop_spammer(void *arg)
+{
+	struct spam_cnd_arg *sa = arg;
+	atomic_store(&sa->stop, true);
 }
 
 static int
 test_poll_deadline_not_reset(void)
 {
 	struct conn_ctx ctx;
-
 	if (conn_setup(&ctx) < 0)
 		return TEST_FAIL;
-
-	struct open_exec_ctx oc = {
-		.client = ctx.client,
-		.server = ctx.server,
-		.command = "cmd",
-		.cbs = &accept_cbs_all,
-		.accept_timeout = 30000,
-	};
-	if (open_exec_channel(&ctx, &oc) < 0) {
-		conn_cleanup(&ctx);
-		return TEST_SKIP;
-	}
-
-	struct spam_cnd_arg sa = {
-		.cnd = &oc.server_ch->poll_cnd,
-		.mtx = &oc.server_ch->buf_mtx,
-		.stop = false,
-	};
-	thrd_t spammer;
-
-	ASSERT_THRD_CREATE(&spammer, spam_cnd_thread, &sa);
-
-	struct timespec t0;
-
-	timespec_get(&t0, TIME_UTC);
-
-	int ev = dssh_chan_poll(oc.server_ch, DSSH_POLL_READ, 500);
-	ASSERT_EQ(ev, 0);
-
-	struct timespec t1;
-
-	timespec_get(&t1, TIME_UTC);
-	sa.stop = true;
-	thrd_join(spammer, NULL);
-
-	long elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000L
-	    + (t1.tv_nsec - t0.tv_nsec) / 1000000L;
-
-	if (elapsed_ms > 1200) {
-		fprintf(stderr, "  poll took %ldms (expected ~500ms)\n",
-		    elapsed_ms);
-		dssh_chan_close(oc.client_ch, 0);
-		dssh_chan_close(oc.server_ch, 0);
-		conn_cleanup(&ctx);
-		return TEST_FAIL;
-	}
-
-	dssh_chan_close(oc.client_ch, 0);
-	dssh_chan_close(oc.server_ch, 0);
+	struct open_exec_ctx oc = {.client = ctx.client, .server = ctx.server,
+	    .command = "cmd", .cbs = &accept_cbs_all, .accept_timeout = 30000};
+	ASSERT_EQ(open_exec_channel(&ctx, &oc), 0);
+	struct spam_cnd_arg sa = {.cnd = &oc.server_ch->poll_cnd};
+	atomic_init(&sa.stop, false);
+	atomic_init(&sa.signals, 0);
+	struct channel_workers workers;
+	channel_workers_init(&workers, &ctx);
+	workers.release = conn_actor_stop_spammer;
+	workers.resource = &sa;
+	ASSERT_EQ(channel_worker_start(&workers, 0, spam_cnd_thread, &sa), 0);
+	ASSERT_TRUE(conn_actor_checkpoint());
+	struct timespec start, end;
+	ASSERT_EQ(clock_gettime(CLOCK_MONOTONIC, &start), 0);
+	ASSERT_TRUE(start.tv_nsec >= 0 && start.tv_nsec < 1000000000L);
+	int events = dssh_chan_poll(oc.server_ch, DSSH_POLL_READ, 500);
+	ASSERT_EQ(clock_gettime(CLOCK_MONOTONIC, &end), 0);
+	ASSERT_TRUE(end.tv_nsec >= 0 && end.tv_nsec < 1000000000L);
+	conn_actor_stop_spammer(&sa);
+	channel_workers_finish(&workers);
+	ASSERT_EQ(workers.results[0], 0);
+	ASSERT_EQ(events, 0);
+	ASSERT_TRUE(atomic_load(&sa.signals) > 0);
+	long nanoseconds = end.tv_nsec - start.tv_nsec;
+	double fraction = (double)nanoseconds;
+	double elapsed = difftime(end.tv_sec, start.tv_sec) + fraction / 1000000000.0;
+	ASSERT_TRUE(elapsed >= 0.4 && elapsed <= 1.2);
+	ASSERT_EQ(dssh_chan_close(oc.client_ch, 0), 0);
+	ASSERT_EQ(dssh_chan_close(oc.server_ch, 0), 0);
 	conn_cleanup(&ctx);
 	return TEST_PASS;
 }
+
 
 /* ================================================================
  * Channel request parser unit tests
@@ -8041,6 +7992,7 @@ test_compression_window_rekey(void)
 #include "channel_worker_cases.h"
 #include "channel_pair_cases.h"
 #include "conn_zc_cases.h"
+#include "conn_actor_cases.h"
 #include "channel_id_cases.h"
 #include "peer_channel_id_cases.h"
 #include "post_close_cases.h"
@@ -8066,6 +8018,19 @@ test_compression_window_rekey(void)
 #include "notification_flag_cases.h"
 
 static struct dssh_test_entry tests[] = {
+	{ "release/actor_owner_reject", test_actor_owner_reject },
+	{ "release/actor_owner_two", test_actor_owner_two },
+	{ "release/actor_owner_accept", test_actor_owner_accept },
+	{ "release/actor_owner_independent", test_actor_owner_independent },
+	{ "release/actor_owner_concurrent", test_actor_owner_concurrent },
+	{ "release/actor_owner_terminate", test_actor_owner_terminate },
+	{ "release/actor_owner_drop", test_actor_owner_drop },
+	{ "release/actor_owner_failure", test_actor_owner_failure },
+	{ "release/actor_owner_blocking", test_actor_owner_blocking },
+	{ "release/actor_owner_callback", test_actor_owner_callback },
+	{ "release/actor_owner_credit", test_actor_owner_credit },
+	{ "release/actor_owner_deadline", test_actor_owner_deadline },
+
 	{ "release/notification_reply_flags", test_notification_reply_flags },
 	{ "release/notification_flag_failures", test_notification_flag_failures },
 	{ "release/terminal_mode_validation", test_terminal_mode_validation },
@@ -8668,6 +8633,9 @@ main(int argc, char *argv[])
 		return incoming_control_probe();
 	if (argc == 2 && strcmp(argv[1], "--audit-close-outcomes") == 0)
 		return close_outcome_probe();
+	if (argc == 4 && strcmp(argv[1], "--channel-fatal") == 0
+	    && strncmp(argv[2], "actor-", 6) == 0)
+		return conn_actor_fatal_child(argv[2] + 6, argv[3]);
 	if (argc == 4 && strcmp(argv[1], "--channel-fatal") == 0
 	    && strncmp(argv[2], "zc-", 3) == 0)
 		return conn_zc_fatal_child(argv[2] + 3, argv[3]);

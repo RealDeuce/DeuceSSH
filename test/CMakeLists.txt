@@ -1951,7 +1951,7 @@ endif()
 if(NOT APPLE)
 dssh_add_test(alloc test_alloc.c)
 target_link_libraries(dssh_test_alloc PRIVATE dssh_mock_io dssh_mock_alloc)
-target_link_options(dssh_test_alloc PRIVATE ${DSSH_WRAP_FLAGS})
+target_link_options(dssh_test_alloc PRIVATE ${DSSH_WRAP_FLAGS} "-Wl,--wrap=dssh_hash_final")
 add_test(NAME dssh_unit_alloc COMMAND dssh_test_alloc)
 set_tests_properties(dssh_unit_alloc PROPERTIES
 	ENVIRONMENT "${DSSH_TEST_KEY_ENV}")
@@ -2057,7 +2057,7 @@ if(Python3_Interpreter_FOUND AND UNIX)
 		set(allocation_create_symbol dssh_thread_thrd_create)
 		set(allocation_join_symbol dssh_thread_thrd_join)
 	endif()
-	target_link_options(dssh_test_allocation_owner PRIVATE ${DSSH_WRAP_FLAGS}
+	target_link_options(dssh_test_allocation_owner PRIVATE ${DSSH_WRAP_FLAGS} "-Wl,--wrap=dssh_hash_final"
 		"-Wl,--wrap=${allocation_create_symbol},--wrap=${allocation_join_symbol},--wrap=mock_tx_client")
 	set(allocation_direct_modes plain tx create-0 create-1 create-2 assert-0 assert-1 assert-2 assert-3)
 	foreach(index RANGE 0 2)
@@ -2104,6 +2104,43 @@ if(Python3_Interpreter_FOUND AND UNIX)
 			ENVIRONMENT "DSSH_TEST_KEY=ed25519;DSSH_TEST_KEX=curve25519;${DSSH_TEST_KEY_ENV}")
 	endforeach()
 endif()
+
+# Private verification-context models require actual native H agreement and
+# before/after full KEX controls for every supported method and key family.
+foreach(method IN ITEMS curve25519 dh-gex group14 group16 sntrup mlkem)
+	foreach(key IN ITEMS ed25519 rsa rsa512)
+		foreach(part IN ITEMS kex_missing_key kex_missing_verify)
+			dssh_add_output_test(dssh_alloc_guard_${method}_${key}_${part} dssh_test_alloc
+				"1 tests: 1 passed, 0 failed, 0 skipped" --exact guard/${part})
+			set_tests_properties(dssh_alloc_guard_${method}_${key}_${part} PROPERTIES
+				FIXTURES_REQUIRED dssh_cached_keys
+				ENVIRONMENT "DSSH_TEST_KEY=${key};DSSH_TEST_KEX=${method};${DSSH_TEST_KEY_ENV}")
+		endforeach()
+	endforeach()
+endforeach()
+set(ALLOCATION_STANDALONE_TESTS guard/kbi_null_callback guard/acceptqueue alloc/kexinit)
+list(APPEND ALLOCATION_STANDALONE_TESTS alloc/register_curve25519_sha256)
+list(APPEND ALLOCATION_STANDALONE_TESTS alloc/register_dh_gex_sha256)
+list(APPEND ALLOCATION_STANDALONE_TESTS alloc/register_dh_group14_sha256)
+list(APPEND ALLOCATION_STANDALONE_TESTS alloc/register_dh_group16_sha512)
+list(APPEND ALLOCATION_STANDALONE_TESTS alloc/register_sntrup761x25519_sha512)
+list(APPEND ALLOCATION_STANDALONE_TESTS alloc/register_mlkem768x25519_sha256)
+list(APPEND ALLOCATION_STANDALONE_TESTS alloc/register_ssh_ed25519)
+list(APPEND ALLOCATION_STANDALONE_TESTS alloc/register_rsa_sha2_256)
+list(APPEND ALLOCATION_STANDALONE_TESTS alloc/register_rsa_sha2_512)
+list(APPEND ALLOCATION_STANDALONE_TESTS alloc/register_aes256_ctr)
+list(APPEND ALLOCATION_STANDALONE_TESTS alloc/register_aes128_cbc)
+list(APPEND ALLOCATION_STANDALONE_TESTS alloc/register_none_enc)
+list(APPEND ALLOCATION_STANDALONE_TESTS alloc/register_hmac_sha2_256)
+list(APPEND ALLOCATION_STANDALONE_TESTS alloc/register_hmac_sha2_512)
+list(APPEND ALLOCATION_STANDALONE_TESTS alloc/register_none_mac)
+list(APPEND ALLOCATION_STANDALONE_TESTS alloc/register_none_comp)
+foreach(group IN LISTS ALLOCATION_STANDALONE_TESTS)
+	dssh_add_output_test(dssh_alloc_standalone_${group} dssh_test_alloc
+		"1 tests: 1 passed, 0 failed, 0 skipped" --exact ${group})
+	set_tests_properties(dssh_alloc_standalone_${group} PROPERTIES FIXTURES_REQUIRED dssh_cached_keys
+		ENVIRONMENT "DSSH_TEST_KEY=ed25519;DSSH_TEST_KEX=curve25519;${DSSH_TEST_KEY_ENV}")
+endforeach()
 
 # Each parser contract has exact method/key bindings and rejects fixture errors.
 set(ALLOCATION_CURVE_PARSE_TESTS

@@ -42,6 +42,24 @@ bool dssh_test_ossl_mac_observed(size_t *actual_length);
 void dssh_test_ossl_random_post_failure(bool enabled);
 bool dssh_test_ossl_random_observed(size_t *length, unsigned int *strength, bool *native_completed);
 
+/* Observe only the named private BN call on this thread. Mode 0 forwards,
+ * 1 refuses before native work, 2 reports failure after native work. End(true)
+ * checks numeric clearing before native-owner cleanup. End(false) only returns
+ * recorded observations and drops the borrow; it never inspects the result. */
+struct dssh_test_bn_random_stats {
+	unsigned calls;
+	unsigned int strength;
+	int range_bits;
+	bool context_present;
+	bool constant_time;
+	bool native_called;
+	bool native_completed;
+	bool in_range;
+	bool cleared;
+};
+void dssh_test_ossl_bn_random_begin(unsigned mode);
+struct dssh_test_bn_random_stats dssh_test_ossl_bn_random_end(bool inspect_result);
+
 /* Current-thread observations of actual sntrup clears, before owner expiry.
  * No owner address is retained. Counts saturate; end disables observation. */
 struct dssh_test_sntrup_clear_stats {

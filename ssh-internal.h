@@ -234,6 +234,8 @@ int dssh_test_thrd_join(thrd_t thr, int *res);
 /* OpenSSL */
 int dssh_test_BN_rand(BIGNUM *rnd, int bits, int top, int bottom);
 int dssh_test_BN_rand_range(BIGNUM *rnd, const BIGNUM *range);
+int dssh_test_BN_priv_rand_range_ex(BIGNUM *rnd, const BIGNUM *range,
+    unsigned int strength, BN_CTX *ctx);
 BIGNUM *dssh_test_BN_dup(const BIGNUM *a);
 int dssh_test_BN_rshift1(BIGNUM *r, const BIGNUM *a);
 int dssh_test_BN_sub_word(BIGNUM *a, BN_ULONG word);
@@ -243,6 +245,7 @@ int dssh_test_EVP_PKEY_CTX_set_rsa_padding(EVP_PKEY_CTX *ctx, int pad_mode);
 
  #define BN_rand(r, b, t, bo)               dssh_test_BN_rand(r, b, t, bo)
  #define BN_rand_range(r, range)           dssh_test_BN_rand_range(r, range)
+ #define BN_priv_rand_range_ex(r, range, s, c) dssh_test_BN_priv_rand_range_ex(r, range, s, c)
  #define BN_dup(a)                        dssh_test_BN_dup(a)
  #define BN_rshift1(r, a)                  dssh_test_BN_rshift1(r, a)
  #define BN_sub_word(a, w)                dssh_test_BN_sub_word(a, w)

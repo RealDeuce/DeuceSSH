@@ -260,6 +260,28 @@ static _Thread_local bool random_seen;
 static _Thread_local size_t random_length;
 static _Thread_local unsigned int random_strength;
 static _Thread_local bool random_completed;
+static _Thread_local bool bn_random_watched;
+static _Thread_local unsigned bn_random_mode;
+static _Thread_local BIGNUM *bn_random_result;
+static _Thread_local struct dssh_test_bn_random_stats bn_random_stats;
+
+void
+dssh_test_ossl_bn_random_begin(unsigned mode)
+{
+	bn_random_mode = mode;
+	bn_random_result = NULL;
+	bn_random_stats = (struct dssh_test_bn_random_stats){0};
+	bn_random_watched = true;
+}
+
+struct dssh_test_bn_random_stats
+dssh_test_ossl_bn_random_end(bool inspect_result)
+{
+	bn_random_stats.cleared = inspect_result && bn_random_result != NULL && BN_is_zero(bn_random_result);
+	bn_random_watched = false;
+	bn_random_result = NULL;
+	return bn_random_stats;
+}
 
 void
 dssh_test_ossl_random_post_failure(bool enabled)
@@ -432,6 +454,9 @@ dssh_test_ossl_reset(void)
 	random_length = 0;
 	random_strength = 0;
 	random_completed = false;
+	bn_random_watched = false;
+	bn_random_result = NULL;
+	bn_random_stats = (struct dssh_test_bn_random_stats){0};
 #endif
 	dssh_test_clock_reset();
 }
@@ -999,6 +1024,35 @@ dssh_test_BN_rand_range(BIGNUM *rnd, const BIGNUM *range)
 	if (should_fail())
 		return 0;
 	return BN_rand_range(rnd, range);
+}
+
+int
+dssh_test_BN_priv_rand_range_ex(BIGNUM *rnd, const BIGNUM *range,
+    unsigned int strength, BN_CTX *ctx)
+{
+	bool refuse = should_fail();
+	if (bn_random_watched) {
+		if (bn_random_stats.calls < UINT_MAX)
+			bn_random_stats.calls++;
+		bn_random_stats.strength = strength;
+		bn_random_stats.range_bits = BN_num_bits(range);
+		bn_random_stats.context_present = ctx != NULL;
+		bn_random_stats.constant_time = BN_get_flags(rnd, BN_FLG_CONSTTIME) != 0;
+		bn_random_result = rnd;
+		if (bn_random_mode == 1)
+			refuse = true;
+	}
+	if (refuse)
+		return 0;
+	int ret = BN_priv_rand_range_ex(rnd, range, strength, ctx);
+	if (bn_random_watched) {
+		bn_random_stats.native_called = true;
+		bn_random_stats.native_completed = ret == 1;
+		bn_random_stats.in_range = ret == 1 && !BN_is_negative(rnd) && BN_cmp(rnd, range) < 0;
+		if (bn_random_mode == 2)
+			return 0;
+	}
+	return ret;
 }
 
 BIGNUM *

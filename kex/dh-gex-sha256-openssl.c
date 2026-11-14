@@ -146,7 +146,8 @@ ossl_keygen(void *opaque, const uint8_t *p, size_t plen, const uint8_t *g, size_
 	if (ret < 0)
 		goto done;
 	if (BN_rshift1(state->range, state->p) != 1 || BN_sub_word(state->range, 2) != 1
-	    || BN_rand_range(state->exponent, state->range) != 1 || BN_add_word(state->exponent, 2) != 1) {
+	    || BN_priv_rand_range_ex(state->exponent, state->range, 256, scratch) != 1
+	    || BN_add_word(state->exponent, 2) != 1) {
 		ret = DSSH_ERROR_INIT;
 		goto done;
 	}

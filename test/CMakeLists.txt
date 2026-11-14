@@ -923,6 +923,26 @@ foreach(method IN ITEMS sntrup mlkem)
 endforeach()
 
 dssh_add_test(dhgex_storage test_dhgex_storage.c)
+if(DEUCESSH_CRYPTO_BACKEND STREQUAL "OpenSSL")
+	dssh_add_test(dh_rng test_dh_rng.c)
+	target_compile_definitions(dssh_test_dh_rng PRIVATE DSSH_DH_RNG_INJECT)
+	foreach(mode IN ITEMS aes128 aes192 aes256 invalid pre post)
+		dssh_add_output_test(dssh_dh_rng_injected_${mode} dssh_test_dh_rng
+			"dh_rng_policy mode=${mode} groups=5 attempts=10 successes=[0-9]+ refusals=[0-9]+ valid=1" ${mode})
+	endforeach()
+	if(TARGET deucessh_static)
+		add_executable(dssh_test_dh_rng_static test_dh_rng.c)
+		set_target_properties(dssh_test_dh_rng_static PROPERTIES
+			C_STANDARD ${DEUCESSH_C_STANDARD} C_STANDARD_REQUIRED ON)
+		target_compile_options(dssh_test_dh_rng_static PRIVATE ${DEUCESSH_COMPILE_OPTIONS})
+		target_include_directories(dssh_test_dh_rng_static PRIVATE ${PROJECT_SOURCE_DIR})
+		target_link_libraries(dssh_test_dh_rng_static PRIVATE deucessh_static OpenSSL::Crypto)
+		foreach(mode IN ITEMS aes128 aes192 aes256 invalid)
+			dssh_add_output_test(dssh_dh_rng_static_${mode} dssh_test_dh_rng_static
+				"dh_rng_policy mode=${mode} groups=5 attempts=10 successes=[0-9]+ refusals=[0-9]+ valid=1" ${mode})
+		endforeach()
+	endif()
+endif()
 if(DEUCESSH_CRYPTO_BACKEND STREQUAL "Botan")
 	foreach(storage IN ITEMS curve_storage hybrid_storage dhgex_storage)
 		target_sources(dssh_test_${storage} PRIVATE key_context_fixture_botan.cpp)
@@ -2083,10 +2103,15 @@ add_test(NAME dssh_targeted_c25519_client_bad_qs
 set_tests_properties(dssh_targeted_c25519_client_bad_qs PROPERTIES
 	ENVIRONMENT "${DSSH_TEST_KEY_ENV}")
 if(DEUCESSH_CRYPTO_BACKEND STREQUAL "OpenSSL")
-add_test(NAME dssh_targeted_dhgex_bn_rand_fail
-	COMMAND dssh_test_alloc dhgex/server_bn_rand_fail)
-set_tests_properties(dssh_targeted_dhgex_bn_rand_fail PROPERTIES
-	ENVIRONMENT "DSSH_TEST_KEX=dh-gex;${DSSH_TEST_KEY_ENV}")
+	foreach(method IN ITEMS dh-gex group14 group16)
+		foreach(key IN ITEMS ed25519 rsa rsa512)
+			dssh_add_output_test(dssh_dh_rng_method_${method}_${key} dssh_test_alloc
+				"1 tests: 1 passed, 0 failed, 0 skipped" --exact dh/private_rng_fail)
+			set_tests_properties(dssh_dh_rng_method_${method}_${key} PROPERTIES
+				FIXTURES_REQUIRED dssh_cached_keys
+				ENVIRONMENT "DSSH_TEST_KEX=${method};DSSH_TEST_KEY=${key};${DSSH_TEST_KEY_ENV}")
+		endforeach()
+	endforeach()
 endif()
 endif()
 

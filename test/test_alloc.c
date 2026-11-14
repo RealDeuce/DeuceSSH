@@ -1558,9 +1558,17 @@ allocation_kex_excluded_peer(dssh_session sess)
 	return kex(sess);
 }
 
+#ifdef DSSH_CRYPTO_OPENSSL
+static bool allocation_kex_random_observe;
+static unsigned allocation_kex_random_mode;
+#endif
+
 struct allocation_kex_observation {
 	int target_result;
 	int peer_result;
+#ifdef DSSH_CRYPTO_OPENSSL
+	struct dssh_test_bn_random_stats random;
+#endif
 	int calls;
 	unsigned created;
 	unsigned joined;
@@ -1630,7 +1638,16 @@ allocation_kex_case(bool client, bool provider, int point,
 				dssh_test_alloc_fail_after(point);
 		}
 		dssh_session target = client ? owner.pair.client : owner.pair.server;
+#ifdef DSSH_CRYPTO_OPENSSL
+		if (allocation_kex_random_observe)
+			dssh_test_ossl_bn_random_begin(allocation_kex_random_mode);
+#endif
 		observed->target_result = kex(target);
+#ifdef DSSH_CRYPTO_OPENSSL
+		/* Failed methods may already have destroyed their native owner. */
+		if (allocation_kex_random_observe)
+			observed->random = dssh_test_ossl_bn_random_end(false);
+#endif
 		observed->calls = provider ? dssh_test_ossl_count() : dssh_test_alloc_count();
 		dssh_test_alloc_reset();
 		dssh_test_ossl_reset();
@@ -2771,95 +2788,47 @@ test_c25519_client_bad_qs_length(void)
 }
 
 #ifdef DSSH_CRYPTO_OPENSSL
-/* ================================================================
- * dh-gex: BN_rand failure during server-side KEX
- * ================================================================ */
-
+/* The named call is observed after checked negotiation, separately from the
+ * generic provider countdown. Fresh method frames own every failure case;
+ * native retained-owner recovery is qualified in test_dh_rng.c. */
 static int
-test_dhgex_server_bn_rand_fail(void)
+test_dh_private_rng_fail(void)
 {
-	if (!test_using_dhgex())
+	const char *method = test_kex_algo_name();
+	if (strcmp(method, "diffie-hellman-group-exchange-sha256") != 0
+	    && strcmp(method, "diffie-hellman-group14-sha256") != 0
+	    && strcmp(method, "diffie-hellman-group16-sha512") != 0)
 		return TEST_SKIP;
-
-	dssh_session server = kex_server_setup();
-	if (server == NULL)
-		return TEST_FAIL;
-
-	/* Build GEX_REQUEST + GEX_INIT with e=2 */
-	uint8_t wire_pkts[8192];
-	size_t wire_total = 0;
-
-	uint8_t req[16];
-	size_t rp = 0;
-	req[rp++] = 34; /* SSH_MSG_KEX_DH_GEX_REQUEST */
-	dssh_serialize_uint32(2048, req, sizeof(req), &rp);
-	dssh_serialize_uint32(4096, req, sizeof(req), &rp);
-	dssh_serialize_uint32(8192, req, sizeof(req), &rp);
-	wire_total += build_plaintext_packet(req, rp,
-	    &wire_pkts[wire_total], sizeof(wire_pkts) - wire_total);
-
-	uint8_t init[16];
-	size_t ip = 0;
-	init[ip++] = 32; /* SSH_MSG_KEX_DH_GEX_INIT */
-	dssh_serialize_uint32(1, init, sizeof(init), &ip);
-	init[ip++] = 0x02; /* mpint value 2 */
-	wire_total += build_plaintext_packet(init, ip,
-	    &wire_pkts[wire_total], sizeof(wire_pkts) - wire_total);
-
-	uint32_t saved_rx_seq = server->trans.rx_seq;
-	uint32_t saved_tx_seq = server->trans.tx_seq;
-
-	int prev_count = -1;
-	for (int n = 0; n < 500; n++) {
-		struct mock_io_state io;
-		if (mock_io_init(&io, 0) < 0)
-			break;
-		dssh_session_set_cbdata(server, &io, &io, &io, &io);
-		mock_io_inject(&io.c2s, wire_pkts, wire_total);
-
-		dssh_result_release(&server->trans.kex_result.lease);
-		server->trans.kex_result = (struct dssh_kex_result){0};
-		server->trans.rx_seq = saved_rx_seq;
-		server->trans.tx_seq = saved_tx_seq;
-		server->trans.rx_since_rekey = 0;
-		server->trans.tx_since_rekey = 0;
-		server->trans.tx_bytes_since_rekey = 0;
-		server->trans.rx_bytes_since_rekey = 0;
-		server->terminate = false;
-
-		dssh_test_ossl_fail_after(n);
-		int res = kex(server);
-		int cur_count = dssh_test_ossl_count();
-		dssh_test_ossl_reset();
-
-		uint8_t drain[16384];
-		mock_io_drain(&io.s2c, drain, sizeof(drain));
-
-		mock_io_close_c2s(&io);
-		mock_io_close_s2c(&io);
-		mock_io_free(&io);
-
-		if (res == 0) {
-			dssh_session_cleanup(server);
-			dssh_test_reset_global_config();
-			ASSERT_TRUE(n > 0);
-			return TEST_PASS;
+	static const unsigned modes[] = {0, 1, 0, 2, 0};
+	bool valid = true;
+	for (unsigned role = 0; role < 2; role++) {
+		for (size_t i = 0; i < sizeof(modes) / sizeof(modes[0]); i++) {
+			unsigned mode = modes[i];
+			struct allocation_kex_observation observed;
+			allocation_kex_random_observe = true;
+			allocation_kex_random_mode = mode;
+			int ret = allocation_kex_case(role == 0, true, -1, &observed);
+			allocation_kex_random_observe = false;
+			const struct dssh_test_bn_random_stats *random = &observed.random;
+			bool checked = ret == 0 && observed.valid && random->calls == 1
+			    && random->strength == 256 && random->range_bits >= 2047
+			    && random->context_present && random->constant_time
+			    && random->native_called == (mode != 1)
+			    && random->native_completed == (mode != 1)
+			    && random->in_range == (mode != 1)
+			    && (mode == 0 ? observed.completed : observed.target_result < 0 && !observed.completed);
+			if (printf("dh_random_method method=%s key=%s role=%u phase=%zu mode=%u calls=%u strength=%u native=%u completed=%u valid=%u\n",
+			        method, test_key_algo_name(), role, i, mode, random->calls,
+			        random->strength, random->native_called ? 1U : 0U,
+			        observed.completed ? 1U : 0U, checked ? 1U : 0U) < 0)
+				checked = false;
+			valid = valid && checked;
 		}
-		if (cur_count == prev_count) {
-			dssh_session_cleanup(server);
-			dssh_test_reset_global_config();
-			return TEST_PASS;
-		}
-		prev_count = cur_count;
 	}
-
-	fprintf(stderr, "  dhgex/server_bn_rand_fail: still incrementing "
-	    "at n=%d (count=%d)\n", 500, prev_count);
-	dssh_session_cleanup(server);
-	dssh_test_reset_global_config();
-	return TEST_FAIL;
+	ASSERT_TRUE(valid);
+	return TEST_PASS;
 }
-#endif /* DSSH_CRYPTO_OPENSSL -- dhgex bn_rand_fail */
+#endif /* DSSH_CRYPTO_OPENSSL -- named DH randomness */
 
 /* ================================================================
  * Test table
@@ -2948,7 +2917,7 @@ static struct dssh_test_entry tests[] = {
 	{ "c25519/server_truncated_init", test_c25519_server_truncated_init },
 	{ "c25519/client_bad_qs_length",  test_c25519_client_bad_qs_length },
 #ifdef DSSH_CRYPTO_OPENSSL
-	{ "dhgex/server_bn_rand_fail",    test_dhgex_server_bn_rand_fail },
+	{ "dh/private_rng_fail",          test_dh_private_rng_fail },
 #endif
 };
 

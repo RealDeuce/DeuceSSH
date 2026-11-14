@@ -1956,6 +1956,65 @@ foreach(allocation_key_mode IN ITEMS ed25519 rsa rsa512)
 	endforeach()
 endforeach()
 
+# Explicit allocation owners cover every supported KEX/key selection. Native
+# controls operate in fresh children and never fabricate native thread handles.
+set(ALLOCATION_THREADED_TESTS alloc/handshake_iterate alloc/auth_iterate alloc/conn_iterate)
+if(DEUCESSH_CRYPTO_BACKEND STREQUAL "OpenSSL")
+	list(APPEND ALLOCATION_THREADED_TESTS ossl/handshake_iterate)
+endif()
+foreach(allocation_kex IN ITEMS curve25519 dh-gex sntrup mlkem group14 group16)
+	foreach(allocation_key_mode IN ITEMS ed25519 rsa rsa512)
+		foreach(allocation_group IN LISTS ALLOCATION_THREADED_TESTS)
+			dssh_add_output_test(dssh_alloc_threaded_${allocation_kex}_${allocation_key_mode}_${allocation_group}
+				dssh_test_alloc "1 tests: 1 passed, 0 failed, 0 skipped" --exact ${allocation_group})
+			set_tests_properties(dssh_alloc_threaded_${allocation_kex}_${allocation_key_mode}_${allocation_group}
+				PROPERTIES FIXTURES_REQUIRED dssh_cached_keys
+				ENVIRONMENT "DSSH_TEST_KEY=${allocation_key_mode};DSSH_TEST_KEX=${allocation_kex};${DSSH_TEST_KEY_ENV}")
+		endforeach()
+	endforeach()
+endforeach()
+foreach(allocation_group IN ITEMS alloc/fixture_sync alloc/fixture_watchdog alloc/fixture_owner)
+	dssh_add_output_test(dssh_alloc_fixture_${allocation_group} dssh_test_alloc
+		"1 tests: 1 passed, 0 failed, 0 skipped" --exact ${allocation_group})
+	set_tests_properties(dssh_alloc_fixture_${allocation_group} PROPERTIES
+		FIXTURES_REQUIRED dssh_cached_keys
+		ENVIRONMENT "DSSH_TEST_KEY=ed25519;DSSH_TEST_KEX=curve25519;${DSSH_TEST_KEY_ENV}")
+endforeach()
+if(Python3_Interpreter_FOUND AND UNIX)
+	dssh_add_test(allocation_owner test_alloc.c)
+	target_sources(dssh_test_allocation_owner PRIVATE peer_thread_failures.c)
+	target_link_libraries(dssh_test_allocation_owner PRIVATE dssh_mock_io dssh_mock_alloc)
+	set(allocation_create_symbol thrd_create)
+	set(allocation_join_symbol thrd_join)
+	if(DSSH_THREADS_SHIM_INCLUDE)
+		set(allocation_create_symbol dssh_thread_thrd_create)
+		set(allocation_join_symbol dssh_thread_thrd_join)
+	endif()
+	target_link_options(dssh_test_allocation_owner PRIVATE ${DSSH_WRAP_FLAGS}
+		"-Wl,--wrap=${allocation_create_symbol},--wrap=${allocation_join_symbol},--wrap=mock_tx_client")
+	set(allocation_owner_modes plain tx create-0 create-1 create-2 assert-0 assert-1 assert-2 assert-3)
+	foreach(index RANGE 0 2)
+		list(APPEND allocation_owner_modes join-${index}-retained join-${index}-released)
+	endforeach()
+	foreach(site IN ITEMS gate.enter_lock gate.arrive_notify gate.enter_wait
+	    gate.ready_lock gate.ready_wait gate.release_lock gate.release_notify
+	    gate.cancel_lock gate.cancel_notify watch.enter_lock watch.enter_wait
+	    watch.cancel_lock watch.cancel_notify)
+		list(APPEND allocation_owner_modes sync-${site}-error)
+	endforeach()
+	foreach(site IN ITEMS gate.enter_unlock gate.ready_unlock gate.release_unlock
+	    gate.cancel_unlock watch.enter_unlock watch.cancel_unlock)
+		list(APPEND allocation_owner_modes sync-${site}-retained sync-${site}-released)
+	endforeach()
+	foreach(mode IN LISTS allocation_owner_modes)
+		add_test(NAME dssh_alloc_owner_${mode} COMMAND ${Python3_EXECUTABLE}
+			${CMAKE_CURRENT_SOURCE_DIR}/allocation_owner_controls.py
+			$<TARGET_FILE:dssh_test_allocation_owner> ${mode})
+		set_tests_properties(dssh_alloc_owner_${mode} PROPERTIES FIXTURES_REQUIRED dssh_cached_keys
+			ENVIRONMENT "DSSH_TEST_KEY=ed25519;DSSH_TEST_KEX=curve25519;${DSSH_TEST_KEY_ENV}")
+	endforeach()
+endif()
+
 # Targeted coverage tests — run in their own process for clean state
 add_test(NAME dssh_targeted_c25519_server_trunc
 	COMMAND dssh_test_alloc c25519/server_truncated_init)

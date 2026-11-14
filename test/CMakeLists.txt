@@ -1975,6 +1975,7 @@ dssh_add_test(transport_errors test_transport_errors.c)
 target_link_libraries(dssh_test_transport_errors PRIVATE
 	dssh_mock_io dssh_test_algos)
 set(TRANSPORT_ERROR_TESTS
+	fixture/setup_allocations fixture/ownership
 	test_modules/roundtrip
 	send/encrypt_error send/mac_error send/mac_overflow_rejected
 	send/sensitive_success send/sensitive_gather_success
@@ -1985,11 +1986,34 @@ set(TRANSPORT_ERROR_TESTS
 	newkeys/enc_init_failure newkeys/mac_init_failure
 )
 foreach(t ${TRANSPORT_ERROR_TESTS})
-	add_test(NAME dssh_transport_errors_${t}
-		COMMAND dssh_test_transport_errors ${t})
+	dssh_add_output_test(dssh_transport_errors_${t} dssh_test_transport_errors
+		"1 tests: 1 passed, 0 failed, 0 skipped" --exact ${t})
 	set_tests_properties(dssh_transport_errors_${t} PROPERTIES
-		ENVIRONMENT "${DSSH_TEST_KEY_ENV}")
+		ENVIRONMENT "${DSSH_TEST_KEY_ENV}"
+		FAIL_REGULAR_EXPRESSION "AddressSanitizer;ThreadSanitizer;UndefinedBehaviorSanitizer;runtime error:")
 endforeach()
+if(Python3_Interpreter_FOUND AND UNIX AND NOT APPLE)
+	dssh_add_test(transport_fixture_owner test_transport_errors.c)
+	target_sources(dssh_test_transport_fixture_owner PRIVATE peer_thread_failures.c)
+	target_link_libraries(dssh_test_transport_fixture_owner PRIVATE dssh_mock_io dssh_test_algos)
+	set(create_symbol thrd_create)
+	set(join_symbol thrd_join)
+	if(DSSH_THREADS_SHIM_INCLUDE)
+		set(create_symbol dssh_thread_thrd_create)
+		set(join_symbol dssh_thread_thrd_join)
+	endif()
+	target_link_options(dssh_test_transport_fixture_owner PRIVATE
+		"-Wl,--wrap=${create_symbol},--wrap=${join_symbol},--wrap=mock_tx_client")
+	set(owner_modes plain tx create-0 create-1 assert-0 assert-1 assert-2)
+	foreach(index RANGE 0 1)
+		list(APPEND owner_modes join-${index}-retained join-${index}-released)
+	endforeach()
+	foreach(mode IN LISTS owner_modes)
+		add_test(NAME dssh_fixture_owner_${mode} COMMAND ${Python3_EXECUTABLE}
+			${CMAKE_CURRENT_SOURCE_DIR}/fixture_owner_controls.py
+			$<TARGET_FILE:dssh_test_transport_fixture_owner> ${mode})
+	endforeach()
+endif()
 set_tests_properties(
 	dssh_transport_errors_send/channel_slot_drain_fatal
 	dssh_transport_errors_send/channel_slot_gather_fatal

@@ -12,13 +12,15 @@ text_entry_matches(const struct dssh_event_entry *entry, const uint8_t *bytes, s
 static int
 test_event_text_queue_lifetime(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	uint8_t bytes[300];
 	for (size_t i = 0; i < sizeof(bytes); i++) {
 		uint8_t value = (uint8_t)(i % 251);
 		bytes[i] = value;
 	}
 	struct dssh_event_queue q;
-	ASSERT_OK(event_queue_init(&q, 64, 32768));
+	ASSERT_OK(chan_unit_event_init(&fixture, &q, 64, 32768));
 	struct dssh_event_entry e = {.type = DSSH_EVENT_EXIT_SIGNAL,
 	    .text_a = {.data = bytes, .len = sizeof(bytes)},
 	    .text_b = {.data = bytes, .len = sizeof(bytes)},
@@ -48,23 +50,25 @@ test_event_text_queue_lifetime(void)
 	}
 	int allocations = dssh_test_alloc_count();
 	dssh_test_alloc_reset();
-	event_queue_free(&q);
+	chan_unit_event_free(&fixture, &q);
 	ASSERT_EQ(ret, 0);
 	ASSERT_TRUE(valid);
 	ASSERT_EQ(allocations, 0);
-	return TEST_PASS;
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int
 test_event_text_queue_rollback(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	uint8_t bytes[300];
 	memset(bytes, 0x85, sizeof(bytes));
 	struct dssh_event_entry e = {.type = DSSH_EVENT_SIGNAL,
 	    .text_a = {.data = bytes, .len = sizeof(bytes)}};
 	for (int fail = 0; fail < 2; fail++) {
 		struct dssh_event_queue q;
-		ASSERT_OK(event_queue_init(&q, 64, 32768));
+		ASSERT_OK(chan_unit_event_init(&fixture, &q, 64, 32768));
 		for (int i = 0; i < 8; i++)
 			ASSERT_OK(event_queue_push(&q, &e));
 		size_t old_text_capacity = q.text_capacity;
@@ -82,16 +86,18 @@ test_event_text_queue_rollback(void)
 			ASSERT_TRUE(event_queue_freeze(&q));
 			ASSERT_TRUE(dssh_test_bytes_equal(q.frozen.text_a, bytes, sizeof(bytes)));
 		}
-		event_queue_free(&q);
+		chan_unit_event_free(&fixture, &q);
 	}
-	return TEST_PASS;
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int
 test_event_text_queue_envelope(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_event_queue q;
-	ASSERT_OK(event_queue_init(&q, 0, 64));
+	ASSERT_OK(chan_unit_event_init(&fixture, &q, 0, 64));
 	struct dssh_event_entry e = {.type = DSSH_EVENT_EOF};
 	int ret = 0;
 	size_t pushed = 0;
@@ -116,6 +122,6 @@ test_event_text_queue_envelope(void)
 	ASSERT_OK(event_queue_push(&q, &e));
 	ASSERT_TRUE(event_queue_freeze(&q));
 	ASSERT_TRUE(dssh_test_bytes_equal(q.frozen.text_a, bytes, 64));
-	event_queue_free(&q);
-	return TEST_PASS;
+	chan_unit_event_free(&fixture, &q);
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }

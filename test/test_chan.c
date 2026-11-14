@@ -10,6 +10,7 @@
 #include "dssh_test_internal.h"
 #include "deucessh-conn.h"
 #include "dssh_test_alloc.h"
+#include "channel_unit_fixture.h"
 
 /* ================================================================
  * Bytebuf -- circular byte buffer
@@ -17,23 +18,27 @@
 
 static int test_bytebuf_init_free(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_bytebuf b;
-	ASSERT_OK(bytebuf_init(&b, 256));
+	ASSERT_OK(chan_unit_bytebuf_init(&fixture, &b, 256));
 	ASSERT_NOT_NULL(b.data);
 	ASSERT_EQ_U(b.capacity, 256);
 	ASSERT_EQ_U(b.head, 0);
 	ASSERT_EQ_U(b.tail, 0);
 	ASSERT_EQ_U(b.used, 0);
 	ASSERT_EQ_U(b.total, 0);
-	bytebuf_free(&b);
+	chan_unit_bytebuf_free(&fixture, &b);
 	ASSERT_NULL(b.data);
-	return TEST_PASS;
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int test_bytebuf_write_read_basic(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_bytebuf b;
-	ASSERT_OK(bytebuf_init(&b, 64));
+	ASSERT_OK(chan_unit_bytebuf_init(&fixture, &b, 64));
 
 	const uint8_t msg[] = "Hello, world!";
 	size_t wrote = bytebuf_write(&b, msg, sizeof(msg));
@@ -47,27 +52,31 @@ static int test_bytebuf_write_read_basic(void)
 	ASSERT_MEM_EQ(out, msg, sizeof(msg));
 	ASSERT_EQ_U(bytebuf_available(&b), 0);
 
-	bytebuf_free(&b);
-	return TEST_PASS;
+	chan_unit_bytebuf_free(&fixture, &b);
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int test_bytebuf_empty_read(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_bytebuf b;
-	ASSERT_OK(bytebuf_init(&b, 32));
+	ASSERT_OK(chan_unit_bytebuf_init(&fixture, &b, 32));
 
 	uint8_t out[16];
 	size_t got = bytebuf_read(&b, out, sizeof(out), 0);
 	ASSERT_EQ_U(got, 0);
 
-	bytebuf_free(&b);
-	return TEST_PASS;
+	chan_unit_bytebuf_free(&fixture, &b);
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int test_bytebuf_write_full(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_bytebuf b;
-	ASSERT_OK(bytebuf_init(&b, 8));
+	ASSERT_OK(chan_unit_bytebuf_init(&fixture, &b, 8));
 
 	uint8_t data[16];
 	memset(data, 0xAA, sizeof(data));
@@ -81,14 +90,16 @@ static int test_bytebuf_write_full(void)
 	size_t wrote2 = bytebuf_write(&b, data, 1);
 	ASSERT_EQ_U(wrote2, 0);
 
-	bytebuf_free(&b);
-	return TEST_PASS;
+	chan_unit_bytebuf_free(&fixture, &b);
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int test_bytebuf_partial_write(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_bytebuf b;
-	ASSERT_OK(bytebuf_init(&b, 10));
+	ASSERT_OK(chan_unit_bytebuf_init(&fixture, &b, 10));
 
 	uint8_t data[7];
 	memset(data, 'A', sizeof(data));
@@ -102,62 +113,68 @@ static int test_bytebuf_partial_write(void)
 	ASSERT_EQ_U(wrote, 3);
 	ASSERT_EQ_U(bytebuf_available(&b), 10);
 
-	bytebuf_free(&b);
-	return TEST_PASS;
+	chan_unit_bytebuf_free(&fixture, &b);
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int test_bytebuf_free_space(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_bytebuf b;
-	ASSERT_OK(bytebuf_init(&b, 100));
+	ASSERT_OK(chan_unit_bytebuf_init(&fixture, &b, 100));
 
 	ASSERT_EQ_U(bytebuf_free_space(&b), 100);
 	ASSERT_EQ_U(bytebuf_available(&b), 0);
 
 	uint8_t data[40];
 	memset(data, 'X', sizeof(data));
-	bytebuf_write(&b, data, 40);
+	ASSERT_EQ_U(bytebuf_write(&b, data, 40), 40);
 	ASSERT_EQ_U(bytebuf_free_space(&b), 60);
 	ASSERT_EQ_U(bytebuf_available(&b), 40);
 
-	bytebuf_free(&b);
-	return TEST_PASS;
+	chan_unit_bytebuf_free(&fixture, &b);
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int test_bytebuf_total_monotonic(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_bytebuf b;
-	ASSERT_OK(bytebuf_init(&b, 16));
+	ASSERT_OK(chan_unit_bytebuf_init(&fixture, &b, 16));
 
 	uint8_t data[4] = {1, 2, 3, 4};
-	bytebuf_write(&b, data, 4);
+	ASSERT_EQ_U(bytebuf_write(&b, data, 4), 4);
 	ASSERT_EQ_U(b.total, 4);
 
 	uint8_t out[4];
-	bytebuf_read(&b, out, sizeof(out), 0);
+	ASSERT_EQ_U(bytebuf_read(&b, out, sizeof(out), 0), sizeof(out));
 	ASSERT_EQ_U(b.total, 4);  /* total doesn't decrease on read */
 
-	bytebuf_write(&b, data, 4);
+	ASSERT_EQ_U(bytebuf_write(&b, data, 4), 4);
 	ASSERT_EQ_U(b.total, 8);
 
-	bytebuf_write(&b, data, 4);
+	ASSERT_EQ_U(bytebuf_write(&b, data, 4), 4);
 	ASSERT_EQ_U(b.total, 12);
 
-	bytebuf_free(&b);
-	return TEST_PASS;
+	chan_unit_bytebuf_free(&fixture, &b);
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int test_bytebuf_wrap_around(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_bytebuf b;
-	ASSERT_OK(bytebuf_init(&b, 8));
+	ASSERT_OK(chan_unit_bytebuf_init(&fixture, &b, 8));
 
 	uint8_t data[6] = {1, 2, 3, 4, 5, 6};
-	bytebuf_write(&b, data, 6);
+	ASSERT_EQ_U(bytebuf_write(&b, data, 6), 6);
 
 	/* Read 4 bytes to advance head */
 	uint8_t out[8];
-	bytebuf_read(&b, out, 4, 0);
+	ASSERT_EQ_U(bytebuf_read(&b, out, 4, 0), 4);
 	ASSERT_EQ_U(bytebuf_available(&b), 2);
 
 	/* Write 6 more bytes -- wraps around */
@@ -172,22 +189,24 @@ static int test_bytebuf_wrap_around(void)
 	uint8_t expected[] = {5, 6, 10, 20, 30, 40, 50, 60};
 	ASSERT_MEM_EQ(out, expected, 8);
 
-	bytebuf_free(&b);
-	return TEST_PASS;
+	chan_unit_bytebuf_free(&fixture, &b);
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int test_bytebuf_wrap_write_split(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_bytebuf b;
-	ASSERT_OK(bytebuf_init(&b, 8));
+	ASSERT_OK(chan_unit_bytebuf_init(&fixture, &b, 8));
 
 	/* Fill and drain to position tail near end */
 	uint8_t fill[7];
 	memset(fill, 'A', 7);
-	bytebuf_write(&b, fill, 7);
+	ASSERT_EQ_U(bytebuf_write(&b, fill, 7), 7);
 
 	uint8_t out[8];
-	bytebuf_read(&b, out, 7, 0);
+	ASSERT_EQ_U(bytebuf_read(&b, out, 7, 0), 7);
 	/* head=7, tail=7 */
 
 	/* Write 5 bytes -- 1 at end, 4 at start */
@@ -199,19 +218,21 @@ static int test_bytebuf_wrap_write_split(void)
 	ASSERT_EQ_U(got, 5);
 	ASSERT_MEM_EQ(out, data, 5);
 
-	bytebuf_free(&b);
-	return TEST_PASS;
+	chan_unit_bytebuf_free(&fixture, &b);
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int test_bytebuf_read_limit(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_bytebuf b;
-	ASSERT_OK(bytebuf_init(&b, 64));
+	ASSERT_OK(chan_unit_bytebuf_init(&fixture, &b, 64));
 
 	uint8_t data[20];
 	for (int i = 0; i < 20; i++)
 		data[i] = (uint8_t)i;
-	bytebuf_write(&b, data, 20);
+	ASSERT_EQ_U(bytebuf_write(&b, data, 20), 20);
 
 	/* Read with limit = 5 */
 	uint8_t out[64];
@@ -222,50 +243,56 @@ static int test_bytebuf_read_limit(void)
 	/* Remaining 15 still available */
 	ASSERT_EQ_U(bytebuf_available(&b), 15);
 
-	bytebuf_free(&b);
-	return TEST_PASS;
+	chan_unit_bytebuf_free(&fixture, &b);
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int test_bytebuf_read_limit_vs_bufsz(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_bytebuf b;
-	ASSERT_OK(bytebuf_init(&b, 64));
+	ASSERT_OK(chan_unit_bytebuf_init(&fixture, &b, 64));
 
 	uint8_t data[30];
 	memset(data, 'Z', 30);
-	bytebuf_write(&b, data, 30);
+	ASSERT_EQ_U(bytebuf_write(&b, data, 30), 30);
 
 	/* bufsz=10 but limit=20 -- bufsz should cap it */
 	uint8_t out[10];
 	size_t got = bytebuf_read(&b, out, 10, 20);
 	ASSERT_EQ_U(got, 10);
 
-	bytebuf_free(&b);
-	return TEST_PASS;
+	chan_unit_bytebuf_free(&fixture, &b);
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int test_bytebuf_read_limit_zero(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_bytebuf b;
-	ASSERT_OK(bytebuf_init(&b, 64));
+	ASSERT_OK(chan_unit_bytebuf_init(&fixture, &b, 64));
 
 	uint8_t data[15];
 	memset(data, 'Q', 15);
-	bytebuf_write(&b, data, 15);
+	ASSERT_EQ_U(bytebuf_write(&b, data, 15), 15);
 
 	/* limit=0 means no limit */
 	uint8_t out[64];
 	size_t got = bytebuf_read(&b, out, sizeof(out), 0);
 	ASSERT_EQ_U(got, 15);
 
-	bytebuf_free(&b);
-	return TEST_PASS;
+	chan_unit_bytebuf_free(&fixture, &b);
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int test_bytebuf_multiple_write_read_cycles(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_bytebuf b;
-	ASSERT_OK(bytebuf_init(&b, 16));
+	ASSERT_OK(chan_unit_bytebuf_init(&fixture, &b, 16));
 
 	uint8_t out[16];
 	for (int cycle = 0; cycle < 20; cycle++) {
@@ -283,55 +310,61 @@ static int test_bytebuf_multiple_write_read_cycles(void)
 	}
 	ASSERT_EQ_U(b.total, 100);
 
-	bytebuf_free(&b);
-	return TEST_PASS;
+	chan_unit_bytebuf_free(&fixture, &b);
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int test_bytebuf_wrap_read_split(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_bytebuf b;
-	ASSERT_OK(bytebuf_init(&b, 8));
+	ASSERT_OK(chan_unit_bytebuf_init(&fixture, &b, 8));
 
 	/* Position head near end */
 	uint8_t fill[6];
 	memset(fill, 'X', 6);
-	bytebuf_write(&b, fill, 6);
+	ASSERT_EQ_U(bytebuf_write(&b, fill, 6), 6);
 
 	uint8_t out[8];
-	bytebuf_read(&b, out, 6, 0);
+	ASSERT_EQ_U(bytebuf_read(&b, out, 6, 0), 6);
 	/* head=6, tail=6 */
 
 	/* Write 6 bytes wrapping: 2 at end + 4 at start */
 	uint8_t data[6] = {10, 20, 30, 40, 50, 60};
-	bytebuf_write(&b, data, 6);
+	ASSERT_EQ_U(bytebuf_write(&b, data, 6), 6);
 
 	/* Read all 6 -- splits across wrap boundary */
 	size_t got = bytebuf_read(&b, out, sizeof(out), 0);
 	ASSERT_EQ_U(got, 6);
 	ASSERT_MEM_EQ(out, data, 6);
 
-	bytebuf_free(&b);
-	return TEST_PASS;
+	chan_unit_bytebuf_free(&fixture, &b);
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int test_bytebuf_zero_len_write(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_bytebuf b;
-	ASSERT_OK(bytebuf_init(&b, 16));
+	ASSERT_OK(chan_unit_bytebuf_init(&fixture, &b, 16));
 
 	size_t wrote = bytebuf_write(&b, (const uint8_t *)"x", 0);
 	ASSERT_EQ_U(wrote, 0);
 	ASSERT_EQ_U(bytebuf_available(&b), 0);
 	ASSERT_EQ_U(b.total, 0);
 
-	bytebuf_free(&b);
-	return TEST_PASS;
+	chan_unit_bytebuf_free(&fixture, &b);
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int test_bytebuf_single_byte_ops(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_bytebuf b;
-	ASSERT_OK(bytebuf_init(&b, 4));
+	ASSERT_OK(chan_unit_bytebuf_init(&fixture, &b, 4));
 
 	/* Write and read one byte at a time, cycling through */
 	for (int i = 0; i < 20; i++) {
@@ -343,14 +376,16 @@ static int test_bytebuf_single_byte_ops(void)
 		ASSERT_EQ(out, val);
 	}
 
-	bytebuf_free(&b);
-	return TEST_PASS;
+	chan_unit_bytebuf_free(&fixture, &b);
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int test_bytebuf_exact_capacity(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_bytebuf b;
-	ASSERT_OK(bytebuf_init(&b, 8));
+	ASSERT_OK(chan_unit_bytebuf_init(&fixture, &b, 8));
 
 	uint8_t data[8] = {1, 2, 3, 4, 5, 6, 7, 8};
 	ASSERT_EQ_U(bytebuf_write(&b, data, 8), 8);
@@ -362,19 +397,21 @@ static int test_bytebuf_exact_capacity(void)
 	ASSERT_MEM_EQ(out, data, 8);
 	ASSERT_EQ_U(bytebuf_free_space(&b), 8);
 
-	bytebuf_free(&b);
-	return TEST_PASS;
+	chan_unit_bytebuf_free(&fixture, &b);
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int test_bytebuf_read_limit_less_than_available(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_bytebuf b;
-	ASSERT_OK(bytebuf_init(&b, 32));
+	ASSERT_OK(chan_unit_bytebuf_init(&fixture, &b, 32));
 
 	uint8_t data[20];
 	for (int i = 0; i < 20; i++)
 		data[i] = (uint8_t)i;
-	bytebuf_write(&b, data, 20);
+	ASSERT_EQ_U(bytebuf_write(&b, data, 20), 20);
 
 	/* limit=3, bufsz=32 -- should read exactly 3 */
 	uint8_t out[32];
@@ -387,14 +424,16 @@ static int test_bytebuf_read_limit_less_than_available(void)
 	ASSERT_EQ_U(got, 17);
 	ASSERT_MEM_EQ(out, data + 3, 17);
 
-	bytebuf_free(&b);
-	return TEST_PASS;
+	chan_unit_bytebuf_free(&fixture, &b);
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int test_bytebuf_fill_drain_refill(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_bytebuf b;
-	ASSERT_OK(bytebuf_init(&b, 8));
+	ASSERT_OK(chan_unit_bytebuf_init(&fixture, &b, 8));
 
 	/* Fill completely */
 	uint8_t data[8] = {1, 2, 3, 4, 5, 6, 7, 8};
@@ -412,70 +451,76 @@ static int test_bytebuf_fill_drain_refill(void)
 	ASSERT_EQ_U(bytebuf_read(&b, out, 8, 0), 8);
 	ASSERT_MEM_EQ(out, data2, 8);
 
-	bytebuf_free(&b);
-	return TEST_PASS;
+	chan_unit_bytebuf_free(&fixture, &b);
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int test_bytebuf_available_after_partial_read(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_bytebuf b;
-	ASSERT_OK(bytebuf_init(&b, 32));
+	ASSERT_OK(chan_unit_bytebuf_init(&fixture, &b, 32));
 
 	uint8_t data[20];
 	memset(data, 'M', 20);
-	bytebuf_write(&b, data, 20);
+	ASSERT_EQ_U(bytebuf_write(&b, data, 20), 20);
 
 	uint8_t out[5];
-	bytebuf_read(&b, out, 5, 0);
+	ASSERT_EQ_U(bytebuf_read(&b, out, 5, 0), 5);
 	ASSERT_EQ_U(bytebuf_available(&b), 15);
 
-	bytebuf_read(&b, out, 5, 0);
+	ASSERT_EQ_U(bytebuf_read(&b, out, 5, 0), 5);
 	ASSERT_EQ_U(bytebuf_available(&b), 10);
 
-	bytebuf_read(&b, out, 5, 0);
+	ASSERT_EQ_U(bytebuf_read(&b, out, 5, 0), 5);
 	ASSERT_EQ_U(bytebuf_available(&b), 5);
 
-	bytebuf_read(&b, out, 5, 0);
+	ASSERT_EQ_U(bytebuf_read(&b, out, 5, 0), 5);
 	ASSERT_EQ_U(bytebuf_available(&b), 0);
 
-	bytebuf_free(&b);
-	return TEST_PASS;
+	chan_unit_bytebuf_free(&fixture, &b);
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int test_bytebuf_total_survives_wrap(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_bytebuf b;
-	ASSERT_OK(bytebuf_init(&b, 8));
+	ASSERT_OK(chan_unit_bytebuf_init(&fixture, &b, 8));
 
 	/* Write/read cycles that wrap multiple times */
 	uint8_t data[6], out[6];
 	memset(data, 'W', 6);
 	for (int i = 0; i < 10; i++) {
-		bytebuf_write(&b, data, 6);
-		bytebuf_read(&b, out, 6, 0);
+		ASSERT_EQ_U(bytebuf_write(&b, data, 6), 6);
+		ASSERT_EQ_U(bytebuf_read(&b, out, 6, 0), 6);
 	}
 	ASSERT_EQ_U(b.total, 60);
 
-	bytebuf_free(&b);
-	return TEST_PASS;
+	chan_unit_bytebuf_free(&fixture, &b);
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int test_bytebuf_read_limit_with_wrap(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_bytebuf b;
-	ASSERT_OK(bytebuf_init(&b, 8));
+	ASSERT_OK(chan_unit_bytebuf_init(&fixture, &b, 8));
 
 	/* Position near end */
 	uint8_t fill[6];
 	memset(fill, 'X', 6);
-	bytebuf_write(&b, fill, 6);
+	ASSERT_EQ_U(bytebuf_write(&b, fill, 6), 6);
 
 	uint8_t out[8];
-	bytebuf_read(&b, out, 6, 0);
+	ASSERT_EQ_U(bytebuf_read(&b, out, 6, 0), 6);
 
 	/* Write 7 bytes wrapping around */
 	uint8_t data[7] = {1, 2, 3, 4, 5, 6, 7};
-	bytebuf_write(&b, data, 7);
+	ASSERT_EQ_U(bytebuf_write(&b, data, 7), 7);
 
 	/* Read with limit=3 -- should cross wrap boundary correctly */
 	size_t got = bytebuf_read(&b, out, sizeof(out), 3);
@@ -487,21 +532,23 @@ static int test_bytebuf_read_limit_with_wrap(void)
 	ASSERT_EQ_U(got, 4);
 	ASSERT_MEM_EQ(out, data + 3, 4);
 
-	bytebuf_free(&b);
-	return TEST_PASS;
+	chan_unit_bytebuf_free(&fixture, &b);
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int test_bytebuf_partial_write_at_wrap(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_bytebuf b;
-	ASSERT_OK(bytebuf_init(&b, 8));
+	ASSERT_OK(chan_unit_bytebuf_init(&fixture, &b, 8));
 
 	/* Advance to tail=6 by writing 6 and reading 6 */
 	uint8_t fill[6];
 	memset(fill, 'F', 6);
-	bytebuf_write(&b, fill, 6);
+	ASSERT_EQ_U(bytebuf_write(&b, fill, 6), 6);
 	uint8_t out[8];
-	bytebuf_read(&b, out, 6, 0);
+	ASSERT_EQ_U(bytebuf_read(&b, out, 6, 0), 6);
 
 	/* Write 3 bytes to partially fill the end */
 	uint8_t d1[3] = {1, 2, 3};
@@ -519,24 +566,26 @@ static int test_bytebuf_partial_write_at_wrap(void)
 	uint8_t expected[8] = {1, 2, 3, 10, 20, 30, 40, 50};
 	ASSERT_MEM_EQ(out, expected, 8);
 
-	bytebuf_free(&b);
-	return TEST_PASS;
+	chan_unit_bytebuf_free(&fixture, &b);
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int test_bytebuf_head_tail_reset_after_free(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_bytebuf b;
-	ASSERT_OK(bytebuf_init(&b, 16));
+	ASSERT_OK(chan_unit_bytebuf_init(&fixture, &b, 16));
 
 	uint8_t data[10];
 	memset(data, 'R', 10);
-	bytebuf_write(&b, data, 10);
-	bytebuf_free(&b);
+	ASSERT_EQ_U(bytebuf_write(&b, data, 10), 10);
+	chan_unit_bytebuf_free(&fixture, &b);
 
 	ASSERT_NULL(b.data);
 	ASSERT_EQ_U(b.used, 0);
 
-	return TEST_PASS;
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 /* ================================================================
@@ -545,15 +594,19 @@ static int test_bytebuf_head_tail_reset_after_free(void)
 
 static int test_acceptqueue_init_free(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_accept_queue q;
 	acceptqueue_init(&q);
 	ASSERT_EQ_U(q.count, 0);
 	acceptqueue_free(&q);
-	return TEST_PASS;
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int test_acceptqueue_push_pop_single(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_accept_queue q;
 	acceptqueue_init(&q);
 
@@ -571,11 +624,13 @@ static int test_acceptqueue_push_pop_single(void)
 	ASSERT_STR_EQ(entry.channel_type, "session");
 
 	acceptqueue_free(&q);
-	return TEST_PASS;
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int test_acceptqueue_pop_empty(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_accept_queue q;
 	acceptqueue_init(&q);
 
@@ -583,20 +638,22 @@ static int test_acceptqueue_pop_empty(void)
 	ASSERT_EQ(acceptqueue_pop(&q, &entry), -1);
 
 	acceptqueue_free(&q);
-	return TEST_PASS;
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int test_acceptqueue_fifo_order(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_accept_queue q;
 	acceptqueue_init(&q);
 
-	acceptqueue_push(&q, 1, 100, 50,
-	    (const uint8_t *)"session", 7);
-	acceptqueue_push(&q, 2, 200, 100,
-	    (const uint8_t *)"direct-tcpip", 12);
-	acceptqueue_push(&q, 3, 300, 150,
-	    (const uint8_t *)"forwarded-tcpip", 15);
+	ASSERT_OK(acceptqueue_push(&q, 1, 100, 50,
+	    (const uint8_t *)"session", 7));
+	ASSERT_OK(acceptqueue_push(&q, 2, 200, 100,
+	    (const uint8_t *)"direct-tcpip", 12));
+	ASSERT_OK(acceptqueue_push(&q, 3, 300, 150,
+	    (const uint8_t *)"forwarded-tcpip", 15));
 
 	struct dssh_incoming_open e;
 	int pop_ret;
@@ -620,11 +677,13 @@ static int test_acceptqueue_fifo_order(void)
 	ASSERT_EQ(acceptqueue_pop(&q, &e), -1);
 
 	acceptqueue_free(&q);
-	return TEST_PASS;
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int test_acceptqueue_type_truncation(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_accept_queue q;
 	acceptqueue_init(&q);
 
@@ -646,11 +705,13 @@ static int test_acceptqueue_type_truncation(void)
 	ASSERT_EQ(e.channel_type[63], '\0');
 
 	acceptqueue_free(&q);
-	return TEST_PASS;
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int test_acceptqueue_exact_63_type(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_accept_queue q;
 	acceptqueue_init(&q);
 
@@ -667,11 +728,13 @@ static int test_acceptqueue_exact_63_type(void)
 	ASSERT_EQ_U(strlen(e.channel_type), 63);
 
 	acceptqueue_free(&q);
-	return TEST_PASS;
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int test_acceptqueue_empty_type(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_accept_queue q;
 	acceptqueue_init(&q);
 
@@ -685,11 +748,13 @@ static int test_acceptqueue_empty_type(void)
 	ASSERT_EQ(e.channel_type[0], '\0');
 
 	acceptqueue_free(&q);
-	return TEST_PASS;
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int test_acceptqueue_many_entries(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_accept_queue q;
 	acceptqueue_init(&q);
 
@@ -700,7 +765,10 @@ static int test_acceptqueue_many_entries(void)
 		/* Fill to capacity */
 		for (uint32_t i = 0; i < DSSH_ACCEPT_QUEUE_CAP; i++) {
 			char type[16];
-			snprintf(type, sizeof(type), "ch%u", seq + i);
+			int formatted = snprintf(type, sizeof(type), "ch%" PRIu32, seq + i);
+			ASSERT_TRUE(formatted >= 0);
+			uintmax_t formatted_size = (uintmax_t)formatted;
+			ASSERT_TRUE(formatted_size < sizeof(type));
 			ASSERT_OK(acceptqueue_push(&q, seq + i,
 			    (seq + i) * 100, (seq + i) * 50,
 			    (const uint8_t *)type, strlen(type)));
@@ -716,8 +784,11 @@ static int test_acceptqueue_many_entries(void)
 			ASSERT_EQ(e.peer_max_packet, (seq + i) * 50);
 
 			char expected[16];
-			snprintf(expected, sizeof(expected), "ch%u",
+			int formatted = snprintf(expected, sizeof(expected), "ch%" PRIu32,
 			    seq + i);
+			ASSERT_TRUE(formatted >= 0);
+			uintmax_t formatted_size = (uintmax_t)formatted;
+			ASSERT_TRUE(formatted_size < sizeof(expected));
 			ASSERT_STR_EQ(e.channel_type, expected);
 		}
 
@@ -728,26 +799,30 @@ static int test_acceptqueue_many_entries(void)
 	ASSERT_EQ(acceptqueue_pop(&q, &e), -1);
 
 	acceptqueue_free(&q);
-	return TEST_PASS;
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int test_acceptqueue_free_nonempty(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_accept_queue q;
 	acceptqueue_init(&q);
 
-	acceptqueue_push(&q, 1, 100, 50,
-	    (const uint8_t *)"session", 7);
-	acceptqueue_push(&q, 2, 200, 100,
-	    (const uint8_t *)"session", 7);
+	ASSERT_OK(acceptqueue_push(&q, 1, 100, 50,
+	    (const uint8_t *)"session", 7));
+	ASSERT_OK(acceptqueue_push(&q, 2, 200, 100,
+	    (const uint8_t *)"session", 7));
 
 	acceptqueue_free(&q);
 	ASSERT_EQ_U(q.count, 0);
-	return TEST_PASS;
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int test_acceptqueue_peer_values(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_accept_queue q;
 	acceptqueue_init(&q);
 
@@ -763,11 +838,13 @@ static int test_acceptqueue_peer_values(void)
 	ASSERT_EQ_U(e.peer_max_packet, UINT32_MAX);
 
 	acceptqueue_free(&q);
-	return TEST_PASS;
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int test_acceptqueue_push_pop_interleaved(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_accept_queue q;
 	acceptqueue_init(&q);
 
@@ -784,17 +861,19 @@ static int test_acceptqueue_push_pop_interleaved(void)
 	ASSERT_EQ(acceptqueue_pop(&q, &e), -1);
 
 	acceptqueue_free(&q);
-	return TEST_PASS;
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int test_acceptqueue_type_nul_terminated(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_accept_queue q;
 	acceptqueue_init(&q);
 
 	/* Push binary data as type -- should be NUL-terminated */
 	uint8_t binary[10] = {65, 66, 67, 0, 68, 69, 70, 0, 71, 72};
-	acceptqueue_push(&q, 0, 0, 0, binary, 10);
+	ASSERT_OK(acceptqueue_push(&q, 0, 0, 0, binary, 10));
 
 	struct dssh_incoming_open e;
 	int pop_ret = acceptqueue_pop(&q, &e);
@@ -806,11 +885,13 @@ static int test_acceptqueue_type_nul_terminated(void)
 	ASSERT_EQ(e.channel_type[2], 'C');
 
 	acceptqueue_free(&q);
-	return TEST_PASS;
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int test_acceptqueue_zero_window_packet(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_accept_queue q;
 	acceptqueue_init(&q);
 
@@ -825,11 +906,13 @@ static int test_acceptqueue_zero_window_packet(void)
 	ASSERT_EQ(e.peer_max_packet, 0);
 
 	acceptqueue_free(&q);
-	return TEST_PASS;
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int test_acceptqueue_single_char_type(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_accept_queue q;
 	acceptqueue_init(&q);
 
@@ -843,18 +926,20 @@ static int test_acceptqueue_single_char_type(void)
 	ASSERT_STR_EQ(e.channel_type, "x");
 
 	acceptqueue_free(&q);
-	return TEST_PASS;
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int test_acceptqueue_pop_does_not_affect_remaining(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_accept_queue q;
 	acceptqueue_init(&q);
 
-	acceptqueue_push(&q, 1, 100, 50,
-	    (const uint8_t *)"alpha", 5);
-	acceptqueue_push(&q, 2, 200, 100,
-	    (const uint8_t *)"bravo", 5);
+	ASSERT_OK(acceptqueue_push(&q, 1, 100, 50,
+	    (const uint8_t *)"alpha", 5));
+	ASSERT_OK(acceptqueue_push(&q, 2, 200, 100,
+	    (const uint8_t *)"bravo", 5));
 
 	struct dssh_incoming_open e1;
 	int pop_ret = acceptqueue_pop(&q, &e1);
@@ -871,7 +956,7 @@ static int test_acceptqueue_pop_does_not_affect_remaining(void)
 	ASSERT_STR_EQ(e2.channel_type, "bravo");
 
 	acceptqueue_free(&q);
-	return TEST_PASS;
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 
@@ -882,78 +967,94 @@ static int test_acceptqueue_pop_does_not_affect_remaining(void)
 static int
 test_parse_uint32_basic(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	uint8_t buf[] = { 0x01, 0x02, 0x03, 0x04 };
 	uint32_t val = 0;
 	int64_t ret = dssh_parse_uint32(buf, sizeof(buf), &val);
 	ASSERT_EQ(ret, 4);
 	ASSERT_EQ_U(val, 0x01020304);
-	return TEST_PASS;
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int
 test_parse_uint32_zero(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	uint8_t buf[] = { 0x00, 0x00, 0x00, 0x00 };
 	uint32_t val = 1;
 	ASSERT_EQ(dssh_parse_uint32(buf, sizeof(buf), &val), 4);
 	ASSERT_EQ_U(val, 0);
-	return TEST_PASS;
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int
 test_parse_uint32_max(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	uint8_t buf[] = { 0xFF, 0xFF, 0xFF, 0xFF };
 	uint32_t val = 0;
 	ASSERT_EQ(dssh_parse_uint32(buf, sizeof(buf), &val), 4);
 	ASSERT_EQ_U(val, UINT32_MAX);
-	return TEST_PASS;
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int
 test_parse_uint32_short_buffer(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	uint8_t buf[] = { 0x01, 0x02, 0x03 };
 	uint32_t val = UINT32_C(0xa5a5a5a5);
 	ASSERT_ERR(dssh_parse_uint32(buf, sizeof(buf), &val), DSSH_ERROR_PARSE);
 	ASSERT_EQ_U(val, UINT32_C(0xa5a5a5a5));
-	return TEST_PASS;
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int
 test_parse_uint32_empty_buffer(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	uint8_t buf[] = { 0 };
 	uint32_t val = UINT32_C(0xa5a5a5a5);
 	ASSERT_ERR(dssh_parse_uint32(buf, 0, &val), DSSH_ERROR_PARSE);
 	ASSERT_EQ_U(val, UINT32_C(0xa5a5a5a5));
-	return TEST_PASS;
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int
 test_serialize_uint32(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	uint8_t buf[8] = { 0 };
 	size_t pos = 0;
 	ASSERT_EQ(dssh_serialize_uint32(0xDEADBEEF, buf, sizeof(buf), &pos), 0);
 	ASSERT_EQ_U(pos, 4);
 	uint8_t expected[] = { 0xDE, 0xAD, 0xBE, 0xEF };
 	ASSERT_MEM_EQ(buf, expected, 4);
-	return TEST_PASS;
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int
 test_serialize_uint32_overflow(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	uint8_t buf[3];
 	size_t pos = 0;
 	ASSERT_ERR(dssh_serialize_uint32(1, buf, sizeof(buf), &pos), DSSH_ERROR_TOOLONG);
-	return TEST_PASS;
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int
 test_uint32_roundtrip(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	uint8_t buf[8];
 	size_t pos = 0;
 	uint32_t orig = 0x12345678;
@@ -962,12 +1063,14 @@ test_uint32_roundtrip(void)
 	ASSERT_EQ(dssh_serialize_uint32(orig, buf, sizeof(buf), &pos), 0);
 	ASSERT_EQ(dssh_parse_uint32(buf, pos, &parsed), 4);
 	ASSERT_EQ_U(parsed, orig);
-	return TEST_PASS;
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int
 test_serialize_at_nonzero_offset(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	uint8_t buf[16] = { 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC };
 	size_t pos = 4;
 
@@ -979,37 +1082,44 @@ test_serialize_at_nonzero_offset(void)
 
 	uint8_t expected_val[] = { 0xAA, 0xBB, 0xCC, 0xDD };
 	ASSERT_MEM_EQ(&buf[4], expected_val, 4);
-	return TEST_PASS;
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int
 test_serialize_overflow_at_offset(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	uint8_t buf[8];
 	size_t pos = 6;
 
 	ASSERT_ERR(dssh_serialize_uint32(1, buf, sizeof(buf), &pos), DSSH_ERROR_TOOLONG);
 	ASSERT_EQ_U(pos, 6);
-	return TEST_PASS;
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int
 test_serialize_pos_past_bufsz(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	uint8_t buf[8];
 	size_t pos = 10;
 
 	ASSERT_ERR(dssh_serialize_uint32(1, buf, sizeof(buf), &pos), DSSH_ERROR_TOOLONG);
 	ASSERT_EQ_U(pos, 10);
-	return TEST_PASS;
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int
 test_serialize_uint32_position_storage(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	const size_t capacity = sizeof(size_t[4]);
 	uint8_t before[sizeof(size_t[4])];
-	uint8_t *bytes = malloc(capacity);
+	uint8_t *bytes = NULL;
+	ASSERT_OK(chan_unit_alloc(&fixture, &bytes, capacity));
 	ASSERT_NOT_NULL(bytes);
 	size_t *pos = (size_t *)(bytes + sizeof(size_t));
 	size_t owner_start = sizeof(size_t);
@@ -1048,16 +1158,18 @@ test_serialize_uint32_position_storage(void)
 			accepted++;
 		}
 	}
-	free(bytes);
+	chan_unit_free(&fixture, &bytes);
 	ASSERT_TRUE(valid);
 	ASSERT_TRUE(rejected > 0);
 	ASSERT_TRUE(accepted > 0);
-	return TEST_PASS;
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int
 test_serialize_uint32_bounds(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	uint8_t bytes[12];
 	uint8_t expected[sizeof(bytes)];
 	const uint8_t encoded[] = {0x12, 0x34, 0x56, 0x78};
@@ -1085,14 +1197,17 @@ test_serialize_uint32_bounds(void)
 	ASSERT_EQ(dssh_serialize_uint32(0, bytes, sizeof(bytes), &pos), DSSH_ERROR_TOOLONG);
 	ASSERT_EQ_U(pos, SIZE_MAX);
 	ASSERT_MEM_EQ(bytes, expected, sizeof(bytes));
-	return TEST_PASS;
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int
 test_parse_uint32_overlapping_output(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	const size_t capacity = sizeof(uint32_t[4]);
-	uint8_t *bytes = malloc(capacity);
+	uint8_t *bytes = NULL;
+	ASSERT_OK(chan_unit_alloc(&fixture, &bytes, capacity));
 	ASSERT_NOT_NULL(bytes);
 	uint32_t *value = (uint32_t *)(bytes + sizeof(uint32_t));
 	const uint8_t encoded[] = {0x12, 0x34, 0x56, 0x78};
@@ -1103,14 +1218,16 @@ test_parse_uint32_overlapping_output(void)
 		int64_t ret = dssh_parse_uint32(bytes + offset, 4, value);
 		valid = ret == 4 && *value == UINT32_C(0x12345678);
 	}
-	free(bytes);
+	chan_unit_free(&fixture, &bytes);
 	ASSERT_TRUE(valid);
-	return TEST_PASS;
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int
 test_cleanse_basic(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	uint8_t buf[16];
 
 	memset(buf, 0xAA, sizeof(buf));
@@ -1118,49 +1235,57 @@ test_cleanse_basic(void)
 
 	for (size_t i = 0; i < sizeof(buf); i++)
 		ASSERT_EQ(buf[i], 0);
-	return TEST_PASS;
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int
 test_cleanse_null(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	dssh_cleanse(NULL, 0);
 	dssh_cleanse(NULL, 100);
-	return TEST_PASS;
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int
 test_cleanse_zero_len(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	uint8_t buf[4] = {0xAA, 0xBB, 0xCC, 0xDD};
 
 	dssh_cleanse(buf, 0);
 
 	ASSERT_EQ(buf[0], 0xAA);
 	ASSERT_EQ(buf[3], 0xDD);
-	return TEST_PASS;
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int
 test_parse_uint32_null(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	uint8_t buf[4] = {0, 0, 0, 1};
 	uint32_t val;
 
 	ASSERT_EQ(dssh_parse_uint32(buf, 4, NULL), DSSH_ERROR_INVALID);
 	ASSERT_EQ(dssh_parse_uint32(NULL, 4, &val), DSSH_ERROR_INVALID);
-	return TEST_PASS;
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int
 test_serialize_uint32_null(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	uint8_t buf[4];
 	size_t pos = 0;
 
 	ASSERT_EQ(dssh_serialize_uint32(1, buf, 4, NULL), DSSH_ERROR_INVALID);
 	ASSERT_EQ(dssh_serialize_uint32(1, NULL, 4, &pos), DSSH_ERROR_INVALID);
-	return TEST_PASS;
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 /* ================================================================
@@ -1169,9 +1294,11 @@ test_serialize_uint32_null(void)
 
 static int test_params_init_shell(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_chan_params p;
 
-	ASSERT_OK(dssh_chan_params_init(&p, DSSH_CHAN_SHELL));
+	ASSERT_OK(chan_unit_params_init(&fixture, &p, DSSH_CHAN_SHELL));
 	ASSERT_EQ(p.type, DSSH_CHAN_SHELL);
 	ASSERT_TRUE(p.flags & DSSH_PARAM_HAS_PTY);
 	ASSERT_STR_EQ(p.term, "dumb");
@@ -1183,37 +1310,43 @@ static int test_params_init_shell(void)
 	ASSERT_EQ_U(p.env_count, 0);
 	ASSERT_NULL(p.modes);
 	ASSERT_EQ_U(p.mode_count, 0);
-	dssh_chan_params_free(&p);
-	return TEST_PASS;
+	chan_unit_params_free(&fixture, &p);
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int test_params_init_exec(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_chan_params p;
 
-	ASSERT_OK(dssh_chan_params_init(&p, DSSH_CHAN_EXEC));
+	ASSERT_OK(chan_unit_params_init(&fixture, &p, DSSH_CHAN_EXEC));
 	ASSERT_EQ(p.type, DSSH_CHAN_EXEC);
 	ASSERT_FALSE(p.flags & DSSH_PARAM_HAS_PTY);
-	dssh_chan_params_free(&p);
-	return TEST_PASS;
+	chan_unit_params_free(&fixture, &p);
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int test_params_init_subsystem(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_chan_params p;
 
-	ASSERT_OK(dssh_chan_params_init(&p, DSSH_CHAN_SUBSYSTEM));
+	ASSERT_OK(chan_unit_params_init(&fixture, &p, DSSH_CHAN_SUBSYSTEM));
 	ASSERT_EQ(p.type, DSSH_CHAN_SUBSYSTEM);
 	ASSERT_FALSE(p.flags & DSSH_PARAM_HAS_PTY);
-	dssh_chan_params_free(&p);
-	return TEST_PASS;
+	chan_unit_params_free(&fixture, &p);
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int test_params_set_pty(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_chan_params p;
 
-	ASSERT_OK(dssh_chan_params_init(&p, DSSH_CHAN_EXEC));
+	ASSERT_OK(chan_unit_params_init(&fixture, &p, DSSH_CHAN_EXEC));
 	ASSERT_FALSE(p.flags & DSSH_PARAM_HAS_PTY);
 
 	ASSERT_OK(dssh_chan_params_set_pty(&p, true));
@@ -1222,15 +1355,17 @@ static int test_params_set_pty(void)
 	ASSERT_OK(dssh_chan_params_set_pty(&p, false));
 	ASSERT_FALSE(p.flags & DSSH_PARAM_HAS_PTY);
 
-	dssh_chan_params_free(&p);
-	return TEST_PASS;
+	chan_unit_params_free(&fixture, &p);
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int test_params_set_accept_early_data(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_chan_params p;
 
-	ASSERT_OK(dssh_chan_params_init(&p, DSSH_CHAN_SHELL));
+	ASSERT_OK(chan_unit_params_init(&fixture, &p, DSSH_CHAN_SHELL));
 	ASSERT_FALSE(p.flags & DSSH_PARAM_ACCEPT_EARLY_DATA);
 
 	ASSERT_OK(dssh_chan_params_set_accept_early_data(&p, true));
@@ -1243,15 +1378,17 @@ static int test_params_set_accept_early_data(void)
 	ASSERT_EQ(dssh_chan_params_set_accept_early_data(NULL, true),
 	    DSSH_ERROR_INVALID);
 
-	dssh_chan_params_free(&p);
-	return TEST_PASS;
+	chan_unit_params_free(&fixture, &p);
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int test_params_set_term(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_chan_params p;
 
-	ASSERT_OK(dssh_chan_params_init(&p, DSSH_CHAN_SHELL));
+	ASSERT_OK(chan_unit_params_init(&fixture, &p, DSSH_CHAN_SHELL));
 	ASSERT_OK(dssh_chan_params_set_term(&p, "xterm-256color"));
 	ASSERT_STR_EQ(p.term, "xterm-256color");
 	ASSERT_OK(dssh_chan_params_set_term(&p, p.term));
@@ -1266,29 +1403,33 @@ static int test_params_set_term(void)
 	ASSERT_OK(dssh_chan_params_set_term(&p, longterm));
 	ASSERT_EQ_U(strlen(p.term), 127);
 
-	dssh_chan_params_free(&p);
-	return TEST_PASS;
+	chan_unit_params_free(&fixture, &p);
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int test_params_set_size(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_chan_params p;
 
-	ASSERT_OK(dssh_chan_params_init(&p, DSSH_CHAN_SHELL));
+	ASSERT_OK(chan_unit_params_init(&fixture, &p, DSSH_CHAN_SHELL));
 	ASSERT_OK(dssh_chan_params_set_size(&p, 80, 24, 640, 480));
 	ASSERT_EQ_U(p.cols, 80);
 	ASSERT_EQ_U(p.rows, 24);
 	ASSERT_EQ_U(p.wpx, 640);
 	ASSERT_EQ_U(p.hpx, 480);
-	dssh_chan_params_free(&p);
-	return TEST_PASS;
+	chan_unit_params_free(&fixture, &p);
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int test_params_set_command(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_chan_params p;
 
-	ASSERT_OK(dssh_chan_params_init(&p, DSSH_CHAN_EXEC));
+	ASSERT_OK(chan_unit_params_init(&fixture, &p, DSSH_CHAN_EXEC));
 	ASSERT_OK(dssh_chan_params_set_command(&p, "ls -la"));
 	ASSERT_NOT_NULL(p.command);
 	ASSERT_STR_EQ(p.command, "ls -la");
@@ -1301,32 +1442,36 @@ static int test_params_set_command(void)
 	ASSERT_OK(dssh_chan_params_set_command(&p, p.command + 6));
 	ASSERT_STR_EQ(p.command, "-a");
 
-	dssh_chan_params_free(&p);
+	chan_unit_params_free(&fixture, &p);
 	ASSERT_NULL(p.command);
-	return TEST_PASS;
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int test_params_set_subsystem(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_chan_params p;
 
-	ASSERT_OK(dssh_chan_params_init(&p, DSSH_CHAN_SUBSYSTEM));
+	ASSERT_OK(chan_unit_params_init(&fixture, &p, DSSH_CHAN_SUBSYSTEM));
 	ASSERT_OK(dssh_chan_params_set_subsystem(&p, "sftp"));
 	ASSERT_STR_EQ(p.subsystem, "sftp");
 	ASSERT_OK(dssh_chan_params_set_subsystem(&p, p.subsystem));
 	ASSERT_STR_EQ(p.subsystem, "sftp");
 	ASSERT_OK(dssh_chan_params_set_subsystem(&p, p.subsystem + 1));
 	ASSERT_STR_EQ(p.subsystem, "ftp");
-	dssh_chan_params_free(&p);
+	chan_unit_params_free(&fixture, &p);
 	ASSERT_NULL(p.subsystem);
-	return TEST_PASS;
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int test_params_add_env(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_chan_params p;
 
-	ASSERT_OK(dssh_chan_params_init(&p, DSSH_CHAN_SHELL));
+	ASSERT_OK(chan_unit_params_init(&fixture, &p, DSSH_CHAN_SHELL));
 
 	ASSERT_OK(dssh_chan_params_add_env(&p, "LANG", "en_US.UTF-8"));
 	ASSERT_OK(dssh_chan_params_add_env(&p, "TERM", "xterm"));
@@ -1340,17 +1485,19 @@ static int test_params_add_env(void)
 	ASSERT_STR_EQ(p.env[2].name, "FOO");
 	ASSERT_STR_EQ(p.env[2].value, "bar");
 
-	dssh_chan_params_free(&p);
+	chan_unit_params_free(&fixture, &p);
 	ASSERT_NULL(p.env);
 	ASSERT_EQ_U(p.env_count, 0);
-	return TEST_PASS;
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int
 test_params_env_failure_atomic(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_chan_params p;
-	ASSERT_OK(dssh_chan_params_init(&p, DSSH_CHAN_EXEC));
+	ASSERT_OK(chan_unit_params_init(&fixture, &p, DSSH_CHAN_EXEC));
 	for (int n = 0; n < 3; n++) {
 		dssh_test_alloc_fail_after(n);
 		int ret = dssh_chan_params_add_env(&p, "name", "value");
@@ -1378,8 +1525,8 @@ test_params_env_failure_atomic(void)
 	ASSERT_EQ_U(p.env_count, 5);
 	ASSERT_STR_EQ(p.env[4].name, "name");
 	ASSERT_STR_EQ(p.env[4].value, "value");
-	dssh_chan_params_free(&p);
-	return TEST_PASS;
+	chan_unit_params_free(&fixture, &p);
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 struct env_decision {
@@ -1401,6 +1548,8 @@ record_env_decision(dssh_channel ch, const struct dssh_chan_params *p, void *cbd
 static int
 test_accept_env_validation(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	bool cancelled = false;
 	const uint8_t valid[] = { 0, 0, 0, 1, 'A', 0, 0, 0, 1, 'B' };
 	uint8_t packet[sizeof(valid) + 1];
@@ -1410,7 +1559,7 @@ test_accept_env_validation(void)
 		.env = record_env_decision,
 		.cbdata = &decision,
 	};
-	ASSERT_OK(dssh_chan_params_init(&p, DSSH_CHAN_EXEC));
+	ASSERT_OK(chan_unit_params_init(&fixture, &p, DSSH_CHAN_EXEC));
 	for (size_t len = 0; len < sizeof(valid); len++)
 		ASSERT_EQ(accept_env_request(NULL, valid, len, &p, &cbs, &cancelled), DSSH_ERROR_PARSE);
 	memcpy(packet, valid, sizeof(valid));
@@ -1438,13 +1587,15 @@ test_accept_env_validation(void)
 	ASSERT_EQ_U(decision.calls, 384);
 	ASSERT_STR_EQ(p.env[0].name, "A");
 	ASSERT_STR_EQ(p.env[127].value, "B");
-	dssh_chan_params_free(&p);
-	return TEST_PASS;
+	chan_unit_params_free(&fixture, &p);
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int
 test_accept_env_byte_limit(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	bool cancelled = false;
 #if SIZE_MAX < 1048576
 	size_t limit = SIZE_MAX;
@@ -1453,9 +1604,12 @@ test_accept_env_byte_limit(void)
 #endif
 	/* Each retained entry includes a one-byte name and two terminators. */
 	size_t value_len = limit / 2 - 3;
+	ASSERT_TRUE(value_len <= SIZE_MAX - 9);
+	ASSERT_TRUE(value_len <= UINT32_MAX);
 	size_t packet_len = value_len + 9;
 	uint32_t wire_len = (uint32_t)value_len;
-	uint8_t *packet = malloc(packet_len);
+	uint8_t *packet = NULL;
+	ASSERT_OK(chan_unit_alloc(&fixture, &packet, packet_len));
 	ASSERT_NOT_NULL(packet);
 	size_t pos = 0;
 	ASSERT_OK(dssh_serialize_uint32(1, packet, packet_len, &pos));
@@ -1468,26 +1622,28 @@ test_accept_env_byte_limit(void)
 		.env = record_env_decision,
 		.cbdata = &decision,
 	};
-	ASSERT_OK(dssh_chan_params_init(&p, DSSH_CHAN_EXEC));
+	ASSERT_OK(chan_unit_params_init(&fixture, &p, DSSH_CHAN_EXEC));
 	ASSERT_OK(accept_env_request(NULL, packet, packet_len, &p, &cbs, &cancelled));
 	ASSERT_OK(accept_env_request(NULL, packet, packet_len, &p, &cbs, &cancelled));
 	ASSERT_EQ(accept_env_request(NULL, packet, packet_len, &p, &cbs, &cancelled), DSSH_ERROR_TOOLONG);
 	ASSERT_EQ_U(decision.calls, 2);
 	ASSERT_EQ_U(p.env_count, 2);
-	dssh_chan_params_free(&p);
-	free(packet);
-	return TEST_PASS;
+	chan_unit_params_free(&fixture, &p);
+	chan_unit_free(&fixture, &packet);
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int
 test_accept_string_validation(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	const uint8_t valid[] = { 0, 0, 0, 3, 'a', 'b', 'c' };
 	const uint8_t empty[] = { 0, 0, 0, 0 };
 	const uint8_t large[] = { 255, 255, 255, 255 };
 	uint8_t packet[sizeof(valid) + 1];
 	struct dssh_chan_params p;
-	ASSERT_OK(dssh_chan_params_init(&p, DSSH_CHAN_EXEC));
+	ASSERT_OK(chan_unit_params_init(&fixture, &p, DSSH_CHAN_EXEC));
 	ASSERT_OK(dssh_chan_params_set_command(&p, "original"));
 	ASSERT_OK(dssh_chan_params_set_subsystem(&p, "original"));
 	for (size_t len = 0; len < sizeof(valid); len++) {
@@ -1520,13 +1676,15 @@ test_accept_string_validation(void)
 	ASSERT_OK(accept_parse_subsystem(empty, sizeof(empty), &p));
 	ASSERT_STR_EQ(p.command, "");
 	ASSERT_STR_EQ(p.subsystem, "");
-	dssh_chan_params_free(&p);
-	return TEST_PASS;
+	chan_unit_params_free(&fixture, &p);
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int
 test_accept_pty_validation(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	/* TERM="x", 80x24 characters, 640x480 pixels, one mode and END. */
 	const uint8_t valid[] = {
 		0, 0, 0, 1, 'x',
@@ -1536,7 +1694,7 @@ test_accept_pty_validation(void)
 	};
 	uint8_t packet[sizeof(valid) + 1];
 	struct dssh_chan_params p;
-	ASSERT_OK(dssh_chan_params_init(&p, DSSH_CHAN_EXEC));
+	ASSERT_OK(chan_unit_params_init(&fixture, &p, DSSH_CHAN_EXEC));
 	ASSERT_OK(dssh_chan_params_set_mode(&p, 1, 42));
 	for (size_t len = 0; len < sizeof(valid); len++)
 		ASSERT_EQ(accept_parse_pty(valid, len, &p), DSSH_ERROR_PARSE);
@@ -1600,15 +1758,17 @@ test_accept_pty_validation(void)
 	packet[24] = 0;
 	ASSERT_OK(accept_parse_pty(packet, 25, &p));
 	ASSERT_EQ_U(p.mode_count, 0);
-	dssh_chan_params_free(&p);
-	return TEST_PASS;
+	chan_unit_params_free(&fixture, &p);
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int test_params_set_mode(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_chan_params p;
 
-	ASSERT_OK(dssh_chan_params_init(&p, DSSH_CHAN_SHELL));
+	ASSERT_OK(chan_unit_params_init(&fixture, &p, DSSH_CHAN_SHELL));
 
 	/* Add several modes */
 	ASSERT_OK(dssh_chan_params_set_mode(&p, 1, 100));
@@ -1623,16 +1783,18 @@ static int test_params_set_mode(void)
 	ASSERT_EQ(p.modes[2].opcode, 160);
 	ASSERT_EQ_U(p.modes[2].value, 300);
 
-	dssh_chan_params_free(&p);
+	chan_unit_params_free(&fixture, &p);
 	ASSERT_NULL(p.modes);
-	return TEST_PASS;
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int test_params_mode_dedup(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_chan_params p;
 
-	ASSERT_OK(dssh_chan_params_init(&p, DSSH_CHAN_SHELL));
+	ASSERT_OK(chan_unit_params_init(&fixture, &p, DSSH_CHAN_SHELL));
 
 	ASSERT_OK(dssh_chan_params_set_mode(&p, 1, 100));
 	ASSERT_OK(dssh_chan_params_set_mode(&p, 42, 200));
@@ -1645,15 +1807,17 @@ static int test_params_mode_dedup(void)
 	ASSERT_EQ(p.modes[1].opcode, 42);
 	ASSERT_EQ_U(p.modes[1].value, 200);
 
-	dssh_chan_params_free(&p);
-	return TEST_PASS;
+	chan_unit_params_free(&fixture, &p);
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int
 test_params_mode_domain(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_chan_params params;
-	ASSERT_OK(dssh_chan_params_init(&params, DSSH_CHAN_SHELL));
+	ASSERT_OK(chan_unit_params_init(&fixture, &params, DSSH_CHAN_SHELL));
 	for (uint16_t code = 1; code <= UINT8_MAX; code++) {
 		uint8_t opcode = (uint8_t)code;
 		ASSERT_OK(dssh_chan_params_set_mode(&params, opcode, UINT32_MAX));
@@ -1673,30 +1837,36 @@ test_params_mode_domain(void)
 	valid = valid && result == DSSH_ERROR_INVALID && dssh_test_alloc_count() == 0
 	    && params.modes == storage && params.mode_capacity == capacity && params.mode_count == UINT8_MAX;
 	dssh_test_alloc_reset();
-	dssh_chan_params_free(&params);
+	chan_unit_params_free(&fixture, &params);
 	ASSERT_TRUE(valid);
 	printf("terminal_mode_domain opcodes=255 updates=255 allocations=0 valid=1\n");
-	return TEST_PASS;
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int test_params_free_null(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	/* Must not crash */
-	dssh_chan_params_free(NULL);
-	return TEST_PASS;
+	chan_unit_params_free(&fixture, NULL);
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int test_params_init_null(void)
 {
-	ASSERT_ERR(dssh_chan_params_init(NULL, DSSH_CHAN_SHELL),
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
+	ASSERT_ERR(chan_unit_params_init(&fixture, NULL, DSSH_CHAN_SHELL),
 	    DSSH_ERROR_INVALID);
-	return TEST_PASS;
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int test_params_set_max_window(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_chan_params p;
-	ASSERT_OK(dssh_chan_params_init(&p, DSSH_CHAN_SHELL));
+	ASSERT_OK(chan_unit_params_init(&fixture, &p, DSSH_CHAN_SHELL));
 
 	/* Default is 0 (library default) */
 	ASSERT_EQ_U(p.max_window, 0);
@@ -1717,8 +1887,8 @@ static int test_params_set_max_window(void)
 	ASSERT_ERR(dssh_chan_params_set_max_window(NULL, 1000),
 	    DSSH_ERROR_INVALID);
 
-	dssh_chan_params_free(&p);
-	return TEST_PASS;
+	chan_unit_params_free(&fixture, &p);
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 /* ================================================================
@@ -1728,8 +1898,10 @@ static int test_params_set_max_window(void)
 static int
 test_event_queue_cap_enforced(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_event_queue q;
-	int res = event_queue_init(&q, 4, 32768);
+	int res = chan_unit_event_init(&fixture, &q, 4, 32768);
 
 	ASSERT_EQ(res, 0);
 
@@ -1747,21 +1919,24 @@ test_event_queue_cap_enforced(void)
 	/* Queue still has 4 entries */
 	ASSERT_EQ_U(q.count, 4);
 
-	event_queue_free(&q);
-	return TEST_PASS;
+	chan_unit_event_free(&fixture, &q);
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int
 test_event_queue_no_cap(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_event_queue q;
-	int res = event_queue_init(&q, 0, 32768);
+	int res = chan_unit_event_init(&fixture, &q, 0, 32768);
 
 	ASSERT_EQ(res, 0);
 
 	struct dssh_event_entry ev = { .type = 1 };
 
-	/* Should grow past initial capacity (8) without limit */
+	/* Zero removes the event-count cap; the separate memory bound remains.
+	 * This modest case grows past the initial capacity of eight. */
 	for (int i = 0; i < 16; i++) {
 		res = event_queue_push(&q, &ev);
 		ASSERT_EQ(res, 0);
@@ -1769,16 +1944,18 @@ test_event_queue_no_cap(void)
 
 	ASSERT_EQ_U(q.count, 16);
 
-	event_queue_free(&q);
-	return TEST_PASS;
+	chan_unit_event_free(&fixture, &q);
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 static int
 test_event_queue_cap_at_initial_capacity(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	/* Cap exactly at initial capacity (8) — no realloc needed */
 	struct dssh_event_queue q;
-	int res = event_queue_init(&q, 8, 32768);
+	int res = chan_unit_event_init(&fixture, &q, 8, 32768);
 
 	ASSERT_EQ(res, 0);
 
@@ -1792,8 +1969,8 @@ test_event_queue_cap_at_initial_capacity(void)
 	res = event_queue_push(&q, &ev);
 	ASSERT_EQ(res, DSSH_ERROR_TOOMANY);
 
-	event_queue_free(&q);
-	return TEST_PASS;
+	chan_unit_event_free(&fixture, &q);
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 /* ================================================================
@@ -1803,16 +1980,18 @@ test_event_queue_cap_at_initial_capacity(void)
 static int
 test_params_copy_failure(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	struct dssh_chan_params p;
 	dssh_test_alloc_fail_after(0);
-	int ret = dssh_chan_params_init(&p, DSSH_CHAN_EXEC);
+	int ret = chan_unit_params_init(&fixture, &p, DSSH_CHAN_EXEC);
 	int count = dssh_test_alloc_count();
 	dssh_test_alloc_reset();
-	dssh_chan_params_free(&p);
+	chan_unit_params_free(&fixture, &p);
 	ASSERT_EQ(ret, DSSH_ERROR_ALLOC);
 	ASSERT_EQ(count, 1);
 	for (unsigned field = 0; field < 3; field++) {
-		ASSERT_OK(dssh_chan_params_init(&p, DSSH_CHAN_EXEC));
+		ASSERT_OK(chan_unit_params_init(&fixture, &p, DSSH_CHAN_EXEC));
 		ASSERT_OK(dssh_chan_params_set_term(&p, "old-term"));
 		ASSERT_OK(dssh_chan_params_set_command(&p, "old-command"));
 		ASSERT_OK(dssh_chan_params_set_subsystem(&p, "old-subsystem"));
@@ -1826,16 +2005,17 @@ test_params_copy_failure(void)
 		const char *current = field == 0 ? p.term : field == 1 ? p.command : p.subsystem;
 		bool intact = current == old && strcmp(current,
 		    field == 0 ? "old-term" : field == 1 ? "old-command" : "old-subsystem") == 0;
-		dssh_chan_params_free(&p);
+		chan_unit_params_free(&fixture, &p);
 		ASSERT_EQ(ret, DSSH_ERROR_ALLOC);
 		ASSERT_EQ(count, 1);
 		ASSERT_TRUE(intact);
 	}
-	return TEST_PASS;
+	return chan_unit_finish(&fixture, TEST_PASS, false);
 }
 
 #include "event_text_queue_cases.h"
 #include "bytebuf_ring_cases.h"
+#include "channel_unit_owner_cases.h"
 
 static struct dssh_test_entry tests[] = {
 	{ "params_copy_failure", test_params_copy_failure },
@@ -1940,5 +2120,14 @@ static struct dssh_test_entry tests[] = {
 	{ "params_set_max_window",          test_params_set_max_window },
 };
 
-DSSH_TEST_NO_CLEANUP
+#define main chan_unit_test_main
 DSSH_TEST_MAIN(tests)
+#undef main
+
+int
+main(int argc, char *argv[])
+{
+	if (argc == 3 && strcmp(argv[1], "--unit-owner") == 0)
+		return chan_unit_owner_main(argv[2]);
+	return chan_unit_test_main(argc, argv);
+}

@@ -840,6 +840,7 @@ add_test(NAME dssh_unit_chan COMMAND dssh_test_chan)
 dssh_add_output_test(dssh_bytebuf_ring dssh_test_chan
 	"1 tests: 1 passed, 0 failed, 0 skipped" --exact bytebuf_ring_positions)
 
+
 dssh_add_test(crypto test_crypto.c)
 add_test(NAME dssh_unit_crypto COMMAND dssh_test_crypto)
 dssh_add_test(sntrup test_sntrup.c)
@@ -1068,6 +1069,14 @@ foreach(part IN LISTS key_generation_parts)
 	set_tests_properties(dssh_key_generation_${part} PROPERTIES ENVIRONMENT "${DSSH_TEST_KEY_ENV}" TIMEOUT 180)
 endforeach()
 find_package(Python3 3.9 QUIET COMPONENTS Interpreter)
+if(Python3_Interpreter_FOUND)
+	foreach(mode IN ITEMS empty buffer-refusal buffer queue-refusal queue queue-frozen
+	    params-refusal params temporary-refusal all nested normal)
+		dssh_add_output_test(dssh_chan_unit_owner_${mode} Python3::Interpreter
+			"chan_unit_observed mode=${mode} valid=1"
+			${CMAKE_CURRENT_SOURCE_DIR}/channel_unit_controls.py $<TARGET_FILE:dssh_test_chan> ${mode})
+	endforeach()
+endif()
 if(Python3_Interpreter_FOUND AND UNIX AND NOT APPLE)
 	# Compile the canonical application sources with GNU linker controls;
 	# both variants continue to link the actual production libraries.

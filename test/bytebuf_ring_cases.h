@@ -3,6 +3,8 @@
 static int
 test_bytebuf_ring_positions(void)
 {
+	struct chan_unit_fixture fixture;
+	chan_unit_begin(&fixture, __func__);
 	const size_t capacities[] = {1, 3, 7, 16, 31, 64};
 	uint8_t data[64];
 	uint8_t output[66];
@@ -16,7 +18,7 @@ test_bytebuf_ring_positions(void)
 		size_t capacity = capacities[c];
 		size_t position = 0;
 		size_t count = 0;
-		int ret = bytebuf_init(&buffer, capacity);
+		int ret = chan_unit_bytebuf_init(&fixture, &buffer, capacity);
 		bool valid = ret == 0;
 		if (!valid)
 			goto retire;
@@ -67,13 +69,13 @@ test_bytebuf_ring_positions(void)
 			}
 		}
 retire:
-		bytebuf_free(&buffer);
+		chan_unit_bytebuf_free(&fixture, &buffer);
 		if (!valid) {
 			fprintf(stderr, "bytebuf ring capacity=%zu position=%zu count=%zu init=%d\n",
 			    capacity, position, count, ret);
-			return TEST_FAIL;
+			return chan_unit_finish(&fixture, TEST_FAIL, false);
 		}
 	}
 	int printed = printf("bytebuf_ring schedules=%" PRIu32 " capacities=6 retired=1\n", checks);
-	return checks != 0 && printed >= 0 ? TEST_PASS : TEST_FAIL;
+	return chan_unit_finish(&fixture, checks != 0 && printed >= 0 ? TEST_PASS : TEST_FAIL, false);
 }

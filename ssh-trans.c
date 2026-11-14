@@ -3,6 +3,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <threads.h>
+#ifdef DSSH_TESTING
+ #include <limits.h>
+#endif
 
 #include "deucessh-algorithms.h"
 #include "deucessh-auth.h"
@@ -202,6 +205,13 @@ dssh_test_arm_rx_bytes_before_count(struct dssh_session_s *sess,
 	    memory_order_relaxed);
 	atomic_store_explicit(&dssh_test_rx_count_sess, sess,
 	    memory_order_release);
+}
+
+DSSH_TESTABLE unsigned
+dssh_test_rekeys_completed(struct dssh_session_s *sess)
+{
+	return atomic_load_explicit(&sess->trans.test_rekeys_completed,
+	    memory_order_acquire);
 }
 #endif
 
@@ -663,6 +673,18 @@ rekey(struct dssh_session_s *sess)
 		else
 			session_set_terminate(sess);
 	}
+#ifdef DSSH_TESTING
+	if (res == 0) {
+		unsigned before = atomic_load_explicit(&sess->trans.test_rekeys_completed,
+		    memory_order_relaxed);
+
+		/* The sole receive owner records completion; saturate so a wrap
+		 * cannot look like a new exchange to an integration observer. */
+		if (before < UINT_MAX)
+			atomic_store_explicit(&sess->trans.test_rekeys_completed,
+			    before + 1, memory_order_release);
+	}
+#endif
 	return res;
 }
 
@@ -4400,6 +4422,9 @@ dssh_session_init(bool client, size_t max_packet_size)
 	atomic_init(&sess->trans.tx_since_rekey, 0);
 	atomic_init(&sess->trans.tx_bytes_since_rekey, 0);
 	atomic_init(&sess->trans.rekey_in_progress, false);
+#ifdef DSSH_TESTING
+	atomic_init(&sess->trans.test_rekeys_completed, 0);
+#endif
 	atomic_init(&sess->trans.rekey_read, DSSH_REKEY_READ_IDLE);
 	atomic_init(&sess->trans.tx_owner_active, false);
 	/* TX slots remain empty until newkeys allocates their byte buffers. */

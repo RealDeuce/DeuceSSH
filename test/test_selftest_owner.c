@@ -8,7 +8,10 @@
 #include "dssh_test.h"
 #include "ssh-internal.h"
 #include "selftest_metadata.h"
+#include "dssh_test_internal.h"
 
+static void owner_rekey_arm(dssh_session, uint64_t);
+static unsigned owner_rekey_count(dssh_session);
 static int owner_create(thrd_t *, thrd_start_t, void *);
 static int owner_join(thrd_t, int *);
 static int owner_callbacks(dssh_transport_io_cb, dssh_transport_io_cb,
@@ -110,9 +113,13 @@ static int native_unlock(mtx_t *mutex)
 #define recv owner_socket_recv
 #undef mtx_unlock
 #define mtx_unlock owner_callback_unlock
+#define dssh_test_arm_rx_bytes_before_count owner_rekey_arm
+#define dssh_test_rekeys_completed owner_rekey_count
 #define main selftest_suite_main
 #include "test_selftest.c"
 #undef main
+#undef dssh_test_arm_rx_bytes_before_count
+#undef dssh_test_rekeys_completed
 #undef selftest_snapshot_id
 #undef clock_gettime
 #undef thrd_sleep
@@ -677,6 +684,7 @@ owner_channel_body(void *argument)
 #include "selftest_wire_controls.h"
 #include "selftest_constructor_controls.h"
 #include "selftest_metadata_controls.h"
+#include "selftest_rekey_controls.h"
 
 static bool
 owner_extent_boundaries(void)
@@ -785,6 +793,8 @@ main(int argc, char **argv)
 	atomic_init(&owner_channels_created, 0);
 	atomic_init(&owner_channels_closed, 0);
 	atomic_init(&owner_channel_ready, false);
+	if (strncmp(owner_mode, "rekey-", 6) == 0)
+		return owner_rekey_control();
 	if (strncmp(owner_mode, "metadata-", 9) == 0)
 		return owner_metadata_control();
 	if (strncmp(owner_mode, "constructor-", 12) == 0)

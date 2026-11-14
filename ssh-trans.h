@@ -247,6 +247,11 @@ struct dssh_transport_state_s {
 	bool        rekey_pending;         /* deferred auto-rekey (set in recv_packet) */
 	bool        tx_slots_pending;      /* protected by tx_queue_mtx */
 
+#ifdef DSSH_TESTING
+	/* Published only after the complete rekey path succeeds. */
+	atomic_uint test_rekeys_completed;
+#endif
+
 				       /* Char arrays (naturally aligned, go last) */
 	char id_str[254];
 	char remote_id_str[254];

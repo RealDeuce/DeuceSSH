@@ -31,6 +31,7 @@
 #include "compression_fixture.h"
 #include "fixture_writer.h"
 #include "selftest_metadata.h"
+#include "selftest_rekey.h"
 
 /* ================================================================
  * Socket I/O callbacks
@@ -1684,6 +1685,8 @@ test_self_rekey_during_data(void)
 
 	/* Arm the exact threshold at the next client receive, independent of
 	 * compression ratio and encrypted packet overhead. */
+	unsigned rekeys_before[2];
+	ASSERT_TRUE(selftest_rekey_snapshot(ctx.client, ctx.server, rekeys_before));
 	unsigned resets_before = compression_fixture_reset_count();
 	uint64_t rx_count = ctx.client->trans.enc_s2c_selected->bytes_per_key;
 	dssh_test_arm_rx_bytes_before_count(ctx.client, rx_count);
@@ -1716,6 +1719,7 @@ test_self_rekey_during_data(void)
 	ASSERT_MEM_EQ(buf, data, sizeof(data));
 
 	/* Verify the connection survived rekey */
+	ASSERT_TRUE(selftest_rekey_wait(ctx.client, ctx.server, rekeys_before));
 	ASSERT_TRUE(compression_fixture_wait_reset(resets_before));
 	ASSERT_FALSE(dssh_session_is_terminated(ctx.client));
 
@@ -1749,6 +1753,8 @@ test_self_rekey_manual(void)
 
 	/* Count at the exact threshold: even a compressed small packet must
 	 * trigger the next client demux rekey. */
+	unsigned rekeys_before[2];
+	ASSERT_TRUE(selftest_rekey_snapshot(ctx.client, ctx.server, rekeys_before));
 	unsigned resets_before = compression_fixture_reset_count();
 	uint64_t rx_count = ctx.client->trans.enc_s2c_selected->bytes_per_key;
 	dssh_test_arm_rx_bytes_before_count(ctx.client, rx_count);
@@ -1778,8 +1784,9 @@ test_self_rekey_manual(void)
 	ASSERT_EQ_U(recvd, sizeof(data) - 1);
 
 	ASSERT_MEM_EQ(buf, data, sizeof(data) - 1);
-	/* The echo and both peers' compression resets must complete before
+	/* The echo, both completed exchanges and compression resets must finish before
 	 * closing the channel can hide an unfinished key transition. */
+	ASSERT_TRUE(selftest_rekey_wait(ctx.client, ctx.server, rekeys_before));
 	ASSERT_TRUE(compression_fixture_wait_reset(resets_before));
 	ASSERT_FALSE(dssh_session_is_terminated(ctx.client));
 
@@ -1844,6 +1851,8 @@ test_self_rekey_preserves_channels(void)
 	    ctx.client->trans.session_id_sz, sid_before, sizeof(sid_before), &sid_sz));
 
 	/* Force rekey */
+	unsigned rekeys_before[2];
+	ASSERT_TRUE(selftest_rekey_snapshot(ctx.client, ctx.server, rekeys_before));
 	unsigned resets_before = compression_fixture_reset_count();
 	uint64_t rx_count = ctx.client->trans.enc_s2c_selected->bytes_per_key;
 	dssh_test_arm_rx_bytes_before_count(ctx.client, rx_count);
@@ -1874,6 +1883,7 @@ test_self_rekey_preserves_channels(void)
 	ASSERT_EQ_U(recvd, sizeof(after) - 1);
 	ASSERT_MEM_EQ(buf, after, sizeof(after) - 1);
 
+	ASSERT_TRUE(selftest_rekey_wait(ctx.client, ctx.server, rekeys_before));
 	ASSERT_TRUE(compression_fixture_wait_reset(resets_before));
 
 	/* Session ID must be unchanged after rekey */
@@ -1957,6 +1967,8 @@ test_self_rekey_inflight_data(void)
 	 * packet, then on the next recv_packet call starts rekey.
 	 * Remaining packets in the socket buffer arrive during the
 	 * kexinit wait loop. */
+	unsigned rekeys_before[2];
+	ASSERT_TRUE(selftest_rekey_snapshot(ctx.client, ctx.server, rekeys_before));
 	unsigned resets_before = compression_fixture_reset_count();
 	uint64_t rx_count = ctx.client->trans.enc_s2c_selected->bytes_per_key;
 	dssh_test_arm_rx_bytes_before_count(ctx.client, rx_count);
@@ -1988,6 +2000,7 @@ test_self_rekey_inflight_data(void)
 	for (size_t i = 0; i < recvd; i++)
 		ASSERT_EQ(buf[i], 'D');
 
+	ASSERT_TRUE(selftest_rekey_wait(ctx.client, ctx.server, rekeys_before));
 	ASSERT_TRUE(compression_fixture_wait_reset(resets_before));
 	ASSERT_FALSE(dssh_session_is_terminated(ctx.client));
 

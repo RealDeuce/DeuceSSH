@@ -91,6 +91,10 @@ extern struct dssh_transport_global_config gconf;
  * decoded by sess. */
 void dssh_test_arm_rx_bytes_before_count(dssh_session sess, uint64_t value);
 
+/* Successful complete rekey paths, excluding the initial handshake. The
+ * counter saturates at UINT_MAX. Read only while the session remains owned. */
+unsigned dssh_test_rekeys_completed(dssh_session sess);
+
 /*
  * Channel buffer primitives from ssh-conn.c (DSSH_TESTABLE).
  */

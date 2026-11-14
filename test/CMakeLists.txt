@@ -2066,9 +2066,21 @@ if(Python3_Interpreter_FOUND AND UNIX)
 	foreach(mode IN LISTS allocation_direct_modes)
 		dssh_add_output_test(dssh_alloc_direct_owner_${mode} Python3::Interpreter
 			"allocation_direct_observed mode=${mode} valid=1"
-			${CMAKE_CURRENT_SOURCE_DIR}/allocation_direct_controls.py $<TARGET_FILE:dssh_test_allocation_owner> ${mode})
+			${CMAKE_CURRENT_SOURCE_DIR}/allocation_direct_controls.py $<TARGET_FILE:dssh_test_allocation_owner> ${mode} direct)
 		set_tests_properties(dssh_alloc_direct_owner_${mode} PROPERTIES FIXTURES_REQUIRED dssh_cached_keys
 			ENVIRONMENT "DSSH_TEST_KEY=ed25519;DSSH_TEST_KEX=curve25519;${DSSH_TEST_KEY_ENV}")
+	endforeach()
+	set(allocation_parser_modes ${allocation_direct_modes} skip-reply bad-request provider-error)
+	foreach(mode IN LISTS allocation_parser_modes)
+		dssh_add_output_test(dssh_alloc_parser_owner_${mode} Python3::Interpreter
+			"allocation_parser_observed mode=${mode} valid=1"
+			${CMAKE_CURRENT_SOURCE_DIR}/allocation_direct_controls.py $<TARGET_FILE:dssh_test_allocation_owner> ${mode} parser)
+		set(parser_method curve25519)
+		if(mode STREQUAL "provider-error")
+			set(parser_method dh-gex)
+		endif()
+		set_tests_properties(dssh_alloc_parser_owner_${mode} PROPERTIES FIXTURES_REQUIRED dssh_cached_keys
+			ENVIRONMENT "DSSH_TEST_KEY=ed25519;DSSH_TEST_KEX=${parser_method};${DSSH_TEST_KEY_ENV}")
 	endforeach()
 	set(allocation_owner_modes plain tx create-0 create-1 create-2 assert-0 assert-1 assert-2 assert-3)
 	foreach(index RANGE 0 2)
@@ -2093,15 +2105,31 @@ if(Python3_Interpreter_FOUND AND UNIX)
 	endforeach()
 endif()
 
-# Targeted coverage tests — run in their own process for clean state
-add_test(NAME dssh_targeted_c25519_server_trunc
-	COMMAND dssh_test_alloc c25519/server_truncated_init)
-set_tests_properties(dssh_targeted_c25519_server_trunc PROPERTIES
-	ENVIRONMENT "${DSSH_TEST_KEY_ENV}")
-add_test(NAME dssh_targeted_c25519_client_bad_qs
-	COMMAND dssh_test_alloc c25519/client_bad_qs_length)
-set_tests_properties(dssh_targeted_c25519_client_bad_qs PROPERTIES
-	ENVIRONMENT "${DSSH_TEST_KEY_ENV}")
+# Each parser contract has exact method/key bindings and rejects fixture errors.
+set(ALLOCATION_CURVE_PARSE_TESTS
+	c25519/client_recv_reply c25519/client_short_ks c25519/client_trunc_ks
+	c25519/client_short_qs c25519/client_bad_qs_len c25519/client_qs_overrun
+	c25519/client_short_sig c25519/client_trunc_sig c25519/server_truncated_init
+	c25519/client_bad_qs_length)
+set(ALLOCATION_GEX_PARSE_TESTS
+	dhgex/client_recv_group_fail dhgex/client_group_empty dhgex/client_group_no_g
+	dhgex/client_group_too_small dhgex/client_bad_reply_type dhgex/client_short_ks
+	dhgex/client_trunc_ks dhgex/client_reply_f_zero dhgex/client_short_sig dhgex/client_trunc_sig)
+foreach(method IN ITEMS curve25519 dh-gex)
+	set(parser_groups ${ALLOCATION_CURVE_PARSE_TESTS})
+	if(method STREQUAL "dh-gex")
+		set(parser_groups ${ALLOCATION_GEX_PARSE_TESTS})
+	endif()
+	foreach(key IN ITEMS ed25519 rsa rsa512)
+		foreach(group IN LISTS parser_groups)
+			dssh_add_output_test(dssh_alloc_parser_${method}_${key}_${group} dssh_test_alloc
+				"1 tests: 1 passed, 0 failed, 0 skipped" --exact ${group})
+			set_tests_properties(dssh_alloc_parser_${method}_${key}_${group} PROPERTIES
+				FIXTURES_REQUIRED dssh_cached_keys
+				ENVIRONMENT "DSSH_TEST_KEY=${key};DSSH_TEST_KEX=${method};${DSSH_TEST_KEY_ENV}")
+		endforeach()
+	endforeach()
+endforeach()
 if(DEUCESSH_CRYPTO_BACKEND STREQUAL "OpenSSL")
 	foreach(method IN ITEMS dh-gex group14 group16)
 		foreach(key IN ITEMS ed25519 rsa rsa512)

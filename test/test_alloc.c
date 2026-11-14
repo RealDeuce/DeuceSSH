@@ -44,7 +44,7 @@
 #include "auth_result_fixture.h"
 
 #include "signature_copy_fixture.h"
-
+#ifdef DSSH_CRYPTO_OPENSSL
 static dssh_session
 init_server_session(void)
 {
@@ -53,7 +53,7 @@ init_server_session(void)
 		test_dhgex_setup(s);
 	return s;
 }
-
+#endif
 static int
 register_all(void)
 {
@@ -1482,38 +1482,7 @@ test_ossl_key_pubkey_iterate(void)
  * negotiated state, then single-threaded iterate of the server-side
  * KEX handler with pre-injected client packets.
  * ================================================================ */
-
-/*
- * Build a plaintext SSH wire packet from a payload.
- * Matches send_packet's format in pre-NEWKEYS mode:
- *   uint32  packet_length (1 + payload_len + padding_len)
- *   byte    padding_length
- *   byte[]  payload
- *   byte[]  zero_padding (at least 4 bytes, 8-byte aligned)
- * Returns total wire length, or 0 on overflow.
- */
-static size_t
-build_plaintext_packet(const uint8_t *payload, size_t payload_len,
-    uint8_t *buf, size_t bufsz)
-{
-	size_t bs = 8;
-	size_t padding_len = bs - ((5 + payload_len) % bs);
-	if (padding_len < 4)
-		padding_len += bs;
-	uint32_t packet_length = (uint32_t)(1 + payload_len + padding_len);
-	size_t total = 4 + packet_length;
-	if (total > bufsz)
-		return 0;
-	size_t pos = 0;
-	dssh_serialize_uint32(packet_length, buf, bufsz, &pos);
-	buf[pos++] = (uint8_t)padding_len;
-	memcpy(&buf[pos], payload, payload_len);
-	pos += payload_len;
-	memset(&buf[pos], 0, padding_len);
-	pos += padding_len;
-	return pos;
-}
-
+#ifdef DSSH_CRYPTO_OPENSSL
 /* Thread: version_exchange + kexinit */
 struct ve_ki_ctx {
 	struct mock_io_state *io;
@@ -1537,7 +1506,7 @@ ve_ki_thread(void *arg)
 	}
 	return 0;
 }
-
+#endif
 /* Direct KEX sweeps use real peers in both directions. The preparation phase
  * completes version exchange and KEXINIT before arming either injector. The
  * opposite KEX actor excludes itself before its first failable operation. */
@@ -1804,221 +1773,358 @@ test_ossl_kex_client_iterate(void)
  * crafted packets to exercise error paths in the client handler.
  * ================================================================ */
 
-struct bad_server_ctx {
-	struct mock_io_state *io;
-	dssh_session sess;
-	const uint8_t *reply_data;
-	size_t reply_len;
-	int result;
+enum allocation_parser_stage {
+	PARSER_CURVE_REPLY,
+	PARSER_GEX_GROUP,
+	PARSER_GEX_REPLY,
+	PARSER_CURVE_INIT
 };
 
-/*
- * Bad server: reads GEX_REQUEST, sends a pre-built reply, then
- * reads GEX_INIT (if the client gets that far) and closes.
- */
-static int
-bad_server_group_thread(void *arg)
+struct allocation_parser_peer {
+	struct mock_io_state *io;
+	dssh_session session;
+	enum allocation_parser_stage stage;
+	const uint8_t *reply;
+	size_t reply_len;
+	const char *model;
+	struct dssh_result_lease producer;
+	unsigned requests;
+	unsigned sends;
+	unsigned groups;
+	unsigned releases;
+	int result;
+	bool model_hit;
+};
+
+struct allocation_parser_observation {
+	int result;
+	int peer_result;
+	unsigned created;
+	unsigned joined;
+	bool delivered;
+	bool retired;
+	bool model_hit;
+};
+
+static void
+allocation_parser_group_release(void *opaque)
 {
-	struct bad_server_ctx *ctx = arg;
-	dssh_test_ossl_exclude_thread();
-	dssh_test_alloc_exclude_thread();
+	struct allocation_parser_peer *peer = opaque;
+	/* One selected group owns one producer lease on this worker. */
+	peer->releases++;
+	dssh_result_release(&peer->producer);
+}
 
-	/* Read GEX_REQUEST from client */
-	uint8_t msg_type;
-	uint8_t *payload;
-	size_t payload_len;
-	ctx->result = recv_packet(ctx->sess,
-	    &msg_type, &payload, &payload_len);
-	if (ctx->result < 0) {
-		mock_io_close_s2c(ctx->io);
-		return 0;
-	}
+static int
+allocation_parser_send(struct allocation_parser_peer *peer, const uint8_t *data, size_t length)
+{
+	int ret = send_packet(peer->session, data, length, NULL);
+	if (ret == 0)
+		peer->sends++;
+	return ret;
+}
 
-	/* Send the crafted reply (if any) */
-	if (ctx->reply_data != NULL && ctx->reply_len > 0) {
-		ctx->result = send_packet(ctx->sess,
-		    ctx->reply_data, ctx->reply_len, NULL);
-	}
-
-	/* Close server output so client unblocks */
-	mock_io_close_s2c(ctx->io);
+static int
+allocation_parser_put_mpint(struct dssh_bytes bytes, uint8_t *buffer, size_t capacity, size_t *pos)
+{
+	if (bytes.data == NULL || bytes.len == 0 || bytes.len > 1024 || *pos > capacity)
+		return DSSH_ERROR_INVALID;
+	bool pad = (bytes.data[0] & 0x80) != 0;
+	size_t encoded = bytes.len + (pad ? 1U : 0U); /* At most1025. */
+	if (capacity - *pos < 4 || encoded > capacity - *pos - 4)
+		return DSSH_ERROR_TOOLONG;
+	uint32_t count = (uint32_t)encoded;
+	int ret = dssh_serialize_uint32(count, buffer, capacity, pos);
+	if (ret < 0)
+		return ret;
+	if (pad)
+		buffer[(*pos)++] = 0;
+	memcpy(buffer + *pos, bytes.data, bytes.len);
+	*pos += bytes.len;
 	return 0;
 }
 
-/*
- * Bad server that sends a valid GEX_GROUP, reads GEX_INIT, then
- * sends a crafted GEX_REPLY.
- */
 static int
-bad_server_reply_thread(void *arg)
+allocation_parser_request(struct allocation_parser_peer *peer, bool init)
 {
-	struct bad_server_ctx *ctx = arg;
+	uint8_t type;
+	uint8_t *payload;
+	size_t length;
+	int ret = recv_packet(peer->session, &type, &payload, &length);
+	if (ret != 0)
+		return ret;
+	uint8_t wanted = peer->stage == PARSER_CURVE_REPLY ? UINT8_C(30)
+	    : init ? UINT8_C(32) : UINT8_C(34);
+	if (strcmp(peer->model, "bad-request") == 0) {
+		peer->model_hit = true;
+		wanted = 34;
+	}
+	if (payload == NULL || length == 0 || type != wanted || payload[0] != type)
+		return DSSH_ERROR_PARSE;
+	if (wanted == 34) {
+		if (length != 13)
+			return DSSH_ERROR_PARSE;
+		static const uint32_t expected[] = {2048, 4096, 8192};
+		for (size_t i = 0; i < 3; i++) {
+			uint32_t value;
+			if (dssh_parse_uint32(payload + 1 + i * 4, 4, &value) != 4 || value != expected[i])
+				return DSSH_ERROR_PARSE;
+		}
+	}
+	else {
+		uint32_t count;
+		if (length < 5 || dssh_parse_uint32(payload + 1, length - 1, &count) != 4
+		    || count != length - 5)
+			return DSSH_ERROR_PARSE;
+		if (wanted == 30) {
+			if (count != 32)
+				return DSSH_ERROR_PARSE;
+		}
+		else if (count == 0 || count > 1025 || (payload[5] & 0x80) != 0
+		    || (payload[5] == 0 && (count < 2 || (payload[6] & 0x80) == 0)))
+			return DSSH_ERROR_PARSE;
+	}
+	peer->requests++;
+	return 0;
+}
+
+static int
+allocation_parser_worker(void *opaque)
+{
+	struct allocation_parser_peer *peer = opaque;
 	struct dssh_dh_gex_group_result group = {0};
 	dssh_test_ossl_exclude_thread();
 	dssh_test_alloc_exclude_thread();
-
-	/* Read GEX_REQUEST */
-	uint8_t msg_type;
-	uint8_t *payload;
-	size_t payload_len;
-	ctx->result = recv_packet(ctx->sess,
-	    &msg_type, &payload, &payload_len);
-	if (ctx->result < 0)
+	peer->result = 0;
+	if (peer->stage != PARSER_CURVE_INIT)
+		peer->result = allocation_parser_request(peer, false);
+	if (peer->result != 0)
 		goto done;
-
-	/* Send a real GEX_GROUP via the real handler's first half.
-	 * Actually, just run the real kex handler -- it sends GROUP
-	 * and reads INIT internally.  Too complex.
-	 *
-	 * Simpler: send GROUP manually, read INIT, send bad REPLY. */
-
-	/* Get the DH group from the provider */
-	struct dssh_dh_gex_provider *prov =
-	    (struct dssh_dh_gex_provider *)ctx->sess->trans.kex_selected->config;
-	ctx->result = prov->select_group(2048, 4096, 8192, &group, prov->cbdata);
-	if (ctx->result > 0)
-		ctx->result = DSSH_ERROR_INVALID;
-	if (ctx->result < 0)
-		goto done;
-	const uint8_t *p_bytes = group.p.data, *g_bytes = group.g.data;
-	size_t p_len = group.p.len, g_len = group.g.len;
-	if (group.lease.release == NULL || p_bytes == NULL || g_bytes == NULL
-	    || p_len == 0 || g_len == 0 || p_len > 1024 || g_len > 1024) {
-		ctx->result = DSSH_ERROR_INVALID;
-		goto done;
-	}
-
-	/* Build and send GEX_GROUP -- serialize raw bytes as SSH mpint */
-	{
-		uint8_t group_msg[4096];
-		size_t gp = 0;
-
-		group_msg[gp++] = 31; /* GEX_GROUP */
-
-		/* Serialize p as mpint (add zero-pad if high bit set) */
-		bool p_pad = (p_len > 0 && (p_bytes[0] & 0x80));
-		uint32_t p_mpint_len = (uint32_t)p_len + (p_pad ? 1 : 0);
-
-		ctx->result = dssh_serialize_uint32(p_mpint_len, group_msg, sizeof(group_msg), &gp);
-		if (ctx->result < 0)
+	if (peer->stage == PARSER_GEX_REPLY) {
+		dssh_kex method = peer->session->trans.kex_selected;
+		struct dssh_dh_gex_provider *provider = method->config;
+		if (provider == NULL || provider->select_group == NULL) {
+			peer->result = DSSH_ERROR_INVALID;
 			goto done;
-		if (p_pad)
-			group_msg[gp++] = 0;
-		memcpy(&group_msg[gp], p_bytes, p_len);
-		gp += p_len;
-
-		/* Serialize g as mpint */
-		bool g_pad = (g_len > 0 && (g_bytes[0] & 0x80));
-		uint32_t g_mpint_len = (uint32_t)g_len + (g_pad ? 1 : 0);
-
-		ctx->result = dssh_serialize_uint32(g_mpint_len, group_msg, sizeof(group_msg), &gp);
-		if (ctx->result < 0)
+		}
+		peer->result = provider->select_group(2048, 4096, 8192, &group, provider->cbdata);
+		if (group.lease.release != NULL) {
+			/* Move this producer lease into a forwarding observation. The
+			 * original result and both records stay live through release. */
+			peer->producer = group.lease;
+			group.lease = (struct dssh_result_lease){allocation_parser_group_release, peer};
+			peer->groups++;
+		}
+		if (strcmp(peer->model, "provider-error") == 0) {
+			peer->model_hit = true;
+			peer->result = DSSH_ERROR_INIT;
+		}
+		if (peer->result != 0)
 			goto done;
-		if (g_pad)
-			group_msg[gp++] = 0;
-		memcpy(&group_msg[gp], g_bytes, g_len);
-		gp += g_len;
-
+		if (peer->groups != 1 || group.p.data == group.g.data) {
+			peer->result = DSSH_ERROR_INVALID;
+			goto done;
+		}
+		uint8_t message[2 * 1024 + 11] = {31};
+		size_t pos = 1;
+		peer->result = allocation_parser_put_mpint(group.p, message, sizeof(message), &pos);
+		if (peer->result == 0)
+			peer->result = allocation_parser_put_mpint(group.g, message, sizeof(message), &pos);
 		dssh_result_release(&group.lease);
-		ctx->result = send_packet(ctx->sess,
-		    group_msg, gp, NULL);
-		if (ctx->result < 0)
+		if (peer->result == 0)
+			peer->result = allocation_parser_send(peer, message, pos);
+		if (peer->result == 0)
+			peer->result = allocation_parser_request(peer, true);
+		if (peer->result != 0)
 			goto done;
 	}
-
-	/* Read GEX_INIT (client's e value) */
-	ctx->result = recv_packet(ctx->sess,
-	    &msg_type, &payload, &payload_len);
-	if (ctx->result < 0)
-		goto done;
-
-	/* Send the crafted bad REPLY */
-	ctx->result = send_packet(ctx->sess,
-	    ctx->reply_data, ctx->reply_len, NULL);
-
+	if (strcmp(peer->model, "skip-reply") == 0)
+		peer->model_hit = true;
+	else if (peer->reply_len != 0)
+		peer->result = allocation_parser_send(peer, peer->reply, peer->reply_len);
 done:
 	dssh_result_release(&group.lease);
-	mock_io_close_s2c(ctx->io);
+	/* Preserve queued bytes and the receiver. Full cancellation belongs to
+	 * the enclosing owner, after the target's result has been observed. */
+	if (peer->stage == PARSER_CURVE_INIT)
+		mock_io_close_c2s_write(peer->io);
+	else
+		mock_io_close_s2c_write(peer->io);
 	return 0;
 }
 
 static int
-dhgex_client_parse_test(int (*server_thread)(void *),
-    const uint8_t *reply, size_t reply_len)
+allocation_parser_start(struct allocation_pair *owner, struct allocation_parser_peer *peer)
 {
-	dssh_test_reset_global_config();
-	dssh_test_alloc_reset();
-	dssh_test_ossl_reset();
-	mock_alloc_reset();
+	unsigned side = peer->stage == PARSER_CURVE_INIT ? 0U : 1U;
+	if (owner->pair.owned[side] || owner->pair.created == UINT_MAX)
+		return DSSH_ERROR_INVALID;
+	peer->io = &owner->pair.io;
+	peer->session = side == 0 ? owner->pair.client : owner->pair.server;
+	if (thrd_create(&owner->pair.threads[side], allocation_parser_worker, peer) != thrd_success)
+		return DSSH_ERROR_INIT;
+	owner->pair.owned[side] = true;
+	owner->pair.created++;
+	return 0;
+}
 
-	if (register_all() < 0)
-		return TEST_FAIL;
-	if (test_generate_host_key() < 0)
-		return TEST_FAIL;
+static bool
+allocation_parser_payload(dssh_session target, const uint8_t *reply, size_t length)
+{
+	if (target->trans.rx_packet == NULL || target->trans.packet_buf_sz < 9
+	    || length > target->trans.packet_buf_sz - 9)
+		return false;
+	uint32_t packet;
+	if (dssh_parse_uint32(target->trans.rx_packet + 4, 4, &packet) != 4)
+		return false;
+	uint32_t padding = target->trans.rx_packet[8];
+	if (packet < padding + 1 || packet - padding - 1 != length)
+		return false;
+	return memcmp(target->trans.rx_packet + 9, reply, length) == 0;
+}
 
-	struct mock_io_state io;
-	if (mock_io_init(&io, 0) < 0)
-		return TEST_FAIL;
-
-	dssh_transport_set_callbacks(mock_tx_dispatch, mock_rx_dispatch,
-	    mock_rxline_dispatch, mock_extra_line_cb);
-
-	dssh_session client = dssh_session_init(true, 0);
-	if (client == NULL) {
-		mock_io_free(&io);
-		return TEST_FAIL;
+static int
+allocation_parser_case(enum allocation_parser_stage stage, const uint8_t *reply,
+    size_t length, int expected, const char *model, struct allocation_parser_observation *observed)
+{
+	*observed = (struct allocation_parser_observation){.result = DSSH_ERROR_INIT,
+	    .peer_result = DSSH_ERROR_INIT};
+	struct allocation_pair owner;
+	struct allocation_parser_peer peer = {.stage = stage, .reply = reply,
+	    .reply_len = length, .model = model, .result = DSSH_ERROR_INIT};
+	int ret = allocation_prepare(&owner, false);
+	if (ret == 0)
+		ret = test_pair_run(&owner.pair, allocation_kex_negotiate);
+	const char *method = stage == PARSER_GEX_GROUP || stage == PARSER_GEX_REPLY
+	    ? "diffie-hellman-group-exchange-sha256" : "curve25519-sha256";
+	if (ret == 0) {
+		bool selected = owner.pair.client->trans.kex_selected != NULL
+		    && owner.pair.server->trans.kex_selected != NULL
+		    && strcmp(owner.pair.client->trans.kex_selected->name, method) == 0
+		    && strcmp(owner.pair.server->trans.kex_selected->name, method) == 0
+		    && owner.pair.client->trans.key_algo_selected != NULL
+		    && owner.pair.server->trans.key_algo_selected != NULL
+		    && strcmp(owner.pair.client->trans.key_algo_selected->name, test_key_algo_name()) == 0
+		    && strcmp(owner.pair.server->trans.key_algo_selected->name, test_key_algo_name()) == 0;
+		if (!selected)
+			ret = DSSH_ERROR_INVALID;
 	}
-	dssh_session_set_cbdata(client, &io, &io, &io, &io);
-	dssh_session_set_hostkey_verify_cb(client, dssh_test_accept_hostkey, NULL);
-
-	dssh_session server = init_server_session();
-	if (server == NULL) {
-		dssh_session_cleanup(client);
-		mock_io_free(&io);
-		return TEST_FAIL;
+	dssh_session target = stage == PARSER_CURVE_INIT ? owner.pair.server : owner.pair.client;
+	uint32_t before = ret == 0 ? target->trans.rx_seq : 0;
+	if (ret == 0)
+		ret = allocation_parser_start(&owner, &peer);
+	if (ret == 0) {
+		observed->result = kex(target);
+		unsigned sends = (stage == PARSER_GEX_REPLY ? 1U : 0U) + (length != 0 ? 1U : 0U);
+		bool packets = target->trans.rx_seq >= before && target->trans.rx_seq - before == sends;
+		observed->delivered = packets && (length == 0
+		    || allocation_parser_payload(target, reply, length));
+		bool target_valid = observed->result == expected && allocation_kex_result_empty(target)
+		    && dssh_session_is_terminated(target) == (length == 0);
+		/* Complete receipt proves the responder has reached its final send.
+		 * Let that send return before termination can alter its result. EOF
+		 * responders already close only after finishing their prerequisites;
+		 * incomplete/unexpected paths still need cancellation to unblock. */
+		if (!observed->delivered || length == 0)
+			test_pair_cancel(&owner.pair);
+		test_pair_join(&owner.pair);
+		observed->peer_result = peer.result;
+		unsigned requests = stage == PARSER_CURVE_INIT ? 0U : stage == PARSER_GEX_REPLY ? 2U : 1U;
+		unsigned groups = stage == PARSER_GEX_REPLY ? 1U : 0U;
+		if (peer.result != 0 || !target_valid || !observed->delivered || peer.requests != requests
+		    || peer.sends != sends || peer.groups != groups || peer.releases != groups)
+			ret = DSSH_ERROR_INVALID;
 	}
-	dssh_session_set_cbdata(server, &io, &io, &io, &io);
+	allocation_cleanup(&owner);
+	allocation_cleanup(&owner);
+	observed->created = owner.pair.created;
+	observed->joined = owner.pair.joined;
+	observed->retired = allocation_pair_retired(&owner);
+	observed->model_hit = peer.model_hit;
+	if (ret == 0 && (!observed->retired || observed->created != 3 || observed->joined != 3))
+		ret = DSSH_ERROR_INVALID;
+	unsigned stage_id = (unsigned)stage; /* One of the four private stage constants. */
+	if (printf("allocation_parser stage=%u method=%s key=%s bytes=%zu result=%d expected=%d peer=%d requests=%u sends=%u groups=%u releases=%u delivered=%u created=%u joined=%u retired=%u fixture=%d\n",
+	        stage_id, method, test_key_algo_name(), length, observed->result, expected, peer.result,
+	        peer.requests, peer.sends, peer.groups, peer.releases, observed->delivered ? 1U : 0U,
+	        observed->created, observed->joined, observed->retired ? 1U : 0U, ret) < 0)
+		ret = DSSH_ERROR_INIT;
+	return ret;
+}
 
-	/* version_exchange + kexinit */
-	{
-		struct ve_ki_ctx ca = { .io = &io, .sess = client };
-		struct ve_ki_ctx sa = { .io = &io, .sess = server };
-		thrd_t ct, st;
-		if (thrd_create(&ct, ve_ki_thread, &ca) != thrd_success)
-			return TEST_FAIL;
-		if (thrd_create(&st, ve_ki_thread, &sa) != thrd_success)
-			return TEST_FAIL;
-		thrd_join(ct, NULL);
-		thrd_join(st, NULL);
-		if (ca.result != 0 || sa.result != 0) {
-			mock_io_close_c2s(&io);
-			mock_io_close_s2c(&io);
-			dssh_session_cleanup(server);
-			dssh_session_cleanup(client);
-			mock_io_free(&io);
-			dssh_test_reset_global_config();
-			return TEST_FAIL;
+static int
+allocation_parser_owner_control(void)
+{
+	const char *mode = getenv("DSSH_PEER_FAILURE");
+	if (mode == NULL)
+		mode = "plain";
+	bool plain = strcmp(mode, "plain") == 0;
+	bool model = strcmp(mode, "skip-reply") == 0 || strcmp(mode, "bad-request") == 0
+	    || strcmp(mode, "provider-error") == 0;
+	enum allocation_parser_stage stage = strcmp(mode, "provider-error") == 0
+	    ? PARSER_GEX_REPLY : PARSER_CURVE_REPLY;
+	static const uint8_t reply[] = {31};
+	struct allocation_parser_observation observed;
+	int ret = allocation_parser_case(stage, reply, sizeof(reply), DSSH_ERROR_PARSE, mode, &observed);
+	bool valid = plain ? ret == 0 : ret < 0;
+	valid = valid && observed.retired && observed.created == observed.joined
+	    && (!model || (observed.model_hit && observed.created == 3));
+	if (model && printf("allocation_parser_model mode=%s hit=%u\n", mode,
+	    observed.model_hit ? 1U : 0U) < 0)
+		return 2;
+	if (printf("allocation_parser_control created=%u joined=%u retired=%u completed=%u fixture=%d valid=%u\n",
+	        observed.created, observed.joined, observed.retired ? 1U : 0U,
+	        ret == 0 ? 1U : 0U, ret, valid ? 1U : 0U) < 0)
+		return 2;
+	return valid ? 0 : 2;
+}
+
+static int
+allocation_parser_assertion_control(unsigned phase)
+{
+	struct allocation_pair owner;
+	struct allocation_parser_peer peer = {.stage = PARSER_CURVE_REPLY, .model = "plain"};
+	int ret = allocation_prepare(&owner, false);
+	owner.pair.operation = allocation_kex_negotiate;
+	if (ret == 0 && phase >= 1)
+		ret = test_pair_start(&owner.pair, 0);
+	if (ret == 0 && phase >= 2) {
+		ret = test_pair_start(&owner.pair, 1);
+		if (ret == 0) {
+			test_pair_join(&owner.pair);
+			ret = owner.pair.client_result != 0 ? owner.pair.client_result : owner.pair.server_result;
 		}
 	}
+	if (ret == 0 && phase >= 3)
+		ret = allocation_parser_start(&owner, &peer);
+	if (ret != 0) {
+		allocation_cleanup(&owner);
+		return 2;
+	}
+	ret = allocation_assertion_failure();
+	bool retired = allocation_pair_retired(&owner);
+	unsigned created = owner.pair.created;
+	unsigned joined = owner.pair.joined;
+	bool valid = ret == TEST_FAIL && retired && created == phase && joined == phase;
+	allocation_cleanup(&owner);
+	if (printf("allocation_parser_assertion phase=%u created=%u joined=%u retired=%u valid=%u\n",
+	        phase, created, joined, retired ? 1U : 0U, valid ? 1U : 0U) < 0)
+		return 2;
+	return valid ? 1 : 2;
+}
 
-	struct bad_server_ctx sctx = {
-		.io = &io, .sess = server,
-		.reply_data = reply, .reply_len = reply_len
-	};
-	thrd_t st;
-	if (thrd_create(&st, server_thread, &sctx) != thrd_success)
-		return TEST_FAIL;
-	int cres = kex(client);
-	mock_io_close_c2s(&io);
-	thrd_join(st, NULL);
+static int
+dhgex_client_parse_test(enum allocation_parser_stage stage, const uint8_t *reply, size_t length, int expected)
+{
+	struct allocation_parser_observation observed;
+	return allocation_parser_case(stage, reply, length, expected, "plain", &observed);
+}
 
-	mock_io_close_s2c(&io);
-	dssh_session_cleanup(server);
-	dssh_session_cleanup(client);
-	mock_io_free(&io);
-	dssh_test_reset_global_config();
-
-	return cres;
+static int
+c25519_client_parse_test(const uint8_t *reply, size_t length)
+{
+	struct allocation_parser_observation observed;
+	return allocation_parser_case(PARSER_CURVE_REPLY, reply, length, DSSH_ERROR_PARSE, "plain", &observed);
 }
 
 /* Line 220: recv GEX_GROUP fails (server closes before sending) */
@@ -2028,8 +2134,8 @@ test_dhgex_client_recv_group_fail(void)
 	if (!test_using_dhgex())
 		return TEST_SKIP;
 	/* Empty reply + close -> recv fails */
-	int res = dhgex_client_parse_test(bad_server_group_thread, NULL, 0);
-	ASSERT_TRUE(res < 0);
+	int res = dhgex_client_parse_test(PARSER_GEX_GROUP, NULL, 0, DSSH_ERROR_PARSE);
+	ASSERT_EQ(res, 0);
 	return TEST_PASS;
 }
 
@@ -2040,8 +2146,8 @@ test_dhgex_client_group_empty(void)
 	if (!test_using_dhgex())
 		return TEST_SKIP;
 	uint8_t group[1] = { 31 }; /* GEX_GROUP, no p or g */
-	int res = dhgex_client_parse_test(bad_server_group_thread, group, 1);
-	ASSERT_TRUE(res < 0);
+	int res = dhgex_client_parse_test(PARSER_GEX_GROUP, group, 1, DSSH_ERROR_PARSE);
+	ASSERT_EQ(res, 0);
 	return TEST_PASS;
 }
 
@@ -2055,10 +2161,10 @@ test_dhgex_client_group_no_g(void)
 	uint8_t group[16];
 	size_t gp = 0;
 	group[gp++] = 31;
-	dssh_serialize_uint32(1, group, sizeof(group), &gp);
+	ASSERT_EQ(dssh_serialize_uint32(1, group, sizeof(group), &gp), 0);
 	group[gp++] = 0x02; /* mpint p=2 */
-	int res = dhgex_client_parse_test(bad_server_group_thread, group, gp);
-	ASSERT_TRUE(res < 0);
+	int res = dhgex_client_parse_test(PARSER_GEX_GROUP, group, gp, DSSH_ERROR_PARSE);
+	ASSERT_EQ(res, 0);
 	return TEST_PASS;
 }
 
@@ -2068,19 +2174,19 @@ test_dhgex_client_group_too_small(void)
 {
 	if (!test_using_dhgex())
 		return TEST_SKIP;
-	/* 768-bit p = 96 data bytes; top bit set so no sign-byte padding
-	 * is needed (counted length matches the real bit-length). */
-	uint8_t group[1 + 4 + 96 + 4 + 1];
+	/* A canonical positive768-bit p needs one sign byte plus96 data bytes. */
+	uint8_t group[1 + 4 + 97 + 4 + 1];
 	size_t  gp = 0;
 	group[gp++] = 31; /* GEX_GROUP */
-	dssh_serialize_uint32(96, group, sizeof(group), &gp);
+	ASSERT_EQ(dssh_serialize_uint32(97, group, sizeof(group), &gp), 0);
+	group[gp++] = 0;
 	group[gp] = 0x80;
 	memset(&group[gp + 1], 0xff, 95);
 	gp += 96;
-	dssh_serialize_uint32(1, group, sizeof(group), &gp);
+	ASSERT_EQ(dssh_serialize_uint32(1, group, sizeof(group), &gp), 0);
 	group[gp++] = 0x02; /* g = 2 */
-	int res = dhgex_client_parse_test(bad_server_group_thread, group, gp);
-	ASSERT_TRUE(res < 0);
+	int res = dhgex_client_parse_test(PARSER_GEX_GROUP, group, gp, DSSH_ERROR_INVALID);
+	ASSERT_EQ(res, 0);
 	return TEST_PASS;
 }
 
@@ -2094,10 +2200,10 @@ test_dhgex_client_bad_reply_type(void)
 	uint8_t reply[8];
 	size_t rp = 0;
 	reply[rp++] = 32; /* wrong type */
-	dssh_serialize_uint32(1, reply, sizeof(reply), &rp);
+	ASSERT_EQ(dssh_serialize_uint32(1, reply, sizeof(reply), &rp), 0);
 	reply[rp++] = 0x02;
-	int res = dhgex_client_parse_test(bad_server_reply_thread, reply, rp);
-	ASSERT_TRUE(res < 0);
+	int res = dhgex_client_parse_test(PARSER_GEX_REPLY, reply, rp, DSSH_ERROR_PARSE);
+	ASSERT_EQ(res, 0);
 	return TEST_PASS;
 }
 
@@ -2109,8 +2215,8 @@ test_dhgex_client_reply_short_ks(void)
 		return TEST_SKIP;
 	/* GEX_REPLY with only msg_type byte -- no K_S length field */
 	uint8_t reply[1] = { 33 };
-	int res = dhgex_client_parse_test(bad_server_reply_thread, reply, 1);
-	ASSERT_TRUE(res < 0);
+	int res = dhgex_client_parse_test(PARSER_GEX_REPLY, reply, 1, DSSH_ERROR_PARSE);
+	ASSERT_EQ(res, 0);
 	return TEST_PASS;
 }
 
@@ -2124,11 +2230,11 @@ test_dhgex_client_reply_truncated_ks(void)
 	uint8_t reply[16];
 	size_t rp = 0;
 	reply[rp++] = 33; /* GEX_REPLY */
-	dssh_serialize_uint32(1000, reply, sizeof(reply), &rp);
+	ASSERT_EQ(dssh_serialize_uint32(1000, reply, sizeof(reply), &rp), 0);
 	reply[rp++] = 0x01;
 	reply[rp++] = 0x02;
-	int res = dhgex_client_parse_test(bad_server_reply_thread, reply, rp);
-	ASSERT_TRUE(res < 0);
+	int res = dhgex_client_parse_test(PARSER_GEX_REPLY, reply, rp, DSSH_ERROR_PARSE);
+	ASSERT_EQ(res, 0);
 	return TEST_PASS;
 }
 
@@ -2143,13 +2249,13 @@ test_dhgex_client_reply_f_zero(void)
 	size_t rp = 0;
 	reply[rp++] = 33; /* GEX_REPLY */
 	/* K_S: empty string (len=0) */
-	dssh_serialize_uint32(0, reply, sizeof(reply), &rp);
+	ASSERT_EQ(dssh_serialize_uint32(0, reply, sizeof(reply), &rp), 0);
 	/* f: mpint 0 (len=0) */
-	dssh_serialize_uint32(0, reply, sizeof(reply), &rp);
-	/* sig: empty (len=0) -- won't be reached since f=0 fails first */
-	dssh_serialize_uint32(0, reply, sizeof(reply), &rp);
-	int res = dhgex_client_parse_test(bad_server_reply_thread, reply, rp);
-	ASSERT_TRUE(res < 0);
+	ASSERT_EQ(dssh_serialize_uint32(0, reply, sizeof(reply), &rp), 0);
+	/* Complete signature framing precedes the mathematical f check. */
+	ASSERT_EQ(dssh_serialize_uint32(0, reply, sizeof(reply), &rp), 0);
+	int res = dhgex_client_parse_test(PARSER_GEX_REPLY, reply, rp, DSSH_ERROR_INVALID);
+	ASSERT_EQ(res, 0);
 	return TEST_PASS;
 }
 
@@ -2164,13 +2270,13 @@ test_dhgex_client_reply_short_sig(void)
 	size_t rp = 0;
 	reply[rp++] = 33; /* GEX_REPLY */
 	/* K_S: empty string (len=0) */
-	dssh_serialize_uint32(0, reply, sizeof(reply), &rp);
+	ASSERT_EQ(dssh_serialize_uint32(0, reply, sizeof(reply), &rp), 0);
 	/* f: mpint 2 */
-	dssh_serialize_uint32(1, reply, sizeof(reply), &rp);
+	ASSERT_EQ(dssh_serialize_uint32(1, reply, sizeof(reply), &rp), 0);
 	reply[rp++] = 0x02;
 	/* No sig at all -- payload ends here */
-	int res = dhgex_client_parse_test(bad_server_reply_thread, reply, rp);
-	ASSERT_TRUE(res < 0);
+	int res = dhgex_client_parse_test(PARSER_GEX_REPLY, reply, rp, DSSH_ERROR_PARSE);
+	ASSERT_EQ(res, 0);
 	return TEST_PASS;
 }
 
@@ -2185,14 +2291,14 @@ test_dhgex_client_reply_truncated_sig(void)
 	size_t rp = 0;
 	reply[rp++] = 33; /* GEX_REPLY */
 	/* K_S: empty string */
-	dssh_serialize_uint32(0, reply, sizeof(reply), &rp);
+	ASSERT_EQ(dssh_serialize_uint32(0, reply, sizeof(reply), &rp), 0);
 	/* f: mpint 2 */
-	dssh_serialize_uint32(1, reply, sizeof(reply), &rp);
+	ASSERT_EQ(dssh_serialize_uint32(1, reply, sizeof(reply), &rp), 0);
 	reply[rp++] = 0x02;
 	/* sig: claiming 1000 bytes but message ends here */
-	dssh_serialize_uint32(1000, reply, sizeof(reply), &rp);
-	int res = dhgex_client_parse_test(bad_server_reply_thread, reply, rp);
-	ASSERT_TRUE(res < 0);
+	ASSERT_EQ(dssh_serialize_uint32(1000, reply, sizeof(reply), &rp), 0);
+	int res = dhgex_client_parse_test(PARSER_GEX_REPLY, reply, rp, DSSH_ERROR_PARSE);
+	ASSERT_EQ(res, 0);
 	return TEST_PASS;
 }
 
@@ -2204,131 +2310,15 @@ test_dhgex_client_reply_truncated_sig(void)
  * the client, sends a crafted ECDH_REPLY, then closes.
  * ================================================================ */
 
-static int
-bad_c25519_server_thread(void *arg)
-{
-	struct bad_server_ctx *ctx = arg;
-	dssh_test_ossl_exclude_thread();
-	dssh_test_alloc_exclude_thread();
-
-	/* Read ECDH_INIT from client */
-	uint8_t msg_type;
-	uint8_t *payload;
-	size_t payload_len;
-	ctx->result = recv_packet(ctx->sess,
-	    &msg_type, &payload, &payload_len);
-	if (ctx->result < 0) {
-		mock_io_close_s2c(ctx->io);
-		return 0;
-	}
-
-	/* Send the crafted reply (if any) */
-	if (ctx->reply_data != NULL && ctx->reply_len > 0) {
-		ctx->result = send_packet(ctx->sess,
-		    ctx->reply_data, ctx->reply_len, NULL);
-	}
-
-	/* Close server output so client unblocks */
-	mock_io_close_s2c(ctx->io);
-	return 0;
-}
-
-static int
-c25519_client_parse_test(int (*server_thread)(void *),
-    const uint8_t *reply, size_t reply_len)
-{
-	dssh_test_reset_global_config();
-	dssh_test_alloc_reset();
-	dssh_test_ossl_reset();
-	mock_alloc_reset();
-
-	if (dssh_register_curve25519_sha256() < 0)
-		return TEST_FAIL;
-	if (test_register_key_algos() < 0)
-		return TEST_FAIL;
-	if (dssh_register_aes256_ctr() < 0)
-		return TEST_FAIL;
-	if (test_register_mac_algos() < 0)
-		return TEST_FAIL;
-	if (dssh_register_none_comp() < 0)
-		return TEST_FAIL;
-	if (test_generate_host_key() < 0)
-		return TEST_FAIL;
-
-	struct mock_io_state io;
-	if (mock_io_init(&io, 0) < 0)
-		return TEST_FAIL;
-
-	dssh_transport_set_callbacks(mock_tx_dispatch, mock_rx_dispatch,
-	    mock_rxline_dispatch, mock_extra_line_cb);
-
-	dssh_session client = dssh_session_init(true, 0);
-	if (client == NULL) {
-		mock_io_free(&io);
-		return TEST_FAIL;
-	}
-	dssh_session_set_cbdata(client, &io, &io, &io, &io);
-	dssh_session_set_hostkey_verify_cb(client, dssh_test_accept_hostkey, NULL);
-
-	dssh_session server = dssh_session_init(false, 0);
-	if (server == NULL) {
-		dssh_session_cleanup(client);
-		mock_io_free(&io);
-		return TEST_FAIL;
-	}
-	dssh_session_set_cbdata(server, &io, &io, &io, &io);
-
-	/* version_exchange + kexinit */
-	{
-		struct ve_ki_ctx ca = { .io = &io, .sess = client };
-		struct ve_ki_ctx sa = { .io = &io, .sess = server };
-		thrd_t ct, st;
-		if (thrd_create(&ct, ve_ki_thread, &ca) != thrd_success)
-			return TEST_FAIL;
-		if (thrd_create(&st, ve_ki_thread, &sa) != thrd_success)
-			return TEST_FAIL;
-		thrd_join(ct, NULL);
-		thrd_join(st, NULL);
-		if (ca.result != 0 || sa.result != 0) {
-			mock_io_close_c2s(&io);
-			mock_io_close_s2c(&io);
-			dssh_session_cleanup(server);
-			dssh_session_cleanup(client);
-			mock_io_free(&io);
-			dssh_test_reset_global_config();
-			return TEST_FAIL;
-		}
-	}
-
-	struct bad_server_ctx sctx = {
-		.io = &io, .sess = server,
-		.reply_data = reply, .reply_len = reply_len
-	};
-	thrd_t st;
-	if (thrd_create(&st, server_thread, &sctx) != thrd_success)
-		return TEST_FAIL;
-	int cres = kex(client);
-	mock_io_close_c2s(&io);
-	thrd_join(st, NULL);
-
-	mock_io_close_s2c(&io);
-	dssh_session_cleanup(server);
-	dssh_session_cleanup(client);
-	mock_io_free(&io);
-	dssh_test_reset_global_config();
-
-	return cres;
-}
-
 /* Line 257: recv ECDH_REPLY fails (server closes before sending) */
 static int
 test_c25519_client_recv_reply_fail(void)
 {
-	if (test_using_dhgex())
+	if (strcmp(test_kex_algo_name(), "curve25519-sha256") != 0)
 		return TEST_SKIP;
 	/* Empty reply + close -> recv fails */
-	int res = c25519_client_parse_test(bad_c25519_server_thread, NULL, 0);
-	ASSERT_TRUE(res < 0);
+	int res = c25519_client_parse_test(NULL, 0);
+	ASSERT_EQ(res, 0);
 	return TEST_PASS;
 }
 
@@ -2336,12 +2326,12 @@ test_c25519_client_recv_reply_fail(void)
 static int
 test_c25519_client_reply_short_ks(void)
 {
-	if (test_using_dhgex())
+	if (strcmp(test_kex_algo_name(), "curve25519-sha256") != 0)
 		return TEST_SKIP;
 	/* ECDH_REPLY with only msg_type byte -- no K_S length field */
 	uint8_t reply[1] = { 31 }; /* SSH_MSG_KEX_ECDH_REPLY */
-	int res = c25519_client_parse_test(bad_c25519_server_thread, reply, 1);
-	ASSERT_TRUE(res < 0);
+	int res = c25519_client_parse_test(reply, 1);
+	ASSERT_EQ(res, 0);
 	return TEST_PASS;
 }
 
@@ -2349,17 +2339,17 @@ test_c25519_client_reply_short_ks(void)
 static int
 test_c25519_client_reply_trunc_ks(void)
 {
-	if (test_using_dhgex())
+	if (strcmp(test_kex_algo_name(), "curve25519-sha256") != 0)
 		return TEST_SKIP;
 	/* K_S length claiming 1000 bytes but only 2 present */
 	uint8_t reply[16];
 	size_t rp = 0;
 	reply[rp++] = 31; /* SSH_MSG_KEX_ECDH_REPLY */
-	dssh_serialize_uint32(1000, reply, sizeof(reply), &rp);
+	ASSERT_EQ(dssh_serialize_uint32(1000, reply, sizeof(reply), &rp), 0);
 	reply[rp++] = 0x01;
 	reply[rp++] = 0x02;
-	int res = c25519_client_parse_test(bad_c25519_server_thread, reply, rp);
-	ASSERT_TRUE(res < 0);
+	int res = c25519_client_parse_test(reply, rp);
+	ASSERT_EQ(res, 0);
 	return TEST_PASS;
 }
 
@@ -2367,15 +2357,15 @@ test_c25519_client_reply_trunc_ks(void)
 static int
 test_c25519_client_reply_short_qs(void)
 {
-	if (test_using_dhgex())
+	if (strcmp(test_kex_algo_name(), "curve25519-sha256") != 0)
 		return TEST_SKIP;
 	/* K_S: empty string (len=0), payload ends before Q_S len */
 	uint8_t reply[8];
 	size_t rp = 0;
 	reply[rp++] = 31; /* SSH_MSG_KEX_ECDH_REPLY */
-	dssh_serialize_uint32(0, reply, sizeof(reply), &rp);
-	int res = c25519_client_parse_test(bad_c25519_server_thread, reply, rp);
-	ASSERT_TRUE(res < 0);
+	ASSERT_EQ(dssh_serialize_uint32(0, reply, sizeof(reply), &rp), 0);
+	int res = c25519_client_parse_test(reply, rp);
+	ASSERT_EQ(res, 0);
 	return TEST_PASS;
 }
 
@@ -2383,18 +2373,19 @@ test_c25519_client_reply_short_qs(void)
 static int
 test_c25519_client_reply_bad_qs_len(void)
 {
-	if (test_using_dhgex())
+	if (strcmp(test_kex_algo_name(), "curve25519-sha256") != 0)
 		return TEST_SKIP;
 	/* K_S="" + Q_S with len=16 (not 32) */
 	uint8_t reply[32];
 	size_t rp = 0;
 	reply[rp++] = 31; /* SSH_MSG_KEX_ECDH_REPLY */
-	dssh_serialize_uint32(0, reply, sizeof(reply), &rp); /* K_S: empty */
-	dssh_serialize_uint32(16, reply, sizeof(reply), &rp); /* Q_S len=16 */
+	ASSERT_EQ(dssh_serialize_uint32(0, reply, sizeof(reply), &rp), 0); /* K_S: empty */
+	ASSERT_EQ(dssh_serialize_uint32(16, reply, sizeof(reply), &rp), 0); /* Q_S len=16 */
 	memset(&reply[rp], 0x42, 16);
 	rp += 16;
-	int res = c25519_client_parse_test(bad_c25519_server_thread, reply, rp);
-	ASSERT_TRUE(res < 0);
+	ASSERT_EQ(dssh_serialize_uint32(0, reply, sizeof(reply), &rp), 0); /* complete sig */
+	int res = c25519_client_parse_test(reply, rp);
+	ASSERT_EQ(res, 0);
 	return TEST_PASS;
 }
 
@@ -2402,17 +2393,17 @@ test_c25519_client_reply_bad_qs_len(void)
 static int
 test_c25519_client_reply_qs_overrun(void)
 {
-	if (test_using_dhgex())
+	if (strcmp(test_kex_algo_name(), "curve25519-sha256") != 0)
 		return TEST_SKIP;
 	uint8_t reply[32];
 	size_t rp = 0;
 	reply[rp++] = 31; /* SSH_MSG_KEX_ECDH_REPLY */
-	dssh_serialize_uint32(0, reply, sizeof(reply), &rp); /* K_S: empty */
-	dssh_serialize_uint32(32, reply, sizeof(reply), &rp); /* Q_S len=32 */
+	ASSERT_EQ(dssh_serialize_uint32(0, reply, sizeof(reply), &rp), 0); /* K_S: empty */
+	ASSERT_EQ(dssh_serialize_uint32(32, reply, sizeof(reply), &rp), 0); /* Q_S len=32 */
 	memset(&reply[rp], 0x42, 10); /* only 10 bytes of Q_S data */
 	rp += 10;
-	int res = c25519_client_parse_test(bad_c25519_server_thread, reply, rp);
-	ASSERT_TRUE(res < 0);
+	int res = c25519_client_parse_test(reply, rp);
+	ASSERT_EQ(res, 0);
 	return TEST_PASS;
 }
 
@@ -2420,19 +2411,19 @@ test_c25519_client_reply_qs_overrun(void)
 static int
 test_c25519_client_reply_short_sig(void)
 {
-	if (test_using_dhgex())
+	if (strcmp(test_kex_algo_name(), "curve25519-sha256") != 0)
 		return TEST_SKIP;
 	/* K_S="" + Q_S(32 bytes) + payload ends before sig len */
 	uint8_t reply[48];
 	size_t rp = 0;
 	reply[rp++] = 31; /* SSH_MSG_KEX_ECDH_REPLY */
-	dssh_serialize_uint32(0, reply, sizeof(reply), &rp); /* K_S: empty */
-	dssh_serialize_uint32(32, reply, sizeof(reply), &rp); /* Q_S len=32 */
+	ASSERT_EQ(dssh_serialize_uint32(0, reply, sizeof(reply), &rp), 0); /* K_S: empty */
+	ASSERT_EQ(dssh_serialize_uint32(32, reply, sizeof(reply), &rp), 0); /* Q_S len=32 */
 	memset(&reply[rp], 0x42, 32);
 	rp += 32;
 	/* No sig at all -- payload ends here */
-	int res = c25519_client_parse_test(bad_c25519_server_thread, reply, rp);
-	ASSERT_TRUE(res < 0);
+	int res = c25519_client_parse_test(reply, rp);
+	ASSERT_EQ(res, 0);
 	return TEST_PASS;
 }
 
@@ -2440,20 +2431,20 @@ test_c25519_client_reply_short_sig(void)
 static int
 test_c25519_client_reply_trunc_sig(void)
 {
-	if (test_using_dhgex())
+	if (strcmp(test_kex_algo_name(), "curve25519-sha256") != 0)
 		return TEST_SKIP;
 	/* K_S="" + Q_S(32 bytes) + sig claiming 1000 bytes */
 	uint8_t reply[64];
 	size_t rp = 0;
 	reply[rp++] = 31; /* SSH_MSG_KEX_ECDH_REPLY */
-	dssh_serialize_uint32(0, reply, sizeof(reply), &rp); /* K_S: empty */
-	dssh_serialize_uint32(32, reply, sizeof(reply), &rp); /* Q_S len=32 */
+	ASSERT_EQ(dssh_serialize_uint32(0, reply, sizeof(reply), &rp), 0); /* K_S: empty */
+	ASSERT_EQ(dssh_serialize_uint32(32, reply, sizeof(reply), &rp), 0); /* Q_S len=32 */
 	memset(&reply[rp], 0x42, 32);
 	rp += 32;
 	/* sig: claiming 1000 bytes but message ends here */
-	dssh_serialize_uint32(1000, reply, sizeof(reply), &rp);
-	int res = c25519_client_parse_test(bad_c25519_server_thread, reply, rp);
-	ASSERT_TRUE(res < 0);
+	ASSERT_EQ(dssh_serialize_uint32(1000, reply, sizeof(reply), &rp), 0);
+	int res = c25519_client_parse_test(reply, rp);
+	ASSERT_EQ(res, 0);
 	return TEST_PASS;
 }
 
@@ -2655,113 +2646,16 @@ test_alloc_kex_client_iterate(void)
 	return allocation_kex_sweep(true, false);
 }
 
-/* ================================================================
- * Helper: set up a negotiated server session (version exchange +
- * kexinit done) and discard the client.  Returns the server session
- * ready for kex(), or NULL on failure.
- * ================================================================ */
-
-static dssh_session
-kex_server_setup(void)
-{
-	dssh_test_reset_global_config();
-	dssh_test_alloc_reset();
-	dssh_test_ossl_reset();
-	mock_alloc_reset();
-
-	if (register_all() < 0)
-		return NULL;
-	if (test_generate_host_key() < 0)
-		return NULL;
-
-	struct mock_io_state setup_io;
-	if (mock_io_init(&setup_io, 0) < 0)
-		return NULL;
-
-	dssh_transport_set_callbacks(mock_tx_dispatch, mock_rx_dispatch,
-	    mock_rxline_dispatch, mock_extra_line_cb);
-
-	dssh_session client = dssh_session_init(true, 0);
-	if (client == NULL) {
-		mock_io_free(&setup_io);
-		return NULL;
-	}
-	dssh_session_set_cbdata(client, &setup_io, &setup_io,
-	    &setup_io, &setup_io);
-	dssh_session_set_hostkey_verify_cb(client, dssh_test_accept_hostkey, NULL);
-
-	dssh_session server = init_server_session();
-	if (server == NULL) {
-		dssh_session_cleanup(client);
-		mock_io_free(&setup_io);
-		return NULL;
-	}
-	dssh_session_set_cbdata(server, &setup_io, &setup_io,
-	    &setup_io, &setup_io);
-
-	struct ve_ki_ctx ca = { .io = &setup_io, .sess = client };
-	struct ve_ki_ctx sa = { .io = &setup_io, .sess = server };
-	thrd_t ct, st;
-	if (thrd_create(&ct, ve_ki_thread, &ca) != thrd_success)
-		return NULL;
-	if (thrd_create(&st, ve_ki_thread, &sa) != thrd_success)
-		return NULL;
-	thrd_join(ct, NULL);
-	thrd_join(st, NULL);
-
-	dssh_session_cleanup(client);
-	mock_io_close_c2s(&setup_io);
-	mock_io_close_s2c(&setup_io);
-	mock_io_free(&setup_io);
-
-	if (ca.result != 0 || sa.result != 0) {
-		dssh_session_cleanup(server);
-		dssh_test_reset_global_config();
-		return NULL;
-	}
-
-	return server;
-}
-
-/* ================================================================
- * curve25519: truncated ECDH_INIT (too short for qc_len parse)
- * ================================================================ */
-
 static int
 test_c25519_server_truncated_init(void)
 {
-	if (test_using_dhgex())
+	if (strcmp(test_kex_algo_name(), "curve25519-sha256") != 0)
 		return TEST_SKIP;
-
-	dssh_session server = kex_server_setup();
-	if (server == NULL)
-		return TEST_FAIL;
-
-	/* Build a truncated ECDH_INIT: just the msg type, no qc_len */
-	uint8_t init[1];
-	init[0] = SSH_MSG_KEX_ECDH_INIT;
-
-	uint8_t wire[64];
-	size_t wire_len = build_plaintext_packet(init, 1, wire, sizeof(wire));
-
-	struct mock_io_state io;
-	if (mock_io_init(&io, 0) < 0) {
-		dssh_session_cleanup(server);
-		dssh_test_reset_global_config();
-		return TEST_FAIL;
-	}
-	dssh_session_set_cbdata(server, &io, &io, &io, &io);
-	mock_io_inject(&io.c2s, wire, wire_len);
-
-	int res = kex(server);
-
-	mock_io_close_c2s(&io);
-	mock_io_close_s2c(&io);
-	mock_io_free(&io);
-	dssh_session_cleanup(server);
-	dssh_test_reset_global_config();
-
-	ASSERT_TRUE(res < 0);
+	static const uint8_t init[] = {SSH_MSG_KEX_ECDH_INIT};
+	struct allocation_parser_observation observed;
+	int ret = allocation_parser_case(PARSER_CURVE_INIT, init, sizeof(init),
+	    DSSH_ERROR_PARSE, "plain", &observed);
+	ASSERT_EQ(ret, 0);
 	return TEST_PASS;
 }
 
@@ -2772,18 +2666,19 @@ test_c25519_server_truncated_init(void)
 static int
 test_c25519_client_bad_qs_length(void)
 {
-	if (test_using_dhgex())
+	if (strcmp(test_kex_algo_name(), "curve25519-sha256") != 0)
 		return TEST_SKIP;
 
 	/* K_S="" + Q_S with len=0 (not 32), enough data present */
 	uint8_t reply[16];
 	size_t rp = 0;
 	reply[rp++] = 31; /* SSH_MSG_KEX_ECDH_REPLY */
-	dssh_serialize_uint32(0, reply, sizeof(reply), &rp); /* K_S: empty */
-	dssh_serialize_uint32(0, reply, sizeof(reply), &rp); /* Q_S len=0 */
+	ASSERT_EQ(dssh_serialize_uint32(0, reply, sizeof(reply), &rp), 0); /* K_S: empty */
+	ASSERT_EQ(dssh_serialize_uint32(0, reply, sizeof(reply), &rp), 0); /* Q_S len=0 */
 
-	int res = c25519_client_parse_test(bad_c25519_server_thread, reply, rp);
-	ASSERT_TRUE(res < 0);
+	ASSERT_EQ(dssh_serialize_uint32(0, reply, sizeof(reply), &rp), 0); /* complete sig */
+	int res = c25519_client_parse_test(reply, rp);
+	ASSERT_EQ(res, 0);
 	return TEST_PASS;
 }
 
@@ -2928,6 +2823,14 @@ DSSH_TEST_MAIN(tests)
 int
 main(int argc, char **argv)
 {
+	if (argc == 2 && strcmp(argv[1], "--allocation-parser-owner") == 0)
+		return allocation_parser_owner_control();
+	if (argc == 3 && strcmp(argv[1], "--allocation-parser-assert") == 0) {
+		if (strlen(argv[2]) != 1 || argv[2][0] < '0' || argv[2][0] > '3')
+			return 2;
+		unsigned phase = (unsigned)(argv[2][0] - '0');
+		return allocation_parser_assertion_control(phase);
+	}
 	if (argc == 2 && strcmp(argv[1], "--allocation-direct-owner") == 0)
 		return allocation_direct_owner_control();
 	if (argc == 3 && strcmp(argv[1], "--allocation-direct-assert") == 0) {

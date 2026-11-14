@@ -16,6 +16,7 @@
 #include "deucessh.h"
 #include "deucessh-result.h"
 #include "../ssh-timespec.h"
+#include "dssh_test_value.h"
 
 static inline bool
 dssh_test_bytes_equal(struct dssh_bytes bytes, const void *data, size_t len)
@@ -76,59 +77,39 @@ void dssh_test_failure_cleanup(void);
 	} \
 } while (0)
 
-#define ASSERT_EQ(a, b) do { \
-	long long _a = (long long)(a); \
-	long long _b = (long long)(b); \
-	if (_a != _b) { \
-		fprintf(stderr, "  ASSERT_EQ failed: %s == %lld, expected %s == %lld\n    at %s:%d\n", \
-		    #a, _a, #b, _b, __FILE__, __LINE__); \
+#define DSSH_TEST_COMPARE(name, a, b, text_a, text_b, condition) do { \
+	struct dssh_test_integer dssh_assert_actual_value = DSSH_TEST_NUMBER(a); \
+	struct dssh_test_integer dssh_assert_expected_value = DSSH_TEST_NUMBER(b); \
+	if (!(condition)) { \
+		dssh_test_report_integer(name, text_a, text_b, dssh_assert_actual_value, \
+		    dssh_assert_expected_value, __FILE__, __LINE__); \
 		dssh_test_failure_cleanup(); \
 		return TEST_FAIL; \
 	} \
 } while (0)
 
-#define ASSERT_NE(a, b) do { \
-	long long _a = (long long)(a); \
-	long long _b = (long long)(b); \
-	if (_a == _b) { \
-		fprintf(stderr, "  ASSERT_NE failed: %s == %s == %lld\n    at %s:%d\n", \
-		    #a, #b, _a, __FILE__, __LINE__); \
-		dssh_test_failure_cleanup(); \
-		return TEST_FAIL; \
-	} \
-} while (0)
-
-/* For unsigned comparisons (size_t, uint32_t, etc.) */
-#define ASSERT_EQ_U(a, b) do { \
-	unsigned long long _a = (unsigned long long)(a); \
-	unsigned long long _b = (unsigned long long)(b); \
-	if (_a != _b) { \
-		fprintf(stderr, "  ASSERT_EQ_U failed: %s == %llu, expected %s == %llu\n    at %s:%d\n", \
-		    #a, _a, #b, _b, __FILE__, __LINE__); \
-		dssh_test_failure_cleanup(); \
-		return TEST_FAIL; \
-	} \
-} while (0)
+#define ASSERT_EQ(a, b) DSSH_TEST_COMPARE("ASSERT_EQ", a, b, #a, #b, \
+	dssh_test_integer_equal(dssh_assert_actual_value, dssh_assert_expected_value))
+#define ASSERT_NE(a, b) DSSH_TEST_COMPARE("ASSERT_NE", a, b, #a, #b, \
+	!dssh_test_integer_equal(dssh_assert_actual_value, dssh_assert_expected_value))
+/* Unsigned comparisons reject negative operands instead of converting them. */
+#define ASSERT_EQ_U(a, b) DSSH_TEST_COMPARE("ASSERT_EQ_U", a, b, #a, #b, \
+	!dssh_assert_actual_value.negative && !dssh_assert_expected_value.negative \
+	    && dssh_test_integer_equal(dssh_assert_actual_value, dssh_assert_expected_value))
 
 #define ASSERT_OK(expr) do { \
-	int64_t _r = (int64_t)(expr); \
-	if (_r < 0) { \
-		fprintf(stderr, "  ASSERT_OK failed: %s returned %" PRId64 "\n    at %s:%d\n", \
-		    #expr, _r, __FILE__, __LINE__); \
+	struct dssh_test_integer dssh_assert_actual_value = DSSH_TEST_NUMBER(expr); \
+	if (dssh_assert_actual_value.negative) { \
+		dssh_test_report_integer("ASSERT_OK", #expr, "nonnegative", dssh_assert_actual_value, \
+		    dssh_test_integer_signed(0), __FILE__, __LINE__); \
 		dssh_test_failure_cleanup(); \
 		return TEST_FAIL; \
 	} \
 } while (0)
 
-#define ASSERT_ERR(expr, code) do { \
-	int64_t _r = (int64_t)(expr); \
-	if (_r != (int64_t)(code)) { \
-		fprintf(stderr, "  ASSERT_ERR failed: %s returned %" PRId64 ", expected %d (%s)\n    at %s:%d\n", \
-		    #expr, _r, (int)(code), #code, __FILE__, __LINE__); \
-		dssh_test_failure_cleanup(); \
-		return TEST_FAIL; \
-	} \
-} while (0)
+#define ASSERT_ERR(expr, code) DSSH_TEST_COMPARE("ASSERT_ERR", expr, code, #expr, #code, \
+	dssh_assert_expected_value.negative \
+	    && dssh_test_integer_equal(dssh_assert_actual_value, dssh_assert_expected_value))
 
 #define ASSERT_NULL(ptr) do { \
 	if ((ptr) != NULL) { \
@@ -149,18 +130,26 @@ void dssh_test_failure_cleanup(void);
 } while (0)
 
 #define ASSERT_MEM_EQ(a, b, n) do { \
-	if (memcmp((a), (b), (n)) != 0) { \
-		fprintf(stderr, "  ASSERT_MEM_EQ failed: %s != %s (len %zu)\n    at %s:%d\n", \
-		    #a, #b, (size_t)(n), __FILE__, __LINE__); \
+	const void *dssh_assert_first_pointer = (a); \
+	const void *dssh_assert_last_pointer = (b); \
+	struct dssh_test_integer dssh_assert_length_value = DSSH_TEST_NUMBER(n); \
+	size_t dssh_assert_count; \
+	bool dssh_assert_valid = dssh_test_integer_size(dssh_assert_length_value, &dssh_assert_count); \
+	if (!dssh_assert_valid || (dssh_assert_count > 0 \
+	    && (dssh_assert_first_pointer == NULL || dssh_assert_last_pointer == NULL \
+	        || memcmp(dssh_assert_first_pointer, dssh_assert_last_pointer, dssh_assert_count) != 0))) { \
+		dssh_test_report_memory(#a, #b, dssh_assert_length_value, __FILE__, __LINE__); \
 		dssh_test_failure_cleanup(); \
 		return TEST_FAIL; \
 	} \
 } while (0)
 
 #define ASSERT_STR_EQ(a, b) do { \
-	if (strcmp((a), (b)) != 0) { \
-		fprintf(stderr, "  ASSERT_STR_EQ failed: \"%s\" != \"%s\"\n    at %s:%d\n", \
-		    (a), (b), __FILE__, __LINE__); \
+	const char *dssh_assert_first_string = (a); \
+	const char *dssh_assert_last_string = (b); \
+	if (dssh_assert_first_string == NULL || dssh_assert_last_string == NULL \
+	    || strcmp(dssh_assert_first_string, dssh_assert_last_string) != 0) { \
+		dssh_test_report_string(dssh_assert_first_string, dssh_assert_last_string, __FILE__, __LINE__); \
 		dssh_test_failure_cleanup(); \
 		return TEST_FAIL; \
 	} \

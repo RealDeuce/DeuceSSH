@@ -4,10 +4,12 @@
  * Uses the mock allocator (--wrap=malloc/calloc/realloc/free) to
  * inject NULL returns at every allocation point in the library.
  * For each function under test, we iterate N from 0 upward, failing
- * the Nth allocation, until the function succeeds -- confirming that
- * every intermediate failure is handled gracefully.
+ * the Nth allocation. A sweep completes only after an observed fault and a
+ * successful operation that did not reach its target. Some older threaded
+ * controllers below still await this completion/ownership migration (R081).
  */
 
+#include <limits.h>
 #include <stddef.h>
 #include <string.h>
 #include <threads.h>
@@ -23,6 +25,7 @@
 #include "dssh_test_internal.h"
 #include "mock_io.h"
 #include "mock_alloc.h"
+#include "dssh_test_ossl.h"
 #include "test_dhgex_provider.h"
 #include "../kex/sntrup761.h"
 
@@ -247,6 +250,68 @@ test_alloc_register_dh_gex(void)
 	return TEST_PASS;
 }
 
+/* A successful operation may tolerate the selected fault. It is still a
+ * fault case, not the final control. Never infer completion from a repeated
+ * count, an uninjected rejection, a skipped target or invalid output. */
+struct allocation_sweep {
+	int next;
+	unsigned faults;
+	unsigned tolerated;
+};
+
+static int
+allocation_sweep_step(struct allocation_sweep *sweep, const char *name,
+    int point, int calls, bool completed, bool valid)
+{
+	if (point < 0 || point != sweep->next || calls < 0 || !valid)
+		return -1;
+	bool injected = calls > point;
+	if (!completed && !injected)
+		return -1;
+	if (injected) {
+		if (sweep->faults == UINT_MAX || (completed && sweep->tolerated == UINT_MAX))
+			return -1;
+		sweep->faults++;
+		if (completed)
+			sweep->tolerated++;
+	}
+	if (point == INT_MAX)
+		return -1;
+	sweep->next++;
+	if (printf("allocation_sweep name=%s key=%s point=%d calls=%d injected=%d completed=%d valid=1\n",
+	        name, test_key_algo_name(), point, calls, injected, completed) < 0)
+		return -1;
+	if (!injected && completed) {
+		if (sweep->faults == 0)
+			return -1;
+		if (printf("allocation_complete name=%s key=%s cases=%d faults=%u tolerated=%u\n",
+		        name, test_key_algo_name(), sweep->next, sweep->faults, sweep->tolerated) < 0)
+			return -1;
+		return 1;
+	}
+	return 0;
+}
+
+/* Deliberate observer controls: tolerated faults and repeated fault counts
+ * must continue; an unreached failure and skipped target must fail. */
+static int
+test_alloc_sweep_contract(void)
+{
+	struct allocation_sweep sweep = {0};
+	ASSERT_EQ(allocation_sweep_step(&sweep, "contract", 0, 2, true, true), 0);
+	ASSERT_EQ(allocation_sweep_step(&sweep, "contract", 1, 2, false, true), 0);
+	ASSERT_EQ(allocation_sweep_step(&sweep, "contract", 2, 2, true, true), 1);
+	ASSERT_EQ(sweep.faults, 2);
+	ASSERT_EQ(sweep.tolerated, 1);
+	sweep = (struct allocation_sweep){0};
+	ASSERT_EQ(allocation_sweep_step(&sweep, "contract", 0, 0, false, true), -1);
+	ASSERT_EQ(allocation_sweep_step(&sweep, "contract", 1, 2, false, true), -1);
+	ASSERT_EQ(allocation_sweep_step(&sweep, "contract", 0, 1, true, false), -1);
+	ASSERT_EQ(allocation_sweep_step(&sweep, "contract", 0, -1, false, true), -1);
+	ASSERT_EQ(allocation_sweep_step(&sweep, "contract", 0, 0, true, true), -1);
+	return TEST_PASS;
+}
+
 /* ================================================================
  * dssh_session_init alloc failures
  *
@@ -260,27 +325,33 @@ test_alloc_session_init(void)
 {
 	dssh_test_reset_global_config();
 	mock_alloc_reset();
-
-	ASSERT_EQ(register_all(), 0);
-
-	/* Fail each allocation in turn */
-	int prev_count = -1;
+	dssh_test_ossl_reset();
+	int setup = register_all();
+	if (setup < 0) {
+		dssh_test_reset_global_config();
+		return TEST_FAIL;
+	}
+	/* Require a valid normal constructor before arming a fault. */
+	dssh_session baseline = dssh_session_init(true, 0);
+	if (baseline == NULL) {
+		dssh_test_reset_global_config();
+		return TEST_FAIL;
+	}
+	dssh_session_cleanup(baseline);
+	struct allocation_sweep sweep = {0};
 	for (int n = 0; n < 100; n++) {
 		mock_alloc_fail_after(n);
 		dssh_session sess = dssh_session_init(true, 0);
-		int cur_count = mock_alloc_count();
+		int calls = mock_alloc_count();
 		mock_alloc_reset();
-		if (sess != NULL) {
-			dssh_session_cleanup(sess);
+		bool completed = sess != NULL;
+		dssh_session_cleanup(sess);
+		int step = allocation_sweep_step(&sweep, "alloc/session_init", n, calls, completed, true);
+		if (step != 0) {
 			dssh_test_reset_global_config();
-			ASSERT_TRUE(n > 0);
-			return TEST_PASS;
+			return step > 0 ? TEST_PASS : TEST_FAIL;
 		}
-		prev_count = cur_count;
 	}
-
-	fprintf(stderr, "  alloc/session_init: still incrementing at "
-	    "n=%d (count=%d), raise limit\n", 100, prev_count);
 	dssh_test_reset_global_config();
 	return TEST_FAIL;
 }
@@ -292,34 +363,40 @@ test_alloc_session_init(void)
  * it must return NULL without leaking the session struct.
  * ================================================================ */
 
-#include "dssh_test_ossl.h"
 
 #ifdef DSSH_CRYPTO_OPENSSL
 static int
 test_ossl_session_init(void)
 {
 	dssh_test_reset_global_config();
-
-	ASSERT_EQ(register_all(), 0);
-
-	/* Fail each ossl/C11 call in turn */
-	int prev_count = -1;
+	mock_alloc_reset();
+	dssh_test_ossl_reset();
+	int setup = register_all();
+	if (setup < 0) {
+		dssh_test_reset_global_config();
+		return TEST_FAIL;
+	}
+	/* Require a valid normal constructor before arming a fault. */
+	dssh_session baseline = dssh_session_init(true, 0);
+	if (baseline == NULL) {
+		dssh_test_reset_global_config();
+		return TEST_FAIL;
+	}
+	dssh_session_cleanup(baseline);
+	struct allocation_sweep sweep = {0};
 	for (int n = 0; n < 100; n++) {
 		dssh_test_ossl_fail_after(n);
 		dssh_session sess = dssh_session_init(true, 0);
-		int cur_count = dssh_test_ossl_count();
+		int calls = dssh_test_ossl_count();
 		dssh_test_ossl_reset();
-		if (sess != NULL) {
-			dssh_session_cleanup(sess);
+		bool completed = sess != NULL;
+		dssh_session_cleanup(sess);
+		int step = allocation_sweep_step(&sweep, "ossl/session_init", n, calls, completed, true);
+		if (step != 0) {
 			dssh_test_reset_global_config();
-			ASSERT_TRUE(n > 0);
-			return TEST_PASS;
+			return step > 0 ? TEST_PASS : TEST_FAIL;
 		}
-		prev_count = cur_count;
 	}
-
-	fprintf(stderr, "  ossl/session_init: still incrementing at "
-	    "n=%d (count=%d), raise limit\n", 100, prev_count);
 	dssh_test_reset_global_config();
 	return TEST_FAIL;
 }
@@ -1343,60 +1420,64 @@ test_ossl_handshake_iterate(void)
 static int
 test_ossl_key_sign_verify_iterate(void)
 {
-	struct test_signature_copies fixture_copies = {0};
-
-	int prev_count = -1;
+	struct allocation_sweep sweep = {0};
 	for (int n = 0; n < 500; n++) {
 		dssh_test_reset_global_config();
 		dssh_test_ossl_reset();
 		mock_alloc_reset();
-
-		int res = test_register_key_algos();
-		if (res < 0)
-			return test_signature_copies_finish(&fixture_copies, TEST_FAIL);
-		if (test_generate_host_key() < 0)
-			return test_signature_copies_finish(&fixture_copies, TEST_FAIL);
-
-		dssh_key_algo ka = find_key_algo(
-		    test_key_algo_name());
-		if (ka == NULL)
-			return test_signature_copies_finish(&fixture_copies, TEST_FAIL);
-
-		const uint8_t data[] = "test data for ossl sign/verify";
-		uint8_t *sig_buf = NULL;
-		size_t sig_len = 0;
-		const uint8_t *pub_buf = NULL;
-		size_t pub_len = 0;
-
-		dssh_test_ossl_fail_after(n);
-
-		int sign_res = test_signature_copy(&fixture_copies, ka->sign, &sig_buf, &sig_len,
-		    data, sizeof(data) - 1, ka->ctx);
-		int pub_res = ka->pubkey(&pub_buf, &pub_len,
-		    ka->ctx);
-		int verify_res = -1;
-		if (sign_res == 0 && pub_res == 0)
-			verify_res = ka->verify(pub_buf, pub_len, sig_buf,
-			    sig_len, data, sizeof(data) - 1);
-
-		test_signature_copy_free(&fixture_copies, sig_buf);
-		int cur_count = dssh_test_ossl_count();
-		dssh_test_ossl_reset();
-
-		if (sign_res == 0 && pub_res == 0 && verify_res == 0) {
+		struct test_signature_copies copies = {0};
+		int ret = test_register_key_algos();
+		if (ret == 0)
+			ret = test_generate_host_key();
+		dssh_key_algo ka = ret == 0 ? find_key_algo(test_key_algo_name()) : NULL;
+		if (ka == NULL) {
 			dssh_test_reset_global_config();
-			ASSERT_TRUE(n > 0);
-			return test_signature_copies_finish(&fixture_copies, TEST_PASS);
+			return TEST_FAIL;
 		}
+		const uint8_t data[] = "test data for ossl sign/verify";
+		uint8_t *sig = NULL;
+		size_t sig_len = 0;
+		const uint8_t *pub = NULL;
+		size_t pub_len = 0;
+		/* Establish the exact callback sequence without injection first. */
+		ret = test_signature_copy(&copies, ka->sign, &sig, &sig_len,
+		    data, sizeof(data) - 1, ka->ctx);
+		if (ret == 0)
+			ret = ka->pubkey(&pub, &pub_len, ka->ctx);
+		if (ret == 0)
+			ret = ka->verify(pub, pub_len, sig, sig_len, data, sizeof(data) - 1);
+		test_signature_copy_free(&copies, sig);
+		if (ret != 0) {
+			test_signature_copies_finish(&copies, TEST_FAIL);
+			dssh_test_reset_global_config();
+			return TEST_FAIL;
+		}
+		sig = NULL;
+		sig_len = 0;
+		pub = NULL;
+		pub_len = 0;
+		dssh_test_ossl_fail_after(n);
+		int sign_res = test_signature_copy(&copies, ka->sign, &sig, &sig_len,
+		    data, sizeof(data) - 1, ka->ctx);
+		int pub_res = ka->pubkey(&pub, &pub_len, ka->ctx);
+		int verify_res = DSSH_ERROR_INIT;
+		bool valid = sign_res <= 0 && pub_res <= 0;
+		if (sign_res == 0 && pub_res == 0) {
+			valid &= sig != NULL && sig_len > 0 && pub != NULL && pub_len > 0;
+			if (valid)
+				verify_res = ka->verify(pub, pub_len, sig, sig_len, data, sizeof(data) - 1);
+			valid &= verify_res <= 0;
+		}
+		int calls = dssh_test_ossl_count();
+		dssh_test_ossl_reset();
+		test_signature_copies_finish(&copies, TEST_PASS);
+		bool completed = sign_res == 0 && pub_res == 0 && verify_res == 0;
 		dssh_test_reset_global_config();
-		if (cur_count == prev_count)
-			return test_signature_copies_finish(&fixture_copies, TEST_PASS);
-		prev_count = cur_count;
+		int step = allocation_sweep_step(&sweep, "ossl/key_sign_verify", n, calls, completed, valid);
+		if (step != 0)
+			return step > 0 ? TEST_PASS : TEST_FAIL;
 	}
-
-	fprintf(stderr, "  ossl/key_sign_verify: still incrementing at n=%d "
-	    "(count=%d), raise limit\n", 500, prev_count);
-	return test_signature_copies_finish(&fixture_copies, TEST_FAIL);
+	return TEST_FAIL;
 }
 
 /* ================================================================
@@ -1406,44 +1487,57 @@ test_ossl_key_sign_verify_iterate(void)
  * ================================================================ */
 
 static int
+generate_selected_key(void)
+{
+	if (test_using_rsa512())
+		return dssh_rsa_sha2_512_generate_key(2048);
+	if (test_using_rsa())
+		return dssh_rsa_sha2_256_generate_key(2048);
+	return dssh_ed25519_generate_key();
+}
+
+static bool
+selected_key_ready(dssh_key_algo ka)
+{
+	if (ka == NULL || ka->haskey(ka->ctx) <= 0)
+		return false;
+	const uint8_t *pub = NULL;
+	size_t length = 0;
+	if (ka->pubkey(&pub, &length, ka->ctx) != 0 || pub == NULL || length == 0)
+		return false;
+	unsigned bits = ka->key_bits(pub, length);
+	return bits == (test_using_rsa() ? 2048U : 256U);
+}
+
+static int
 test_ossl_keygen_iterate(void)
 {
-	const char *algo = test_key_algo_name();
-	bool is_rsa = (strcmp(algo, "rsa-sha2-256") == 0);
-	int prev_count = -1;
-
+	struct allocation_sweep sweep = {0};
 	for (int n = 0; n < 500; n++) {
 		dssh_test_reset_global_config();
 		dssh_test_ossl_reset();
 		mock_alloc_reset();
-
-		int res = test_register_key_algos();
-		if (res < 0)
-			return TEST_FAIL;
-
-		dssh_test_ossl_fail_after(n);
-
-		if (is_rsa)
-			res = dssh_rsa_sha2_256_generate_key(2048);
-		else
-			res = dssh_ed25519_generate_key();
-
-		int cur_count = dssh_test_ossl_count();
-		dssh_test_ossl_reset();
-
-		if (res == 0) {
+		int ret = test_register_key_algos();
+		dssh_key_algo ka = ret == 0 ? find_key_algo(test_key_algo_name()) : NULL;
+		if (ka == NULL) {
 			dssh_test_reset_global_config();
-			ASSERT_TRUE(n > 0);
-			return TEST_PASS;
+			return TEST_FAIL;
+		}
+		dssh_test_ossl_fail_after(n);
+		ret = generate_selected_key();
+		int calls = dssh_test_ossl_count();
+		dssh_test_ossl_reset();
+		bool valid = ret <= 0 && (ret == 0 ? selected_key_ready(ka) : ka->ctx == NULL);
+		/* No other registered key family may acquire this generation. */
+		for (dssh_key_algo other = gconf.key_algo_head; other != NULL; other = other->next) {
+			if (other != ka)
+				valid &= other->ctx == NULL;
 		}
 		dssh_test_reset_global_config();
-		if (cur_count == prev_count)
-			return TEST_PASS;
-		prev_count = cur_count;
+		int step = allocation_sweep_step(&sweep, "ossl/keygen", n, calls, ret == 0, valid);
+		if (step != 0)
+			return step > 0 ? TEST_PASS : TEST_FAIL;
 	}
-
-	fprintf(stderr, "  ossl/keygen: still incrementing at n=%d "
-	    "(count=%d), raise limit\n", 500, prev_count);
 	return TEST_FAIL;
 }
 
@@ -1457,51 +1551,56 @@ test_ossl_keygen_iterate(void)
 static int
 test_ossl_enc_iterate(void)
 {
-	int prev_count = -1;
+	/* First AES-256-CTR block of NIST SP 800-38A F.5.5; the complete
+	 * published corpus is also covered by test_algo_enc.c. */
+	static const uint8_t key[32] = {
+		0x60, 0x3d, 0xeb, 0x10, 0x15, 0xca, 0x71, 0xbe,
+		0x2b, 0x73, 0xae, 0xf0, 0x85, 0x7d, 0x77, 0x81,
+		0x1f, 0x35, 0x2c, 0x07, 0x3b, 0x61, 0x08, 0xd7,
+		0x2d, 0x98, 0x10, 0xa3, 0x09, 0x14, 0xdf, 0xf4
+	};
+	static const uint8_t iv[16] = {
+		0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7,
+		0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe, 0xff
+	};
+	static const uint8_t plaintext[16] = {
+		0x6b, 0xc1, 0xbe, 0xe2, 0x2e, 0x40, 0x9f, 0x96,
+		0xe9, 0x3d, 0x7e, 0x11, 0x73, 0x93, 0x17, 0x2a
+	};
+	static const uint8_t ciphertext[16] = {
+		0x60, 0x1e, 0xc3, 0x13, 0x77, 0x57, 0x89, 0xa5,
+		0xb7, 0xa7, 0xf5, 0x04, 0xbb, 0xf3, 0xd2, 0x28
+	};
+	struct allocation_sweep sweep = {0};
 	for (int n = 0; n < 500; n++) {
 		dssh_test_reset_global_config();
 		dssh_test_ossl_reset();
 		mock_alloc_reset();
-
-		ASSERT_EQ(dssh_register_aes256_ctr(), 0);
-
-		dssh_enc enc = gconf.enc_head;
-		if (enc == NULL)
-			return TEST_FAIL;
-
-		uint8_t key[32], iv[16];
-		memset(key, 0x42, sizeof(key));
-		memset(iv, 0x00, sizeof(iv));
-
-		dssh_test_ossl_fail_after(n);
-
-		dssh_enc_ctx *ectx = NULL;
-		int res = enc->init(key, iv, true, &ectx);
-		int enc_res = -1;
-		if (res == 0) {
-			uint8_t buf[16];
-			memset(buf, 'A', sizeof(buf));
-			enc_res = enc->encrypt(buf, sizeof(buf), ectx);
-			if (enc->cleanup)
-				enc->cleanup(ectx);
-		}
-
-		int cur_count = dssh_test_ossl_count();
-		dssh_test_ossl_reset();
-
-		if (res == 0 && enc_res == 0) {
+		int ret = dssh_register_aes256_ctr();
+		dssh_enc enc = ret == 0 ? gconf.enc_head : NULL;
+		if (enc == NULL) {
 			dssh_test_reset_global_config();
-			ASSERT_TRUE(n > 0);
-			return TEST_PASS;
+			return TEST_FAIL;
 		}
+		uint8_t buf[sizeof(plaintext)];
+		memcpy(buf, plaintext, sizeof(buf));
+		dssh_enc_ctx *ctx = NULL;
+		dssh_test_ossl_fail_after(n);
+		ret = enc->init(key, iv, true, &ctx);
+		bool valid = ret <= 0 && (ret < 0 || ctx != NULL);
+		if (ret == 0 && valid)
+			ret = enc->encrypt(buf, sizeof(buf), ctx);
+		int calls = dssh_test_ossl_count();
+		dssh_test_ossl_reset();
+		valid &= ret <= 0 && (ret != 0 || memcmp(buf, ciphertext, sizeof(buf)) == 0);
+		/* Retire a published context on either init outcome. */
+		if (ctx != NULL)
+			enc->cleanup(ctx);
 		dssh_test_reset_global_config();
-		if (cur_count == prev_count)
-			return TEST_PASS;
-		prev_count = cur_count;
+		int step = allocation_sweep_step(&sweep, "ossl/enc", n, calls, ret == 0, valid);
+		if (step != 0)
+			return step > 0 ? TEST_PASS : TEST_FAIL;
 	}
-
-	fprintf(stderr, "  ossl/enc: still incrementing at n=%d "
-	    "(count=%d), raise limit\n", 500, prev_count);
 	return TEST_FAIL;
 }
 
@@ -1515,52 +1614,45 @@ test_ossl_enc_iterate(void)
 static int
 test_ossl_mac_iterate(void)
 {
-	int prev_count = -1;
+	/* RFC 4231 case 1: zero-extending the 20-byte key to the SSH
+	 * module's fixed 32-byte key input leaves the HMAC key block exact. */
+	static const uint8_t expected[32] = {
+		0xb0, 0x34, 0x4c, 0x61, 0xd8, 0xdb, 0x38, 0x53,
+		0x5c, 0xa8, 0xaf, 0xce, 0xaf, 0x0b, 0xf1, 0x2b,
+		0x88, 0x1d, 0xc2, 0x00, 0xc9, 0x83, 0x3d, 0xa7,
+		0x26, 0xe9, 0x37, 0x6c, 0x2e, 0x32, 0xcf, 0xf7
+	};
+	struct allocation_sweep sweep = {0};
 	for (int n = 0; n < 500; n++) {
 		dssh_test_reset_global_config();
 		dssh_test_ossl_reset();
 		mock_alloc_reset();
-
-		ASSERT_EQ(dssh_register_hmac_sha2_256(), 0);
-
-		dssh_mac mac = gconf.mac_head;
-		if (mac == NULL)
-			return TEST_FAIL;
-
-		uint8_t key[32];
-		memset(key, 0x42, sizeof(key));
-
-		dssh_test_ossl_fail_after(n);
-
-		dssh_mac_ctx *mctx = NULL;
-		int res = mac->init(key, &mctx);
-		int gen_res = -1;
-		if (res == 0) {
-			uint8_t data[16];
-			memset(data, 'B', sizeof(data));
-			uint8_t tag[64];
-			gen_res = mac->generate(data, sizeof(data),
-			    tag, mctx);
-			if (mac->cleanup)
-				mac->cleanup(mctx);
-		}
-
-		int cur_count = dssh_test_ossl_count();
-		dssh_test_ossl_reset();
-
-		if (res == 0 && gen_res == 0) {
+		int ret = dssh_register_hmac_sha2_256();
+		dssh_mac mac = ret == 0 ? gconf.mac_head : NULL;
+		if (mac == NULL) {
 			dssh_test_reset_global_config();
-			ASSERT_TRUE(n > 0);
-			return TEST_PASS;
+			return TEST_FAIL;
 		}
+		uint8_t key[32] = {0};
+		memset(key, 0x0b, 20);
+		const uint8_t data[] = "Hi There";
+		uint8_t tag[32] = {0};
+		dssh_mac_ctx *ctx = NULL;
+		dssh_test_ossl_fail_after(n);
+		ret = mac->init(key, &ctx);
+		bool valid = ret <= 0 && (ret < 0 || ctx != NULL);
+		if (ret == 0 && valid)
+			ret = mac->generate(data, sizeof(data) - 1, tag, ctx);
+		int calls = dssh_test_ossl_count();
+		dssh_test_ossl_reset();
+		valid &= ret <= 0 && (ret != 0 || memcmp(tag, expected, sizeof(tag)) == 0);
+		if (ctx != NULL)
+			mac->cleanup(ctx);
 		dssh_test_reset_global_config();
-		if (cur_count == prev_count)
-			return TEST_PASS;
-		prev_count = cur_count;
+		int step = allocation_sweep_step(&sweep, "ossl/mac", n, calls, ret == 0, valid);
+		if (step != 0)
+			return step > 0 ? TEST_PASS : TEST_FAIL;
 	}
-
-	fprintf(stderr, "  ossl/mac: still incrementing at n=%d "
-	    "(count=%d), raise limit\n", 500, prev_count);
 	return TEST_FAIL;
 }
 
@@ -1574,56 +1666,44 @@ test_ossl_mac_iterate(void)
 static int
 test_ossl_key_verify_iterate(void)
 {
-	struct test_signature_copies fixture_copies = {0};
-
+	struct test_signature_copies copies = {0};
 	dssh_test_reset_global_config();
 	dssh_test_ossl_reset();
 	mock_alloc_reset();
-
-	int res = test_register_key_algos();
-	if (res < 0)
-		return test_signature_copies_finish(&fixture_copies, TEST_FAIL);
-	if (test_generate_host_key() < 0)
-		return test_signature_copies_finish(&fixture_copies, TEST_FAIL);
-
-	dssh_key_algo ka = find_key_algo(test_key_algo_name());
-	if (ka == NULL)
-		return test_signature_copies_finish(&fixture_copies, TEST_FAIL);
-
-	/* Generate valid sig + pubkey blobs with ossl off */
+	int ret = test_register_key_algos();
+	if (ret == 0)
+		ret = test_generate_host_key();
+	dssh_key_algo ka = ret == 0 ? find_key_algo(test_key_algo_name()) : NULL;
 	const uint8_t data[] = "test data for verify iterate";
-	uint8_t *sig_buf = NULL;
-	const uint8_t *pub_buf = NULL;
-	size_t sig_len, pub_len;
-	ASSERT_EQ(test_signature_copy(&fixture_copies, ka->sign, &sig_buf, &sig_len,
-	    data, sizeof(data) - 1, ka->ctx), 0);
-	ASSERT_EQ(ka->pubkey(&pub_buf, &pub_len, ka->ctx), 0);
-
-	int prev_count = -1;
-	for (int n = 0; n < 500; n++) {
-		dssh_test_ossl_fail_after(n);
-		int vres = ka->verify(pub_buf, pub_len, sig_buf, sig_len,
-		    data, sizeof(data) - 1);
-		int cur_count = dssh_test_ossl_count();
-		dssh_test_ossl_reset();
-
-		if (vres == 0) {
-			dssh_test_reset_global_config();
-			ASSERT_TRUE(n > 0);
-			return test_signature_copies_finish(&fixture_copies, TEST_PASS);
+	uint8_t *sig = NULL;
+	const uint8_t *pub = NULL;
+	size_t sig_len = 0;
+	size_t pub_len = 0;
+	if (ka != NULL)
+		ret = test_signature_copy(&copies, ka->sign, &sig, &sig_len,
+		    data, sizeof(data) - 1, ka->ctx);
+	if (ret == 0 && ka != NULL)
+		ret = ka->pubkey(&pub, &pub_len, ka->ctx);
+	if (ret == 0 && ka != NULL)
+		ret = ka->verify(pub, pub_len, sig, sig_len, data, sizeof(data) - 1);
+	int result = TEST_FAIL;
+	if (ret == 0 && ka != NULL) {
+		struct allocation_sweep sweep = {0};
+		for (int n = 0; n < 500; n++) {
+			dssh_test_ossl_fail_after(n);
+			ret = ka->verify(pub, pub_len, sig, sig_len, data, sizeof(data) - 1);
+			int calls = dssh_test_ossl_count();
+			dssh_test_ossl_reset();
+			int step = allocation_sweep_step(&sweep, "ossl/key_verify", n, calls, ret == 0, ret <= 0);
+			if (step != 0) {
+				result = step > 0 ? TEST_PASS : TEST_FAIL;
+				break;
+			}
 		}
-		if (cur_count == prev_count) {
-			dssh_test_reset_global_config();
-			return test_signature_copies_finish(&fixture_copies, TEST_PASS);
-		}
-		prev_count = cur_count;
 	}
-
-	fprintf(stderr, "  ossl/key_verify: still incrementing at n=%d "
-	    "(count=%d), raise limit\n", 500, prev_count);
-	test_signature_copy_free(&fixture_copies, sig_buf);
+	test_signature_copies_finish(&copies, result);
 	dssh_test_reset_global_config();
-	return test_signature_copies_finish(&fixture_copies, TEST_FAIL);
+	return result;
 }
 
 static int
@@ -1632,49 +1712,62 @@ test_ossl_key_pubkey_iterate(void)
 	dssh_test_reset_global_config();
 	dssh_test_ossl_reset();
 	mock_alloc_reset();
-	ASSERT_OK(test_register_key_algos());
-	ASSERT_OK(test_generate_host_key());
-	dssh_key_algo ka = find_key_algo(test_key_algo_name());
-	ASSERT_NOT_NULL(ka);
+	int ret = test_register_key_algos();
+	if (ret == 0)
+		ret = test_generate_host_key();
+	dssh_key_algo ka = ret == 0 ? find_key_algo(test_key_algo_name()) : NULL;
+	if (ka == NULL) {
+		dssh_test_reset_global_config();
+		return TEST_FAIL;
+	}
 	dssh_key_algo_ctx *original_ctx = ka->ctx;
 	const uint8_t *original_blob = NULL;
 	size_t original_len = 0;
-	ASSERT_OK(ka->pubkey(&original_blob, &original_len, ka->ctx));
-
-	/* Published keys are complete: readers use the immutable cache. */
+	ret = ka->pubkey(&original_blob, &original_len, ka->ctx);
+	if (ret != 0 || original_blob == NULL || original_len == 0) {
+		dssh_test_reset_global_config();
+		return TEST_FAIL;
+	}
+	/* The cached reader must not consume the armed provider fault. */
 	dssh_test_ossl_fail_after(0);
 	const uint8_t *blob = NULL;
 	size_t len = 0;
-	int ret = ka->pubkey(&blob, &len, ka->ctx);
+	ret = ka->pubkey(&blob, &len, ka->ctx);
 	int calls = dssh_test_ossl_count();
 	dssh_test_ossl_reset();
-	ASSERT_OK(ret);
-	ASSERT_EQ(calls, 0);
-	ASSERT_TRUE(blob == original_blob);
-	ASSERT_EQ_U(len, original_len);
-
-	/* Exercise cache construction during replacement, including every
-	 * backend failure, while retaining the previously published key. */
-	for (int n = 0; n < 500; n++) {
+	bool valid = ret == 0 && calls == 0 && blob == original_blob && len == original_len;
+	int result = TEST_FAIL;
+	struct allocation_sweep sweep = {0};
+	for (int n = 0; valid && n < 500; n++) {
 		dssh_test_ossl_fail_after(n);
 		ret = test_generate_host_key();
+		calls = dssh_test_ossl_count();
 		dssh_test_ossl_reset();
+		valid = ret <= 0;
 		if (ret < 0) {
-			ASSERT_TRUE(ka->ctx == original_ctx);
-			ASSERT_OK(ka->pubkey(&blob, &len, ka->ctx));
-			ASSERT_TRUE(blob == original_blob);
-			ASSERT_EQ_U(len, original_len);
-			continue;
+			valid &= ka->ctx == original_ctx;
+			if (valid)
+				valid = ka->pubkey(&blob, &len, ka->ctx) == 0
+				    && blob == original_blob && len == original_len;
 		}
-		ASSERT_TRUE(n > 0);
-		ASSERT_OK(ka->pubkey(&blob, &len, ka->ctx));
-		ASSERT_NOT_NULL(blob);
-		ASSERT_TRUE(len > 0);
-		dssh_test_reset_global_config();
-		return TEST_PASS;
+		else {
+			valid &= selected_key_ready(ka);
+			/* A tolerated replacement can retire the former key. Track
+			 * the new live cache for the following iteration, not freed
+			 * pointer values from a prior successful replacement. */
+			if (valid) {
+				original_ctx = ka->ctx;
+				valid = ka->pubkey(&original_blob, &original_len, ka->ctx) == 0;
+			}
+		}
+		int step = allocation_sweep_step(&sweep, "ossl/key_pubkey", n, calls, ret == 0, valid);
+		if (step != 0) {
+			result = step > 0 ? TEST_PASS : TEST_FAIL;
+			break;
+		}
 	}
 	dssh_test_reset_global_config();
-	return TEST_FAIL;
+	return result;
 }
 
 #endif /* DSSH_CRYPTO_OPENSSL -- ossl key/enc/mac iterate */
@@ -3439,6 +3532,8 @@ static struct dssh_test_entry tests[] = {
 	{ "alloc/dssh_register_none_enc",      test_alloc_register_none_enc },
 	{ "alloc/dssh_register_none_mac",      test_alloc_register_none_mac },
 	{ "alloc/register_dh_gex",        test_alloc_register_dh_gex },
+
+	{ "alloc/sweep_contract",         test_alloc_sweep_contract },
 
 	/* Session init */
 	{ "alloc/session_init",           test_alloc_session_init },

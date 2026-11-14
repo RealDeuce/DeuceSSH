@@ -1937,6 +1937,25 @@ add_test(NAME dssh_unit_alloc_dhgex_rsa512 COMMAND dssh_test_alloc)
 set_tests_properties(dssh_unit_alloc_dhgex_rsa512 PROPERTIES
 	ENVIRONMENT "DSSH_TEST_KEX=dh-gex;DSSH_TEST_KEY=rsa512;${DSSH_TEST_KEY_ENV}")
 
+# Sequential failure sweeps have exact, independently selectable completion
+# controls. Keep existing aggregates; threaded/parser migration remains separate.
+set(ALLOCATION_SEQUENTIAL_TESTS alloc/sweep_contract alloc/session_init)
+if(DEUCESSH_CRYPTO_BACKEND STREQUAL "OpenSSL")
+	list(APPEND ALLOCATION_SEQUENTIAL_TESTS ossl/session_init
+		ossl/key_sign_verify ossl/keygen ossl/enc ossl/mac
+		ossl/key_verify ossl/key_pubkey)
+endif()
+foreach(allocation_key_mode IN ITEMS ed25519 rsa rsa512)
+	foreach(allocation_group IN LISTS ALLOCATION_SEQUENTIAL_TESTS)
+		dssh_add_output_test(dssh_alloc_sweep_${allocation_key_mode}_${allocation_group}
+			dssh_test_alloc "1 tests: 1 passed, 0 failed, 0 skipped"
+			--exact ${allocation_group})
+		set_tests_properties(dssh_alloc_sweep_${allocation_key_mode}_${allocation_group}
+			PROPERTIES FIXTURES_REQUIRED dssh_cached_keys
+			ENVIRONMENT "DSSH_TEST_KEY=${allocation_key_mode};DSSH_TEST_KEX=curve25519;${DSSH_TEST_KEY_ENV}")
+	endforeach()
+endforeach()
+
 # Targeted coverage tests — run in their own process for clean state
 add_test(NAME dssh_targeted_c25519_server_trunc
 	COMMAND dssh_test_alloc c25519/server_truncated_init)

@@ -32,6 +32,10 @@ static int64_t owner_read(dssh_channel, int, uint8_t *, size_t);
 static int owner_log(dssh_session, dssh_log_cb, void *);
 static int owner_timeout(dssh_session, int);
 static int owner_terminate(dssh_session, dssh_terminate_cb, void *);
+static int owner_socket_poll(struct pollfd *, nfds_t, int);
+static ssize_t owner_socket_send(int, const void *, size_t, int);
+static ssize_t owner_socket_recv(int, void *, size_t, int);
+static int owner_callback_unlock(mtx_t *);
 
 /* Capture the existing native/test redirections before overriding only calls
  * in the included fixture. No library demux create/join is intercepted. */
@@ -42,6 +46,10 @@ static int native_create(thrd_t *t, thrd_start_t f, void *a)
 static int native_join(thrd_t t, int *r)
 {
 	return thrd_join(t, r);
+}
+static int native_unlock(mtx_t *mutex)
+{
+	return mtx_unlock(mutex);
 }
 
 #undef thrd_create
@@ -69,9 +77,18 @@ static int native_join(thrd_t t, int *r)
 #define dssh_session_set_log_cb owner_log
 #define dssh_session_set_timeout owner_timeout
 #define dssh_session_set_terminate_cb owner_terminate
+#define poll owner_socket_poll
+#define send owner_socket_send
+#define recv owner_socket_recv
+#undef mtx_unlock
+#define mtx_unlock owner_callback_unlock
 #define main selftest_suite_main
 #include "test_selftest.c"
 #undef main
+#undef mtx_unlock
+#undef poll
+#undef send
+#undef recv
 #undef dssh_session_set_log_cb
 #undef dssh_session_set_timeout
 #undef dssh_session_set_terminate_cb
@@ -610,6 +627,8 @@ owner_channel_body(void *argument)
 	return complete && ret == 0 ? 0 : -1;
 }
 
+#include "selftest_socket_controls.h"
+
 static bool
 owner_extent_boundaries(void)
 {
@@ -717,6 +736,9 @@ main(int argc, char **argv)
 	atomic_init(&owner_channels_created, 0);
 	atomic_init(&owner_channels_closed, 0);
 	atomic_init(&owner_channel_ready, false);
+	if (strncmp(owner_mode, "socket-", 7) == 0
+	    || strncmp(owner_mode, "callback-unlock-", 16) == 0)
+		return owner_socket_control();
 	if (strncmp(owner_mode, "standalone-", 11) == 0) {
 		int result;
 		if (strcmp(owner_mode, "standalone-log") == 0)

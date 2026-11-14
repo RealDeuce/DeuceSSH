@@ -2384,6 +2384,22 @@ target_link_libraries(dssh_test_selftest PRIVATE dssh_mock_comp)
 if(Python3_Interpreter_FOUND AND UNIX AND NOT APPLE)
 	dssh_add_test(selftest_owner test_selftest_owner.c)
 	target_link_libraries(dssh_test_selftest_owner PRIVATE dssh_mock_comp)
+	set(selftest_socket_modes callback-unlock-native callback-unlock-retained
+		callback-unlock-released socket-recv-eof)
+	foreach(kind IN ITEMS native eintr error-before error-after zero oversize short short-error)
+		list(APPEND selftest_socket_modes socket-send-${kind} socket-recv-${kind})
+	endforeach()
+	foreach(kind IN ITEMS native eintr error-before error-after zero count nval hup err other terminated)
+		list(APPEND selftest_socket_modes socket-poll-${kind})
+	endforeach()
+	foreach(kind IN ITEMS native eintr error-before error-after zero oversize full capacity eof empty-eof)
+		list(APPEND selftest_socket_modes socket-line-${kind})
+	endforeach()
+	foreach(mode IN LISTS selftest_socket_modes)
+		add_test(NAME dssh_selftest_socket_${mode} COMMAND ${Python3_EXECUTABLE}
+			${CMAKE_CURRENT_SOURCE_DIR}/selftest_socket_controls.py
+			$<TARGET_FILE:dssh_test_selftest_owner> ${mode})
+	endforeach()
 	foreach(mode IN ITEMS standalone-log standalone-clock standalone-terminate)
 		add_test(NAME dssh_selftest_completion_${mode} COMMAND ${Python3_EXECUTABLE}
 			${CMAKE_CURRENT_SOURCE_DIR}/selftest_completion_controls.py

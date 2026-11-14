@@ -102,9 +102,9 @@ handshake_cleanup(struct test_session_pair *ctx)
 {
 	dssh_test_alloc_reset();
 	dssh_test_ossl_reset();
+	test_pair_destroy(ctx);
 	test_enc_reset();
 	test_mac_reset();
-	test_pair_destroy(ctx);
 	dssh_test_reset_global_config();
 }
 
@@ -113,9 +113,9 @@ dssh_test_failure_cleanup(void)
 {
 	dssh_test_alloc_reset();
 	dssh_test_ossl_reset();
+	test_pair_destroy_active();
 	test_enc_reset();
 	test_mac_reset();
-	test_pair_destroy_active();
 	dssh_test_reset_global_config();
 }
 

@@ -16,18 +16,19 @@
 #include "deucessh.h"
 #include "ssh-trans.h"
 #include "test_enc.h"
+#include "dssh_test_counter.h"
 
 #define TEST_ENC_BLOCK_SIZE 16
 #define TEST_ENC_KEY_SIZE   32
 
 /* Global failure injection counters */
 static atomic_int init_fail_at = -1;
-static atomic_int init_count;
+static dssh_test_counter init_count;
 static atomic_bool init_failure_seen;
 static atomic_int encrypt_fail_at = -1;
-static atomic_int encrypt_count;
+static dssh_test_counter encrypt_count;
 static atomic_int decrypt_fail_at = -1;
-static atomic_int decrypt_count;
+static dssh_test_counter decrypt_count;
 
 void
 test_enc_reset(void)
@@ -80,8 +81,10 @@ test_enc_init(const uint8_t *key, const uint8_t *iv,
 	(void)iv;
 	(void)encrypt_dir;
 
+	if (key == NULL || ctx == NULL)
+		return DSSH_ERROR_INVALID;
 	int fail_at = atomic_load(&init_fail_at);
-	if (fail_at >= 0 && atomic_fetch_add(&init_count, 1) == fail_at) {
+	if (fail_at >= 0 && dssh_test_counter_next(&init_count) == fail_at) {
 		init_failure_seen = true;
 		return DSSH_ERROR_INIT;
 	}
@@ -97,8 +100,10 @@ test_enc_init(const uint8_t *key, const uint8_t *iv,
 static int
 test_enc_encrypt(uint8_t *buf, size_t bufsz, dssh_enc_ctx *ctx)
 {
+	if (ctx == NULL || (buf == NULL && bufsz != 0))
+		return DSSH_ERROR_INVALID;
 	int fail_at = atomic_load(&encrypt_fail_at);
-	if (fail_at >= 0 && atomic_fetch_add(&encrypt_count, 1) == fail_at)
+	if (fail_at >= 0 && dssh_test_counter_next(&encrypt_count) == fail_at)
 		return DSSH_ERROR_INIT;
 
 	struct dssh_enc_ctx *cbd = ctx;
@@ -110,8 +115,10 @@ test_enc_encrypt(uint8_t *buf, size_t bufsz, dssh_enc_ctx *ctx)
 static int
 test_enc_decrypt(uint8_t *buf, size_t bufsz, dssh_enc_ctx *ctx)
 {
+	if (ctx == NULL || (buf == NULL && bufsz != 0))
+		return DSSH_ERROR_INVALID;
 	int fail_at = atomic_load(&decrypt_fail_at);
-	if (fail_at >= 0 && atomic_fetch_add(&decrypt_count, 1) == fail_at)
+	if (fail_at >= 0 && dssh_test_counter_next(&decrypt_count) == fail_at)
 		return DSSH_ERROR_INIT;
 
 	/* XOR cipher: decrypt == encrypt */
@@ -124,6 +131,8 @@ test_enc_decrypt(uint8_t *buf, size_t bufsz, dssh_enc_ctx *ctx)
 static void
 test_enc_cleanup(dssh_enc_ctx *ctx)
 {
+	if (ctx != NULL)
+		dssh_secure_zero(ctx, sizeof(*ctx));
 	free(ctx);
 }
 
@@ -131,6 +140,8 @@ int
 register_test_enc(void)
 {
 	static const char name[] = "aes256-ctr";
+	if (sizeof(struct dssh_enc_s) > SIZE_MAX - sizeof(name))
+		return DSSH_ERROR_INVALID;
 	struct dssh_enc_s *enc = malloc(sizeof(*enc) + sizeof(name));
 	if (enc == NULL)
 		return DSSH_ERROR_ALLOC;

@@ -716,6 +716,10 @@ foreach(model IN ITEMS native i16 i32 i64)
 		"counter model=${model} calls=1024 created=4 joined=4 boundary=1 unique=1 valid=1" normal)
 endforeach()
 
+# Exercise the five actual test-module counter bindings with real contexts.
+dssh_add_test(module_counters test_module_counters.c)
+add_test(NAME dssh_module_counters COMMAND dssh_test_module_counters normal)
+
 # A shared cache needs a single writer before parallel tests start.  Unit key
 # tests also load these files without going through test_generate_host_key().
 dssh_add_test(key_setup test_key_setup.c)
@@ -1166,6 +1170,13 @@ if(Python3_Interpreter_FOUND)
 	endforeach()
 endif()
 if(Python3_Interpreter_FOUND AND UNIX)
+	foreach(binding IN ITEMS enc-init enc-encrypt enc-decrypt mac-init mac-generate)
+		foreach(mode IN ITEMS exhausted negative)
+			add_test(NAME dssh_module_counter_${binding}_${mode} COMMAND ${Python3_EXECUTABLE}
+				${CMAKE_CURRENT_SOURCE_DIR}/module_counter_controls.py
+				$<TARGET_FILE:dssh_test_module_counters> ${binding} ${mode})
+		endforeach()
+	endforeach()
 	foreach(model IN ITEMS native i16 i32 i64)
 		foreach(mode IN ITEMS exhausted negative)
 			add_test(NAME dssh_counter_${model}_${mode} COMMAND ${Python3_EXECUTABLE}
@@ -2275,6 +2286,7 @@ set_property(TARGET dssh_test_algos PROPERTY C_STANDARD_REQUIRED ON)
 target_include_directories(dssh_test_algos PUBLIC
 	${PROJECT_SOURCE_DIR}
 	${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_options(dssh_test_algos PRIVATE ${DEUCESSH_COMPILE_OPTIONS})
 target_link_libraries(dssh_test_algos PRIVATE deucessh_test_lib)
 target_link_libraries(dssh_test_algo_mac PRIVATE dssh_test_algos)
 

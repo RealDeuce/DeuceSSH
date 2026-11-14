@@ -433,6 +433,7 @@ if(UNIX)
 endif()
 set_property(TARGET dssh_test_ossl PROPERTY C_STANDARD ${DEUCESSH_C_STANDARD})
 set_property(TARGET dssh_test_ossl PROPERTY C_STANDARD_REQUIRED ON)
+target_compile_options(dssh_test_ossl PRIVATE ${DEUCESSH_COMPILE_OPTIONS})
 target_include_directories(dssh_test_ossl PUBLIC
 	${CMAKE_CURRENT_SOURCE_DIR})
 if(DSSH_THREADS_SHIM_INCLUDE)
@@ -2383,6 +2384,14 @@ target_link_libraries(dssh_test_selftest PRIVATE dssh_mock_comp)
 if(Python3_Interpreter_FOUND AND UNIX AND NOT APPLE)
 	dssh_add_test(selftest_owner test_selftest_owner.c)
 	target_link_libraries(dssh_test_selftest_owner PRIVATE dssh_mock_comp)
+	dssh_add_test(wait_observation test_wait_observation.c)
+	set(selftest_wait_symbol cnd_timedwait)
+	if(DSSH_THREADS_SHIM_INCLUDE)
+		set(selftest_wait_symbol dssh_thread_cnd_timedwait)
+	endif()
+	target_link_options(dssh_test_wait_observation PRIVATE "-Wl,--wrap=${selftest_wait_symbol}")
+	dssh_add_output_test(dssh_wait_observation dssh_test_wait_observation
+		"wait_observation cases=10 native_success=1 native_timeout=1 reported_error=1 excluded=1 other=1 injection=1 disabled=1 thread_reset=1 full_reset=1 wildcard=1 valid=1")
 	set(selftest_owner_modes plain assert-body)
 	foreach(index RANGE 0 4)
 		list(APPEND selftest_owner_modes create-${index}
@@ -2460,6 +2469,7 @@ set(SELFTEST_TESTS
 	test_self_rekey_preserves_channels
 	test_self_rekey_inflight_data
 	test_self_connection_drop
+	test_self_socket_boundaries
 	test_null_session_api
 	test_log_api
 	test_set_timeout

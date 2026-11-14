@@ -434,6 +434,8 @@ dssh_test_ossl_reset(void)
 	rejected_unlocks = 0;
 	unlock_fail_mutex = NULL;
 	wait_probe = NULL;
+	dssh_test_wait_observe_begin(NULL, NULL);
+	dssh_test_wait_observe_end();
 	dssh_test_mtx_watch_ownership(NULL);
 	wake_fail_mutex = NULL;
 	wake_fail_condition = NULL;
@@ -500,6 +502,8 @@ dssh_test_thrd_reset(void)
 	rejected_unlocks = 0;
 	unlock_fail_mutex = NULL;
 	wait_probe = NULL;
+	dssh_test_wait_observe_begin(NULL, NULL);
+	dssh_test_wait_observe_end();
 	dssh_test_mtx_watch_ownership(NULL);
 	wake_fail_mutex = NULL;
 	wake_fail_condition = NULL;
@@ -1275,6 +1279,29 @@ probe_wait_result(struct dssh_test_wait_probe *probe)
 	return probe->result;
 }
 
+static _Thread_local bool wait_observing;
+static _Thread_local const cnd_t *wait_observe_target;
+static _Thread_local const cnd_t *wait_observe_exclude;
+static _Thread_local struct dssh_test_wait_observation wait_observation;
+
+void
+dssh_test_wait_observe_begin(const cnd_t *target, const cnd_t *exclude)
+{
+	wait_observation = (struct dssh_test_wait_observation){0};
+	wait_observe_target = target;
+	wait_observe_exclude = exclude;
+	wait_observing = true;
+}
+
+struct dssh_test_wait_observation
+dssh_test_wait_observe_end(void)
+{
+	wait_observing = false;
+	wait_observe_target = NULL;
+	wait_observe_exclude = NULL;
+	return wait_observation;
+}
+
 static int
 condition_wait(cnd_t *cond, mtx_t *mtx, const struct timespec *ts)
 {
@@ -1303,6 +1330,12 @@ condition_wait(cnd_t *cond, mtx_t *mtx, const struct timespec *ts)
 				atomic_store(&probe->native_calls, calls + 1);
 		}
 		ret = ts != NULL ? cnd_timedwait(cond, mtx, ts) : cnd_wait(cond, mtx);
+		if (wait_observing && ts != NULL && cond != wait_observe_exclude
+		    && (wait_observe_target == NULL || cond == wait_observe_target)) {
+			wait_observation.native = true;
+			wait_observation.timed_out |= ret == thrd_timedout;
+			wait_observation.failed |= ret != thrd_success && ret != thrd_timedout;
+		}
 	} while (first && probe->until_timeout && ts != NULL && ret == thrd_success);
 	if (first) {
 		atomic_store(&probe->native_result, ret);

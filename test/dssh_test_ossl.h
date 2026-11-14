@@ -136,6 +136,18 @@ struct dssh_test_wait_probe {
 };
 void dssh_test_wait_probe(struct dssh_test_wait_probe *probe);
 
+/* Passive current-thread observation of actual timed native waits. NULL target
+ * accepts any condition except exclude. Both reset functions end/clear this scope.
+ * No callbacks or native operations run
+ * while recording. End drops both condition borrows before owner retirement. */
+struct dssh_test_wait_observation {
+	bool native;
+	bool timed_out;
+	bool failed;
+};
+void dssh_test_wait_observe_begin(const cnd_t *target, const cnd_t *exclude);
+struct dssh_test_wait_observation dssh_test_wait_observe_end(void);
+
 /* Observe wrapped library ownership of one mutex on this thread. Configure
  * with no ownership of that mutex; native test/controller calls are not counted.
  * No callback or native mutex operation occurs when querying the flag. */

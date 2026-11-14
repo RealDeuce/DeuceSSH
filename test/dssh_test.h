@@ -21,7 +21,7 @@ static inline bool
 dssh_test_bytes_equal(struct dssh_bytes bytes, const void *data, size_t len)
 {
 	return bytes.len == len && (len == 0
-	    || (bytes.data != NULL && memcmp(bytes.data, data, len) == 0));
+	    || (bytes.data != NULL && data != NULL && memcmp(bytes.data, data, len) == 0));
 }
 
 
@@ -190,42 +190,147 @@ void dssh_test_failure_cleanup(void);
 #define DSSH_TEST_NO_CLEANUP \
 	void dssh_test_failure_cleanup(void) { }
 
+#include <float.h>
+#include <math.h>
 #include <signal.h>
 #include <time.h>
+
+/* Defined before library test redirections: measuring a leaf must not consume
+ * that leaf's library-clock fault counter. Overrides are private selftest hooks. */
+#ifndef DSSH_TEST_RUNNER_CLOCK
+ #define DSSH_TEST_RUNNER_CLOCK timespec_get
+#endif
+#ifndef DSSH_TEST_RUNNER_SIGNAL
+ #define DSSH_TEST_RUNNER_SIGNAL signal
+#endif
+#ifndef DSSH_TEST_RUNNER_PRINTF
+ #define DSSH_TEST_RUNNER_PRINTF printf
+#endif
+#ifndef DSSH_TEST_RUNNER_FLUSH
+ #define DSSH_TEST_RUNNER_FLUSH fflush
+#endif
+
+static inline bool
+dssh_test_runner_clock(struct timespec *value)
+{
+	return DSSH_TEST_RUNNER_CLOCK(value, TIME_UTC) == TIME_UTC
+	    && value->tv_nsec >= 0 && value->tv_nsec < 1000000000L;
+}
+
+/* The double interval comes from standard difftime, avoiding subtraction in
+ * time_t. Leave headroom before multiplication and the bounded fractional add. */
+static inline bool
+dssh_test_runner_elapsed(double seconds, long first, long last, double *out)
+{
+	if (!isfinite(seconds) || seconds < 0 || seconds > DBL_MAX / 2000.0
+	    || first < 0 || first >= 1000000000L || last < 0 || last >= 1000000000L)
+		return false;
+	long nanos = last - first;
+	double fraction = (double)nanos;
+	double elapsed = seconds * 1000.0 + fraction / 1000000.0;
+	if (elapsed < 0)
+		return false;
+	*out = elapsed;
+	return true;
+}
+
+static inline int
+dssh_test_runner_error(const char *message)
+{
+	if (fputs(message, stderr) < 0 || fflush(stderr) != 0)
+		return 2;
+	return 2;
+}
+
+static inline int
+dssh_test_run(const struct dssh_test_entry *table, size_t count, int argc, char **argv)
+{
+	if (argc < 1 || argc > 3 || argv == NULL || table == NULL
+	    || count == 0 || count > SIZE_MAX / sizeof(*table))
+		return dssh_test_runner_error("Invalid test runner configuration\n");
+	bool exact = argc == 3;
+	const char *filter = argc > 1 ? argv[argc - 1] : NULL;
+	if ((argc == 2 && (argv[1] == NULL || strcmp(argv[1], "--exact") == 0))
+	    || (exact && (argv[1] == NULL || strcmp(argv[1], "--exact") != 0))
+	    || (argc > 1 && (filter == NULL || filter[0] == 0)))
+		return dssh_test_runner_error("Invalid test selection\n");
+	size_t selected = 0;
+	for (size_t i = 0; i < count; i++) {
+		if (table[i].name == NULL || table[i].name[0] == 0 || table[i].fn == NULL)
+			return dssh_test_runner_error("Invalid test table entry\n");
+		if (filter == NULL || (exact ? strcmp(table[i].name, filter) == 0
+		    : strstr(table[i].name, filter) != NULL))
+			selected++;
+	}
+	if (exact && selected > 1)
+		return dssh_test_runner_error("Ambiguous exact test selection\n");
+	if (selected == 0) {
+		if (DSSH_TEST_RUNNER_PRINTF("\n0 tests: 0 passed, 0 failed, 0 skipped\n") < 0
+		    || DSSH_TEST_RUNNER_FLUSH(stdout) != 0)
+			return 2;
+		return 1;
+	}
+#ifdef SIGPIPE
+	if (DSSH_TEST_RUNNER_SIGNAL(SIGPIPE, SIG_IGN) == SIG_ERR)
+		return dssh_test_runner_error("Unable to ignore SIGPIPE for tests\n");
+#endif
+	/* Each tally is bounded by the validated actual table extent. */
+	size_t total = 0, passed = 0, failed = 0, skipped = 0;
+	for (size_t i = 0; i < count; i++) {
+		if (filter != NULL && (exact ? strcmp(table[i].name, filter) != 0
+		    : strstr(table[i].name, filter) == NULL))
+			continue;
+		if (DSSH_TEST_RUNNER_PRINTF("%-60s ", table[i].name) < 0
+		    || DSSH_TEST_RUNNER_FLUSH(stdout) != 0)
+			return 2;
+		struct timespec start, end;
+		bool started = dssh_test_runner_clock(&start);
+		int result = table[i].fn();
+		bool ended = dssh_test_runner_clock(&end);
+		total++;
+		const char *label;
+		if (result == TEST_PASS) {
+			passed++;
+			label = "PASS";
+		}
+		else if (result == TEST_SKIP) {
+			skipped++;
+			label = "SKIP";
+		}
+		else {
+			failed++;
+			label = "FAIL";
+		}
+		if (DSSH_TEST_RUNNER_PRINTF("%s", label) < 0)
+			return 2;
+		if (result != TEST_PASS && result != TEST_FAIL && result != TEST_SKIP) {
+			if (DSSH_TEST_RUNNER_PRINTF(" (invalid result %d)", result) < 0)
+				return 2;
+		}
+		double milliseconds;
+		bool timed = started && ended && dssh_test_runner_elapsed(
+		    difftime(end.tv_sec, start.tv_sec), start.tv_nsec, end.tv_nsec, &milliseconds);
+		if (!timed) {
+			if (DSSH_TEST_RUNNER_PRINTF(" (timing unavailable)") < 0)
+				return 2;
+		}
+		else if (milliseconds >= 100.0) {
+			if (DSSH_TEST_RUNNER_PRINTF(" (%.0fms)", milliseconds) < 0)
+				return 2;
+		}
+		if (DSSH_TEST_RUNNER_PRINTF("\n") < 0)
+			return 2;
+	}
+	if (DSSH_TEST_RUNNER_PRINTF("\n%zu tests: %zu passed, %zu failed, %zu skipped\n",
+	    total, passed, failed, skipped) < 0 || DSSH_TEST_RUNNER_FLUSH(stdout) != 0)
+		return 2;
+	return failed > 0 ? 1 : 0;
+}
+
 #define DSSH_TEST_MAIN(test_table) \
 int main(int argc, char *argv[]) \
 { \
-	signal(SIGPIPE, SIG_IGN); \
-	bool exact = (argc > 2) && (strcmp(argv[1], "--exact") == 0); \
-	const char *filter = exact ? argv[2] : ((argc > 1) ? argv[1] : NULL); \
-	int total = 0, passed = 0, failed = 0, skipped = 0; \
-	size_t count = sizeof(test_table) / sizeof(test_table[0]); \
-	for (size_t i = 0; i < count; i++) { \
-		if (filter && (exact ? strcmp(test_table[i].name, filter) != 0 \
-		    : strstr(test_table[i].name, filter) == NULL)) \
-			continue; \
-		total++; \
-		printf("%-60s ", test_table[i].name); \
-		fflush(stdout); \
-		struct timespec _t0, _t1; \
-		clock_gettime(CLOCK_MONOTONIC, &_t0); \
-		int result = test_table[i].fn(); \
-		clock_gettime(CLOCK_MONOTONIC, &_t1); \
-		long _ms = (_t1.tv_sec - _t0.tv_sec) * 1000L \
-		    + (_t1.tv_nsec - _t0.tv_nsec) / 1000000L; \
-		const char *_label = result > 0 ? "PASS" \
-		    : result == 0 ? "FAIL" : "SKIP"; \
-		if (_ms >= 100) \
-			printf("%s (%ldms)\n", _label, _ms); \
-		else \
-			printf("%s\n", _label); \
-		if (result > 0) passed++; \
-		else if (result == 0) failed++; \
-		else skipped++; \
-	} \
-	printf("\n%d tests: %d passed, %d failed, %d skipped\n", \
-	    total, passed, failed, skipped); \
-	return failed > 0 ? 1 : 0; \
+	return dssh_test_run(test_table, sizeof(test_table) / sizeof(test_table[0]), argc, argv); \
 }
 
 #endif

@@ -687,6 +687,8 @@ endforeach()
 
 # The assertion hook must run before stack-owned contexts go out of scope.
 dssh_add_test(framework test_framework.c)
+dssh_add_test(runner test_runner.c)
+dssh_add_output_test(dssh_runner_elapsed dssh_test_runner "runner_elapsed cases=10 valid=1" elapsed)
 add_test(NAME dssh_test_framework COMMAND dssh_test_framework)
 
 # Execute the shared exact-count body with native and signed width models.
@@ -1102,6 +1104,19 @@ foreach(part IN LISTS key_generation_parts)
 	set_tests_properties(dssh_key_generation_${part} PROPERTIES ENVIRONMENT "${DSSH_TEST_KEY_ENV}" TIMEOUT 180)
 endforeach()
 find_package(Python3 3.9 QUIET COMPONENTS Interpreter)
+if(Python3_Interpreter_FOUND)
+	set(RUNNER_CONTROL_MODES exact all substring none missing-exact extra empty bad-option
+		duplicate null-name null-function skip fail positive negative
+		clock-first clock-last nano-negative nano-over reverse fraction
+		write-first write-last flush-first flush-last io-real)
+	if(UNIX)
+		list(APPEND RUNNER_CONTROL_MODES signal-first signal-last)
+	endif()
+	foreach(mode IN LISTS RUNNER_CONTROL_MODES)
+		add_test(NAME dssh_runner_${mode} COMMAND ${Python3_EXECUTABLE}
+			${CMAKE_CURRENT_SOURCE_DIR}/runner_controls.py $<TARGET_FILE:dssh_test_runner> ${mode})
+	endforeach()
+endif()
 if(Python3_Interpreter_FOUND AND UNIX)
 	foreach(model IN ITEMS native i16 i32 i64)
 		foreach(mode IN ITEMS exhausted negative)

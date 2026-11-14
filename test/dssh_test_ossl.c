@@ -36,6 +36,7 @@
 #endif
 
 #include "dssh_test_ossl.h"
+#include "dssh_test_counter.h"
 #include "../ssh-timespec.h"
 
 static _Thread_local bool sntrup_clear_watched;
@@ -559,7 +560,7 @@ should_thrd_fail(void)
 	int fa = atomic_load(&thrd_fail_at);
 	if (fa < 0)
 		return false;
-	int n = atomic_fetch_add(&thrd_call_num, 1);
+	int n = dssh_test_counter_next(&thrd_call_num);
 	return (n == fa);
 }
 
@@ -567,7 +568,7 @@ should_thrd_fail(void)
 int
 dssh_test_thrd_join(thrd_t thr, int *res)
 {
-	atomic_fetch_add(&join_call_num, 1);
+	dssh_test_counter_next(&join_call_num);
 	if (atomic_exchange(&join_fail_next, false)) {
 		if (fputs("DSSH_TEST_JOIN_FAILURE\n", stderr) < 0 || fflush(stderr) != 0)
 			_Exit(9);
@@ -591,7 +592,7 @@ should_fail(void)
 	int fa = atomic_load(&ossl_fail_at);
 	if (fa < 0)
 		return false;
-	int n = atomic_fetch_add(&ossl_call_num, 1);
+	int n = dssh_test_counter_next(&ossl_call_num);
 	return (n == fa);
 }
 

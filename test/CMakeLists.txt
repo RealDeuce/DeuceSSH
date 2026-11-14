@@ -689,6 +689,19 @@ endforeach()
 dssh_add_test(framework test_framework.c)
 add_test(NAME dssh_test_framework COMMAND dssh_test_framework)
 
+# Execute the shared exact-count body with native and signed width models.
+foreach(model IN ITEMS native i16 i32 i64)
+	dssh_add_test(counter_${model} test_counter.c)
+	target_compile_definitions(dssh_test_counter_${model} PRIVATE DSSH_TEST_COUNTER_MODEL="${model}")
+	if(NOT model STREQUAL "native")
+		string(SUBSTRING ${model} 1 -1 bits)
+		target_compile_definitions(dssh_test_counter_${model} PRIVATE
+			DSSH_TEST_COUNTER_TYPE=int${bits}_t DSSH_TEST_COUNTER_MAX=INT${bits}_MAX)
+	endif()
+	dssh_add_output_test(dssh_counter_${model} dssh_test_counter_${model}
+		"counter model=${model} calls=1024 created=4 joined=4 boundary=1 unique=1 valid=1" normal)
+endforeach()
+
 # A shared cache needs a single writer before parallel tests start.  Unit key
 # tests also load these files without going through test_generate_host_key().
 dssh_add_test(key_setup test_key_setup.c)
@@ -1089,6 +1102,15 @@ foreach(part IN LISTS key_generation_parts)
 	set_tests_properties(dssh_key_generation_${part} PROPERTIES ENVIRONMENT "${DSSH_TEST_KEY_ENV}" TIMEOUT 180)
 endforeach()
 find_package(Python3 3.9 QUIET COMPONENTS Interpreter)
+if(Python3_Interpreter_FOUND AND UNIX)
+	foreach(model IN ITEMS native i16 i32 i64)
+		foreach(mode IN ITEMS exhausted negative)
+			add_test(NAME dssh_counter_${model}_${mode} COMMAND ${Python3_EXECUTABLE}
+				${CMAKE_CURRENT_SOURCE_DIR}/counter_controls.py
+				$<TARGET_FILE:dssh_test_counter_${model}> ${model} ${mode})
+		endforeach()
+	endforeach()
+endif()
 if(Python3_Interpreter_FOUND)
 	foreach(mode IN ITEMS empty buffer-refusal buffer queue-refusal queue queue-frozen
 	    params-refusal params temporary-refusal all nested normal)

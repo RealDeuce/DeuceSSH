@@ -16,6 +16,7 @@
 #include <stdbool.h>
 
 #include "dssh_test_alloc.h"
+#include "dssh_test_counter.h"
 
 static atomic_int dssh_alloc_fail_at = -1;
 static atomic_int dssh_alloc_num = 0;
@@ -151,7 +152,7 @@ should_fail(void)
 	int fa = atomic_load(&dssh_alloc_fail_at);
 	if (fa < 0)
 		return false;
-	int n = atomic_fetch_add(&dssh_alloc_num, 1);
+	int n = dssh_test_counter_next(&dssh_alloc_num);
 	return (n == fa);
 }
 

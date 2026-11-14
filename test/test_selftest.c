@@ -3064,6 +3064,8 @@ test_self_chan_close_no_exit_code(void)
 
 
 struct selftest_break_action {
+	atomic_bool entered;
+	atomic_bool duplicate;
 	atomic_bool seen;
 	atomic_bool valid;
 };
@@ -3073,6 +3075,10 @@ selftest_break_action(dssh_channel ch, const struct dssh_chan_break_request *req
     void *data)
 {
 	struct selftest_break_action *action = data;
+	if (atomic_exchange(&action->entered, true)) {
+		atomic_store(&action->duplicate, true);
+		return false;
+	}
 	bool valid = ch != NULL && request != NULL && request->length == 500
 	    && !request->want_reply && request->stdout_pos == 0 && request->stderr_pos == 0;
 	atomic_store(&action->valid, valid);
@@ -3088,6 +3094,8 @@ test_self_chan_send_break(void)
 	if (selftest_setup(&ctx) != 0)
 		return TEST_FAIL;
 	struct selftest_break_action action;
+	atomic_init(&action.entered, false);
+	atomic_init(&action.duplicate, false);
 	atomic_init(&action.seen, false);
 	atomic_init(&action.valid, false);
 	ASSERT_EQ(dssh_session_set_break_cb(ctx.server, selftest_break_action, &action), 0);
@@ -3112,6 +3120,7 @@ test_self_chan_send_break(void)
 	selftest_join(&ctx.server_thread, &ctx.server_thread_active);
 	ASSERT_EQ(arg.result, 0);
 	selftest_cleanup(&ctx);
+	ASSERT_FALSE(atomic_load(&action.duplicate));
 	return TEST_PASS;
 }
 

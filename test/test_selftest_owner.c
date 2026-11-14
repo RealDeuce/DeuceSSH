@@ -36,6 +36,9 @@ static int owner_socket_poll(struct pollfd *, nfds_t, int);
 static ssize_t owner_socket_send(int, const void *, size_t, int);
 static ssize_t owner_socket_recv(int, void *, size_t, int);
 static int owner_callback_unlock(mtx_t *);
+static int owner_break(dssh_session, dssh_chan_break_cb, void *);
+static int owner_env(struct dssh_chan_params *, const char *, const char *);
+static void owner_wire_server_retired(void);
 
 /* Capture the existing native/test redirections before overriding only calls
  * in the included fixture. No library demux create/join is intercepted. */
@@ -77,6 +80,8 @@ static int native_unlock(mtx_t *mutex)
 #define dssh_session_set_log_cb owner_log
 #define dssh_session_set_timeout owner_timeout
 #define dssh_session_set_terminate_cb owner_terminate
+#define dssh_session_set_break_cb owner_break
+#define dssh_chan_params_add_env owner_env
 #define poll owner_socket_poll
 #define send owner_socket_send
 #define recv owner_socket_recv
@@ -85,6 +90,8 @@ static int native_unlock(mtx_t *mutex)
 #define main selftest_suite_main
 #include "test_selftest.c"
 #undef main
+#undef dssh_session_set_break_cb
+#undef dssh_chan_params_add_env
 #undef mtx_unlock
 #undef poll
 #undef send
@@ -538,11 +545,14 @@ owner_cleanup(dssh_session sess)
 		abort();
 	}
 	bool owned = sess != NULL;
+	bool server = owned && !sess->trans.client;
 	struct log_test_state *log = owned ? owner_log_borrow : NULL;
 	if (owned)
 		owner_log_borrow = NULL;
 	bool log_valid = log != NULL && log->valid;
 	dssh_session_cleanup(sess);
+	if (server)
+		owner_wire_server_retired();
 	if (log != NULL)
 		owner_standalone_borrow_valid = log_valid && log->valid;
 	if (owned) {
@@ -628,6 +638,7 @@ owner_channel_body(void *argument)
 }
 
 #include "selftest_socket_controls.h"
+#include "selftest_wire_controls.h"
 
 static bool
 owner_extent_boundaries(void)
@@ -736,6 +747,8 @@ main(int argc, char **argv)
 	atomic_init(&owner_channels_created, 0);
 	atomic_init(&owner_channels_closed, 0);
 	atomic_init(&owner_channel_ready, false);
+	if (strncmp(owner_mode, "wire-", 5) == 0)
+		return owner_wire_control();
 	if (strncmp(owner_mode, "socket-", 7) == 0
 	    || strncmp(owner_mode, "callback-unlock-", 16) == 0)
 		return owner_socket_control();

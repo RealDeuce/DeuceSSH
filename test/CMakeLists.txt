@@ -2384,6 +2384,16 @@ target_link_libraries(dssh_test_selftest PRIVATE dssh_mock_comp)
 if(Python3_Interpreter_FOUND AND UNIX AND NOT APPLE)
 	dssh_add_test(selftest_owner test_selftest_owner.c)
 	target_link_libraries(dssh_test_selftest_owner PRIVATE dssh_mock_comp)
+	target_link_options(dssh_test_selftest_owner PRIVATE "-Wl,--wrap=send_commit"
+		"-Wl,--wrap=recv_packet")
+	foreach(mode IN ITEMS wire-env-native wire-env-omitted wire-env-reply
+		wire-break-native wire-break-duplicate)
+		add_test(NAME dssh_selftest_wire_${mode} COMMAND ${Python3_EXECUTABLE}
+			${CMAKE_CURRENT_SOURCE_DIR}/selftest_wire_controls.py
+			$<TARGET_FILE:dssh_test_selftest_owner> ${mode})
+		set_tests_properties(dssh_selftest_wire_${mode} PROPERTIES
+			FIXTURES_REQUIRED dssh_cached_keys ENVIRONMENT "${DSSH_TEST_KEY_ENV}")
+	endforeach()
 	set(selftest_socket_modes callback-unlock-native callback-unlock-retained
 		callback-unlock-released socket-recv-eof)
 	foreach(kind IN ITEMS native eintr error-before error-after zero oversize short short-error)

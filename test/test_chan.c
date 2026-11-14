@@ -1835,10 +1835,12 @@ test_params_copy_failure(void)
 }
 
 #include "event_text_queue_cases.h"
+#include "bytebuf_ring_cases.h"
 
 static struct dssh_test_entry tests[] = {
 	{ "params_copy_failure", test_params_copy_failure },
 	/* Bytebuf */
+	{ "bytebuf_ring_positions", test_bytebuf_ring_positions },
 	{ "bytebuf_init_free",                test_bytebuf_init_free },
 	{ "bytebuf_write_read_basic",         test_bytebuf_write_read_basic },
 	{ "bytebuf_empty_read",               test_bytebuf_empty_read },

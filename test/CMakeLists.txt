@@ -583,6 +583,24 @@ function(dssh_add_test test_name source_file)
 	endif()
 endfunction()
 
+# Exercise the exact production ring arithmetic under unsigned size models.
+foreach(model IN ITEMS native u8 u16 u32 u64)
+	add_executable(dssh_test_ring_sizes_${model} test_ring_sizes.c)
+	set_property(TARGET dssh_test_ring_sizes_${model} PROPERTY C_STANDARD ${DEUCESSH_C_STANDARD})
+	set_property(TARGET dssh_test_ring_sizes_${model} PROPERTY C_STANDARD_REQUIRED ON)
+	target_include_directories(dssh_test_ring_sizes_${model} PRIVATE ${PROJECT_SOURCE_DIR})
+	target_compile_options(dssh_test_ring_sizes_${model} PRIVATE ${DEUCESSH_COMPILE_OPTIONS})
+	target_compile_definitions(dssh_test_ring_sizes_${model} PRIVATE DSSH_RING_MODEL_NAME="${model}")
+	if(NOT model STREQUAL "native")
+		string(SUBSTRING ${model} 1 -1 bits)
+		target_compile_definitions(dssh_test_ring_sizes_${model} PRIVATE
+			DSSH_RING_SIZE_TYPE=uint${bits}_t DSSH_RING_SIZE_LIMIT=UINT${bits}_MAX
+			DSSH_RING_MODEL_BITS=${bits})
+	endif()
+	dssh_add_output_test(dssh_ring_sizes_${model} dssh_test_ring_sizes_${model}
+		"ring_sizes model=${model} width=[0-9]+ checks=[1-9][0-9]* failed=0")
+endforeach()
+
 # Exercise the exact production packet arithmetic under unsigned size models.
 foreach(model IN ITEMS native u16 u32 u64)
 	add_executable(dssh_test_packet_sizes_${model} test_packet_sizes.c)
@@ -819,6 +837,8 @@ set_tests_properties(dssh_portable_api PROPERTIES TIMEOUT 60)
 
 dssh_add_test(chan test_chan.c)
 add_test(NAME dssh_unit_chan COMMAND dssh_test_chan)
+dssh_add_output_test(dssh_bytebuf_ring dssh_test_chan
+	"1 tests: 1 passed, 0 failed, 0 skipped" --exact bytebuf_ring_positions)
 
 dssh_add_test(crypto test_crypto.c)
 add_test(NAME dssh_unit_crypto COMMAND dssh_test_crypto)

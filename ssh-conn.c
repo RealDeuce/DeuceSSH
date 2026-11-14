@@ -7,6 +7,7 @@
 #include "deucessh-conn.h"
 #include "ssh-internal.h"
 #include "ssh-window.h"
+#include "ssh-ring.h"
 
 #ifdef DSSH_TESTING
  #include "dssh_test_alloc.h"
@@ -181,7 +182,7 @@ bytebuf_write(struct dssh_bytebuf *b, const uint8_t *data, size_t len)
 	if (len > first)
 		memcpy(b->data, &data[first], len - first);
 
-	b->tail = (b->tail + len) % b->capacity;
+	b->tail = dssh_ring_advance(b->tail, len, b->capacity);
 	b->used += len;
 	if (len > SIZE_MAX - b->total)
 		b->total = SIZE_MAX;
@@ -214,7 +215,7 @@ bytebuf_read(struct dssh_bytebuf *b, uint8_t *buf, size_t bufsz, size_t limit)
 	if (avail > first)
 		memcpy(&buf[first], b->data, avail - first);
 
-	b->head = (b->head + avail) % b->capacity;
+	b->head = dssh_ring_advance(b->head, avail, b->capacity);
 	b->used -= avail;
 	return avail;
 }

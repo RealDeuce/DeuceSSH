@@ -9,6 +9,7 @@
 #include "dssh_test_internal.h"
 #include "deucessh-crypto.h"
 #include "deucessh-algorithms.h"
+#include "fixture_writer.h"
 
 struct module_fixture {
 	uint8_t signature_storage;
@@ -23,6 +24,8 @@ struct module_fixture {
 	unsigned rx_calls;
 	unsigned writes;
 	bool receiving;
+	bool fired;
+	unsigned handlers;
 	unsigned init_at;
 	unsigned inits;
 	unsigned live;
@@ -51,12 +54,19 @@ static struct module_fixture *active;
 static int
 memory_write(const uint8_t *buf, size_t len)
 {
-	if (len > sizeof(active->wire) - active->used)
+	if (active == NULL || active->used > sizeof(active->wire)
+	    || len > sizeof(active->wire) - active->used || (buf == NULL && len != 0)
+	    || active->writes == UINT_MAX)
 		return DSSH_ERROR_TOOLONG;
-	memcpy(&active->wire[active->used], buf, len);
+	if (len != 0)
+		memcpy(&active->wire[active->used], buf, len);
 	active->used += len;
 	active->writes++;
-	return active->stage == 6 ? active->result : 0;
+	if (active->stage == 6) {
+		active->fired = true;
+		return active->result;
+	}
+	return 0;
 }
 
 static int
@@ -72,14 +82,21 @@ memory_rx(uint8_t *buf, size_t len, dssh_session sess, void *opaque)
 {
 	(void)sess;
 	(void)opaque;
+	if (active == NULL || active->used > sizeof(active->wire) || active->read > active->used
+	    || (buf == NULL && len != 0) || active->rx_calls == UINT_MAX || active->reads == UINT_MAX)
+		return DSSH_ERROR_INVALID;
 	active->rx_calls++;
 	if (len > active->used - active->read)
 		return DSSH_ERROR_INIT;
-	memcpy(buf, &active->wire[active->read], len);
+	if (len != 0)
+		memcpy(buf, &active->wire[active->read], len);
 	active->read += len;
 	unsigned call = active->reads++;
-	return (active->stage == 7 && call == 0) || (active->stage == 8 && call == 1)
-	    ? active->result : 0;
+	if ((active->stage == 7 && call == 0) || (active->stage == 8 && call == 1)) {
+		active->fired = true;
+		return active->result;
+	}
+	return 0;
 }
 
 static int
@@ -98,47 +115,63 @@ memory_gather(const struct dssh_tx_iov *iov, size_t count, dssh_session sess, vo
 {
 	(void)sess;
 	(void)opaque;
+	if (active == NULL || (iov == NULL && count != 0))
+		return DSSH_ERROR_INVALID;
 	for (size_t i = 0; i < count; i++) {
 		int ret = memory_write(iov[i].base, iov[i].len);
 		if (ret != 0)
 			return ret;
 	}
-	return active->stage == 9 ? active->result : 0;
+	if (active->stage == 9) {
+		active->fired = true;
+		return active->result;
+	}
+	return 0;
 }
 
 static int
 stateless_encrypt(uint8_t *buf, size_t len, dssh_enc_ctx *ctx)
 {
-	if (ctx != NULL)
+	if (active == NULL || ctx != NULL || (buf == NULL && len != 0) || active->encrypts == UINT_MAX)
 		return DSSH_ERROR_INVALID;
 	active->encrypts++;
 	for (size_t i = 0; i < len; i++)
 		buf[i] ^= 0x5a;
-	return active->stage == 1 ? active->result : 0;
+	if (active->stage == 1) {
+		active->fired = true;
+		return active->result;
+	}
+	return 0;
 }
 
 static int
 stateless_decrypt(uint8_t *buf, size_t len, dssh_enc_ctx *ctx)
 {
-	if (ctx != NULL)
+	if (active == NULL || ctx != NULL || (buf == NULL && len != 0) || active->decrypts == UINT_MAX)
 		return DSSH_ERROR_INVALID;
 	unsigned call = active->decrypts++;
 	for (size_t i = 0; i < len; i++)
 		buf[i] ^= 0x5a;
-	return (active->stage == 2 && call == 0) || (active->stage == 3 && call == 1)
-	    ? active->result : 0;
+	if ((active->stage == 2 && call == 0) || (active->stage == 3 && call == 1)) {
+		active->fired = true;
+		return active->result;
+	}
+	return 0;
 }
 
 static int
 stateless_mac(const uint8_t *buf, size_t len, uint8_t *out, dssh_mac_ctx *ctx)
 {
-	if (ctx != NULL)
+	if (active == NULL || ctx != NULL || out == NULL || (buf == NULL && len != 0))
 		return DSSH_ERROR_INVALID;
 	memset(out, 0, 16);
 	for (size_t i = 0; i < len; i++)
 		out[i % 16] ^= buf[i];
-	return (active->stage == 4 && !active->receiving) || (active->stage == 5 && active->receiving)
-	    ? active->result : 0;
+	if ((active->stage == 4 && !active->receiving) || (active->stage == 5 && active->receiving)) {
+		active->fired = true;
+		return active->result;
+	}
+	return 0;
 }
 
 static bool
@@ -150,7 +183,18 @@ packet_case(bool client_sender, unsigned stage, int result)
 	bool valid = dssh_transport_set_callbacks(memory_tx, memory_rx, memory_line, NULL) == 0;
 	if (stage == 9)
 		valid = valid && dssh_transport_set_tx_gather(memory_gather) == 0;
+	if (sizeof(struct dssh_enc_s) > SIZE_MAX - sizeof("stateless")) {
+		active = NULL;
+		dssh_test_reset_global_config();
+		return false;
+	}
 	dssh_enc enc = calloc(1, sizeof(*enc) + sizeof("stateless"));
+	if (sizeof(struct dssh_mac_s) > SIZE_MAX - sizeof("stateless")) {
+		free(enc);
+		active = NULL;
+		dssh_test_reset_global_config();
+		return false;
+	}
 	dssh_mac mac = calloc(1, sizeof(*mac) + sizeof("stateless"));
 	dssh_session sender = dssh_session_init(client_sender, 0);
 	dssh_session receiver = dssh_session_init(!client_sender, 0);
@@ -174,10 +218,9 @@ packet_case(bool client_sender, unsigned stage, int result)
 			peers[i]->trans.enc_s2c_active = enc;
 			peers[i]->trans.mac_c2s_active = mac;
 			peers[i]->trans.mac_s2c_active = mac;
-			peers[i]->trans.rx_mac_buf = malloc(16);
-			peers[i]->trans.rx_mac_computed = malloc(16);
-			peers[i]->trans.rx_mac_capacity = 16;
-			valid = valid && peers[i]->trans.rx_mac_buf != NULL && peers[i]->trans.rx_mac_computed != NULL;
+			int buffers = reserve_mac_buffers(peers[i], 16);
+			valid = buffers == 0 && peers[i]->trans.rx_mac_buf != NULL
+			    && peers[i]->trans.rx_mac_computed != NULL && peers[i]->trans.rx_mac_capacity == 16 && valid;
 		}
 	}
 	if (valid) {
@@ -199,7 +242,7 @@ packet_case(bool client_sender, unsigned stage, int result)
 			if (valid) {
 				ret = recv_packet(receiver, &type, &received, &length);
 				if (stage == 0)
-					valid = ret == 0 && fixture.decrypts == 2 && length == sizeof(payload)
+					valid = ret == 0 && fixture.decrypts == 2 && type == payload[0] && received != NULL && length == sizeof(payload)
 					    && memcmp(received, payload, sizeof(payload)) == 0
 					    && !dssh_session_is_terminated(receiver);
 				else
@@ -207,15 +250,16 @@ packet_case(bool client_sender, unsigned stage, int result)
 			}
 		}
 	}
+	valid = fixture.fired == (stage != 0) && valid;
 	dssh_session_cleanup(receiver);
 	dssh_session_cleanup(sender);
 	free(enc);
 	free(mac);
 	active = NULL;
 	dssh_test_reset_global_config();
-	if (!valid)
-		fprintf(stderr, "sender=%d stage=%u result=%d enc=%u dec=%u read=%u write=%u\n",
-		    client_sender, stage, result, fixture.encrypts, fixture.decrypts, fixture.reads, fixture.writes);
+	if (!valid && fprintf(stderr, "sender=%d stage=%u result=%d enc=%u dec=%u read=%u write=%u\n",
+		    client_sender, stage, result, fixture.encrypts, fixture.decrypts, fixture.reads, fixture.writes) < 0)
+		return false;
 	return valid;
 }
 
@@ -261,6 +305,8 @@ static void
 enc_cleanup(dssh_enc_ctx *ctx)
 {
 	if (ctx != NULL) {
+		if (active == NULL || active->live == 0)
+			abort();
 		active->live--;
 		free(ctx);
 	}
@@ -270,6 +316,8 @@ static void
 mac_cleanup(dssh_mac_ctx *ctx)
 {
 	if (ctx != NULL) {
+		if (active == NULL || active->live == 0)
+			abort();
 		active->live--;
 		free(ctx);
 	}
@@ -285,8 +333,13 @@ test_keyed_registration(void)
 	for (unsigned keyed = 0; keyed < 2; keyed++) {
 		for (unsigned mask = 0; mask < 8; mask++) {
 			dssh_test_reset_global_config();
-			ASSERT_OK(dssh_register_none_enc());
+			ASSERT_EQ(dssh_register_none_enc(), 0);
 			dssh_enc head = gconf.enc_head;
+			ASSERT_NOT_NULL(head);
+			if (sizeof(struct dssh_enc_s) > SIZE_MAX - sizeof("admission")) {
+				dssh_test_reset_global_config();
+				return TEST_FAIL;
+			}
 			dssh_enc candidate = calloc(1, sizeof(*candidate) + sizeof("admission"));
 			ASSERT_NOT_NULL(candidate);
 			memcpy(candidate->name, "admission", sizeof("admission"));
@@ -308,10 +361,11 @@ test_keyed_registration(void)
 			    && candidate->encrypt == ((mask & 2U) != 0 ? stateless_encrypt : NULL)
 			    && candidate->decrypt == ((mask & 4U) != 0 ? stateless_decrypt : NULL)
 			    && strcmp(candidate->name, "admission") == 0;
-			if (ret == 0)
-				valid = gconf.enc_tail == candidate && head->next == candidate && gconf.enc_entries == 2 && valid;
+			bool published = head->next == candidate;
+			if (published)
+				valid = ret == 0 && gconf.enc_tail == candidate && gconf.enc_entries == 2 && valid;
 			else {
-				valid = gconf.enc_tail == head && head->next == NULL && gconf.enc_entries == 1 && valid;
+				valid = ret != 0 && gconf.enc_tail == head && head->next == NULL && gconf.enc_entries == 1 && valid;
 				free(candidate);
 			}
 			if (!valid) {
@@ -324,8 +378,13 @@ test_keyed_registration(void)
 		for (unsigned tagged = 0; tagged < 2; tagged++) {
 			for (unsigned mask = 0; mask < 4; mask++) {
 				dssh_test_reset_global_config();
-				ASSERT_OK(dssh_register_none_mac());
+				ASSERT_EQ(dssh_register_none_mac(), 0);
 				dssh_mac head = gconf.mac_head;
+				ASSERT_NOT_NULL(head);
+				if (sizeof(struct dssh_mac_s) > SIZE_MAX - sizeof("admission")) {
+					dssh_test_reset_global_config();
+					return TEST_FAIL;
+				}
 				dssh_mac candidate = calloc(1, sizeof(*candidate) + sizeof("admission"));
 				ASSERT_NOT_NULL(candidate);
 				memcpy(candidate->name, "admission", sizeof("admission"));
@@ -345,10 +404,11 @@ test_keyed_registration(void)
 				    && candidate->init == ((mask & 1U) != 0 ? mac_init : NULL)
 				    && candidate->generate == ((mask & 2U) != 0 ? stateless_mac : NULL)
 				    && strcmp(candidate->name, "admission") == 0;
-				if (ret == 0)
-					valid = gconf.mac_tail == candidate && head->next == candidate && gconf.mac_entries == 2 && valid;
+				bool published = head->next == candidate;
+				if (published)
+					valid = ret == 0 && gconf.mac_tail == candidate && gconf.mac_entries == 2 && valid;
 				else {
-					valid = gconf.mac_tail == head && head->next == NULL && gconf.mac_entries == 1 && valid;
+					valid = ret != 0 && gconf.mac_tail == head && head->next == NULL && gconf.mac_entries == 1 && valid;
 					free(candidate);
 				}
 				if (!valid) {
@@ -361,7 +421,9 @@ test_keyed_registration(void)
 			}
 		}
 	}
-	fprintf(stderr, "keyed_admission cases=%u mismatches=%u\n", checked, mismatches);
+	if (fprintf(stderr, "keyed_admission cases=%u mismatches=%u\n", checked, mismatches) < 0
+	    || fflush(stderr) != 0)
+		return TEST_FAIL;
 	ASSERT_EQ_U(checked, 32);
 	ASSERT_EQ_U(mismatches, 0);
 	return TEST_PASS;
@@ -380,7 +442,11 @@ test_init_results(void)
 			struct dssh_mac_s mac = { .init = mac_init, .cleanup = mac_cleanup, .key_size = 1, .digest_size = 16 };
 			struct dssh_kex_s method = { .hash_name = "SHA-256" };
 			dssh_session sess = dssh_session_init(true, 0);
-			ASSERT_NOT_NULL(sess);
+			if (sess == NULL) {
+				active = NULL;
+				dssh_test_reset_global_config();
+				return TEST_FAIL;
+			}
 			sess->trans.kex_selected = &method;
 			sess->trans.enc_c2s_selected = &enc;
 			sess->trans.enc_s2c_selected = &enc;
@@ -426,6 +492,8 @@ observe_kex_result(const void *storage, size_t size, void *data)
 		}
 	}
 	dssh_result_release(fixture->kex_lease);
+	if (fixture->kex_frees == fixture->kex_allocations)
+		fixture->kex_lease = NULL;
 }
 
 static uint8_t *
@@ -445,6 +513,9 @@ static int
 handler(const struct dssh_kex_context *ctx, struct dssh_kex_result *out)
 {
 	(void)ctx;
+	if (active == NULL || out == NULL || active->handlers == UINT_MAX)
+		return DSSH_ERROR_INVALID;
+	active->handlers++;
 	active->kex_lease = &out->lease;
 	uint8_t *secret = NULL, *hash = NULL;
 	if (active->stage != 1)
@@ -489,11 +560,13 @@ test_handler_results(void)
 			    .cleanup = test_kex_stateless_cleanup, .hash_name = "SHA-256" };
 			sess->trans.kex_selected = &method;
 			int ret = kex(sess);
-			bool valid = ret == (results[i] > 0 ? DSSH_ERROR_INVALID : results[i]);
+			bool valid = ret == (results[i] > 0 ? DSSH_ERROR_INVALID : results[i])
+			    && fixture.handlers == 1 && fixture.kex_allocations == 2;
 			if (results[i] != 0)
 				valid = valid && sess->trans.kex_result.shared_secret.data == NULL && sess->trans.kex_result.exchange_hash.data == NULL;
 			dssh_session_cleanup(sess);
-			valid = valid && fixture.kex_allocations == fixture.kex_frees && fixture.kex_bad_release == 0;
+			valid = valid && fixture.kex_allocations == fixture.kex_frees && fixture.kex_bad_release == 0
+			    && fixture.kex_lease == NULL;
 			dssh_test_alloc_reset();
 			active = NULL;
 			dssh_test_reset_global_config();
@@ -515,18 +588,24 @@ test_handler_outputs(void)
 		struct module_fixture fixture = { .stage = stage };
 		active = &fixture;
 		dssh_session sess = dssh_session_init(true, 0);
-		ASSERT_NOT_NULL(sess);
+		if (sess == NULL) {
+			active = NULL;
+			dssh_test_reset_global_config();
+			return TEST_FAIL;
+		}
 		struct dssh_kex_s method = { .init = test_kex_stateless_init, .handler = handler,
 			    .cleanup = test_kex_stateless_cleanup, .hash_name = "SHA-256" };
 		sess->trans.kex_selected = &method;
 		int ret = kex(sess);
 		int expected = stage == 7 ? 0 : DSSH_ERROR_INVALID;
-		bool valid = ret == expected;
+		bool valid = ret == expected && fixture.handlers == 1
+		    && fixture.kex_allocations == (stage == 1 || stage == 2 ? 1U : 2U);
 		if (ret != 0)
 			valid = valid && sess->trans.kex_result.shared_secret.data == NULL
 			    && sess->trans.kex_result.exchange_hash.data == NULL;
 		dssh_session_cleanup(sess);
-		valid = valid && fixture.kex_allocations == fixture.kex_frees && fixture.kex_bad_release == 0;
+		valid = valid && fixture.kex_allocations == fixture.kex_frees && fixture.kex_bad_release == 0
+			    && fixture.kex_lease == NULL;
 		dssh_test_alloc_reset();
 		active = NULL;
 		dssh_test_reset_global_config();
@@ -629,6 +708,8 @@ auth_haskey(dssh_key_algo_ctx *ctx)
 static dssh_key_algo
 register_auth_module(void)
 {
+	if (sizeof(struct dssh_key_algo_s) > SIZE_MAX - sizeof("contract-key"))
+		return NULL;
 	dssh_key_algo ka = calloc(1, sizeof(*ka) + sizeof("contract-key"));
 	if (ka == NULL)
 		return NULL;
@@ -732,23 +813,20 @@ test_auth_server_results(void)
 		}
 		if (valid) {
 			uint8_t request[64];
-			size_t pos = 0;
-			request[pos++] = 1;
-			int ret = dssh_serialize_uint32(12, request, sizeof(request), &pos);
-			valid = valid && ret == 0;
-			memcpy(&request[pos], "contract-key", 12);
-			pos += 12;
-			ret = dssh_serialize_uint32(1, request, sizeof(request), &pos);
-			valid = valid && ret == 0;
-			request[pos++] = 7;
-			ret = dssh_serialize_uint32(1, request, sizeof(request), &pos);
-			valid = valid && ret == 0;
-			request[pos++] = 7;
+			struct fixture_writer writer = {.data = request, .capacity = sizeof(request), .valid = true};
+			const uint8_t signed_request = 1;
+			const uint8_t key = 7;
+			const uint8_t name[] = "contract-key";
+			valid = fixture_writer_bytes(&writer, &signed_request, 1)
+			    && fixture_writer_string(&writer, name, sizeof(name) - 1)
+			    && fixture_writer_string(&writer, &key, 1)
+			    && fixture_writer_string(&writer, &key, 1);
 			struct dssh_auth_server_cbs cbs = {
 				.methods_str = "publickey", .publickey_cb = accept_publickey, .cbdata = &fixture,
 			};
 			const uint8_t username[] = "user";
-			ret = handle_auth_publickey(sess, &cbs, username, sizeof(username) - 1, request, pos, 0);
+			int ret = valid ? handle_auth_publickey(sess, &cbs, username, sizeof(username) - 1,
+			    request, writer.used, 0) : DSSH_ERROR_INVALID;
 			bool success = results[i] == 0;
 			/* Handler outcomes: one means completed, zero means continue. */
 			valid = valid && ret == (success ? 1 : 0) && fixture.verified == 1
@@ -764,12 +842,53 @@ test_auth_server_results(void)
 	return TEST_PASS;
 }
 
+static int
+test_fixture_writer(void)
+{
+	uint8_t frame[10];
+	memset(frame, 0xa5, sizeof(frame));
+	struct fixture_writer writer = {.data = frame + 1, .capacity = 8, .valid = true};
+	const uint8_t input[] = {1, 2, 3, 4};
+	const uint8_t expected[] = {0, 0, 0, 4, 1, 2, 3, 4};
+	bool valid = fixture_writer_string(&writer, input, sizeof(input)) && writer.used == 8
+	    && frame[0] == 0xa5 && frame[9] == 0xa5 && memcmp(frame + 1, expected, sizeof(expected)) == 0;
+	uint8_t saved[sizeof(frame)];
+	memcpy(saved, frame, sizeof(saved));
+	valid = !fixture_writer_u32(&writer, 7) && !writer.valid && writer.used == 8
+	    && !fixture_writer_bytes(&writer, NULL, 0) && memcmp(frame, saved, sizeof(frame)) == 0 && valid;
+	for (size_t capacity = 0; capacity < sizeof(expected); capacity++) {
+		memset(frame, 0xa5, sizeof(frame));
+		writer = (struct fixture_writer){.data = frame + 1, .capacity = capacity, .valid = true};
+		bool rejected = !fixture_writer_string(&writer, input, sizeof(input)) && !writer.valid && writer.used == 0;
+		for (size_t i = 0; i < sizeof(frame); i++)
+			rejected = frame[i] == 0xa5 && rejected;
+		valid = rejected && valid;
+	}
+	writer = (struct fixture_writer){.data = frame + 1, .capacity = 4, .valid = true};
+	const uint8_t empty[] = {0, 0, 0, 0};
+	valid = fixture_writer_string(&writer, NULL, 0) && writer.used == 4
+	    && memcmp(frame + 1, empty, sizeof(empty)) == 0 && valid;
+	writer = (struct fixture_writer){.valid = true};
+	valid = fixture_writer_bytes(&writer, NULL, 0) && !fixture_writer_string(&writer, NULL, 1) && valid;
+	writer = (struct fixture_writer){.data = frame, .capacity = sizeof(frame), .used = SIZE_MAX, .valid = true};
+	valid = !fixture_writer_repeated_string(&writer, 0x11, 1) && !writer.valid && valid;
+	writer = (struct fixture_writer){.data = frame, .capacity = sizeof(frame), .valid = true};
+	valid = !fixture_writer_repeated_string(&writer, 0x11, SIZE_MAX) && writer.used == 0 && !writer.valid && valid;
+	writer = (struct fixture_writer){.data = frame + 1, .capacity = 8, .valid = true};
+	valid = fixture_writer_repeated_string(&writer, 0x11, 4) && writer.used == 8 && valid;
+	const uint8_t repeated[] = {0, 0, 0, 4, 0x11, 0x11, 0x11, 0x11};
+	valid = memcmp(frame + 1, repeated, sizeof(repeated)) == 0 && valid;
+	ASSERT_TRUE(valid);
+	return TEST_PASS;
+}
+
 #include "module_init_cases.h"
 #include "packet_bounds_cases.h"
 #include "key_availability_cases.h"
 #include "kex_state_cases.h"
 
 static struct dssh_test_entry tests[] = {
+	{ "fixture/packet_writer", test_fixture_writer },
 	{ "registration/keyed_callbacks", test_keyed_registration },
 	{ "kex/state_ownership", test_kex_state_ownership },
 	{ "kex/state_init_failure", test_kex_state_init_failure },
@@ -801,7 +920,17 @@ static struct dssh_test_entry tests[] = {
 void
 dssh_test_failure_cleanup(void)
 {
-	/* Assertions are outside ownership, or before session initialization. */
+	/* Every session/context owner is retired before assertions; release all
+	 * remaining stack borrows and test-global injection/registration state. */
+	active = NULL;
+	init_trace = NULL;
+	init_lifecycle = NULL;
+	packet_input = NULL;
+	kex_trace = NULL;
+	dssh_test_alloc_reset();
+	dssh_test_ossl_reset();
+	dssh_test_clock_reset();
+	dssh_test_reset_global_config();
 }
 
 DSSH_TEST_MAIN(tests)

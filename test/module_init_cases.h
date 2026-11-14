@@ -134,6 +134,9 @@ make_init_modules(struct init_modules *modules, bool zero_key)
 		{ trace_a_mac_c2s_cleanup, trace_a_mac_s2c_cleanup }, { trace_b_mac_c2s_cleanup, trace_b_mac_s2c_cleanup },
 	};
 	memset(modules, 0, sizeof(*modules));
+	if (sizeof(struct dssh_enc_s) > SIZE_MAX - sizeof("init-trace")
+	    || sizeof(struct dssh_mac_s) > SIZE_MAX - sizeof("init-trace"))
+		return false;
 	for (unsigned provider = 0; provider < 2; provider++) {
 		for (unsigned slot = 0; slot < 2; slot++) {
 			dssh_enc enc = calloc(1, sizeof(*enc) + sizeof("init-trace"));
@@ -459,7 +462,8 @@ test_init_lifecycle(void)
 			}
 		}
 	}
-	printf("init_lifecycle cases=%u failures=%u\n", cases, failures);
+	if (printf("init_lifecycle cases=%u failures=%u\n", cases, failures) < 0 || fflush(stdout) != 0)
+		return TEST_FAIL;
 	ASSERT_EQ_U(cases, 192);
 	ASSERT_EQ_U(failures, 0);
 	return TEST_PASS;
@@ -595,7 +599,8 @@ test_handler_digest_failure(void)
 			if (mode == 3)
 				valid = valid && dssh_test_ossl_count() == 1;
 			dssh_session_cleanup(sess);
-			valid = valid && fixture.kex_allocations == fixture.kex_frees && fixture.kex_bad_release == 0;
+			valid = valid && fixture.kex_allocations == fixture.kex_frees && fixture.kex_bad_release == 0
+			    && fixture.kex_lease == NULL;
 			dssh_test_alloc_reset();
 			dssh_test_ossl_reset();
 			active = NULL;

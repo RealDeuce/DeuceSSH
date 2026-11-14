@@ -8,6 +8,11 @@ packet_metadata_case(bool client, uint16_t block, size_t length)
 	struct module_fixture fixture = {0};
 	active = &fixture;
 	bool valid = dssh_transport_set_callbacks(memory_tx, memory_rx, memory_line, NULL) == 0;
+	if (length == 0 || length > 256 || sizeof(struct dssh_enc_s) > SIZE_MAX - sizeof("bounds")) {
+		active = NULL;
+		dssh_test_reset_global_config();
+		return false;
+	}
 	dssh_enc enc = calloc(1, sizeof(*enc) + sizeof("bounds"));
 	size_t packet_size = UINT16_MAX;
 	if (packet_size <= SIZE_MAX / 2)
@@ -54,7 +59,7 @@ packet_metadata_case(bool client, uint16_t block, size_t length)
 				uint8_t *received = NULL;
 				size_t received_length = 0;
 				ret = recv_packet(receiver, &type, &received, &received_length);
-				valid = ret == 0 && type == payload[0] && received_length == length
+				valid = ret == 0 && type == payload[0] && received_length == length && received != NULL
 				    && memcmp(received, payload, length) == 0;
 			}
 		}
@@ -64,9 +69,10 @@ packet_metadata_case(bool client, uint16_t block, size_t length)
 	free(enc);
 	active = NULL;
 	dssh_test_reset_global_config();
-	if (!valid)
-		fprintf(stderr, "packet bounds: client=%d block=%u length=%zu result=%d expected=%d encrypts=%u writes=%u\n",
-		    client, block, length, ret, expected, fixture.encrypts, fixture.writes);
+	unsigned block_print = block;
+	if (!valid && fprintf(stderr, "packet bounds: client=%d block=%u length=%zu result=%d expected=%d encrypts=%u writes=%u\n",
+		    client, block_print, length, ret, expected, fixture.encrypts, fixture.writes) < 0)
+		return false;
 	return valid;
 }
 
@@ -97,7 +103,7 @@ test_receive_block_bounds(void)
 			dssh_test_reset_global_config();
 			struct module_fixture fixture = {0};
 			active = &fixture;
-			ASSERT_OK(dssh_transport_set_callbacks(memory_tx, memory_rx, memory_line, NULL));
+			ASSERT_EQ(dssh_transport_set_callbacks(memory_tx, memory_rx, memory_line, NULL), 0);
 			dssh_session sess = dssh_session_init(role != 0, 0);
 			ASSERT_NOT_NULL(sess);
 			struct dssh_enc_s enc = { .blocksize = blocks[i], .decrypt = stateless_decrypt };
@@ -143,8 +149,14 @@ test_slot_size_bounds(void)
 	for (unsigned reuse = 0; reuse < 2; reuse++) {
 		for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
 			struct dssh_tx_slot slot = {0};
+			atomic_init(&slot.ready, false);
 			if (reuse != 0) {
-				ASSERT_OK(alloc_tx_slot(&slot, 1, 16, 16));
+				int initialized = alloc_tx_slot(&slot, 1, 16, 16);
+				if (initialized != 0 || slot.buf == NULL || slot.buf_sz != 36) {
+					free_tx_slot(&slot);
+					dssh_test_failure_cleanup();
+					return TEST_FAIL;
+				}
 				memset(slot.buf, 0xa5, slot.buf_sz);
 				slot.payload_len = 1;
 				atomic_store(&slot.ready, true);
@@ -204,17 +216,22 @@ packet_input_rx(uint8_t *buf, size_t length, dssh_session sess, void *data)
 {
 	(void)sess;
 	struct packet_input_fixture *input = data;
+	if (input == NULL || input->read > input->packet_total || input->rx_calls == UINT_MAX
+	    || (buf == NULL && length != 0) || (input->packet == NULL && input->packet_total != 0))
+		return DSSH_ERROR_INVALID;
 	input->rx_calls++;
 	if (input->read < input->packet_total) {
 		if (length > input->packet_total - input->read)
 			return DSSH_ERROR_INIT;
-		memcpy(buf, &input->packet[input->read], length);
+		if (length != 0)
+			memcpy(buf, &input->packet[input->read], length);
 		input->read += length;
 		return 0;
 	}
 	if (input->tag_read > input->tag_size || length > input->tag_size - input->tag_read)
 		return DSSH_ERROR_INIT;
-	memset(buf, 0, length);
+	if (length != 0)
+		memset(buf, 0, length);
 	input->tag_read += length;
 	return 0;
 }
@@ -222,7 +239,9 @@ packet_input_rx(uint8_t *buf, size_t length, dssh_session sess, void *data)
 static int
 packet_input_mac(const uint8_t *buf, size_t length, uint8_t *out, dssh_mac_ctx *ctx)
 {
-	if (ctx != NULL || length != packet_input->packet_total + 4
+	if (packet_input == NULL || ctx != NULL || buf == NULL || out == NULL
+	    || packet_input->packet_total > SIZE_MAX - 4 || packet_input->mac_calls == UINT_MAX
+	    || length != packet_input->packet_total + 4
 	    || DSSH_GET_U32(buf) != packet_input->sequence
 	    || memcmp(&buf[4], packet_input->packet, packet_input->packet_total) != 0)
 		return DSSH_ERROR_INVALID;
@@ -301,8 +320,9 @@ test_packet_receive_extents(void)
 	packet_input = NULL;
 	free(packet);
 	dssh_test_reset_global_config();
-	printf("packet_receive_extents packets=%u payload=65519 mac_input=65532 tags=128/65535 valid=%u\n",
-	    packets, valid ? 1U : 0U);
+	if (printf("packet_receive_extents packets=%u payload=65519 mac_input=65532 tags=128/65535 valid=%u\n",
+	    packets, valid ? 1U : 0U) < 0 || fflush(stdout) != 0)
+		return TEST_FAIL;
 	ASSERT_TRUE(valid && packets == 8);
 	return TEST_PASS;
 }

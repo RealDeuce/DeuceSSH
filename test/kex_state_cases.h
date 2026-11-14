@@ -55,7 +55,7 @@ kex_trace_callback(bool restricted)
 		int ret = mtx_trylock(mutexes[i]);
 		if (ret == thrd_success) {
 			if (mtx_unlock(mutexes[i]) != thrd_success)
-				kex_trace->valid = false;
+				abort();
 		}
 		else
 			kex_trace->valid = false;
@@ -487,6 +487,8 @@ test_kex_required_callbacks(void)
 	for (unsigned missing = 0; missing < 5; missing++) {
 		dssh_test_reset_global_config();
 		static const char name[] = "kex-contract";
+		if (sizeof(struct dssh_kex_s) > SIZE_MAX - sizeof(name))
+			return TEST_FAIL;
 		dssh_kex method = malloc(sizeof(*method) + sizeof(name));
 		ASSERT_NOT_NULL(method);
 		*method = (struct dssh_kex_s){.init = test_kex_stateless_init,
@@ -502,11 +504,12 @@ test_kex_required_callbacks(void)
 			method->hash_name = NULL;
 		int ret = dssh_transport_register_kex(method);
 		bool valid = ret == (missing == 4 ? 0 : DSSH_ERROR_INVALID);
-		if (ret != 0)
+		int configuration = 17;
+		bool published = gconf.kex_head == method;
+		if (!published)
 			free(method);
 		else {
-			/* Successful registration borrows the actual definition/config. */
-			int configuration = 17;
+			/* Keep the borrowed configuration alive through the reset below. */
 			valid = valid && dssh_kex_set_ctx(name, &configuration) == 0
 			    && gconf.kex_head == method && method->config == &configuration;
 		}

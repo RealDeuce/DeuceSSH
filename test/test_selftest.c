@@ -407,6 +407,7 @@ selftest_cleanup(struct selftest_ctx *ctx)
 	atomic_store(&delayed_tx_release, true);
 	dssh_test_clock_reset();
 	dssh_test_wait_observe_end();
+	dssh_test_channel_observe_end();
 	selftest_cancel(ctx);
 	for (unsigned i = 0; i < 2; i++)
 		selftest_join(&ctx->setup_thread[i], &ctx->setup_thread_active[i]);
@@ -1239,7 +1240,7 @@ test_self_exec_echo(void)
 
 	/* Wait for server's WINDOW_ADJUST (remote_window starts at 0) */
 	int wev = dssh_chan_poll(ch, DSSH_POLL_WRITE, 5000);
-	ASSERT_TRUE(wev > 0);
+	ASSERT_EQ(wev, DSSH_POLL_WRITE);
 
 	const uint8_t data[] = "Hello, DeuceSSH!";
 	ASSERT_TRUE(selftest_write_all(ch, data, sizeof(data) - 1, 5000));
@@ -1250,8 +1251,7 @@ test_self_exec_echo(void)
 	for (int i = 0; i < 50; i++) {
 		int ev = dssh_chan_poll(ch,
 		    DSSH_POLL_READ, 1000);
-		if (ev < 0)
-			break;
+		ASSERT_TRUE(ev == 0 || ev == DSSH_POLL_READ);
 		if (ev == 0)
 			continue;
 		int64_t n = dssh_chan_read(ch, 0,
@@ -1364,7 +1364,7 @@ test_self_shell_echo(void)
 
 	/* Wait for server's WINDOW_ADJUST (remote_window starts at 0) */
 	int wev = dssh_chan_poll(ch, DSSH_POLL_WRITE, 5000);
-	ASSERT_TRUE(wev > 0);
+	ASSERT_EQ(wev, DSSH_POLL_WRITE);
 
 	const uint8_t data[] = "shell-test";
 	ASSERT_TRUE(selftest_write_all(ch, data, sizeof(data) - 1, 5000));
@@ -1374,7 +1374,8 @@ test_self_shell_echo(void)
 	for (int i = 0; i < 50; i++) {
 		int ev = dssh_chan_poll(ch,
 		    DSSH_POLL_READ, 1000);
-		if (ev <= 0)
+		ASSERT_TRUE(ev == 0 || ev == DSSH_POLL_READ);
+		if (ev == 0)
 			break;
 		int64_t n = dssh_chan_read(ch, 0,
 		    buf + recvd, sizeof(buf) - recvd);
@@ -1521,7 +1522,8 @@ test_self_multiple_channels(void)
 	for (int i = 0; i < 50; i++) {
 		int ev = dssh_chan_poll(ch1,
 		    DSSH_POLL_READ, 1000);
-		if (ev <= 0)
+		ASSERT_TRUE(ev == 0 || ev == DSSH_POLL_READ);
+		if (ev == 0)
 			break;
 		int64_t n = dssh_chan_read(ch1, 0,
 		    buf + recvd, sizeof(buf) - recvd);
@@ -1549,7 +1551,8 @@ test_self_multiple_channels(void)
 	for (int i = 0; i < 50; i++) {
 		int ev = dssh_chan_poll(ch2,
 		    DSSH_POLL_READ, 1000);
-		if (ev <= 0)
+		ASSERT_TRUE(ev == 0 || ev == DSSH_POLL_READ);
+		if (ev == 0)
 			break;
 		int64_t n = dssh_chan_read(ch2, 0,
 		    buf + recvd, sizeof(buf) - recvd);
@@ -1678,7 +1681,8 @@ test_self_rekey_during_data(void)
 	for (int i = 0; i < 100; i++) {
 		int ev = dssh_chan_poll(ch,
 		    DSSH_POLL_READ, 1000);
-		if (ev <= 0)
+		ASSERT_TRUE(ev == 0 || ev == DSSH_POLL_READ);
+		if (ev == 0)
 			continue;
 		int64_t n = dssh_chan_read(ch, 0,
 		    buf + recvd, sizeof(buf) - recvd);
@@ -1740,7 +1744,8 @@ test_self_rekey_manual(void)
 	for (int i = 0; i < 100; i++) {
 		int ev = dssh_chan_poll(ch,
 		    DSSH_POLL_READ, 1000);
-		if (ev <= 0)
+		ASSERT_TRUE(ev == 0 || ev == DSSH_POLL_READ);
+		if (ev == 0)
 			continue;
 		int64_t n = dssh_chan_read(ch, 0,
 		    buf + recvd, sizeof(buf) - recvd);
@@ -1796,7 +1801,8 @@ test_self_rekey_preserves_channels(void)
 	for (int i = 0; i < 50; i++) {
 		int ev = dssh_chan_poll(ch,
 		    DSSH_POLL_READ, 1000);
-		if (ev <= 0)
+		ASSERT_TRUE(ev == 0 || ev == DSSH_POLL_READ);
+		if (ev == 0)
 			break;
 		int64_t n = dssh_chan_read(ch, 0,
 		    buf + recvd, sizeof(buf) - recvd);
@@ -1832,7 +1838,8 @@ test_self_rekey_preserves_channels(void)
 	for (int i = 0; i < 100; i++) {
 		int ev = dssh_chan_poll(ch,
 		    DSSH_POLL_READ, 1000);
-		if (ev <= 0)
+		ASSERT_TRUE(ev == 0 || ev == DSSH_POLL_READ);
+		if (ev == 0)
 			continue;
 		int64_t n = dssh_chan_read(ch, 0,
 		    buf + recvd, sizeof(buf) - recvd);
@@ -1942,7 +1949,8 @@ test_self_rekey_inflight_data(void)
 	for (int i = 0; i < 200; i++) {
 		int ev = dssh_chan_poll(ch,
 		    DSSH_POLL_READ, 1000);
-		if (ev <= 0)
+		ASSERT_TRUE(ev == 0 || ev == DSSH_POLL_READ);
+		if (ev == 0)
 			continue;
 		int64_t n = dssh_chan_read(ch, 0,
 		    buf + recvd, sizeof(buf) - recvd);
@@ -2001,7 +2009,8 @@ test_self_connection_drop(void)
 	for (int i = 0; i < 50; i++) {
 		int ev = dssh_chan_poll(ch,
 		    DSSH_POLL_READ, 1000);
-		if (ev <= 0)
+		ASSERT_TRUE(ev == 0 || ev == DSSH_POLL_READ);
+		if (ev == 0)
 			continue;
 		int64_t n = dssh_chan_read(ch, 0,
 		    buf + recvd, sizeof(buf) - recvd);
@@ -2014,6 +2023,7 @@ test_self_connection_drop(void)
 			break;
 	}
 	ASSERT_EQ_U(recvd, sizeof(data) - 1);
+	ASSERT_MEM_EQ(buf, data, sizeof(data) - 1);
 
 	/* Yank the socket out from under both sessions.
 	 * This simulates a VPN drop, cable pull, or peer crash.
@@ -2337,9 +2347,11 @@ test_open_channel_timeout(void)
 
 	/* Server never calls accept, so no CONFIRMATION is sent */
 	dssh_test_wait_observe_begin(NULL, NULL);
+	dssh_test_channel_observe_begin(DSSH_TEST_CHANNEL_OPEN_WAIT);
 	dssh_channel ch = open_exec(&ctx,"cmd");
+	struct dssh_test_channel_observation channel = dssh_test_channel_observe_end();
 	struct dssh_test_wait_observation wait = dssh_test_wait_observe_end();
-	ASSERT_TRUE(selftest_wait_expired(wait));
+	ASSERT_TRUE(dssh_test_channel_expired(wait, channel));
 	ASSERT_NULL(ch);
 
 
@@ -2369,10 +2381,12 @@ setup_timeout_server_thread(void *arg)
 	a->ch = NULL;
 
 	dssh_test_wait_observe_begin(NULL, &ctx->server->accept_cnd);
+	dssh_test_channel_observe_begin(DSSH_TEST_CHANNEL_ACCEPT_WAIT);
 	a->ch = selftest_accept(ctx,
 	    &selftest_accept_cbs, 30000);
+	struct dssh_test_channel_observation channel = dssh_test_channel_observe_end();
 	struct dssh_test_wait_observation wait = dssh_test_wait_observe_end();
-	a->result = a->ch == NULL && selftest_wait_expired(wait) ? 0 : -1;
+	a->result = a->ch == NULL && dssh_test_channel_expired(wait, channel) ? 0 : -1;
 	return 0;
 }
 
@@ -2536,8 +2550,9 @@ test_self_chan_exec_echo(void)
 
 	for (int i = 0; i < 50; i++) {
 		int ev = dssh_chan_poll(ch, DSSH_POLL_READ, 1000);
+		ASSERT_TRUE(ev == 0 || ev == DSSH_POLL_READ);
 
-		if (ev <= 0)
+		if (ev == 0)
 			break;
 
 		int64_t n = dssh_chan_read(ch, 0, buf + recvd,
@@ -2605,8 +2620,9 @@ test_self_chan_shell_pty(void)
 
 	for (int i = 0; i < 50; i++) {
 		int ev = dssh_chan_poll(ch, DSSH_POLL_READ, 1000);
+		ASSERT_TRUE(ev == 0 || ev == DSSH_POLL_READ);
 
-		if (ev <= 0)
+		if (ev == 0)
 			break;
 
 		int64_t n = dssh_chan_read(ch, 0, buf + recvd,
@@ -2723,8 +2739,9 @@ test_self_chan_accept_exec(void)
 
 	for (int i = 0; i < 50; i++) {
 		int ev = dssh_chan_poll(ch, DSSH_POLL_READ, 1000);
+		ASSERT_TRUE(ev == 0 || ev == DSSH_POLL_READ);
 
-		if (ev <= 0)
+		if (ev == 0)
 			break;
 
 		int64_t n = dssh_chan_read(ch, 0, buf + recvd,
@@ -2831,8 +2848,9 @@ test_self_chan_accept_shell_pty(void)
 
 	for (int i = 0; i < 50; i++) {
 		int ev = dssh_chan_poll(ch, DSSH_POLL_READ, 1000);
+		ASSERT_TRUE(ev == 0 || ev == DSSH_POLL_READ);
 
-		if (ev <= 0)
+		if (ev == 0)
 			break;
 
 		int64_t n = dssh_chan_read(ch, 0, buf + recvd,
@@ -2847,6 +2865,7 @@ test_self_chan_accept_shell_pty(void)
 			break;
 	}
 	ASSERT_EQ_U(recvd, sizeof(data) - 1);
+	ASSERT_MEM_EQ(buf, data, sizeof(data) - 1);
 
 	ASSERT_EQ(selftest_channel_close(&ctx, true, ch, 0), 0);
 	selftest_join(&ctx.server_thread, &ctx.server_thread_active);

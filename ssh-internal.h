@@ -610,4 +610,12 @@ DSSH_PRIVATE int dssh_clock_read(struct timespec *ts);
 /* Convert a positive timeout, preserving the caller's output on failure. */
 DSSH_PRIVATE int dssh_deadline_from_ms(struct timespec *ts, intmax_t timeout_ms);
 
+/* Observe exact private results only in test builds. Release preprocessing
+ * leaves the original expression, with no added call or evaluation. */
+#ifdef DSSH_TESTING
+ #define DSSH_TEST_CHANNEL_RESULT(stage, value) dssh_test_channel_observe_result(stage, value)
+#else
+ #define DSSH_TEST_CHANNEL_RESULT(stage, value) value
+#endif
+
 #endif   // ifndef DSSH_INTERNAL_H

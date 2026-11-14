@@ -3600,7 +3600,7 @@ open_session_channel(struct dssh_session_s *sess, struct dssh_channel_s *ch, boo
 	if (res < 0)
 		return res;
 
-	return wait_open_response(sess, ch);
+	return DSSH_TEST_CHANNEL_RESULT(DSSH_TEST_CHANNEL_OPEN_WAIT, wait_open_response(sess, ch));
 }
 
 /* Finish an outstanding request with only its associated mutex held. */
@@ -5393,7 +5393,7 @@ chan_accept_setup_loop(struct dssh_session_s *sess, struct dssh_channel_s *ch,
 		uint8_t  msg_type;
 		uint8_t *payload;
 		size_t   payload_len;
-		int      res = setup_recv(sess, ch, &msg_type, &payload, &payload_len);
+		int      res = DSSH_TEST_CHANNEL_RESULT(DSSH_TEST_CHANNEL_ACCEPT_WAIT, setup_recv(sess, ch, &msg_type, &payload, &payload_len));
 		if (res < 0)
 			return res;
 		if (msg_type == SSH_MSG_CHANNEL_CLOSE) {

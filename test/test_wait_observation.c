@@ -2,6 +2,7 @@
 #include "dssh_test.h"
 #include "ssh-internal.h"
 #include "dssh_test_ossl.h"
+#include <limits.h>
 
 #ifdef DSSH_THREADS_SHIM
  #define REAL_WAIT __real_dssh_thread_cnd_timedwait
@@ -130,5 +131,71 @@ test_observations(void)
 }
 
 DSSH_TEST_NO_CLEANUP
-static struct dssh_test_entry tests[] = { { "observations", test_observations } };
+static int
+test_channel_results(void)
+{
+	static const int results[] = {
+		0, DSSH_ERROR_ALLOC, DSSH_ERROR_PARSE, DSSH_ERROR_TERMINATED,
+		DSSH_ERROR_TIMEOUT, 42, INT_MIN, INT_MAX
+	};
+	static const enum dssh_test_channel_stage stages[] = {
+		DSSH_TEST_CHANNEL_OPEN_WAIT, DSSH_TEST_CHANNEL_ACCEPT_WAIT
+	};
+	for (size_t stage = 0; stage < 2; stage++) {
+		enum dssh_test_channel_stage target = stages[stage];
+		enum dssh_test_channel_stage other = stages[1 - stage];
+		for (size_t i = 0; i < sizeof(results) / sizeof(results[0]); i++) {
+			struct dssh_test_channel_observation observed = dssh_test_channel_observe_end();
+			ASSERT_FALSE(observed.seen);
+			ASSERT_EQ(dssh_test_channel_observe_result(target, results[i]), results[i]);
+			observed = dssh_test_channel_observe_end();
+			ASSERT_FALSE(observed.seen);
+			dssh_test_channel_observe_begin(target);
+			ASSERT_EQ(dssh_test_channel_observe_result(other, DSSH_ERROR_TIMEOUT), DSSH_ERROR_TIMEOUT);
+			ASSERT_EQ(dssh_test_channel_observe_result(target, results[i]), results[i]);
+			ASSERT_EQ(dssh_test_channel_observe_result(target, DSSH_ERROR_TIMEOUT), DSSH_ERROR_TIMEOUT);
+			observed = dssh_test_channel_observe_end();
+			ASSERT_TRUE(observed.seen);
+			ASSERT_EQ(observed.result, results[i]);
+		}
+		for (unsigned reset = 0; reset < 2; reset++) {
+			dssh_test_channel_observe_begin(target);
+			ASSERT_EQ(dssh_test_channel_observe_result(target, DSSH_ERROR_TIMEOUT), DSSH_ERROR_TIMEOUT);
+			if (reset == 0)
+				dssh_test_thrd_reset();
+			else
+				dssh_test_ossl_reset();
+			ASSERT_EQ(dssh_test_channel_observe_result(target, 42), 42);
+			struct dssh_test_channel_observation observed = dssh_test_channel_observe_end();
+			ASSERT_FALSE(observed.seen);
+		}
+		dssh_test_channel_observe_begin(other);
+		ASSERT_EQ(dssh_test_channel_observe_result(other, 42), 42);
+		dssh_test_channel_observe_begin(target);
+		struct dssh_test_channel_observation observed = dssh_test_channel_observe_end();
+		ASSERT_FALSE(observed.seen);
+	}
+	for (unsigned flags = 0; flags < 16; flags++) {
+		struct dssh_test_wait_observation native = {
+			.native = (flags & 1) != 0,
+			.timed_out = (flags & 2) != 0,
+			.failed = (flags & 4) != 0
+		};
+		for (size_t i = 0; i < sizeof(results) / sizeof(results[0]); i++) {
+			struct dssh_test_channel_observation channel = {
+				.seen = (flags & 8) != 0, .result = results[i]
+			};
+			bool expected = flags == 11 && results[i] == DSSH_ERROR_TIMEOUT;
+			ASSERT_EQ(dssh_test_channel_expired(native, channel), expected);
+		}
+	}
+	if (puts("channel_observation flows=16 classifier_cases=128 reset_cases=4 restart_cases=2 valid=1") < 0)
+		return TEST_FAIL;
+	return TEST_PASS;
+}
+
+static struct dssh_test_entry tests[] = {
+	{ "observations", test_observations },
+	{ "channel_results", test_channel_results }
+};
 DSSH_TEST_MAIN(tests)

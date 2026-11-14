@@ -148,6 +148,24 @@ struct dssh_test_wait_observation {
 void dssh_test_wait_observe_begin(const cnd_t *target, const cnd_t *exclude);
 struct dssh_test_wait_observation dssh_test_wait_observe_end(void);
 
+/* First result at the selected actual connection wait site on this thread.
+ * No callback, pointer borrow, allocation, status override or native operation.
+ * End and both reset functions disable/clear the observation. */
+enum dssh_test_channel_stage {
+	DSSH_TEST_CHANNEL_OPEN_WAIT,
+	DSSH_TEST_CHANNEL_ACCEPT_WAIT
+};
+struct dssh_test_channel_observation {
+	bool seen;
+	int result;
+};
+void dssh_test_channel_observe_begin(enum dssh_test_channel_stage stage);
+int dssh_test_channel_observe_result(enum dssh_test_channel_stage stage, int result);
+struct dssh_test_channel_observation dssh_test_channel_observe_end(void);
+/* Expiry must belong to the selected operation, not a later cleanup wait. */
+bool dssh_test_channel_expired(struct dssh_test_wait_observation native,
+    struct dssh_test_channel_observation channel);
+
 /* Observe wrapped library ownership of one mutex on this thread. Configure
  * with no ownership of that mutex; native test/controller calls are not counted.
  * No callback or native mutex operation occurs when querying the flag. */

@@ -2384,6 +2384,11 @@ target_link_libraries(dssh_test_selftest PRIVATE dssh_mock_comp)
 if(Python3_Interpreter_FOUND AND UNIX AND NOT APPLE)
 	dssh_add_test(selftest_owner test_selftest_owner.c)
 	target_link_libraries(dssh_test_selftest_owner PRIVATE dssh_mock_comp)
+	foreach(mode IN ITEMS standalone-log standalone-clock standalone-terminate)
+		add_test(NAME dssh_selftest_completion_${mode} COMMAND ${Python3_EXECUTABLE}
+			${CMAKE_CURRENT_SOURCE_DIR}/selftest_completion_controls.py
+			$<TARGET_FILE:dssh_test_selftest_owner> ${mode})
+	endforeach()
 	dssh_add_test(wait_observation test_wait_observation.c)
 	set(selftest_wait_symbol cnd_timedwait)
 	if(DSSH_THREADS_SHIM_INCLUDE)

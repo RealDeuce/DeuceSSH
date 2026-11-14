@@ -29,6 +29,9 @@ static int owner_channel_close(dssh_channel, int64_t);
 static int owner_poll(dssh_channel, int, int);
 static int64_t owner_write(dssh_channel, int, const uint8_t *, size_t);
 static int64_t owner_read(dssh_channel, int, uint8_t *, size_t);
+static int owner_log(dssh_session, dssh_log_cb, void *);
+static int owner_timeout(dssh_session, int);
+static int owner_terminate(dssh_session, dssh_terminate_cb, void *);
 
 /* Capture the existing native/test redirections before overriding only calls
  * in the included fixture. No library demux create/join is intercepted. */
@@ -63,9 +66,15 @@ static int native_join(thrd_t t, int *r)
 #define dssh_chan_poll owner_poll
 #define dssh_chan_write owner_write
 #define dssh_chan_read owner_read
+#define dssh_session_set_log_cb owner_log
+#define dssh_session_set_timeout owner_timeout
+#define dssh_session_set_terminate_cb owner_terminate
 #define main selftest_suite_main
 #include "test_selftest.c"
 #undef main
+#undef dssh_session_set_log_cb
+#undef dssh_session_set_timeout
+#undef dssh_session_set_terminate_cb
 #undef close
 #undef dssh_chan_params_init
 #undef dssh_chan_params_free
@@ -110,11 +119,86 @@ static bool owner_io_armed;
 static bool owner_io_fired;
 static unsigned owner_write_calls;
 static unsigned owner_read_calls;
+static bool owner_standalone_fired;
+static bool owner_standalone_borrow_valid;
+static struct log_test_state *owner_log_borrow;
+static dssh_terminate_cb owner_terminate_borrow;
+static void *owner_terminate_data;
+static unsigned owner_terminate_calls;
 
 #define owner_note(...) do { \
 	if (fprintf(stderr, __VA_ARGS__) < 0 || fflush(stderr) != 0) \
 		_Exit(7); \
 } while (0)
+
+/* The original assertion hook tears down the registered owner while its
+ * callback storage is still live. Keep no owner or stack borrow afterward. */
+static int
+owner_standalone_failure(const char *mode, int ret)
+{
+	if (ret != 0 || !owner_main || strcmp(owner_mode, mode) != 0)
+		return ret;
+	if (owner_standalone_fired)
+		abort();
+	owner_standalone_fired = true;
+	owner_note("SELFTEST_STANDALONE_FAILURE mode=%s native=0 reported=%d\n",
+	    owner_mode, DSSH_ERROR_INIT);
+	return DSSH_ERROR_INIT;
+}
+
+static int
+owner_log(dssh_session sess, dssh_log_cb callback, void *data)
+{
+	int ret = dssh_session_set_log_cb(sess, callback, data);
+	if (ret == 0 && owner_main && strcmp(owner_mode, "standalone-log") == 0) {
+		if (callback != log_test_cb || data == NULL)
+			abort();
+		owner_log_borrow = data;
+	}
+	return owner_standalone_failure("standalone-log", ret);
+}
+
+static int
+owner_timeout(dssh_session sess, int timeout)
+{
+	int ret = dssh_session_set_timeout(sess, timeout);
+	if (sess == NULL)
+		return ret;
+	if (ret == 0 && owner_main && strcmp(owner_mode, "standalone-clock") == 0)
+		owner_standalone_borrow_valid = true;
+	return owner_standalone_failure("standalone-clock", ret);
+}
+
+static void
+owner_terminate_callback(dssh_session sess, void *data)
+{
+	dssh_terminate_cb callback = owner_terminate_borrow;
+	bool matches = data != NULL && data == owner_terminate_data;
+	owner_terminate_borrow = NULL;
+	owner_terminate_data = NULL;
+	if (!matches || callback != terminate_test_cb || owner_terminate_calls != 0)
+		abort();
+	int *count = data;
+	bool valid = *count == 0;
+	callback(sess, data);
+	owner_terminate_calls++;
+	owner_standalone_borrow_valid = valid && *count == 1;
+}
+
+static int
+owner_terminate(dssh_session sess, dssh_terminate_cb callback, void *data)
+{
+	if (!owner_main || strcmp(owner_mode, "standalone-terminate") != 0)
+		return dssh_session_set_terminate_cb(sess, callback, data);
+	if (callback != terminate_test_cb || data == NULL)
+		abort();
+	int ret = dssh_session_set_terminate_cb(sess, owner_terminate_callback, data);
+	if (ret == 0) {
+		owner_terminate_borrow = callback;
+		owner_terminate_data = data;
+	}
+	return owner_standalone_failure("standalone-terminate", ret);
+}
 
 static bool
 owner_selected(const char *prefix, unsigned index, const char *suffix)
@@ -437,7 +521,13 @@ owner_cleanup(dssh_session sess)
 		abort();
 	}
 	bool owned = sess != NULL;
+	struct log_test_state *log = owned ? owner_log_borrow : NULL;
+	if (owned)
+		owner_log_borrow = NULL;
+	bool log_valid = log != NULL && log->valid;
 	dssh_session_cleanup(sess);
+	if (log != NULL)
+		owner_standalone_borrow_valid = log_valid && log->valid;
 	if (owned) {
 		if (owner_released >= owner_sessions)
 			abort();
@@ -627,6 +717,33 @@ main(int argc, char **argv)
 	atomic_init(&owner_channels_created, 0);
 	atomic_init(&owner_channels_closed, 0);
 	atomic_init(&owner_channel_ready, false);
+	if (strncmp(owner_mode, "standalone-", 11) == 0) {
+		int result;
+		if (strcmp(owner_mode, "standalone-log") == 0)
+			result = test_log_api();
+		else if (strcmp(owner_mode, "standalone-clock") == 0)
+			result = test_set_timeout();
+		else if (strcmp(owner_mode, "standalone-terminate") == 0)
+			result = test_set_terminate_cb();
+		else
+			return 2;
+		bool valid = result == TEST_FAIL && owner_standalone_fired
+		    && owner_standalone_borrow_valid && g_active_ctx == NULL
+		    && owner_log_borrow == NULL && owner_terminate_borrow == NULL
+		    && owner_terminate_data == NULL
+		    && owner_sessions == 1 && owner_released == 1 && owner_closed == 0
+		    && owner_attempts == 0 && owner_created == 0 && owner_joined == 0
+		    && owner_join_attempts == 0 && owner_param_calls == 0
+		    && owner_open_attempts == 0 && owner_param_clean
+		    && atomic_load(&owner_channels_created) == 0
+		    && atomic_load(&owner_channels_closed) == 0
+		    && owner_terminate_calls == (strcmp(owner_mode, "standalone-terminate") == 0 ? 1U : 0U);
+		owner_note("SELFTEST_STANDALONE mode=%s fired=%u sessions=%u released=%u fds=%u borrowed=%u active=%u valid=%u\n",
+		    owner_mode, owner_standalone_fired ? 1U : 0U, owner_sessions,
+		    owner_released, owner_closed, owner_standalone_borrow_valid ? 1U : 0U,
+		    g_active_ctx != NULL ? 1U : 0U, valid ? 1U : 0U);
+		return valid ? 0 : 2;
+	}
 	struct selftest_ctx ctx;
 	int extra = owner_extra_control(&ctx);
 	if (extra != 3)

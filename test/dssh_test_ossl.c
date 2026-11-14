@@ -37,6 +37,7 @@
 
 #include "dssh_test_ossl.h"
 #include "dssh_test_counter.h"
+#include "../deucessh.h"
 #include "../ssh-timespec.h"
 
 static _Thread_local bool sntrup_clear_watched;
@@ -436,6 +437,7 @@ dssh_test_ossl_reset(void)
 	wait_probe = NULL;
 	dssh_test_wait_observe_begin(NULL, NULL);
 	dssh_test_wait_observe_end();
+	dssh_test_channel_observe_end();
 	dssh_test_mtx_watch_ownership(NULL);
 	wake_fail_mutex = NULL;
 	wake_fail_condition = NULL;
@@ -504,6 +506,7 @@ dssh_test_thrd_reset(void)
 	wait_probe = NULL;
 	dssh_test_wait_observe_begin(NULL, NULL);
 	dssh_test_wait_observe_end();
+	dssh_test_channel_observe_end();
 	dssh_test_mtx_watch_ownership(NULL);
 	wake_fail_mutex = NULL;
 	wake_fail_condition = NULL;
@@ -1277,6 +1280,45 @@ probe_wait_result(struct dssh_test_wait_probe *probe)
 	while (!atomic_load(&probe->release)) {
 	}
 	return probe->result;
+}
+
+static _Thread_local bool channel_observing;
+static _Thread_local enum dssh_test_channel_stage channel_stage;
+static _Thread_local struct dssh_test_channel_observation channel_observation;
+
+void
+dssh_test_channel_observe_begin(enum dssh_test_channel_stage stage)
+{
+	channel_observation = (struct dssh_test_channel_observation){0};
+	channel_stage = stage;
+	channel_observing = true;
+}
+
+int
+dssh_test_channel_observe_result(enum dssh_test_channel_stage stage, int result)
+{
+	if (channel_observing && stage == channel_stage && !channel_observation.seen) {
+		channel_observation.seen = true;
+		channel_observation.result = result;
+	}
+	return result;
+}
+
+struct dssh_test_channel_observation
+dssh_test_channel_observe_end(void)
+{
+	struct dssh_test_channel_observation result = channel_observation;
+	channel_observing = false;
+	channel_observation = (struct dssh_test_channel_observation){0};
+	return result;
+}
+
+bool
+dssh_test_channel_expired(struct dssh_test_wait_observation native,
+    struct dssh_test_channel_observation channel)
+{
+	return native.native && native.timed_out && !native.failed
+	    && channel.seen && channel.result == DSSH_ERROR_TIMEOUT;
 }
 
 static _Thread_local bool wait_observing;

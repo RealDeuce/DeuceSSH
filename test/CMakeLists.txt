@@ -1437,6 +1437,19 @@ foreach(part IN ITEMS group_selection group_validation peer_validation mpint_val
 		ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys)
 endforeach()
 dssh_add_variant_tests(dssh_transport dssh_test_transport)
+set(transport_pair_leaves vex/basic vex/remote_stored
+	gather/roundtrip rxline/from_rx_handshake)
+foreach(suffix IN ITEMS "" _hmac256 _dhgex _rsa _rsa512 _dhgex_rsa _dhgex_rsa512
+	_sntrup _sntrup_rsa _sntrup_rsa512 _mlkem _mlkem_rsa _mlkem_rsa512
+	_rsa_hmac256 _dhgex_hmac256 _sntrup_hmac256)
+	get_test_property(dssh_transport${suffix} ENVIRONMENT transport_pair_environment)
+	foreach(leaf IN LISTS transport_pair_leaves)
+		dssh_add_output_test(dssh_transport_pair_${leaf}${suffix} dssh_test_transport
+			"1 tests: 1 passed, 0 failed, 0 skipped" --exact ${leaf})
+		set_tests_properties(dssh_transport_pair_${leaf}${suffix} PROPERTIES
+			ENVIRONMENT "${transport_pair_environment}" TIMEOUT 120)
+	endforeach()
+endforeach()
 foreach(suffix IN ITEMS "" _hmac256 _dhgex _rsa _rsa512 _dhgex_rsa _dhgex_rsa512
 	_sntrup _sntrup_rsa _sntrup_rsa512 _mlkem _mlkem_rsa _mlkem_rsa512
 	_rsa_hmac256 _dhgex_hmac256 _sntrup_hmac256)
@@ -2626,6 +2639,22 @@ if(Python3_Interpreter_FOUND AND UNIX AND NOT APPLE)
 		add_test(NAME dssh_fixture_owner_${mode} COMMAND ${Python3_EXECUTABLE}
 			${CMAKE_CURRENT_SOURCE_DIR}/fixture_owner_controls.py
 			$<TARGET_FILE:dssh_test_transport_fixture_owner> ${mode})
+	endforeach()
+	dssh_add_test(transport_pair_owner test_transport.c)
+	target_sources(dssh_test_transport_pair_owner PRIVATE peer_thread_failures.c dh_group_result_provider.c)
+	target_compile_definitions(dssh_test_transport_pair_owner PRIVATE DSSH_TRANSPORT_PAIR_CONTROLS)
+	target_link_libraries(dssh_test_transport_pair_owner PRIVATE dssh_mock_io dssh_mock_comp)
+	target_link_options(dssh_test_transport_pair_owner PRIVATE
+		"-Wl,--wrap=${create_symbol},--wrap=${join_symbol},--wrap=mock_tx_client")
+	foreach(kind RANGE 0 3)
+		foreach(mode IN LISTS owner_modes)
+			add_test(NAME dssh_transport_pair_owner_${kind}_${mode} COMMAND ${CMAKE_COMMAND} -E env
+				"DSSH_TRANSPORT_PAIR_KIND=${kind}" ${Python3_EXECUTABLE}
+				${CMAKE_CURRENT_SOURCE_DIR}/fixture_owner_controls.py
+				$<TARGET_FILE:dssh_test_transport_pair_owner> ${mode})
+			set_tests_properties(dssh_transport_pair_owner_${kind}_${mode} PROPERTIES
+				ENVIRONMENT "${DSSH_TEST_KEY_ENV}" TIMEOUT 120)
+		endforeach()
 	endforeach()
 endif()
 set_tests_properties(

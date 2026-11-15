@@ -39,6 +39,8 @@
 #include "signature_copy_fixture.h"
 #include "kex_result_fixture.h"
 
+static bool transport_pair_case(unsigned kind);
+
 static int (*extra_algorithm_registration)(void);
 static const char *handshake_kex_filter;
 static int (*handshake_language_setup)(dssh_session client, dssh_session server);
@@ -979,110 +981,17 @@ test_derive_key_bad_hash(void)
  * Version exchange (~6 tests, mock I/O)
  * ================================================================ */
 
-struct version_exchange_ctx {
-	struct mock_io_state io;
-	dssh_session client;
-	dssh_session server;
-	int client_result;
-	int server_result;
-};
-
-static int
-version_client_thread(void *arg)
-{
-	struct version_exchange_ctx *ctx = arg;
-	ctx->client_result = version_exchange(ctx->client);
-	return 0;
-}
-
-static int
-version_server_thread(void *arg)
-{
-	struct version_exchange_ctx *ctx = arg;
-	ctx->server_result = version_exchange(ctx->server);
-	return 0;
-}
-
 static int
 test_version_exchange_basic(void)
 {
-	dssh_test_reset_global_config();
-	dssh_transport_set_callbacks(mock_tx_dispatch, mock_rx_dispatch,
-	    mock_rxline_dispatch, mock_extra_line_cb);
-
-	struct version_exchange_ctx ctx;
-	memset(&ctx, 0, sizeof(ctx));
-	ASSERT_OK(mock_io_init(&ctx.io, 0));
-
-	/* Need to register at least something so session_init locks the registry */
-	ASSERT_OK(dssh_register_none_comp());
-
-	ctx.client = dssh_session_init(true, 0);
-	ASSERT_NOT_NULL(ctx.client);
-	dssh_session_set_cbdata(ctx.client, &ctx.io, &ctx.io, &ctx.io, &ctx.io);
-
-	ctx.server = init_server_session();
-	ASSERT_NOT_NULL(ctx.server);
-	dssh_session_set_cbdata(ctx.server, &ctx.io, &ctx.io, &ctx.io, &ctx.io);
-
-	thrd_t ct, st;
-	ASSERT_TRUE(thrd_create(&ct, version_client_thread, &ctx) == thrd_success);
-	ASSERT_TRUE(thrd_create(&st, version_server_thread, &ctx) == thrd_success);
-	thrd_join(ct, NULL);
-	thrd_join(st, NULL);
-
-	ASSERT_OK(ctx.client_result);
-	ASSERT_OK(ctx.server_result);
-
-	dssh_session_cleanup(ctx.client);
-	dssh_session_cleanup(ctx.server);
-	mock_io_free(&ctx.io);
-	dssh_test_reset_global_config();
+	ASSERT_TRUE(transport_pair_case(0));
 	return TEST_PASS;
 }
 
 static int
 test_version_exchange_remote_stored(void)
 {
-	dssh_test_reset_global_config();
-	dssh_transport_set_callbacks(mock_tx_dispatch, mock_rx_dispatch,
-	    mock_rxline_dispatch, mock_extra_line_cb);
-
-	struct version_exchange_ctx ctx;
-	memset(&ctx, 0, sizeof(ctx));
-	ASSERT_OK(mock_io_init(&ctx.io, 0));
-	ASSERT_OK(dssh_register_none_comp());
-
-	ctx.client = dssh_session_init(true, 0);
-	ASSERT_NOT_NULL(ctx.client);
-	dssh_session_set_cbdata(ctx.client, &ctx.io, &ctx.io, &ctx.io, &ctx.io);
-
-	ctx.server = init_server_session();
-	ASSERT_NOT_NULL(ctx.server);
-	dssh_session_set_cbdata(ctx.server, &ctx.io, &ctx.io, &ctx.io, &ctx.io);
-
-	thrd_t ct, st;
-	ASSERT_TRUE(thrd_create(&ct, version_client_thread, &ctx) == thrd_success);
-	ASSERT_TRUE(thrd_create(&st, version_server_thread, &ctx) == thrd_success);
-	thrd_join(ct, NULL);
-	thrd_join(st, NULL);
-
-	ASSERT_OK(ctx.client_result);
-	ASSERT_OK(ctx.server_result);
-
-	/* Both should have captured each other's version */
-	const char *client_remote = dssh_transport_get_remote_version(ctx.client);
-	const char *server_remote = dssh_transport_get_remote_version(ctx.server);
-	ASSERT_NOT_NULL(client_remote);
-	ASSERT_NOT_NULL(server_remote);
-	/* Both should start with SSH-2.0- */
-	ASSERT_TRUE(strncmp(client_remote, "SSH-2.0-", 8) == 0);
-	ASSERT_TRUE(strncmp(server_remote, "SSH-2.0-", 8) == 0);
-
-	dssh_session_cleanup(ctx.client);
-	dssh_session_cleanup(ctx.server);
-	mock_io_free(&ctx.io);
-	dssh_test_reset_global_config();
+	ASSERT_TRUE(transport_pair_case(1));
 	return TEST_PASS;
 }
 
@@ -7319,18 +7228,24 @@ test_gather_cb(const struct dssh_tx_iov *iov, size_t iovcnt,
     dssh_session sess, void *cbdata)
 {
 	struct mock_io_state *io = cbdata;
+	if (iov == NULL || iovcnt == 0)
+		return DSSH_ERROR_INVALID;
 
 	atomic_store(&gather_invoked, 1);
 
 	/* Send each iov entry through the per-packet TX path */
 	for (size_t i = 0; i < iovcnt; i++) {
+		if (iov[i].base == NULL || iov[i].len == 0)
+			return DSSH_ERROR_INVALID;
+		/* The mock sender reads these borrowed wire bytes. */
+		uint8_t *packet = (uint8_t *)iov[i].base;
 		if (sess->trans.client) {
-			if (mock_tx_client((uint8_t *)(uintptr_t)iov[i].base,
+			if (mock_tx_client(packet,
 			    iov[i].len, sess, io) != 0)
 				return -1;
 		}
 		else {
-			if (mock_tx_server((uint8_t *)(uintptr_t)iov[i].base,
+			if (mock_tx_server(packet,
 			    iov[i].len, sess, io) != 0)
 				return -1;
 		}
@@ -7387,91 +7302,7 @@ test_tx_gather_toolate(void)
 static int
 test_tx_gather_roundtrip(void)
 {
-	dssh_test_reset_global_config();
-
-	/* Set gather callback BEFORE registering algorithms or creating sessions */
-	ASSERT_OK(dssh_transport_set_tx_gather(test_gather_cb));
-
-	if (register_all_algorithms() < 0) {
-		dssh_test_reset_global_config();
-		return TEST_SKIP;
-	}
-	if (test_generate_host_key() < 0) {
-		dssh_test_reset_global_config();
-		return TEST_SKIP;
-	}
-
-	struct mock_io_state io;
-	if (mock_io_init(&io, 0) < 0) {
-		dssh_test_reset_global_config();
-		return TEST_SKIP;
-	}
-
-	dssh_transport_set_callbacks(mock_tx_dispatch, mock_rx_dispatch,
-	    mock_rxline_dispatch, mock_extra_line_cb);
-
-	atomic_store(&gather_invoked, 0);
-
-	dssh_session client = dssh_session_init(true, 0);
-	if (client == NULL) {
-		mock_io_free(&io);
-		dssh_test_reset_global_config();
-		return TEST_SKIP;
-	}
-	dssh_session_set_cbdata(client, &io, &io, &io, &io);
-	dssh_session_set_hostkey_verify_cb(client, dssh_test_accept_hostkey, NULL);
-
-	dssh_session server = init_server_session();
-	if (server == NULL) {
-		dssh_session_cleanup(client);
-		mock_io_free(&io);
-		dssh_test_reset_global_config();
-		return TEST_SKIP;
-	}
-	dssh_session_set_cbdata(server, &io, &io, &io, &io);
-
-	/* Run handshake in threads */
-	struct handshake_ctx hctx;
-	hctx.io = io;
-	hctx.client = client;
-	hctx.server = server;
-	hctx.client_result = -1;
-	hctx.server_result = -1;
-
-	thrd_t ct, st;
-	if (thrd_create(&ct, handshake_client_thread, &hctx) != thrd_success) {
-		dssh_session_cleanup(server);
-		dssh_session_cleanup(client);
-		mock_io_free(&io);
-		dssh_test_reset_global_config();
-		return TEST_SKIP;
-	}
-	if (thrd_create(&st, handshake_server_thread, &hctx) != thrd_success) {
-		dssh_session_terminate(client);
-		mock_io_close_c2s(&hctx.io);
-		mock_io_close_s2c(&hctx.io);
-		thrd_join(ct, NULL);
-		dssh_session_cleanup(server);
-		dssh_session_cleanup(client);
-		mock_io_free(&io);
-		dssh_test_reset_global_config();
-		return TEST_SKIP;
-	}
-
-	thrd_join(ct, NULL);
-	thrd_join(st, NULL);
-
-	/* Handshake must succeed */
-	ASSERT_OK(hctx.client_result);
-	ASSERT_OK(hctx.server_result);
-
-	/* Gather callback must have been invoked at least once */
-	ASSERT_TRUE(atomic_load(&gather_invoked));
-
-	dssh_session_cleanup(server);
-	dssh_session_cleanup(client);
-	mock_io_free(&hctx.io);
-	dssh_test_reset_global_config();
+	ASSERT_TRUE(transport_pair_case(2));
 	return TEST_PASS;
 }
 
@@ -7482,81 +7313,11 @@ test_tx_gather_roundtrip(void)
 static int
 test_rxline_from_rx_handshake(void)
 {
-	dssh_test_reset_global_config();
-
-	if (register_all_algorithms() < 0)
-		return TEST_SKIP;
-	if (test_generate_host_key() < 0)
-		return TEST_SKIP;
-
-	struct mock_io_state io;
-	if (mock_io_init(&io, 0) < 0) {
-		dssh_test_reset_global_config();
-		return TEST_SKIP;
-	}
-
-	/* Pass NULL for rx_line -- forces rxline_from_rx fallback */
-	dssh_transport_set_callbacks(mock_tx_dispatch, mock_rx_dispatch,
-	    NULL, mock_extra_line_cb);
-
-	dssh_session client = dssh_session_init(true, 0);
-	if (client == NULL) {
-		mock_io_free(&io);
-		dssh_test_reset_global_config();
-		return TEST_SKIP;
-	}
-	dssh_session_set_cbdata(client, &io, &io, &io, &io);
-	dssh_session_set_hostkey_verify_cb(client, dssh_test_accept_hostkey, NULL);
-
-	dssh_session server = init_server_session();
-	if (server == NULL) {
-		dssh_session_cleanup(client);
-		mock_io_free(&io);
-		dssh_test_reset_global_config();
-		return TEST_SKIP;
-	}
-	dssh_session_set_cbdata(server, &io, &io, &io, &io);
-
-	/* Run handshake in threads — version exchange uses rxline_from_rx */
-	struct handshake_ctx hctx;
-	hctx.io = io;
-	hctx.client = client;
-	hctx.server = server;
-	hctx.client_result = -1;
-	hctx.server_result = -1;
-
-	thrd_t ct, st;
-	if (thrd_create(&ct, handshake_client_thread, &hctx) != thrd_success) {
-		dssh_session_cleanup(server);
-		dssh_session_cleanup(client);
-		mock_io_free(&io);
-		dssh_test_reset_global_config();
-		return TEST_SKIP;
-	}
-	if (thrd_create(&st, handshake_server_thread, &hctx) != thrd_success) {
-		dssh_session_terminate(client);
-		mock_io_close_c2s(&hctx.io);
-		mock_io_close_s2c(&hctx.io);
-		thrd_join(ct, NULL);
-		dssh_session_cleanup(server);
-		dssh_session_cleanup(client);
-		mock_io_free(&io);
-		dssh_test_reset_global_config();
-		return TEST_SKIP;
-	}
-
-	thrd_join(ct, NULL);
-	thrd_join(st, NULL);
-
-	ASSERT_OK(hctx.client_result);
-	ASSERT_OK(hctx.server_result);
-
-	dssh_session_cleanup(server);
-	dssh_session_cleanup(client);
-	mock_io_free(&hctx.io);
-	dssh_test_reset_global_config();
+	ASSERT_TRUE(transport_pair_case(3));
 	return TEST_PASS;
 }
+
+#include "transport_pair_cases.h"
 
 /* ================================================================
  * Test table
@@ -9297,6 +9058,9 @@ test_rekey_global_pipeline(void)
 #include "gather_batch_cases.h"
 
 static struct dssh_test_entry tests[] = {
+#ifdef DSSH_TRANSPORT_PAIR_CONTROLS
+	{ "fixture/ownership", test_transport_pair_ownership },
+#endif
 	{ "release/test_layout", test_transport_test_layout },
 	{ "gather/batch", test_gather_batch },
 	{ "gather/batch_budget", test_gather_batch_budget },
@@ -9732,5 +9496,26 @@ static struct dssh_test_entry tests[] = {
 	{ "rxline/from_rx_handshake",        test_rxline_from_rx_handshake },
 };
 
-DSSH_TEST_NO_CLEANUP
+void
+dssh_test_failure_cleanup(void)
+{
+	transport_pair_assertion_cleanup();
+}
+
+#define main transport_test_main
 DSSH_TEST_MAIN(tests)
+#undef main
+
+int
+main(int argc, char **argv)
+{
+#ifdef DSSH_TRANSPORT_PAIR_CONTROLS
+	if (argc == 3 && strcmp(argv[1], "--fixture-assert") == 0) {
+		if (strlen(argv[2]) != 1 || argv[2][0] < '0' || argv[2][0] > '2')
+			return 2;
+		unsigned phase = (unsigned)(argv[2][0] - '0');
+		return transport_pair_assertion_control(phase);
+	}
+#endif
+	return transport_test_main(argc, argv);
+}

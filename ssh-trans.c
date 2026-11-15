@@ -58,6 +58,19 @@ DSSH_TESTABLE struct dssh_transport_global_config gconf = {
 static _Thread_local struct dssh_session_s *io_callback_session;
 static _Thread_local struct dssh_session_s *tx_owned_session;
 
+/* Only the packet-engine owner stages a batch. Queued slot buffers can be
+ * reused by producers as soon as they are retired, so retain their wire bytes
+ * separately. The caller's final packet needs no copy. */
+#define DSSH_TX_BATCH_PACKETS 16
+struct dssh_tx_batch {
+	struct dssh_session_s *sess;
+	size_t offsets[DSSH_TX_BATCH_PACKETS];
+	size_t lengths[DSSH_TX_BATCH_PACKETS];
+	size_t count;
+	size_t bytes;
+};
+static _Thread_local struct dssh_tx_batch *tx_batch;
+
 static dssh_enc
 enc_c2s_module(struct dssh_session_s *sess)
 {
@@ -212,6 +225,19 @@ dssh_test_rekeys_completed(struct dssh_session_s *sess)
 {
 	return atomic_load_explicit(&sess->trans.test_rekeys_completed,
 	    memory_order_acquire);
+}
+
+/* Compare actual library layout with a consumer compiled without injector
+ * redirections. Keep this observation out of production builds and exports. */
+DSSH_TESTABLE void
+dssh_test_session_layout(size_t out[6])
+{
+	out[0] = sizeof(struct dssh_transport_state_s);
+	out[1] = sizeof(struct dssh_session_s);
+	out[2] = offsetof(struct dssh_transport_state_s, id_str);
+	out[3] = offsetof(struct dssh_transport_state_s, remote_id_str);
+	out[4] = offsetof(struct dssh_session_s, initialized);
+	out[5] = offsetof(struct dssh_session_s, timeout_ms);
 }
 #endif
 
@@ -1308,7 +1334,9 @@ done:
 }
 
 /*
- * Update TX counters after a successful send.  Caller owns the packet engine.
+ * Account for a sent packet or reserve its key budget while its complete wire
+ * bytes await a gathered callback. A failed callback terminates the session;
+ * staged packets are never prepared again or counted twice.
  */
 static void
 tx_update_counters(struct dssh_session_s *sess, size_t wire_len)
@@ -1323,20 +1351,75 @@ tx_update_counters(struct dssh_session_s *sess, size_t wire_len)
 	}
 }
 
-/*
- * Batch counter update for gather sends.  Caller owns the packet engine.
- */
-static void
-tx_update_counters_batch(struct dssh_session_s *sess, size_t count, size_t total_bytes)
+/* Flush retained controls and an optional last packet without lending live
+ * slot storage. No mutex is held and the caller owns the packet engine. */
+static int
+tx_batch_flush(struct dssh_tx_batch *batch, const uint8_t *tail, size_t tail_len)
 {
-	atomic_fetch_add(&sess->trans.tx_since_rekey, (uint_fast32_t)count);
-	{
-		uint64_t old_tb = atomic_load(&sess->trans.tx_bytes_since_rekey);
-		if (total_bytes > UINT64_MAX - old_tb)
-			atomic_store(&sess->trans.tx_bytes_since_rekey, UINT64_MAX);
-		else
-			atomic_store(&sess->trans.tx_bytes_since_rekey, old_tb + total_bytes);
+	struct dssh_session_s *sess = batch->sess;
+	struct dssh_tx_iov iov[DSSH_TX_BATCH_PACKETS + 1];
+	size_t count = batch->count;
+	int ret = 0;
+	for (size_t i = 0; i < count; i++) {
+		iov[i].base = &sess->trans.tx_gather_buf[batch->offsets[i]];
+		iov[i].len = batch->lengths[i];
 	}
+	if (tail != NULL) {
+		iov[count].base = tail;
+		iov[count].len = tail_len;
+		count++;
+	}
+	if (count != 0) {
+		ret = sess->terminate ? DSSH_ERROR_TERMINATED : call_tx_gather(sess, iov, count);
+		if (ret < 0)
+			session_set_terminate_no_wake(sess);
+	}
+	if (batch->bytes != 0)
+		dssh_cleanse(sess->trans.tx_gather_buf, batch->bytes);
+	batch->count = 0;
+	batch->bytes = 0;
+	return ret;
+}
+
+/* The fixed packet count bounds retained control storage. Grow its allocation
+ * only when required and keep offsets rather than pointers across realloc. */
+static int
+tx_batch_append(struct dssh_tx_batch *batch, const uint8_t *wire, size_t wire_len)
+{
+	struct dssh_session_s *sess = batch->sess;
+	int ret;
+	if (batch->count == DSSH_TX_BATCH_PACKETS || wire_len > SIZE_MAX - batch->bytes) {
+		ret = tx_batch_flush(batch, NULL, 0);
+		if (ret < 0)
+			return ret;
+	}
+	size_t needed = batch->bytes + wire_len;
+	if (needed > sess->trans.tx_gather_capacity) {
+		size_t capacity = sess->trans.tx_gather_capacity;
+		if (capacity < 1024)
+			capacity = 1024;
+		while (capacity < needed) {
+			if (capacity > SIZE_MAX / 2) {
+				capacity = needed;
+				break;
+			}
+			capacity *= 2;
+		}
+		uint8_t *storage = realloc(sess->trans.tx_gather_buf, capacity);
+		if (storage == NULL) {
+			session_set_terminate_no_wake(sess);
+			return DSSH_ERROR_ALLOC;
+		}
+		sess->trans.tx_gather_buf = storage;
+		sess->trans.tx_gather_capacity = capacity;
+	}
+	memcpy(&sess->trans.tx_gather_buf[batch->bytes], wire, wire_len);
+	batch->offsets[batch->count] = batch->bytes;
+	batch->lengths[batch->count] = wire_len;
+	batch->count++;
+	batch->bytes = needed;
+	tx_update_counters(sess, wire_len);
+	return 0;
 }
 
 /*
@@ -1353,14 +1436,16 @@ tx_finalize(struct dssh_session_s *sess, uint8_t *buf, size_t payload_len)
 
 	if (ret < 0)
 		return ret;
-	ret = call_io(sess, gconf.tx, wire, wire_len, sess->tx_cbdata);
+	bool staged = tx_batch != NULL && tx_batch->sess == sess;
+	ret = staged ? tx_batch_append(tx_batch, wire, wire_len)
+	    : call_io(sess, gconf.tx, wire, wire_len, sess->tx_cbdata);
 	if (sess->trans.comp_tx_packet != NULL) {
 		dssh_cleanse(sess->trans.comp_tx_packet, 4);
 		dssh_cleanse(&sess->trans.comp_tx_packet[4], sess->trans.packet_buf_sz);
 	}
-	if (ret == 0)
+	if (ret == 0 && !staged)
 		tx_update_counters(sess, wire_len);
-	else
+	else if (ret < 0)
 		session_set_terminate_no_wake(sess);
 	return ret;
 }
@@ -1861,47 +1946,66 @@ tx_unlock_with_result(struct dssh_session_s *sess, int result)
 }
 
 /*
- * Send a gathered iov via tx_gather callback, update counters.
- * Caller MUST own the packet engine.  No mutex is held.  Returns 0 on success.
- */
-static int
-tx_send_gathered(struct dssh_session_s *sess, struct dssh_tx_iov *iov, size_t iovcnt, size_t total_bytes)
-{
-	int ret = call_tx_gather(sess, iov, iovcnt);
-
-	if (ret == 0)
-		tx_update_counters_batch(sess, iovcnt, total_bytes);
-	else
-		session_set_terminate_no_wake(sess);
-	return ret;
-}
-
-/*
- * Drain control slots to completion, then send the caller's packet through
- * tx_gather.  Slot buffers cannot safely remain referenced by an iovec after
- * ready is cleared because the demux may immediately reuse them.
+ * Gather queued control packets with the caller's packet. Each retired slot
+ * has an independently retained wire copy, including compressed output, and
+ * reserves its packet budget before the next packet is prepared. Bounded full
+ * batches are sent before collecting further controls. The final caller packet
+ * remains in its original wire buffer until callback return.
  * Caller MUST own the packet engine.
  */
 DSSH_PRIVATE int
 tx_gather_with_packet(struct dssh_session_s *sess, uint8_t *buf, size_t payload_len)
 {
+	if (tx_batch != NULL)
+		return DSSH_ERROR_INVALID;
+	struct dssh_tx_batch batch = {.sess = sess};
+	tx_batch = &batch;
+	int ret = 0;
 	if (!atomic_load_explicit(&sess->trans.rekey_in_progress, memory_order_acquire)) {
-		int drain_ret = drain_tx_slots(sess);
-		if (drain_ret < 0)
-			return drain_ret;
+		ret = drain_tx_slots(sess);
+		if (ret < 0) {
+			/* Earlier controls may already be prepared when a later slot is
+			 * refused before touching stream state. Send that valid prefix. */
+			if (tx_drain_refused(sess, ret)) {
+				int flush_ret = tx_batch_flush(&batch, NULL, 0);
+				if (flush_ret < 0)
+					ret = flush_ret;
+			}
+			goto done;
+		}
 	}
-	if (sess->terminate)
-		return DSSH_ERROR_TERMINATED;
+	if (sess->terminate) {
+		ret = DSSH_ERROR_TERMINATED;
+		goto done;
+	}
 
 	uint8_t *wire;
 	size_t   wire_len;
-	int      ret = tx_finalize_prepare(sess, buf, payload_len, &wire, &wire_len);
+	ret = tx_finalize_prepare(sess, buf, payload_len, &wire, &wire_len);
 
-	if (ret < 0)
-		return ret;
-	struct dssh_tx_iov iov = { .base = wire, .len = wire_len };
+	if (ret < 0) {
+		if (tx_drain_refused(sess, ret)) {
+			int flush_ret = tx_batch_flush(&batch, NULL, 0);
+			if (flush_ret < 0)
+				ret = flush_ret;
+		}
+		goto done;
+	}
+	/* The complete vector's byte sum must also fit size_t. A narrow platform
+	 * may need to send its valid control prefix separately from a large tail. */
+	if (wire_len > SIZE_MAX - batch.bytes) {
+		ret = tx_batch_flush(&batch, NULL, 0);
+		if (ret < 0)
+			goto done;
+	}
+	ret = tx_batch_flush(&batch, wire, wire_len);
+	if (ret == 0)
+		tx_update_counters(sess, wire_len);
 
-	ret = tx_send_gathered(sess, &iov, 1, wire_len);
+done:
+	if (batch.bytes != 0)
+		dssh_cleanse(sess->trans.tx_gather_buf, batch.bytes);
+	tx_batch = NULL;
 	if (sess->trans.comp_tx_packet != NULL) {
 		dssh_cleanse(sess->trans.comp_tx_packet, 4);
 		dssh_cleanse(&sess->trans.comp_tx_packet[4], sess->trans.packet_buf_sz);
@@ -4346,6 +4450,9 @@ transport_cleanup(struct dssh_session_s *sess)
 	sess->trans.comp_tx_packet = NULL;
 	cleanse_free(sess->trans.comp_rx_input, sess->trans.packet_buf_sz);
 	sess->trans.comp_rx_input = NULL;
+	cleanse_free(sess->trans.tx_gather_buf, sess->trans.tx_gather_capacity);
+	sess->trans.tx_gather_buf = NULL;
+	sess->trans.tx_gather_capacity = 0;
 	cleanse_free(sess->trans.tx_packet, 4 + sess->trans.packet_buf_sz);
 	sess->trans.tx_packet = NULL;
 	cleanse_free(sess->trans.rx_packet, 4 + sess->trans.packet_buf_sz);

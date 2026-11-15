@@ -392,7 +392,9 @@ target_compile_definitions(deucessh_test_lib PRIVATE DSSH_TESTING
 	$<$<COMPILE_LANGUAGE:C>:_POSIX_C_SOURCE=200809L>
 	$<$<STREQUAL:${DEUCESSH_CRYPTO_BACKEND},OpenSSL>:DSSH_CRYPTO_OPENSSL>
 	$<$<STREQUAL:${DEUCESSH_CRYPTO_BACKEND},Botan>:DSSH_CRYPTO_BOTAN>)
-target_compile_definitions(deucessh_test_lib PUBLIC ${DSSH_TIME_SHIM_DEFINITIONS})
+# Consumers need the instrumented private layout without enabling allocator or
+# provider macro redirections in their own fixture code.
+target_compile_definitions(deucessh_test_lib PUBLIC DSSH_TEST_LAYOUT ${DSSH_TIME_SHIM_DEFINITIONS})
 target_include_directories(deucessh_test_lib
 	PUBLIC ${PROJECT_SOURCE_DIR}
 	PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -1435,6 +1437,21 @@ foreach(part IN ITEMS group_selection group_validation peer_validation mpint_val
 		ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys)
 endforeach()
 dssh_add_variant_tests(dssh_transport dssh_test_transport)
+dssh_add_output_test(dssh_transport_test_layout dssh_test_transport
+	"1 tests: 1 passed, 0 failed, 0 skipped" --exact release/test_layout)
+set_tests_properties(dssh_transport_test_layout PROPERTIES FIXTURES_SETUP dssh_internal_test_layout)
+foreach(compression IN ITEMS none test-growth zlib)
+	if(compression STREQUAL "zlib" AND NOT ZLIB_FOUND)
+		continue()
+	endif()
+	foreach(part IN ITEMS batch batch_budget batch_failures batch_allocation batch_refill)
+		dssh_add_output_test(dssh_gather_${part}_${compression} dssh_test_transport
+			"1 tests: 1 passed, 0 failed, 0 skipped" --exact gather/${part})
+		set_tests_properties(dssh_gather_${part}_${compression} PROPERTIES
+			ENVIRONMENT "DSSH_TEST_COMPRESSION=${compression};${DSSH_TEST_KEY_ENV}"
+			FIXTURES_REQUIRED "dssh_cached_keys;dssh_internal_test_layout" TIMEOUT 120)
+	endforeach()
+endforeach()
 foreach(method IN ITEMS curve25519 dh-gex group14 group16 sntrup mlkem)
 	foreach(key IN ITEMS ed25519 rsa rsa512)
 		foreach(part IN ITEMS kex auth)

@@ -9574,8 +9574,15 @@ test_rekey_global_pipeline(void)
 #include "transport_ext_info_cases.h"
 #include "language_cases.h"
 #include "key_borrow_cases.h"
+#include "gather_batch_cases.h"
 
 static struct dssh_test_entry tests[] = {
+	{ "release/test_layout", test_transport_test_layout },
+	{ "gather/batch", test_gather_batch },
+	{ "gather/batch_budget", test_gather_batch_budget },
+	{ "gather/batch_failures", test_gather_batch_failures },
+	{ "gather/batch_allocation", test_gather_batch_allocation },
+	{ "gather/batch_refill", test_gather_batch_refill },
 	{ "release/key_borrow_kex", test_key_borrow_kex },
 	{ "release/key_borrow_auth", test_key_borrow_auth },
 	{ "language/local", test_language_local },

@@ -94,6 +94,7 @@ void dssh_test_arm_rx_bytes_before_count(dssh_session sess, uint64_t value);
 /* Successful complete rekey paths, excluding the initial handshake. The
  * counter saturates at UINT_MAX. Read only while the session remains owned. */
 unsigned dssh_test_rekeys_completed(dssh_session sess);
+void dssh_test_session_layout(size_t out[6]);
 
 /* Current-thread, one-shot observation of detach waiting for active dispatch.
  * No status override or callback. Keep waiting alive until this thread joins;

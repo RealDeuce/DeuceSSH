@@ -209,6 +209,10 @@ struct dssh_transport_state_s {
 	uint8_t               *comp_tx_packet;
 	uint8_t               *comp_rx_input;
 	size_t                 comp_tx_payload_limit;
+	/* Reusable wire copies for queued controls in a gathered send. The caller's
+	 * final packet remains borrowed only until the synchronous callback returns. */
+	uint8_t               *tx_gather_buf;
+	size_t                 tx_gather_capacity;
 
 	/* C11 synchronization (platform-dependent size) */
 	cnd_t rekey_cnd;    /* wakes senders blocked by TX ownership/rekey */
@@ -247,7 +251,7 @@ struct dssh_transport_state_s {
 	bool        rekey_pending;         /* deferred auto-rekey (set in recv_packet) */
 	bool        tx_slots_pending;      /* protected by tx_queue_mtx */
 
-#ifdef DSSH_TESTING
+#if defined(DSSH_TESTING) || defined(DSSH_TEST_LAYOUT)
 	/* Published only after the complete rekey path succeeds. */
 	atomic_uint test_rekeys_completed;
 #endif

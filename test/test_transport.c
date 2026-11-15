@@ -7187,132 +7187,7 @@ register_fixed_rekey_methods(void)
 	return 0;
 }
 
-static int
-fixed_rekey_receive(void *opaque)
-{
-	struct rekey_thread_arg *arg = opaque;
-	uint8_t type, *payload = NULL;
-	size_t length = 0;
-	arg->result = recv_packet(arg->ctx->server, &type, &payload, &length);
-	if (arg->result == 0 && (type != SSH_MSG_SERVICE_REQUEST || length != 2
-	    || payload == NULL || payload[0] != SSH_MSG_SERVICE_REQUEST || payload[1] != 0x42))
-		arg->result = DSSH_ERROR_INVALID;
-	return 0;
-}
-
-static int
-test_fixed_rekey_methods(void)
-{
-	struct handshake_ctx ctx;
-	extra_algorithm_registration = register_fixed_rekey_methods;
-	handshake_kex_filter = "diffie-hellman-group16-sha512";
-	int ret = handshake_setup(&ctx);
-	extra_algorithm_registration = NULL;
-	handshake_kex_filter = NULL;
-	uint8_t session_id[64];
-	bool valid = ret == 0 && ctx.client->trans.session_id_sz == sizeof(session_id)
-	    && ctx.server->trans.session_id_sz == sizeof(session_id);
-	if (valid)
-		memcpy(session_id, ctx.client->trans.session_id, sizeof(session_id));
-	const char *methods[] = {"diffie-hellman-group14-sha256", "curve25519-sha256", "diffie-hellman-group16-sha512"};
-	for (size_t i = 0; valid && i < sizeof(methods) / sizeof(methods[0]); i++) {
-		valid = dssh_session_set_kex_filter(ctx.client, &methods[i], 1) == 0
-		    && dssh_session_set_kex_filter(ctx.server, &methods[i], 1) == 0;
-		if (!valid)
-			break;
-		struct rekey_thread_arg client = {&ctx, DSSH_ERROR_INIT}, server = {&ctx, DSSH_ERROR_INIT};
-		thrd_t ct, st;
-		if (thrd_create(&st, fixed_rekey_receive, &server) != thrd_success) {
-			valid = false;
-			break;
-		}
-		if (thrd_create(&ct, rekey_client_thread, &client) != thrd_success) {
-			mock_io_close_c2s(&ctx.io);
-			mock_io_close_s2c(&ctx.io);
-			if (thrd_join(st, NULL) != thrd_success)
-				abort();
-			valid = false;
-			break;
-		}
-		if (thrd_join(ct, NULL) != thrd_success)
-			abort();
-		ret = client.result;
-		if (ret == 0) {
-			uint8_t message[] = {SSH_MSG_SERVICE_REQUEST, 0x42};
-			ret = send_packet(ctx.client, message, sizeof(message), NULL);
-		}
-		if (ret != 0) {
-			mock_io_close_c2s(&ctx.io);
-			mock_io_close_s2c(&ctx.io);
-		}
-		if (thrd_join(st, NULL) != thrd_success)
-			abort();
-		valid = ret == 0 && server.result == 0
-		    && strcmp(dssh_transport_get_kex_name(ctx.client), methods[i]) == 0
-		    && strcmp(dssh_transport_get_kex_name(ctx.server), methods[i]) == 0
-		    && ctx.client->trans.session_id_sz == sizeof(session_id)
-		    && ctx.server->trans.session_id_sz == sizeof(session_id)
-		    && memcmp(ctx.client->trans.session_id, session_id, sizeof(session_id)) == 0
-		    && memcmp(ctx.server->trans.session_id, session_id, sizeof(session_id)) == 0;
-		printf("fixed DH rekey: method=%s session-id=64 valid=%u\n", methods[i], valid ? 1U : 0U);
-	}
-	handshake_cleanup(&ctx);
-	ASSERT_TRUE(valid);
-	return TEST_PASS;
-}
-
-static int
-test_rekey_changes_algorithms(void)
-{
-	struct handshake_ctx ctx;
-	if (handshake_setup_with_cipher(&ctx, true) < 0) {
-		handshake_cleanup(&ctx);
-		return TEST_FAIL;
-	}
-	int client_result = 0;
-	int server_result = 0;
-	bool changed = true;
-	for (unsigned round = 0; round < 2; round++) {
-		const char *mac_name = ctx.client->trans.mac_c2s_selected->digest_size == 32
-		    ? "hmac-sha2-512" : "hmac-sha2-256";
-		const char *cipher_name = round == 0 ? "aes128-cbc" : "aes256-ctr";
-		const char *macs[] = { mac_name };
-		const char *ciphers[] = { cipher_name };
-		ASSERT_OK(dssh_session_set_mac_filter(ctx.client, macs, 1));
-		ASSERT_OK(dssh_session_set_mac_filter(ctx.server, macs, 1));
-		ASSERT_OK(dssh_session_set_enc_filter(ctx.client, ciphers, 1));
-		ASSERT_OK(dssh_session_set_enc_filter(ctx.server, ciphers, 1));
-		struct rekey_thread_arg ca = { &ctx, -1 };
-		struct rekey_thread_arg sa = { &ctx, -1 };
-		thrd_t ct, st;
-		ASSERT_THRD_CREATE(&ct, rekey_client_thread, &ca);
-		ASSERT_THRD_CREATE(&st, rekey_server_recv_thread, &sa);
-		thrd_join(ct, NULL);
-		client_result = ca.result;
-		if (client_result == 0) {
-			uint8_t message[] = { SSH_MSG_SERVICE_REQUEST, 0x42 };
-			client_result = send_packet(ctx.client, message, sizeof(message), NULL);
-		}
-		if (client_result < 0) {
-			mock_io_close_c2s(&ctx.io);
-			mock_io_close_s2c(&ctx.io);
-		}
-		thrd_join(st, NULL);
-		server_result = sa.result;
-		if (client_result < 0 || server_result < 0)
-			break;
-		changed = changed
-		    && strcmp(dssh_transport_get_mac_name(ctx.client, DSSH_CLIENT_TO_SERVER), mac_name) == 0
-		    && strcmp(dssh_transport_get_mac_name(ctx.server, DSSH_CLIENT_TO_SERVER), mac_name) == 0
-		    && strcmp(dssh_transport_get_enc_name(ctx.client, DSSH_CLIENT_TO_SERVER), cipher_name) == 0
-		    && strcmp(dssh_transport_get_enc_name(ctx.server, DSSH_CLIENT_TO_SERVER), cipher_name) == 0;
-	}
-	handshake_cleanup(&ctx);
-	ASSERT_EQ(client_result, 0);
-	ASSERT_EQ(server_result, 0);
-	ASSERT_TRUE(changed);
-	return TEST_PASS;
-}
+#include "transport_transition_cases.h"
 
 static int
 boundary_tx(uint8_t *buf, size_t bufsz, dssh_session sess, void *cbdata)
@@ -8898,7 +8773,7 @@ static struct dssh_test_entry tests[] = {
 	{ "rekey/owned_roundtrip", test_rekey_owned_roundtrip },
 	{ "rekey/sequence_oracle", test_rekey_sequence_oracle },
 #if defined(DSSH_TRANSPORT_REKEY_CONTROLS)
-	{ "fixture/ownership", test_transport_rekey_ownership },
+	{ "fixture/ownership", test_transport_rekey_selected_ownership },
 #elif defined(DSSH_TRANSPORT_PAIR_CONTROLS)
 	{ "fixture/ownership", test_transport_pair_ownership },
 #endif
@@ -9352,7 +9227,7 @@ main(int argc, char **argv)
 			return 2;
 		unsigned phase = (unsigned)(argv[2][0] - '0');
 #ifdef DSSH_TRANSPORT_REKEY_CONTROLS
-		return transport_rekey_assertion_control(phase);
+		return transport_rekey_selected_assertion_control(phase);
 #else
 		return transport_pair_assertion_control(phase);
 #endif

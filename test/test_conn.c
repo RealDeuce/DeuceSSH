@@ -43,6 +43,8 @@ static _Thread_local int (*setup_tx_test_hook)(dssh_session sess);
 static _Thread_local int (*accept_phase_test_hook)(dssh_session sess);
 static _Thread_local int (*window_tx_return_test_hook)(dssh_session sess);
 static bool window_test_gather;
+static int (*conn_mac_registration)(void);
+static _Thread_local int (*gather_vector_test_hook)(const struct dssh_tx_iov *, size_t, dssh_session);
 
 static int
 mock_tx_dispatch(uint8_t *buf, size_t bufsz,
@@ -72,6 +74,11 @@ static int
 window_mock_gather(const struct dssh_tx_iov *iov, size_t count,
     dssh_session sess, void *cbdata)
 {
+	if (gather_vector_test_hook != NULL) {
+		int ret = gather_vector_test_hook(iov, count, sess);
+		if (ret != 0)
+			return ret;
+	}
 	for (size_t i = 0; i < count; i++) {
 		/* The library owns mutable packet storage; the fixture only reads it. */
 		uint8_t *bytes = (uint8_t *)(uintptr_t)iov[i].base;
@@ -155,7 +162,7 @@ register_all_algorithms(void)
 	res = dssh_register_aes256_ctr();
 	if (res < 0)
 		return res;
-	res = test_register_mac_algos();
+	res = conn_mac_registration != NULL ? conn_mac_registration() : test_register_mac_algos();
 	if (res < 0)
 		return res;
 	res = dssh_test_register_optional_comp();
@@ -8012,8 +8019,10 @@ test_compression_window_rekey(void)
 #include "conn_storage_cases.h"
 #include "conn_consume_cases.h"
 #include "conn_eof_cases.h"
+#include "gather_full_cases.h"
 
 static struct dssh_test_entry tests[] = {
+	{ "gather/full_batch_sha512", test_gather_full_batch },
 	{ "release/native_eof_probe", test_native_eof_probe },
 	{ "release/native_eof_wire", test_native_eof_wire },
 	{ "release/consume_owner_close", test_consume_owner_close },

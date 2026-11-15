@@ -1732,6 +1732,16 @@ set(AUTH_TESTS
 dssh_add_individual_tests(dssh_test_auth dssh_auth AUTH_TESTS)
 
 dssh_add_test(conn test_conn.c)
+foreach(compression IN ITEMS none test-growth zlib)
+	if(compression STREQUAL "zlib" AND NOT ZLIB_FOUND)
+		continue()
+	endif()
+	dssh_add_output_test(dssh_gather_full_${compression} dssh_test_conn
+		"1 tests: 1 passed, 0 failed, 0 skipped" --exact gather/full_batch_sha512)
+	set_tests_properties(dssh_gather_full_${compression} PROPERTIES
+		ENVIRONMENT "DSSH_TEST_KEX=curve25519;DSSH_TEST_KEY=ed25519;DSSH_TEST_MAC=hmac512;DSSH_TEST_COMPRESSION=${compression};${DSSH_TEST_KEY_ENV}"
+		FIXTURES_REQUIRED "dssh_cached_keys;dssh_internal_test_layout" TIMEOUT 120)
+endforeach()
 foreach(part IN ITEMS admission resize)
 	dssh_add_output_test(dssh_conn_tx_slot_${part} dssh_test_conn
 		"1 tests: 1 passed, 0 failed, 0 skipped" --exact release/tx_slot_${part})
@@ -3073,8 +3083,10 @@ foreach(test_name IN LISTS dssh_registered_tests)
 	get_test_property("${test_name}" ENVIRONMENT test_environment)
 	if(NOT test_name STREQUAL "dssh_test_keys"
 			AND "${test_environment}" MATCHES "DSSH_TEST_RSA_KEY=")
-		set_tests_properties("${test_name}" PROPERTIES
-			FIXTURES_REQUIRED dssh_cached_keys)
+		get_test_property("${test_name}" FIXTURES_REQUIRED test_fixtures)
+		if(NOT "dssh_cached_keys" IN_LIST test_fixtures)
+			set_property(TEST "${test_name}" APPEND PROPERTY FIXTURES_REQUIRED dssh_cached_keys)
+		endif()
 	endif()
 endforeach()
 

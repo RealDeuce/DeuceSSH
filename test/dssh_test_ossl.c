@@ -371,6 +371,9 @@ static atomic_int join_call_num;
 static _Thread_local mtx_t *reject_mutex_once;
 static _Thread_local mtx_t *rejected_mutex;
 static _Thread_local unsigned rejected_unlocks;
+static _Thread_local mtx_t *trylock_mutex;
+static _Thread_local bool trylock_fail_once;
+static _Thread_local struct dssh_test_trylock_stats trylock_stats;
 static _Thread_local mtx_t *unlock_fail_mutex;
 static _Thread_local unsigned unlock_fail_skip;
 static _Thread_local bool unlock_fail_release_real;
@@ -433,6 +436,9 @@ dssh_test_ossl_reset(void)
 	reject_mutex_once = NULL;
 	rejected_mutex = NULL;
 	rejected_unlocks = 0;
+	trylock_mutex = NULL;
+	trylock_fail_once = false;
+	trylock_stats = (struct dssh_test_trylock_stats){0};
 	unlock_fail_mutex = NULL;
 	wait_probe = NULL;
 	dssh_test_wait_observe_begin(NULL, NULL);
@@ -502,6 +508,9 @@ dssh_test_thrd_reset(void)
 	reject_mutex_once = NULL;
 	rejected_mutex = NULL;
 	rejected_unlocks = 0;
+	trylock_mutex = NULL;
+	trylock_fail_once = false;
+	trylock_stats = (struct dssh_test_trylock_stats){0};
 	unlock_fail_mutex = NULL;
 	wait_probe = NULL;
 	dssh_test_wait_observe_begin(NULL, NULL);
@@ -512,6 +521,22 @@ dssh_test_thrd_reset(void)
 	wake_fail_condition = NULL;
 	wake_fail_remaining = 0;
 	wake_fail_hits = 0;
+}
+
+void
+dssh_test_trylock_begin(mtx_t *mutex, bool fail_once)
+{
+	trylock_mutex = mutex;
+	trylock_fail_once = fail_once;
+	trylock_stats = (struct dssh_test_trylock_stats){0};
+}
+
+struct dssh_test_trylock_stats
+dssh_test_trylock_end(void)
+{
+	trylock_mutex = NULL;
+	trylock_fail_once = false;
+	return trylock_stats;
 }
 
 void
@@ -1230,6 +1255,33 @@ dssh_test_mtx_lock(mtx_t *mtx)
 	int ret = mtx_lock(mtx);
 	if (ret == thrd_success && mtx == ownership_mutex)
 		ownership_held = true;
+	if (ret == thrd_success && mtx == rejected_mutex)
+		rejected_mutex = NULL;
+	return ret;
+}
+
+int
+dssh_test_mtx_trylock(mtx_t *mtx)
+{
+	bool watched = mtx == trylock_mutex;
+	int ret;
+	if (watched && trylock_stats.attempts < UINT_MAX)
+		trylock_stats.attempts++;
+	if (watched && trylock_fail_once) {
+		trylock_fail_once = false;
+		trylock_stats.injected = true;
+		ret = thrd_error;
+	}
+	else {
+		if (watched && trylock_stats.native_calls < UINT_MAX)
+			trylock_stats.native_calls++;
+		ret = mtx_trylock(mtx);
+	}
+	if (watched) {
+		trylock_stats.last_result = ret;
+		if (ret != thrd_success)
+			rejected_mutex = mtx;
+	}
 	if (ret == thrd_success && mtx == rejected_mutex)
 		rejected_mutex = NULL;
 	return ret;

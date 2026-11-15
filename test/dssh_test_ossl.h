@@ -88,6 +88,17 @@ int dssh_test_join_count(void);
  * fixture must never invoke a native unlock on an unowned mutex. */
 void dssh_test_mtx_reject_once(mtx_t *mutex);
 unsigned dssh_test_mtx_rejected_unlocks(void);
+/* Current-thread, named-mutex trylock control. Default calls remain native and
+ * do not consume the general lock countdown. Failure is before acquisition;
+ * a native observation can establish actual contention on a valid mutex. */
+struct dssh_test_trylock_stats {
+	unsigned attempts;
+	unsigned native_calls;
+	int last_result;
+	bool injected;
+};
+void dssh_test_trylock_begin(mtx_t *mutex, bool fail_once);
+struct dssh_test_trylock_stats dssh_test_trylock_end(void);
 /* Fatal-path control, independent of the recoverable operation countdown.
  * skip is the number of successful matching releases before reporting failure.
  * release_real distinguishes retained ownership from error after real release. */

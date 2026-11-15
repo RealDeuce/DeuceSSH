@@ -216,6 +216,7 @@ int dssh_test_thrd_create(thrd_t *thr, thrd_start_t func, void *arg);
  #define thrd_create(t, f, a) dssh_test_thrd_create(t, f, a)
 
 int dssh_test_mtx_lock(mtx_t *mtx);
+int dssh_test_mtx_trylock(mtx_t *mtx);
 int dssh_test_mtx_unlock(mtx_t *mtx);
 int dssh_test_cnd_wait(cnd_t *cond, mtx_t *mtx);
 int dssh_test_cnd_timedwait(cnd_t *cond, mtx_t *mtx, const struct timespec *ts);
@@ -224,6 +225,7 @@ int dssh_test_cnd_signal(cnd_t *cond);
 int dssh_test_thrd_join(thrd_t thr, int *res);
 
  #define mtx_lock(m)            dssh_test_mtx_lock(m)
+ #define mtx_trylock(m)         dssh_test_mtx_trylock(m)
  #define mtx_unlock(m)          dssh_test_mtx_unlock(m)
  #define cnd_wait(c, m)         dssh_test_cnd_wait(c, m)
  #define cnd_timedwait(c, m, t) dssh_test_cnd_timedwait(c, m, t)

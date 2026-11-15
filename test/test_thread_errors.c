@@ -1066,8 +1066,10 @@ test_limit_acquire(void)
 
 #include "termination_wakeup_cases.h"
 #include "condition_wait_cases.h"
+#include "log_queue_cases.h"
 
 static struct dssh_test_entry tests[] = {
+	{ "thrd/log_queue_outcomes", test_log_queue_outcomes },
 	{ "thrd/setup_ownership", test_setup_ownership },
 	{ "thrd/assertion_ownership", test_assertion_ownership },
 	{ "thrd/wakeup_setup_ownership", test_wakeup_setup_ownership },

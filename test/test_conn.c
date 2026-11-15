@@ -777,6 +777,7 @@ open_exec_channel(struct conn_ctx *owner, struct open_exec_ctx *ctx)
 #include "conn_lifecycle_fixture.h"
 #include "conn_storage_fixture.h"
 #include "conn_consume_fixture.h"
+#include "conn_eof_fixture.h"
 
 /* ================================================================
  * Helper: open a shell channel concurrently
@@ -8010,8 +8011,11 @@ test_compression_window_rekey(void)
 #include "conn_lifecycle_cases.h"
 #include "conn_storage_cases.h"
 #include "conn_consume_cases.h"
+#include "conn_eof_cases.h"
 
 static struct dssh_test_entry tests[] = {
+	{ "release/native_eof_probe", test_native_eof_probe },
+	{ "release/native_eof_wire", test_native_eof_wire },
 	{ "release/consume_owner_close", test_consume_owner_close },
 	{ "release/consume_owner_reservation", test_consume_owner_reservation },
 	{ "release/consume_owner_mode", test_consume_owner_mode },

@@ -2125,6 +2125,17 @@ dssh_add_output_test(dssh_conn_consume_capture_bounds dssh_test_conn
 set_tests_properties(dssh_conn_consume_capture_bounds PROPERTIES TIMEOUT 120
 	ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys)
 
+foreach(part IN ITEMS probe wire)
+	dssh_add_output_test(dssh_conn_native_eof_${part} dssh_test_conn
+		"1 tests: 1 passed, 0 failed, 0 skipped" --exact release/native_eof_${part})
+	set_tests_properties(dssh_conn_native_eof_${part} PROPERTIES TIMEOUT 120
+		ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys)
+endforeach()
+dssh_add_output_test(dssh_conn_native_eof_wire_growth dssh_test_conn
+	"1 tests: 1 passed, 0 failed, 0 skipped" --exact release/native_eof_wire)
+set_tests_properties(dssh_conn_native_eof_wire_growth PROPERTIES TIMEOUT 120
+	ENVIRONMENT "${DSSH_TEST_KEY_ENV};DSSH_TEST_COMPRESSION=test-growth" FIXTURES_REQUIRED dssh_cached_keys)
+
 # Actual SIGABRT checks run in a fresh exec, with no inherited library workers.
 if(UNIX)
 	add_executable(dssh_test_fatal_driver test_fatal_driver.c)

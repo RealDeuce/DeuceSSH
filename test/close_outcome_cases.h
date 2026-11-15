@@ -94,19 +94,20 @@ struct close_outcome_wire {
 };
 
 static bool
-close_outcome_drain(dssh_session peer, struct close_outcome_wire *wire)
+close_outcome_drain(dssh_session peer, struct close_outcome_wire *wire,
+    struct mock_io_pipe *pipe, unsigned expected)
 {
-	/* The sender's native write end has been closed. Absence is EOF, not an
-	 * empty-read timeout. Read at most the complete three-packet sequence. */
-	for (unsigned i = 0; i < 4; i++) {
+	if (peer == NULL || wire == NULL || pipe == NULL || expected > 3)
+		return false;
+	/* Decode only the expected complete packets. A parser error is failure;
+	 * the final native probe establishes that no further byte remains. */
+	for (unsigned i = 0; i < expected; i++) {
 		uint8_t type;
 		uint8_t *packet;
 		size_t length;
 		int ret = recv_packet(peer, &type, &packet, &length);
-		if (ret < 0) {
-			wire->end = ret;
-			return ret == -1;
-		}
+		if (ret != 0)
+			return false;
 		if (length < 5 || DSSH_GET_U32(packet + 1) != 42)
 			return false;
 		if (type == SSH_MSG_CHANNEL_REQUEST && length == 25
@@ -122,7 +123,8 @@ close_outcome_drain(dssh_session peer, struct close_outcome_wire *wire)
 		else
 			return false;
 	}
-	return false;
+	wire->end = conn_native_eof(pipe);
+	return wire->end == 0;
 }
 
 static const char *const close_outcome_names[] = {
@@ -236,11 +238,14 @@ close_outcome_run(struct conn_ctx *ctx, unsigned kind, unsigned role, unsigned g
 	else
 		mock_io_close_s2c_write(&ctx->io);
 	struct close_outcome_wire wire = {0};
-	bool valid = close_outcome_drain(ctx->client, &wire);
 	bool expect_status = role == 0 && (kind == 0 || kind == 1 || kind == 7
 	    || kind == 8 || kind == 10 || kind == 16);
 	bool expect_eof = kind <= 5 || kind == 8 || kind == 10 || kind == 11 || kind == 16;
 	bool expect_close = kind <= 5 || kind == 10 || kind == 11 || kind == 16;
+	unsigned expected_packets = (expect_status ? 1U : 0U) + (expect_eof ? 1U : 0U)
+	    + (expect_close ? 1U : 0U);
+	struct mock_io_pipe *pipe = ctx->server->trans.client ? &ctx->io.c2s : &ctx->io.s2c;
+	bool valid = close_outcome_drain(ctx->client, &wire, pipe, expected_packets);
 	bool expect_terminated = (kind >= 6 && kind <= 9) || kind == 12 || kind == 13
 	    || kind == 14 || kind == 16 || kind == 17;
 	uint32_t expected_code = kind == 0 ? 0 : kind == 1 ? UINT32_MAX : 42;

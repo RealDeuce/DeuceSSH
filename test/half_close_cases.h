@@ -318,19 +318,17 @@ half_close_failure_run(struct conn_ctx *ctx, unsigned role, unsigned gather, boo
 	dssh_test_thrd_reset();
 	bool published = half_close_sent(ch);
 	int repeated = dssh_chan_shutwr(ch);
-	/* End native output after the operation. Queued packet bytes still drain,
-	 * while absence of a packet is a definite native EOF, never a timeout. */
+	/* End native output, decode any expected EOF packet, then require actual
+	 * native EOF rather than accepting a negative parser status. */
 	if (ctx->server->trans.client)
 		mock_io_close_c2s_write(&ctx->io);
 	else
 		mock_io_close_s2c_write(&ctx->io);
 	bool wire = !publication || peer_id_receive_control(ctx->client, SSH_MSG_CHANNEL_EOF, 5, 41);
-	uint8_t type;
-	uint8_t *payload;
-	size_t length;
-	int end = recv_packet(ctx->client, &type, &payload, &length);
+	struct mock_io_pipe *pipe = ctx->server->trans.client ? &ctx->io.c2s : &ctx->io.s2c;
+	int end = conn_native_eof(pipe);
 	bool valid = first == (publication ? DSSH_ERROR_TERMINATED : DSSH_ERROR_INIT)
-	    && !published && repeated == DSSH_ERROR_TERMINATED && wire && end == -1
+	    && !published && repeated == DSSH_ERROR_TERMINATED && wire && end == 0
 	    && unowned_unlocks == 0 && !atomic_load(&ctx->server->trans.tx_owner_active)
 	    && dssh_session_is_terminated(ctx->server);
 	ASSERT_TRUE(printf("half_close_%s role=%u gather=%u first=%d published=%u repeated=%d wire=%u end=%d unowned_unlocks=%u valid=%u\n",

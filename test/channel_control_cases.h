@@ -207,11 +207,7 @@ channel_control_failure_run(struct conn_ctx *ctx, unsigned operation, bool acqui
 	ASSERT_FALSE(atomic_load(&ctx->server->trans.tx_owner_active));
 	ASSERT_EQ(channel_control_call(ch, operation), DSSH_ERROR_TERMINATED);
 	mock_io_close_c2s_write(&ctx->io);
-	uint8_t type;
-	uint8_t *packet;
-	size_t length;
-	int end = recv_packet(ctx->client, &type, &packet, &length);
-	ASSERT_EQ(end, -1);
+	ASSERT_EQ(conn_native_eof(&ctx->io.c2s), 0);
 	printf("channel_control_failure operation=%u acquisition=%u result=%d no_packet=1 no_unowned_unlock=1\n",
 	    operation, acquisition ? 1U : 0U, result);
 	return TEST_PASS;

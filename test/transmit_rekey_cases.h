@@ -12,6 +12,7 @@ enum transmit_rekey_case {
 struct transmit_rekey_fixture {
 	struct conn_ctx ctx;
 	struct conn_rx_gate gate;
+	struct flow_fixture flow;
 	dssh_session peer;
 	enum transmit_rekey_case mode;
 	atomic_bool peer_done;
@@ -29,7 +30,7 @@ transmit_rekey_debug(bool display, const uint8_t *message, size_t len, void *opa
 {
 	struct transmit_rekey_fixture *fixture = opaque;
 	unsigned index = atomic_fetch_add(&fixture->replayed, 1);
-	if (index != 0 || !display || len != 1 || message[0] != 'd'
+	if (index != 0 || !display || len != 1 || message == NULL || message[0] != 'd'
 	    || atomic_load(&fixture->gate.sess->trans.rekey_in_progress))
 		atomic_store(&fixture->failure, DSSH_ERROR_INVALID);
 }
@@ -51,10 +52,10 @@ transmit_rekey_global(const uint8_t *name, size_t name_len, bool want_reply,
 	(void)payload;
 	(void)payload_len;
 	struct transmit_rekey_fixture *fixture = opaque;
-	if (name_len == 2 && memcmp(name, "id", 2) == 0)
+	if (name_len == 2 && name != NULL && memcmp(name, "id", 2) == 0)
 		return DSSH_ERROR_REJECTED;
 	unsigned index = atomic_fetch_add(&fixture->replayed, 1);
-	if (!want_reply || name_len != 1 || (index != 1 && index != 3)
+	if (!want_reply || name_len != 1 || name == NULL || (index != 1 && index != 3)
 	    || name[0] != (index == 1 ? 'a' : 'b')
 	    || atomic_load(&fixture->gate.sess->trans.rekey_in_progress))
 		atomic_store(&fixture->failure, DSSH_ERROR_INVALID);
@@ -97,7 +98,7 @@ transmit_rekey_receive_offer(dssh_session peer)
 	uint8_t *payload;
 	size_t len;
 	int ret = recv_packet_raw(peer, &type, &payload, &len);
-	if (ret < 0)
+	if (ret != 0)
 		return ret;
 	if (type != SSH_MSG_KEXINIT || len < 17 || peer->trans.peer_kexinit != NULL)
 		return DSSH_ERROR_PARSE;
@@ -162,13 +163,13 @@ transmit_rekey_prepare(struct transmit_rekey_fixture *fixture)
 	ASSERT_TRUE(compression_fixture_selected(fixture->ctx.client, fixture->ctx.server));
 	dssh_kex method = atomic_load(&sender->trans.kex_selected);
 	ASSERT_TRUE(method != NULL && strcmp(method->name, test_kex_algo_name()) == 0);
-	ASSERT_OK(dssh_session_set_log_cb(sender, transmit_rekey_log, fixture));
-	ASSERT_OK(dssh_session_set_debug_cb(sender, transmit_rekey_debug, fixture));
-	ASSERT_OK(dssh_session_set_unimplemented_cb(sender, transmit_rekey_unimplemented, fixture));
-	ASSERT_OK(dssh_session_set_global_request_cb(sender, transmit_rekey_global, fixture));
-	ASSERT_OK(dssh_session_start(sender));
+	ASSERT_EQ(dssh_session_set_log_cb(sender, transmit_rekey_log, fixture), 0);
+	ASSERT_EQ(dssh_session_set_debug_cb(sender, transmit_rekey_debug, fixture), 0);
+	ASSERT_EQ(dssh_session_set_unimplemented_cb(sender, transmit_rekey_unimplemented, fixture), 0);
+	ASSERT_EQ(dssh_session_set_global_request_cb(sender, transmit_rekey_global, fixture), 0);
+	ASSERT_EQ(dssh_session_start(sender), 0);
 	ASSERT_TRUE(dssh_test_wait_bool(&fixture->gate.empty, true));
-	ASSERT_OK(tx_acquire(sender, SSH_MSG_IGNORE));
+	ASSERT_EQ(tx_acquire(sender, SSH_MSG_IGNORE), 0);
 	if (fixture->mode == TRANSMIT_REKEY_BYTES) {
 		dssh_enc cipher = sender->trans.client ? sender->trans.enc_c2s_active : sender->trans.enc_s2c_active;
 		if (cipher == NULL || cipher->bytes_per_key <= 1) {
@@ -181,6 +182,7 @@ transmit_rekey_prepare(struct transmit_rekey_fixture *fixture)
 		atomic_store(&sender->trans.tx_since_rekey, DSSH_REKEY_SOFT_LIMIT - 1);
 	}
 	tx_unlock_with_slots(sender);
+	ASSERT_TRUE(flow_checkpoint(FLOW_REKEY_PREPARED));
 	return TEST_PASS;
 }
 
@@ -203,18 +205,18 @@ transmit_rekey_success(struct transmit_rekey_fixture *fixture)
 	dssh_session peer = fixture->peer;
 	if (fixture->mode == TRANSMIT_REKEY_INFLIGHT)
 		ASSERT_TRUE(transmit_rekey_pipeline(peer));
-	ASSERT_OK(send_packet(sender, transmit_rekey_ignore, sizeof(transmit_rekey_ignore), NULL));
+	ASSERT_EQ(send_packet(sender, transmit_rekey_ignore, sizeof(transmit_rekey_ignore), NULL), 0);
 	ASSERT_TRUE(atomic_load(&sender->trans.rekey_in_progress));
 	ASSERT_EQ(atomic_load(&sender->trans.rekey_read), DSSH_REKEY_READ_CLAIMED);
 	uint8_t type;
 	uint8_t *payload;
 	size_t len;
-	ASSERT_OK(recv_packet_raw(peer, &type, &payload, &len));
+	ASSERT_EQ(recv_packet_raw(peer, &type, &payload, &len), 0);
 	ASSERT_EQ(type, SSH_MSG_IGNORE);
 	ASSERT_EQ_U(len, sizeof(transmit_rekey_ignore));
 
-	thrd_t thread;
-	ASSERT_EQ(thrd_create(&thread, transmit_rekey_peer_worker, fixture), thrd_success);
+	ASSERT_EQ(channel_worker_start(&fixture->flow.workers, 0, transmit_rekey_peer_worker, fixture), 0);
+	ASSERT_TRUE(flow_checkpoint(FLOW_REKEY_STARTED));
 	bool valid = fixture->mode != TRANSMIT_REKEY_SIMULTANEOUS
 	    || dssh_test_wait_bool(&fixture->peer_offer, true);
 	atomic_store(&fixture->gate.resume, true);
@@ -225,11 +227,9 @@ transmit_rekey_success(struct transmit_rekey_fixture *fixture)
 		mock_io_close_c2s(&fixture->ctx.io);
 		mock_io_close_s2c(&fixture->ctx.io);
 	}
-	int ret;
-	if (thrd_join(thread, &ret) != thrd_success)
-		abort();
+	channel_worker_join(&fixture->flow.workers, 0);
 	ASSERT_TRUE(valid);
-	ASSERT_OK(ret);
+	ASSERT_EQ(fixture->flow.workers.results[0], 0);
 	ASSERT_FALSE(atomic_load(&sender->trans.rekey_in_progress));
 	ASSERT_TRUE(atomic_load(&sender->trans.tx_since_rekey) < DSSH_REKEY_SOFT_LIMIT);
 	ASSERT_EQ_U(atomic_load(&fixture->replayed), fixture->mode == TRANSMIT_REKEY_INFLIGHT ? 4 : 0);
@@ -263,7 +263,7 @@ transmit_rekey_failure_run(struct transmit_rekey_fixture *fixture)
 	uint8_t type;
 	uint8_t *payload;
 	size_t len;
-	ASSERT_OK(recv_packet_raw(fixture->peer, &type, &payload, &len));
+	ASSERT_EQ(recv_packet_raw(fixture->peer, &type, &payload, &len), 0);
 	ASSERT_EQ(type, SSH_MSG_IGNORE);
 	return TEST_PASS;
 }
@@ -287,17 +287,19 @@ static int
 transmit_rekey_exchange_failure(struct transmit_rekey_fixture *fixture)
 {
 	dssh_session sender = fixture->gate.sess;
-	ASSERT_OK(send_packet(sender, transmit_rekey_ignore, sizeof(transmit_rekey_ignore), NULL));
+	ASSERT_EQ(send_packet(sender, transmit_rekey_ignore, sizeof(transmit_rekey_ignore), NULL), 0);
 	ASSERT_TRUE(atomic_load(&sender->trans.rekey_in_progress));
 	uint_fast32_t sent = atomic_load(&sender->trans.tx_since_rekey);
 	struct transmit_rekey_waiter waiter = {.sess = sender};
 	atomic_init(&waiter.done, false);
 	atomic_bool *waiting = dssh_test_thrd_watch_condition(&sender->trans.rekey_cnd);
-	thrd_t thread;
-	bool started = thrd_create(&thread, transmit_rekey_waiter_send, &waiter) == thrd_success;
+	fixture->flow.watching = true;
+	ASSERT_EQ(channel_worker_start(&fixture->flow.workers, 0, transmit_rekey_waiter_send, &waiter), 0);
+	ASSERT_TRUE(flow_checkpoint(FLOW_REKEY_STARTED));
+	ASSERT_TRUE(conn_actor_waiting(waiting, &sender->trans.tx_mtx));
+	ASSERT_TRUE(flow_checkpoint(FLOW_REKEY_WAITING));
 	const uint8_t malformed = SSH_MSG_KEXINIT;
-	bool valid = started && dssh_test_wait_bool(waiting, true)
-	    && send_packet(fixture->peer, &malformed, 1, NULL) == 0;
+	bool valid = send_packet(fixture->peer, &malformed, 1, NULL) == 0;
 	atomic_store(&fixture->gate.resume, true);
 	valid = valid && dssh_test_wait_bool(&waiter.done, true)
 	    && dssh_test_wait_bool(&sender->demux_running, false);
@@ -306,16 +308,22 @@ transmit_rekey_exchange_failure(struct transmit_rekey_fixture *fixture)
 		mock_io_close_c2s(&fixture->ctx.io);
 		mock_io_close_s2c(&fixture->ctx.io);
 	}
-	int result = DSSH_ERROR_INIT;
-	if (started && thrd_join(thread, &result) != thrd_success)
-		abort();
+	channel_worker_join(&fixture->flow.workers, 0);
 	dssh_test_thrd_watch_condition(NULL);
+	fixture->flow.watching = false;
 	ASSERT_TRUE(valid);
-	ASSERT_EQ(result, DSSH_ERROR_TERMINATED);
+	ASSERT_EQ(fixture->flow.workers.results[0], DSSH_ERROR_TERMINATED);
 	ASSERT_EQ(atomic_load(&fixture->failure), DSSH_ERROR_PARSE);
 	ASSERT_EQ_U(atomic_load(&sender->trans.tx_since_rekey), sent);
 	ASSERT_FALSE(atomic_load(&sender->trans.tx_owner_active));
 	return TEST_PASS;
+}
+
+static void
+transmit_rekey_release(void *data)
+{
+	struct transmit_rekey_fixture *fixture = data;
+	atomic_store(&fixture->gate.resume, true);
 }
 
 static int
@@ -326,7 +334,7 @@ transmit_rekey_run(enum transmit_rekey_case mode)
 	window_test_gather = reverse;
 	int setup = conn_setup_mode(&fixture.ctx, false);
 	window_test_gather = false;
-	ASSERT_OK(setup);
+	ASSERT_EQ(setup, 0);
 	fixture.gate.sess = reverse ? fixture.ctx.server : fixture.ctx.client;
 	fixture.peer = reverse ? fixture.ctx.client : fixture.ctx.server;
 	atomic_init(&fixture.gate.empty, false);
@@ -336,6 +344,7 @@ transmit_rekey_run(enum transmit_rekey_case mode)
 	atomic_init(&fixture.replayed, 0);
 	atomic_init(&fixture.failure, 0);
 	conn_rx_gate = &fixture.gate;
+	flow_init(&fixture.flow, &fixture.ctx, transmit_rekey_release, &fixture);
 	int ret = transmit_rekey_prepare(&fixture);
 	if (ret == TEST_PASS) {
 		if (mode == TRANSMIT_REKEY_PEER_FAILURE)
@@ -346,6 +355,7 @@ transmit_rekey_run(enum transmit_rekey_case mode)
 			ret = transmit_rekey_success(&fixture);
 	}
 	atomic_store(&fixture.gate.resume, true);
+	flow_finish(&fixture.flow);
 	conn_cleanup(&fixture.ctx);
 	conn_rx_gate = NULL;
 	return ret;
@@ -354,7 +364,7 @@ transmit_rekey_run(enum transmit_rekey_case mode)
 static int
 test_transmit_rekey_threshold(void)
 {
-	ASSERT_OK(transmit_rekey_run(TRANSMIT_REKEY_PACKETS));
+	ASSERT_EQ(transmit_rekey_run(TRANSMIT_REKEY_PACKETS), TEST_PASS);
 	return transmit_rekey_run(TRANSMIT_REKEY_BYTES);
 }
 
@@ -373,7 +383,7 @@ test_transmit_rekey_simultaneous(void)
 static int
 test_transmit_rekey_failure(void)
 {
-	ASSERT_OK(transmit_rekey_run(TRANSMIT_REKEY_ALLOC_FAILURE));
-	ASSERT_OK(transmit_rekey_run(TRANSMIT_REKEY_IO_FAILURE));
+	ASSERT_EQ(transmit_rekey_run(TRANSMIT_REKEY_ALLOC_FAILURE), TEST_PASS);
+	ASSERT_EQ(transmit_rekey_run(TRANSMIT_REKEY_IO_FAILURE), TEST_PASS);
 	return transmit_rekey_run(TRANSMIT_REKEY_PEER_FAILURE);
 }

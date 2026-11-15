@@ -33,7 +33,8 @@ tx_slot_foreign_owner(struct conn_ctx *ctx, bool credit)
 	bool valid = ret == DSSH_ERROR_INVALID && owned
 	    && !atomic_load(&ctx->client->trans.tx_owner_active)
 	    && !dssh_session_is_terminated(ctx->server);
-	printf("tx_slot_foreign credit=%d result=%d owner_retained=%d\n", credit, ret, owned);
+	if (printf("tx_slot_foreign credit=%d result=%d owner_retained=%d\n", credit, ret, owned) < 0)
+		return false;
 	return valid && tx_slot_ordinary_reply(ctx->client, ctx->server)
 	    && tx_slot_ordinary_reply(ctx->server, ctx->client);
 }
@@ -65,7 +66,8 @@ tx_slot_owned_wait(struct conn_ctx *ctx)
 	    && atomic_load(&slot->ready) && tx_owner_is_current(sess)
 	    && !dssh_session_is_terminated(sess);
 	tx_unlock_with_slots(sess);
-	printf("tx_slot_owner_wait queued=%d result=%d waits=%u\n", queued, ret, waits);
+	if (printf("tx_slot_owner_wait queued=%d result=%d waits=%u\n", queued, ret, waits) < 0)
+		return false;
 	return valid && !atomic_load(&slot->ready) && tx_slot_receive_reply(ctx->server, first);
 }
 
@@ -88,7 +90,8 @@ tx_slot_capacity(struct conn_ctx *ctx)
 	if (valid)
 		valid = send_to_slot(sess, slot, &reply, 1) == 0 && atomic_load(&slot->ready);
 	tx_unlock_with_slots(sess);
-	printf("tx_slot_capacity result=%d published=%d\n", ret, ready);
+	if (printf("tx_slot_capacity result=%d published=%d\n", ret, ready) < 0)
+		return false;
 	return valid && !atomic_load(&slot->ready) && tx_slot_receive_reply(ctx->server, reply);
 }
 
@@ -134,12 +137,20 @@ tx_slot_resize_while_waiting(struct conn_ctx *ctx)
 	    || !tx_slot_receive_reply(ctx->server, first)
 	    || tx_acquire(sess, SSH_MSG_IGNORE) != 0)
 		return false;
+	struct flow_fixture flow;
+	flow_init(&flow, ctx, NULL, NULL);
+	flow.tx.session = sess;
+	flow.tx.held = true;
 	bool valid = send_to_slot(sess, slot, &first, 1) == 0 && atomic_load(&slot->ready);
 	struct tx_slot_sender sender = {.sess = sess, .reply = SSH_MSG_REQUEST_SUCCESS};
 	atomic_bool *waited = dssh_test_thrd_watch_condition(&sess->trans.tx_slot_cnd);
-	thrd_t worker;
-	bool started = valid && thrd_create(&worker, tx_slot_send_worker, &sender) == thrd_success;
-	valid = started && dssh_test_wait_bool(waited, true);
+	flow.watching = true;
+	ASSERT_TRUE(valid);
+	ASSERT_EQ(channel_worker_start(&flow.workers, 0, tx_slot_send_worker, &sender), 0);
+	ASSERT_TRUE(flow_checkpoint(FLOW_TX_STARTED));
+	valid = conn_actor_waiting(waited, &sess->trans.tx_queue_mtx);
+	ASSERT_TRUE(valid);
+	ASSERT_TRUE(flow_checkpoint(FLOW_TX_WAITING));
 	if (valid) {
 		/* The owner replaces storage while a real producer waits on the
 		 * occupied slot. The new allocation also fits the active epoch. */
@@ -157,12 +168,9 @@ tx_slot_resize_while_waiting(struct conn_ctx *ctx)
 	}
 	if (!valid)
 		session_set_terminate(sess);
-	tx_unlock_with_slots(sess);
-	int result = DSSH_ERROR_INIT;
-	if (started && thrd_join(worker, &result) != thrd_success)
-		abort();
-	dssh_test_thrd_watch_condition(NULL);
-	return valid && result == 0 && !atomic_load(&slot->ready)
+	callback_release_tx(&flow.tx);
+	flow_finish(&flow);
+	return valid && flow.tx.result == 0 && flow.workers.results[0] == 0 && !atomic_load(&slot->ready)
 	    && tx_slot_receive_reply(ctx->server, first)
 	    && tx_slot_receive_reply(ctx->server, sender.reply);
 }
@@ -203,7 +211,7 @@ tx_slot_refusal_send_requests(void *opaque)
 				return DSSH_ERROR_INIT;
 		}
 		int ret = send_packet(peer->sess, msg, len, NULL);
-		if (ret < 0)
+		if (ret != 0)
 			return ret;
 	}
 	return 0;
@@ -216,7 +224,7 @@ tx_slot_refusal_global(const uint8_t *name, size_t name_len, bool want_reply,
 	(void)payload;
 	(void)len;
 	(void)data;
-	return want_reply && name_len == 1 && name[0] == 'a' ? 0 : DSSH_ERROR_REJECTED;
+	return want_reply && name_len == 1 && name != NULL && name[0] == 'a' ? 0 : DSSH_ERROR_REJECTED;
 }
 
 static bool
@@ -253,32 +261,38 @@ tx_slot_refusal_run(struct conn_ctx *ctx, bool global, enum tx_slot_refusal_mode
     atomic_int *error)
 {
 	dssh_session sess = ctx->server;
-	ASSERT_OK(dssh_session_set_global_request_cb(sess, tx_slot_refusal_global, NULL));
-	ASSERT_OK(dssh_session_set_log_cb(sess, tx_slot_refusal_log, error));
+	ASSERT_EQ(dssh_session_set_global_request_cb(sess, tx_slot_refusal_global, NULL), 0);
+	ASSERT_EQ(dssh_session_set_log_cb(sess, tx_slot_refusal_log, error), 0);
 	ASSERT_TRUE(compression_fixture_selected(ctx->client, sess));
-	ASSERT_OK(dssh_session_start(sess));
-	ASSERT_OK(tx_acquire(sess, SSH_MSG_IGNORE));
+	ASSERT_EQ(dssh_session_start(sess), 0);
+	struct flow_fixture flow;
+	flow_init(&flow, ctx, NULL, NULL);
+	ASSERT_EQ(tx_acquire(sess, SSH_MSG_IGNORE), 0);
+	flow.tx.session = sess;
+	flow.tx.held = true;
 	struct dssh_tx_slot *slot = global ? &sess->trans.global_reply_slot : &sess->trans.open_fail_slot;
 	uint_fast32_t count = atomic_load(&sess->trans.tx_since_rekey);
 	uint32_t seq = sess->trans.tx_seq;
 	struct tx_slot_refusal_peer peer = {.sess = ctx->client, .global = global};
 	atomic_bool *waiting = dssh_test_thrd_watch_condition(&sess->trans.tx_slot_cnd);
-	thrd_t writer;
-	bool started = thrd_create(&writer, tx_slot_refusal_send_requests, &peer) == thrd_success;
-	int result = DSSH_ERROR_INIT;
-	if (started && thrd_join(writer, &result) != thrd_success)
-		abort();
-	bool valid = started && result == 0 && dssh_test_wait_bool(waiting, true)
-	    && atomic_load(&slot->ready);
+	flow.watching = true;
+	ASSERT_EQ(channel_worker_start(&flow.workers, 0, tx_slot_refusal_send_requests, &peer), 0);
+	ASSERT_TRUE(flow_checkpoint(FLOW_REFUSAL_STARTED));
+	channel_worker_join(&flow.workers, 0);
+	bool valid = flow.workers.results[0] == 0
+	    && conn_actor_waiting(waiting, &sess->trans.tx_queue_mtx) && atomic_load(&slot->ready);
+	ASSERT_TRUE(valid);
+	ASSERT_TRUE(flow_checkpoint(FLOW_REFUSAL_WAITING));
 	if (valid && mode == TX_SLOT_KEY_REFUSAL)
 		atomic_store(&sess->trans.tx_since_rekey, DSSH_REKEY_HARD_LIMIT);
 	else if (valid && mode == TX_SLOT_SIZE_REFUSAL)
 		sess->trans.comp_tx_payload_limit = 0;
-	tx_unlock_with_slots(sess);
-	dssh_test_thrd_watch_condition(NULL);
+	callback_release_tx(&flow.tx);
+	flow_finish(&flow);
 
 	if (mode == TX_SLOT_NO_REFUSAL) {
 		ASSERT_TRUE(valid);
+		ASSERT_EQ(flow.tx.result, 0);
 		ASSERT_TRUE(count <= UINT_FAST32_MAX - 2 && tx_slot_wait_transmitted(sess, count + 2));
 		if (global) {
 			ASSERT_TRUE(tx_slot_receive_reply(ctx->client, SSH_MSG_REQUEST_SUCCESS));
@@ -301,8 +315,8 @@ tx_slot_refusal_run(struct conn_ctx *ctx, bool global, enum tx_slot_refusal_mode
 	bool preserved = atomic_load(&slot->ready);
 	bool emitted = sess->trans.tx_seq != seq;
 	int reported = atomic_load(error);
-	printf("tx_slot_refusal global=%d mode=%d waited=%d stopped=%d preserved=%d emitted=%d error=%d\n",
-	    global, mode, valid, stopped, preserved, emitted, reported);
+	ASSERT_TRUE(printf("tx_slot_refusal global=%d mode=%d waited=%d stopped=%d preserved=%d emitted=%d error=%d\n",
+	    global, mode, valid, stopped, preserved, emitted, reported) >= 0);
 	ASSERT_TRUE(stopped);
 	ASSERT_TRUE(dssh_session_is_terminated(sess));
 	ASSERT_TRUE(preserved);
@@ -316,7 +330,6 @@ test_tx_slot_refusal(void)
 {
 	const char *compression = getenv("DSSH_TEST_COMPRESSION");
 	bool growth = compression != NULL && strcmp(compression, "test-growth") == 0;
-	bool passed = true;
 	for (unsigned i = 0; i < 4; i++) {
 		struct conn_ctx ctx;
 		if (conn_setup_mode(&ctx, false) != 0)
@@ -327,9 +340,9 @@ test_tx_slot_refusal(void)
 		atomic_init(&error, 0);
 		int ret = tx_slot_refusal_run(&ctx, i % 2 == 0, mode, &error);
 		conn_cleanup(&ctx);
-		passed = ret == TEST_PASS && passed;
+		if (ret != TEST_PASS)
+			return TEST_FAIL;
 	}
-	ASSERT_TRUE(passed);
 	return TEST_PASS;
 }
 

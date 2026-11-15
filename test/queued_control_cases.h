@@ -17,6 +17,8 @@ struct queue_retry_fixture {
 	atomic_bool bad;
 	atomic_uint data_calls;
 	atomic_bool *pause_entered;
+	atomic_bool cancelled;
+	atomic_bool merge_expired;
 	bool merge_valid;
 	int rekey_result;
 	atomic_bool data_done;
@@ -40,9 +42,13 @@ static uint32_t
 queue_retry_stream(dssh_channel ch, int stream, const uint8_t *data, size_t length, void *opaque)
 {
 	struct queue_retry_fixture *f = opaque;
-	uint32_t consumed = f->stream_cb(ch, stream, data, length, f->stream_cbdata);
+	uint32_t consumed = 0;
+	if (f->stream_cb == NULL)
+		atomic_store(&f->bad, true);
+	else
+		consumed = f->stream_cb(ch, stream, data, length, f->stream_cbdata);
 	atomic_store(&f->stream_entered, true);
-	if (!dssh_test_wait_bool(&f->stream_release, true))
+	if (!wire_wait(ch->sess, &f->stream_release))
 		atomic_store(&f->bad, true);
 	return consumed;
 }
@@ -72,15 +78,13 @@ queue_retry_zc(dssh_channel ch, int stream, const uint8_t *data, size_t length, 
 	(void)ch;
 	struct queue_retry_fixture *f = opaque;
 	unsigned call = atomic_fetch_add(&f->data_calls, 1);
-	if (stream != 0 || length != (call == 0 ? 24U : 8U) || call > 1)
+	if (stream != 0 || call > 1 || !flow_bytes(data, length, call == 0 ? 24U : 8U, 0x6d)) {
 		atomic_store(&f->bad, true);
-	for (size_t i = 0; i < length; i++) {
-		if (data[i] != 0x6d)
-			atomic_store(&f->bad, true);
+		return 0;
 	}
 	if (call == 1) {
 		atomic_store(&f->second_entered, true);
-		if (!dssh_test_wait_bool(&f->second_release, true))
+		if (!wire_wait(ch->sess, &f->second_release))
 			atomic_store(&f->bad, true);
 	}
 	return length <= UINT32_MAX ? (uint32_t)length : UINT32_MAX;
@@ -90,12 +94,15 @@ static int
 queue_retry_merge(void *opaque)
 {
 	struct queue_retry_fixture *f = opaque;
-	bool valid = dssh_test_wait_bool(f->pause_entered, true);
+	bool valid = wire_wait(f->ctx.server, f->pause_entered);
+	if (!valid && !atomic_load(&f->cancelled))
+		atomic_store(&f->merge_expired, true);
+	valid = valid && !atomic_load(&f->cancelled);
 	atomic_store(&f->second_release, true);
 	struct timespec start;
 	if (clock_gettime(CLOCK_MONOTONIC, &start) != 0)
 		valid = false;
-	while (valid) {
+	while (valid && !atomic_load(&f->cancelled)) {
 		if (mtx_lock(&f->channel->buf_mtx) != thrd_success)
 			abort();
 		bool ready = f->channel->local_window == 0 && f->channel->window_adjust_pending == 8
@@ -105,8 +112,10 @@ queue_retry_merge(void *opaque)
 		if (ready)
 			break;
 		valid = dssh_test_wait_tick(&start);
+		if (!valid && !atomic_load(&f->cancelled))
+			atomic_store(&f->merge_expired, true);
 	}
-	f->merge_valid = valid;
+	f->merge_valid = valid && !atomic_load(&f->cancelled);
 	dssh_test_thrd_resume_mutex();
 	return 0;
 }
@@ -120,13 +129,13 @@ queue_retry_global(const uint8_t *name, size_t name_len, bool want_reply,
 	(void)data;
 	struct queue_retry_fixture *f = opaque;
 	if (name_len == DSSH_STRLEN("queue-credit-ready")
-	    && memcmp(name, "queue-credit-ready", name_len) == 0
+	    && name != NULL && memcmp(name, "queue-credit-ready", name_len) == 0
 	    && !want_reply && data_len == 0) {
 		atomic_store(&f->data_done, true);
 		/* Keep the receiver at a known boundary while the controller models
 		 * a temporary packet-budget refusal. Resume after that budget is
 		 * restored so ordinary auto-rekey does not consume the model state. */
-		if (!dssh_test_wait_bool(&f->marker_release, true))
+		if (!wire_wait(f->ctx.server, &f->marker_release))
 			atomic_store(&f->bad, true);
 	}
 	return DSSH_ERROR_REJECTED;
@@ -205,7 +214,7 @@ queue_retry_peer(void *opaque)
 	    && queue_retry_receive(sess, SSH_MSG_CHANNEL_SUCCESS, 42, NULL)
 	    && queue_retry_initial_window(sess);
 	atomic_store(&f->peer_ready, true);
-	valid = valid && dssh_test_wait_bool(&f->owner_ready, true);
+	valid = valid && wire_wait(sess, &f->owner_ready);
 	uint8_t packet[64];
 	size_t pos = 0;
 	packet[pos++] = SSH_MSG_GLOBAL_REQUEST;
@@ -255,13 +264,13 @@ queue_retry_peer(void *opaque)
 		valid = send_packet(sess, packet, pos, NULL) == 0;
 	}
 	if (valid && queue_retry_rekey_kind(f->kind)) {
-		valid = dssh_test_wait_bool(&f->rekey_go, true);
+		valid = wire_wait(sess, &f->rekey_go);
 		atomic_store(&f->rekey_started, true);
 		f->rekey_result = valid ? rekey(sess) : DSSH_ERROR_TIMEOUT;
 		valid = valid && f->rekey_result == 0;
 	}
 	if (valid)
-		valid = dssh_test_wait_bool(&f->flush_ready, true);
+		valid = wire_wait(sess, &f->flush_ready);
 	if (valid && f->kind != 8 && f->kind != 9)
 		valid = queue_retry_receive(sess, SSH_MSG_REQUEST_FAILURE, 0, NULL)
 		    && queue_retry_receive(sess, SSH_MSG_CHANNEL_OPEN_FAILURE, 43, NULL);
@@ -294,6 +303,19 @@ queue_retry_mask(struct queue_retry_fixture *f)
 	    | (atomic_load(&f->channel->chan_reply_slot.ready) ? 8U : 0U);
 }
 
+static void
+queue_retry_release(void *data)
+{
+	struct queue_retry_fixture *fixture = data;
+	atomic_store(&fixture->cancelled, true);
+	atomic_store(&fixture->owner_ready, true);
+	atomic_store(&fixture->flush_ready, true);
+	atomic_store(&fixture->second_release, true);
+	atomic_store(&fixture->rekey_go, true);
+	atomic_store(&fixture->marker_release, true);
+	atomic_store(&fixture->stream_release, true);
+}
+
 static int
 queue_retry_case(unsigned kind, bool gather, unsigned probe)
 {
@@ -312,31 +334,38 @@ queue_retry_case(unsigned kind, bool gather, unsigned probe)
 	atomic_init(&f.rekey_go, false);
 	atomic_init(&f.rekey_started, false);
 	atomic_init(&f.bad, false);
+	atomic_init(&f.cancelled, false);
+	atomic_init(&f.merge_expired, false);
 	atomic_init(&f.data_calls, 0);
 	window_test_gather = gather;
 	int setup = conn_setup_no_start(&f.ctx);
 	window_test_gather = false;
-	ASSERT_OK(setup);
+	ASSERT_EQ(setup, 0);
 	ASSERT_TRUE(f.ctx.server->trans.comp_s2c_active != NULL
 	    && strcmp(f.ctx.server->trans.comp_s2c_active->name, "none") != 0);
-	ASSERT_OK(dssh_session_set_timeout(f.ctx.server, 30000));
-	ASSERT_OK(dssh_session_set_timeout(f.ctx.client, 30000));
-	ASSERT_OK(dssh_session_set_global_request_cb(f.ctx.server, queue_retry_global, &f));
-	ASSERT_OK(dssh_session_start(f.ctx.server));
-	thrd_t acceptor, peer;
-	ASSERT_EQ(thrd_create(&acceptor, queue_retry_accept, &f), thrd_success);
-	bool started = thrd_create(&peer, queue_retry_peer, &f) == thrd_success;
-	bool valid = started && dssh_test_wait_bool(&f.peer_ready, true)
+	ASSERT_EQ(dssh_session_set_timeout(f.ctx.server, 30000), 0);
+	ASSERT_EQ(dssh_session_set_timeout(f.ctx.client, 30000), 0);
+	ASSERT_EQ(dssh_session_set_global_request_cb(f.ctx.server, queue_retry_global, &f), 0);
+	ASSERT_EQ(dssh_session_start(f.ctx.server), 0);
+	struct flow_fixture flow;
+	flow_init(&flow, &f.ctx, queue_retry_release, &f);
+	flow.tx.session = f.ctx.server;
+	ASSERT_EQ(channel_worker_start(&flow.workers, 0, queue_retry_accept, &f), 0);
+	ASSERT_EQ(channel_worker_start(&flow.workers, 1, queue_retry_peer, &f), 0);
+	ASSERT_TRUE(flow_checkpoint(FLOW_QUEUE_STARTED));
+	bool valid = dssh_test_wait_bool(&f.peer_ready, true)
 	    && dssh_test_wait_bool(&f.accepted, true);
 	if (!valid) {
 		mock_io_close_c2s(&f.ctx.io);
 		mock_io_close_s2c(&f.ctx.io);
 	}
-	if (thrd_join(acceptor, NULL) != thrd_success)
-		abort();
+	channel_worker_join(&flow.workers, 0);
+	ASSERT_EQ(flow.workers.results[0], 0);
 	valid = valid && f.channel != NULL;
-	bool owned = valid && tx_acquire(f.ctx.server, SSH_MSG_IGNORE) == 0;
-	valid = valid && owned;
+	ASSERT_TRUE(valid);
+	flow.tx.held = tx_acquire(f.ctx.server, SSH_MSG_IGNORE) == 0;
+	valid = flow.tx.held;
+	ASSERT_TRUE(valid);
 	if (valid && kind == 12) {
 		if (mtx_lock(&f.channel->buf_mtx) != thrd_success)
 			abort();
@@ -347,6 +376,7 @@ queue_retry_case(unsigned kind, bool gather, unsigned probe)
 		if (mtx_unlock(&f.channel->buf_mtx) != thrd_success)
 			abort();
 	}
+	ASSERT_TRUE(flow_checkpoint(FLOW_QUEUE_OWNED));
 	atomic_store(&f.owner_ready, true);
 	if (valid && kind != 8 && kind != 9)
 		valid = dssh_test_wait_bool(&f.ctx.server->trans.global_reply_slot.ready, true)
@@ -361,25 +391,28 @@ queue_retry_case(unsigned kind, bool gather, unsigned probe)
 	if (valid && queue_retry_merge_kind(kind))
 		valid = dssh_test_wait_bool(&f.channel->wa_slot.ready, true)
 		    && dssh_test_wait_bool(&f.second_entered, true);
-	else if (valid)
-		valid = (dssh_chan_poll(f.channel, DSSH_POLL_READ, 3000) & DSSH_POLL_READ) != 0
-		    && dssh_chan_read(f.channel, 0, data, sizeof(data)) == 24 && data[0] == 0x6d;
+	else if (valid) {
+		int polled = dssh_chan_poll(f.channel, DSSH_POLL_READ, 3000);
+		valid = polled >= 0 && (polled & DSSH_POLL_READ) != 0
+		    && dssh_chan_read(f.channel, 0, data, sizeof(data)) == 24
+		    && flow_bytes(data, sizeof(data), 24, 0x6d);
+	}
 	atomic_store(&f.stream_release, true);
 	if (valid)
 		valid = queue_retry_mask(&f) == ((kind == 8 || kind == 9) ? 12U : 15U);
+	ASSERT_TRUE(valid);
+	ASSERT_TRUE(flow_checkpoint(FLOW_QUEUE_READY));
 	size_t saved_capacity = f.ctx.server->trans.comp_tx_payload_limit;
 	uint_fast32_t saved_count = atomic_load(&f.ctx.server->trans.tx_since_rekey);
 	unsigned observed = 0;
-	thrd_t merger;
 	bool merger_started = false;
 	if (valid) {
 		if (queue_retry_merge_kind(kind)) {
 			f.pause_entered = dssh_test_thrd_pause_mutex_after(&f.channel->buf_mtx, 1);
-			merger_started = thrd_create(&merger, queue_retry_merge, &f) == thrd_success;
-			if (!merger_started) {
-				atomic_store(&f.second_release, true);
-				dssh_test_thrd_resume_mutex();
-			}
+			flow.paused = true;
+			ASSERT_EQ(channel_worker_start(&flow.workers, 0, queue_retry_merge, &f), 0);
+			merger_started = true;
+			ASSERT_TRUE(flow_checkpoint(FLOW_QUEUE_MERGER));
 		}
 		if (kind == 1 || kind == 10)
 			atomic_store(&f.ctx.server->trans.tx_since_rekey, DSSH_REKEY_HARD_LIMIT);
@@ -403,16 +436,15 @@ queue_retry_case(unsigned kind, bool gather, unsigned probe)
 			valid = result == (kind == 10 ? DSSH_ERROR_REKEY_NEEDED : DSSH_ERROR_TOOLONG) && valid;
 		}
 		else {
-			tx_unlock_with_slots(f.ctx.server);
-			owned = false;
+			callback_release_tx(&flow.tx);
 		}
 		if (merger_started) {
-			if (thrd_join(merger, NULL) != thrd_success)
-				abort();
-			valid = valid && f.merge_valid;
+			channel_worker_join(&flow.workers, 0);
+			valid = valid && flow.workers.results[0] == 0 && f.merge_valid;
 		}
 		if (queue_retry_merge_kind(kind)) {
 			(void)dssh_test_thrd_pause_mutex_after(NULL, 0);
+			flow.paused = false;
 			valid = valid && merger_started;
 		}
 		observed = queue_retry_mask(&f);
@@ -445,9 +477,11 @@ queue_retry_case(unsigned kind, bool gather, unsigned probe)
 			    && !atomic_load(&f.ctx.server->trans.rekey_in_progress)
 			    && atomic_load(&f.channel->remote_window) == 1024;
 		}
-		if (!owned)
-			owned = tx_acquire(f.ctx.server, SSH_MSG_IGNORE) == 0;
-		if (owned) {
+		ASSERT_TRUE(valid);
+		ASSERT_TRUE(flow_checkpoint(FLOW_QUEUE_REFUSED));
+		if (!flow.tx.held)
+			flow.tx.held = tx_acquire(f.ctx.server, SSH_MSG_IGNORE) == 0;
+		if (flow.tx.held) {
 			f.ctx.server->trans.comp_tx_payload_limit = saved_capacity;
 			unsigned sent = kind == 3 || kind == 6 ? 2U : kind == 4 ? 1U : kind == 7 ? 3U : 0U;
 			if (saved_count > UINT_FAST32_MAX - sent)
@@ -456,12 +490,12 @@ queue_retry_case(unsigned kind, bool gather, unsigned probe)
 			atomic_store(&f.ctx.server->trans.tx_since_rekey, restored);
 			atomic_store(&f.ctx.server->trans.rekey_in_progress, false);
 		}
-		valid = valid && owned;
+		valid = valid && flow.tx.held;
 	}
 	atomic_store(&f.marker_release, true);
 	atomic_store(&f.flush_ready, true);
-	if (owned)
-		tx_unlock_with_slots(f.ctx.server);
+	ASSERT_TRUE(valid);
+	callback_release_tx(&flow.tx);
 	if (f.channel != NULL && !dssh_session_is_terminated(f.ctx.server)) {
 		uint8_t done[5];
 		size_t pos = 0;
@@ -470,21 +504,22 @@ queue_retry_case(unsigned kind, bool gather, unsigned probe)
 		int ret = send_packet(f.ctx.server, done, pos, NULL);
 		valid = ret == 0 && valid;
 	}
-	bool finished = started && queue_retry_wait_peer(&f);
+	ASSERT_TRUE(valid);
+	bool finished = queue_retry_wait_peer(&f);
 	if (!finished) {
 		mock_io_close_c2s(&f.ctx.io);
 		mock_io_close_s2c(&f.ctx.io);
 	}
-	if (started && thrd_join(peer, NULL) != thrd_success)
-		abort();
+	flow_finish(&flow);
+	ASSERT_EQ(flow.workers.results[1], 0);
 	if (queue_retry_rekey_kind(kind))
 		valid = valid && f.rekey_result == 0
 		    && dssh_test_wait_bool(&f.ctx.server->trans.rekey_in_progress, false);
 	valid = valid && finished && f.peer_valid && !atomic_load(&f.bad) && queue_retry_mask(&f) == 0
 	    && !dssh_session_is_terminated(f.ctx.server) && !dssh_session_is_terminated(f.ctx.client);
 	if (!valid)
-		fprintf(stderr, "queued controls kind=%u gather=%u probe=%u retained=%u peer=%u rekey=%d finished=%u\n",
-		    kind, gather ? 1U : 0U, probe, observed, f.peer_valid ? 1U : 0U, f.rekey_result, finished ? 1U : 0U);
+		ASSERT_TRUE(fprintf(stderr, "queued controls kind=%u gather=%u probe=%u retained=%u peer=%u rekey=%d finished=%u\n",
+		    kind, gather ? 1U : 0U, probe, observed, f.peer_valid ? 1U : 0U, f.rekey_result, finished ? 1U : 0U) >= 0);
 	conn_cleanup(&f.ctx);
 	ASSERT_TRUE(valid);
 	return TEST_PASS;

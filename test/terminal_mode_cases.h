@@ -1,46 +1,61 @@
 /* Terminal mode builder, exact wire bytes and application callback/getter trace. */
+/* Sequential builders retire before the caller makes an assertion. */
+static bool
+terminal_mode_invalid_builder(unsigned populated)
+{
+	struct dssh_chan_params params = {0};
+	bool valid = false;
+	int ret = dssh_chan_params_init(&params, DSSH_CHAN_SHELL);
+	if (ret != 0)
+		goto done;
+	if (populated != 0 && dssh_chan_params_set_mode(&params, 42, 1) != 0)
+		goto done;
+	if (populated == 2) {
+		if (dssh_chan_params_set_mode(&params, 53, 1) != 0)
+			goto done;
+		params.modes[1].opcode = 0;
+	}
+	struct dssh_chan_mode_entry *storage = params.modes;
+	size_t count = params.mode_count, capacity = params.mode_capacity;
+	dssh_test_alloc_fail_after(0);
+	ret = dssh_chan_params_set_mode(&params, populated == 2 ? 42 : 0, UINT32_MAX);
+	int attempts = dssh_test_alloc_count();
+	dssh_test_alloc_reset();
+	valid = ret == DSSH_ERROR_INVALID && attempts == 0 && params.modes == storage
+	    && params.mode_count == count && params.mode_capacity == capacity;
+	if (populated != 0)
+		valid = valid && params.modes[0].opcode == 42 && params.modes[0].value == 1;
+	if (populated == 2)
+		valid = valid && params.modes[1].opcode == 0 && params.modes[1].value == 1;
+done:
+	dssh_chan_params_free(&params);
+	return valid;
+}
+
 static int
 test_terminal_mode_validation(void)
 {
-	unsigned cases = 0, failures = 0;
+	unsigned cases = 0;
 	for (unsigned populated = 0; populated < 3; populated++) {
-		struct dssh_chan_params params;
-		ASSERT_OK(dssh_chan_params_init(&params, DSSH_CHAN_SHELL));
-		if (populated != 0)
-			ASSERT_OK(dssh_chan_params_set_mode(&params, 42, 1));
-		if (populated == 2) {
-			ASSERT_OK(dssh_chan_params_set_mode(&params, 53, 1));
-			params.modes[1].opcode = 0;
-		}
-		struct dssh_chan_mode_entry *storage = params.modes;
-		size_t count = params.mode_count, capacity = params.mode_capacity;
-		dssh_test_alloc_fail_after(0);
-		int result = dssh_chan_params_set_mode(&params, populated == 2 ? 42 : 0, UINT32_MAX);
-		int attempts = dssh_test_alloc_count();
-		dssh_test_alloc_reset();
-		bool valid = result == DSSH_ERROR_INVALID && attempts == 0 && params.modes == storage
-		    && params.mode_count == count && params.mode_capacity == capacity;
-		if (populated != 0)
-			valid = valid && params.modes[0].opcode == 42 && params.modes[0].value == 1;
-		if (populated == 2)
-			valid = valid && params.modes[1].opcode == 0 && params.modes[1].value == 1;
-		if (!valid)
-			failures++;
-		dssh_chan_params_free(&params);
+		ASSERT_TRUE(terminal_mode_invalid_builder(populated));
+		ASSERT_TRUE(consume_checkpoint(CO_MODE_VALIDATED));
 		cases++;
 	}
 	struct conn_ctx ctx;
-	ASSERT_OK(conn_setup(&ctx));
-	struct dssh_chan_params params;
-	ASSERT_OK(dssh_chan_params_init(&params, DSSH_CHAN_EXEC));
-	ASSERT_OK(dssh_chan_params_set_command(&params, "terminal-mode"));
+	ASSERT_EQ(conn_setup(&ctx), 0);
+	struct consume_params_fixture fixture = {0};
+	consume_params_own(&fixture, &ctx);
+	ASSERT_TRUE(consume_checkpoint(CO_MODE_EMPTY));
+	ASSERT_EQ(dssh_chan_params_init(&fixture.params, DSSH_CHAN_EXEC), 0);
+	ASSERT_EQ(dssh_chan_params_set_command(&fixture.params, "terminal-mode"), 0);
+	ASSERT_TRUE(consume_checkpoint(CO_MODE_BUILT));
 	for (unsigned zc = 0; zc < 2; zc++) {
 		for (unsigned pty = 0; pty < 2; pty++) {
 			for (unsigned position = 0; position < 3; position++) {
 				struct dssh_chan_mode_entry modes[] = {{.opcode = 1, .value = 0},
 				    {.opcode = 42, .value = 1}, {.opcode = 159, .value = UINT32_MAX}};
 				modes[position].opcode = 0;
-				struct dssh_chan_params trial = params;
+				struct dssh_chan_params trial = fixture.params;
 				trial.flags = pty != 0 ? DSSH_PARAM_HAS_PTY : 0;
 				trial.modes = modes;
 				trial.mode_count = 3;
@@ -50,19 +65,19 @@ test_terminal_mode_validation(void)
 				    : dssh_chan_open(ctx.client, &trial);
 				int attempts = dssh_test_alloc_count();
 				dssh_test_alloc_reset();
-				bool valid = channel == NULL && attempts == 0 && ctx.client->channel_count == 0
+				ASSERT_TRUE(channel == NULL && attempts == 0 && ctx.client->channel_count == 0
 				    && modes[position].opcode == 0 && trial.mode_count == 3 && trial.modes == modes
-				    && !dssh_session_is_terminated(ctx.client);
-				if (!valid)
-					failures++;
+				    && !dssh_session_is_terminated(ctx.client));
 				cases++;
 			}
 		}
 	}
-	dssh_chan_params_free(&params);
+	ASSERT_TRUE(consume_checkpoint(CO_MODE_COPY));
+	flow_finish(&fixture.flow);
+	ASSERT_TRUE(fixture.retired);
 	conn_cleanup(&ctx);
-	printf("terminal_mode_validation cases=%u failures=%u\n", cases, failures);
-	return cases == 15 && failures == 0 ? TEST_PASS : TEST_FAIL;
+	ASSERT_TRUE(printf("terminal_mode_validation cases=%u failures=0\n", cases) >= 0);
+	return cases == 15 ? TEST_PASS : TEST_FAIL;
 }
 
 struct terminal_mode_capture {
@@ -77,11 +92,13 @@ terminal_mode_data(dssh_channel channel, int stream, const uint8_t *bytes, size_
 	(void)channel;
 	struct terminal_mode_capture *capture = opaque;
 	unsigned count = atomic_load(&capture->count);
-	if (stream != 0 || count > sizeof(capture->bytes) || length > sizeof(capture->bytes) - count) {
+	if (stream != 0 || count > sizeof(capture->bytes) || length > sizeof(capture->bytes) - count
+	    || (length != 0 && bytes == NULL)) {
 		atomic_store(&capture->bad, true);
 		return 0;
 	}
-	memcpy(capture->bytes + count, bytes, length);
+	if (length != 0)
+		memcpy(capture->bytes + count, bytes, length);
 	unsigned received = (unsigned)length;
 	atomic_store(&capture->count, count + received);
 	uint32_t consumed = (uint32_t)length;
@@ -126,9 +143,10 @@ terminal_mode_exec(dssh_channel channel, const struct dssh_chan_params *params,
 {
 	struct terminal_mode_job *job = opaque;
 	job->terminal_calls++;
+	const char *command = dssh_chan_get_command(channel);
 	job->valid = job->valid && dssh_chan_get_pty(channel) == params
 	    && dssh_chan_get_type(channel) == DSSH_CHAN_EXEC
-	    && strcmp(dssh_chan_get_command(channel), "terminal-mode") == 0
+	    && command != NULL && strcmp(command, "terminal-mode") == 0
 	    && terminal_mode_values(params, job->mode);
 	if (job->zc) {
 		result->zc_cb = terminal_mode_data;
@@ -190,30 +208,177 @@ terminal_mode_params(struct dssh_chan_params *params, unsigned mode)
 static bool
 terminal_mode_transmit(struct terminal_mode_job *job, const uint8_t *bytes, size_t length)
 {
+	if ((length != 0 && bytes == NULL) || length > sizeof(job->capture.bytes))
+		return false;
+	int64_t expected = (int64_t)length;
 	if (!job->zc)
 		return dssh_chan_poll(job->channel, DSSH_POLL_WRITE, 5000) == DSSH_POLL_WRITE
-		    && dssh_chan_write(job->channel, 0, bytes, length) == 5;
+		    && dssh_chan_write(job->channel, 0, bytes, length) == expected;
 	if (!control_frame_window_ready(job->channel))
 		return false;
-	uint8_t *buffer;
-	size_t capacity;
+	uint8_t *buffer = NULL;
+	size_t capacity = 0;
 	int result = dssh_chan_zc_getbuf(job->channel, 0, &buffer, &capacity);
 	if (result != 0)
 		return false;
-	if (capacity < length) {
+	if (buffer == NULL || capacity < length) {
 		int cancelled = dssh_chan_zc_cancel(job->channel);
 		if (cancelled != 0)
 			abort();
 		return false;
 	}
-	memcpy(buffer, bytes, length);
+	if (length != 0)
+		memcpy(buffer, bytes, length);
 	result = dssh_chan_zc_send(job->channel, length);
-	if (result != 0) {
-		int cancelled = dssh_chan_zc_cancel(job->channel);
-		if (cancelled != 0 && cancelled != DSSH_ERROR_INVALID)
-			return false;
-	}
+	/* A valid send consumes its reservation on every result. */
 	return result == 0;
+}
+
+static int
+terminal_mode_roundtrip_case(unsigned gather, unsigned zc, unsigned mode, unsigned unused)
+{
+	(void)unused;
+	struct conn_ctx ctx;
+	window_test_gather = gather != 0;
+	int setup = conn_setup(&ctx);
+	window_test_gather = false;
+	ASSERT_EQ(setup, 0);
+	struct consume_params_fixture fixture = {0};
+	consume_params_own(&fixture, &ctx);
+	ASSERT_TRUE(consume_checkpoint(CO_MODE_EMPTY));
+	bool valid = terminal_mode_params(&fixture.params, mode);
+	ASSERT_TRUE(valid);
+	ASSERT_TRUE(consume_checkpoint(CO_MODE_BUILT));
+	struct terminal_mode_job jobs[2] = {{.session = ctx.client, .params = &fixture.params,
+	    .zc = zc != 0, .mode = mode}, {.session = ctx.server, .accept = true,
+	    .zc = zc != 0, .mode = mode}};
+	for (unsigned i = 0; i < 2; i++)
+		terminal_mode_job_init(&jobs[i]);
+	ASSERT_EQ(channel_worker_start(&fixture.flow.workers, 1, terminal_mode_worker, &jobs[1]), 0);
+	ASSERT_TRUE(consume_checkpoint(CO_MODE_FIRST));
+	ASSERT_EQ(channel_worker_start(&fixture.flow.workers, 0, terminal_mode_worker, &jobs[0]), 0);
+	ASSERT_TRUE(consume_checkpoint(CO_MODE_STARTED));
+	channel_worker_join(&fixture.flow.workers, 0);
+	channel_worker_join(&fixture.flow.workers, 1);
+	valid = valid && fixture.flow.workers.results[0] == 0 && fixture.flow.workers.results[1] == 0
+	    && jobs[0].channel != NULL && jobs[1].channel != NULL && jobs[1].valid
+	    && jobs[1].pty_calls == 1 && jobs[1].terminal_calls == 1;
+	ASSERT_TRUE(valid);
+	ASSERT_TRUE(consume_checkpoint(CO_MODE_JOINED));
+	if (valid) {
+		const struct dssh_chan_params *copy = dssh_chan_get_pty(jobs[0].channel);
+		valid = copy != NULL && copy->modes != NULL && copy->modes != fixture.params.modes && copy->mode_count == fixture.params.mode_count;
+		if (valid) {
+			for (size_t i = 0; i < copy->mode_count; i++)
+				valid = copy->modes[i].opcode == fixture.params.modes[i].opcode
+				    && copy->modes[i].value == fixture.params.modes[i].value && valid;
+		}
+	}
+	ASSERT_TRUE(valid);
+	ASSERT_TRUE(consume_checkpoint(CO_MODE_COPY));
+	dssh_chan_params_free(&fixture.params);
+	valid = valid && terminal_mode_values(dssh_chan_get_pty(jobs[1].channel), mode);
+	static const uint8_t bytes[] = {0, 0xc3, 0xa9, 0xff, 27};
+	for (unsigned writer = 0; writer < 2 && valid; writer++) {
+		struct terminal_mode_job *receiver = &jobs[writer == 0 ? 1 : 0];
+		valid = terminal_mode_transmit(&jobs[writer], bytes, sizeof(bytes));
+		if (valid && zc != 0) {
+			struct timespec start;
+			valid = clock_gettime(CLOCK_MONOTONIC, &start) == 0;
+			while (valid && atomic_load(&receiver->capture.count) < sizeof(bytes))
+				valid = dssh_test_wait_tick(&start);
+			valid = valid && atomic_load(&receiver->capture.count) == sizeof(bytes)
+			    && !atomic_load(&receiver->capture.bad)
+			    && memcmp(receiver->capture.bytes, bytes, sizeof(bytes)) == 0;
+		}
+		else if (valid) {
+			uint8_t output[sizeof(bytes)];
+			valid = dssh_chan_poll(receiver->channel, DSSH_POLL_READ, 5000) == DSSH_POLL_READ
+			    && dssh_chan_read(receiver->channel, 0, output, sizeof(output)) == 5
+			    && memcmp(output, bytes, sizeof(bytes)) == 0;
+		}
+		ASSERT_TRUE(valid);
+		ASSERT_TRUE(consume_checkpoint(CO_MODE_DATA));
+	}
+	ASSERT_TRUE(valid);
+	flow_finish(&fixture.flow);
+	ASSERT_TRUE(fixture.retired);
+	conn_cleanup(&ctx);
+	ASSERT_TRUE(consume_checkpoint(CO_MODE_DONE));
+	return TEST_PASS;
+}
+
+static int
+terminal_mode_wire_case(unsigned gather, unsigned zc, unsigned mode, unsigned unused)
+{
+	(void)unused;
+	struct conn_ctx ctx;
+	window_test_gather = gather != 0;
+	int setup = conn_setup_mode(&ctx, false);
+	window_test_gather = false;
+	ASSERT_EQ(setup, 0);
+	ASSERT_EQ(dssh_session_start(ctx.client), 0);
+	struct consume_params_fixture fixture = {0};
+	consume_params_own(&fixture, &ctx);
+	ASSERT_TRUE(consume_checkpoint(CO_MODE_EMPTY));
+	bool valid = terminal_mode_params(&fixture.params, mode);
+	ASSERT_TRUE(valid);
+	ASSERT_TRUE(consume_checkpoint(CO_MODE_BUILT));
+	struct terminal_mode_job job = {.session = ctx.client, .params = &fixture.params, .zc = zc != 0};
+	terminal_mode_job_init(&job);
+	ASSERT_EQ(channel_worker_start(&fixture.flow.workers, 0, terminal_mode_worker, &job), 0);
+	ASSERT_TRUE(consume_checkpoint(CO_MODE_STARTED));
+	uint32_t local = 0;
+	valid = channel_id_receive_open(ctx.server, &local);
+	uint8_t reply[17];
+	size_t reply_length = valid ? channel_id_build_reply(reply, local, true, 42) : 0;
+	uint8_t type, *payload;
+	size_t length;
+	uint8_t absent[] = {53, 0, 0, 0, 1, 160, 255, 255, 255, 255, 0};
+	uint8_t present[] = {53, 0, 0, 0, 1, 42, 0, 0, 0, 1, 160, 255, 255, 255, 255, 0};
+	present[9] = mode == 1 ? 0 : 1;
+	present[10] = mode % 2 != 0 ? 255 : 160;
+	const uint8_t *expected = mode == 0 ? absent : present;
+	size_t mode_length = mode == 0 ? sizeof(absent) : sizeof(present);
+	if (valid)
+		valid = send_packet(ctx.server, reply, reply_length, NULL) == 0
+		    && recv_packet(ctx.server, &type, &payload, &length) == 0
+		    && type == SSH_MSG_CHANNEL_REQUEST && length == 45 + mode_length
+		    && DSSH_GET_U32(payload + 1) == 42 && DSSH_GET_U32(payload + 5) == 7
+		    && memcmp(payload + 9, "pty-req", 7) == 0 && payload[16] == 1
+		    && DSSH_GET_U32(payload + 17) == 4 && memcmp(payload + 21, "dumb", 4) == 0
+		    && DSSH_GET_U32(payload + 25) == 87 && DSSH_GET_U32(payload + 29) == 29
+		    && DSSH_GET_U32(payload + 33) == 0 && DSSH_GET_U32(payload + 37) == 0
+		    && DSSH_GET_U32(payload + 41) == mode_length
+		    && memcmp(payload + 45, expected, mode_length) == 0;
+	if (valid) {
+		size_t pos = 0;
+		reply[pos++] = SSH_MSG_CHANNEL_SUCCESS;
+		DSSH_PUT_U32(local, reply, &pos);
+		valid = send_packet(ctx.server, reply, pos, NULL) == 0
+		    && recv_packet(ctx.server, &type, &payload, &length) == 0
+		    && type == SSH_MSG_CHANNEL_REQUEST && length == 31
+		    && DSSH_GET_U32(payload + 1) == 42 && DSSH_GET_U32(payload + 5) == 4
+		    && memcmp(payload + 9, "exec", 4) == 0 && payload[13] == 1
+		    && DSSH_GET_U32(payload + 14) == 13 && memcmp(payload + 18, "terminal-mode", 13) == 0
+		    && send_packet(ctx.server, reply, pos, NULL) == 0
+		    && peer_id_receive_control(ctx.server, SSH_MSG_CHANNEL_WINDOW_ADJUST, 9, 42);
+	}
+	if (!valid) {
+		mock_io_close_c2s(&ctx.io);
+		mock_io_close_s2c(&ctx.io);
+	}
+	ASSERT_TRUE(valid);
+	ASSERT_TRUE(consume_checkpoint(CO_MODE_WIRE));
+	channel_worker_join(&fixture.flow.workers, 0);
+	valid = valid && fixture.flow.workers.results[0] == 0 && job.channel != NULL;
+	ASSERT_TRUE(valid);
+	ASSERT_TRUE(consume_checkpoint(CO_MODE_JOINED));
+	flow_finish(&fixture.flow);
+	ASSERT_TRUE(fixture.retired);
+	conn_cleanup(&ctx);
+	ASSERT_TRUE(consume_checkpoint(CO_MODE_DONE));
+	return TEST_PASS;
 }
 
 static int
@@ -223,67 +388,13 @@ test_terminal_mode_roundtrip(void)
 	for (unsigned gather = 0; gather < 2; gather++) {
 		for (unsigned zc = 0; zc < 2; zc++) {
 			for (unsigned mode = 0; mode < 4; mode++) {
-				struct conn_ctx ctx;
-				window_test_gather = gather != 0;
-				int setup = conn_setup(&ctx);
-				window_test_gather = false;
-				ASSERT_OK(setup);
-				struct dssh_chan_params params;
-				bool valid = terminal_mode_params(&params, mode);
-				struct terminal_mode_job jobs[2] = {{.session = ctx.client, .params = &params,
-				    .zc = zc != 0, .mode = mode}, {.session = ctx.server, .accept = true,
-				    .zc = zc != 0, .mode = mode}};
-				for (unsigned i = 0; i < 2; i++)
-					terminal_mode_job_init(&jobs[i]);
-				struct channel_workers workers;
-				channel_workers_init(&workers, &ctx);
-				if (valid)
-					valid = channel_worker_start(&workers, 1, terminal_mode_worker, &jobs[1]) == 0
-					    && channel_worker_start(&workers, 0, terminal_mode_worker, &jobs[0]) == 0;
-				if (!valid)
-					channel_workers_cancel(&workers);
-				channel_workers_finish(&workers);
-				valid = valid && workers.results[0] == 0 && workers.results[1] == 0
-				    && jobs[0].channel != NULL && jobs[1].channel != NULL && jobs[1].valid
-				    && jobs[1].pty_calls == 1 && jobs[1].terminal_calls == 1;
-				if (valid) {
-					const struct dssh_chan_params *copy = dssh_chan_get_pty(jobs[0].channel);
-					valid = copy != NULL && copy->modes != params.modes && copy->mode_count == params.mode_count;
-					if (valid) {
-						for (size_t i = 0; i < copy->mode_count; i++)
-							valid = copy->modes[i].opcode == params.modes[i].opcode
-							    && copy->modes[i].value == params.modes[i].value && valid;
-					}
-				}
-				dssh_chan_params_free(&params);
-				valid = valid && terminal_mode_values(dssh_chan_get_pty(jobs[1].channel), mode);
-				static const uint8_t bytes[] = {0, 0xc3, 0xa9, 0xff, 27};
-				for (unsigned writer = 0; writer < 2 && valid; writer++) {
-					struct terminal_mode_job *receiver = &jobs[writer == 0 ? 1 : 0];
-					valid = terminal_mode_transmit(&jobs[writer], bytes, sizeof(bytes));
-					if (valid && zc != 0) {
-						struct timespec start;
-						valid = clock_gettime(CLOCK_MONOTONIC, &start) == 0;
-						while (valid && atomic_load(&receiver->capture.count) < sizeof(bytes))
-							valid = dssh_test_wait_tick(&start);
-						valid = valid && atomic_load(&receiver->capture.count) == sizeof(bytes)
-						    && !atomic_load(&receiver->capture.bad)
-						    && memcmp(receiver->capture.bytes, bytes, sizeof(bytes)) == 0;
-					}
-					else if (valid) {
-						uint8_t output[sizeof(bytes)];
-						valid = dssh_chan_poll(receiver->channel, DSSH_POLL_READ, 5000) == DSSH_POLL_READ
-						    && dssh_chan_read(receiver->channel, 0, output, sizeof(output)) == 5
-						    && memcmp(output, bytes, sizeof(bytes)) == 0;
-					}
-				}
-				conn_cleanup(&ctx);
-				ASSERT_TRUE(valid);
+				if (terminal_mode_roundtrip_case(gather, zc, mode, 0) != TEST_PASS)
+					return TEST_FAIL;
 				cases++;
 			}
 		}
 	}
-	printf("terminal_mode_roundtrip cases=%u valid=1\n", cases);
+	ASSERT_TRUE(printf("terminal_mode_roundtrip cases=%u valid=1\n", cases) >= 0);
 	return cases == 16 ? TEST_PASS : TEST_FAIL;
 }
 
@@ -294,69 +405,51 @@ test_terminal_mode_wire(void)
 	for (unsigned gather = 0; gather < 2; gather++) {
 		for (unsigned zc = 0; zc < 2; zc++) {
 			for (unsigned mode = 0; mode < 4; mode++) {
-				struct conn_ctx ctx;
-				window_test_gather = gather != 0;
-				int setup = conn_setup_mode(&ctx, false);
-				window_test_gather = false;
-				ASSERT_OK(setup);
-				ASSERT_OK(dssh_session_start(ctx.client));
-				struct dssh_chan_params params;
-				bool valid = terminal_mode_params(&params, mode);
-				struct terminal_mode_job job = {.session = ctx.client, .params = &params, .zc = zc != 0};
-				terminal_mode_job_init(&job);
-				thrd_t worker;
-				bool started = valid && thrd_create(&worker, terminal_mode_worker, &job) == thrd_success;
-				uint32_t local = 0;
-				valid = started && channel_id_receive_open(ctx.server, &local);
-				uint8_t reply[17];
-				size_t reply_length = valid ? channel_id_build_reply(reply, local, true, 42) : 0;
-				uint8_t type, *payload;
-				size_t length;
-				uint8_t absent[] = {53, 0, 0, 0, 1, 160, 255, 255, 255, 255, 0};
-				uint8_t present[] = {53, 0, 0, 0, 1, 42, 0, 0, 0, 1, 160, 255, 255, 255, 255, 0};
-				present[9] = mode == 1 ? 0 : 1;
-				present[10] = mode % 2 != 0 ? 255 : 160;
-				const uint8_t *expected = mode == 0 ? absent : present;
-				size_t mode_length = mode == 0 ? sizeof(absent) : sizeof(present);
-				if (valid)
-					valid = send_packet(ctx.server, reply, reply_length, NULL) == 0
-					    && recv_packet(ctx.server, &type, &payload, &length) == 0
-					    && type == SSH_MSG_CHANNEL_REQUEST && length == 45 + mode_length
-					    && DSSH_GET_U32(payload + 1) == 42 && DSSH_GET_U32(payload + 5) == 7
-					    && memcmp(payload + 9, "pty-req", 7) == 0 && payload[16] == 1
-					    && DSSH_GET_U32(payload + 17) == 4 && memcmp(payload + 21, "dumb", 4) == 0
-					    && DSSH_GET_U32(payload + 25) == 87 && DSSH_GET_U32(payload + 29) == 29
-					    && DSSH_GET_U32(payload + 33) == 0 && DSSH_GET_U32(payload + 37) == 0
-					    && DSSH_GET_U32(payload + 41) == mode_length
-					    && memcmp(payload + 45, expected, mode_length) == 0;
-				if (valid) {
-					size_t pos = 0;
-					reply[pos++] = SSH_MSG_CHANNEL_SUCCESS;
-					DSSH_PUT_U32(local, reply, &pos);
-					valid = send_packet(ctx.server, reply, pos, NULL) == 0
-					    && recv_packet(ctx.server, &type, &payload, &length) == 0
-					    && type == SSH_MSG_CHANNEL_REQUEST && length == 31
-					    && DSSH_GET_U32(payload + 1) == 42 && DSSH_GET_U32(payload + 5) == 4
-					    && memcmp(payload + 9, "exec", 4) == 0 && payload[13] == 1
-					    && DSSH_GET_U32(payload + 14) == 13 && memcmp(payload + 18, "terminal-mode", 13) == 0
-					    && send_packet(ctx.server, reply, pos, NULL) == 0
-					    && peer_id_receive_control(ctx.server, SSH_MSG_CHANNEL_WINDOW_ADJUST, 9, 42);
-				}
-				if (!valid) {
-					mock_io_close_c2s(&ctx.io);
-					mock_io_close_s2c(&ctx.io);
-				}
-				int result = 1;
-				if (started && thrd_join(worker, &result) != thrd_success)
-					abort();
-				valid = valid && started && result == 0 && job.channel != NULL;
-				dssh_chan_params_free(&params);
-				conn_cleanup(&ctx);
-				ASSERT_TRUE(valid);
+				if (terminal_mode_wire_case(gather, zc, mode, 0) != TEST_PASS)
+					return TEST_FAIL;
 				cases++;
 			}
 		}
 	}
-	printf("terminal_mode_wire cases=%u valid=1\n", cases);
+	ASSERT_TRUE(printf("terminal_mode_wire cases=%u valid=1\n", cases) >= 0);
 	return cases == 16 ? TEST_PASS : TEST_FAIL;
+}
+
+static int
+test_terminal_capture_bounds(void)
+{
+	struct terminal_mode_capture capture = {0};
+	atomic_init(&capture.count, 0);
+	atomic_init(&capture.bad, false);
+	const uint8_t bytes[] = {0, 1, 2, 3, 4, 5, 6, 7};
+	ASSERT_EQ_U(terminal_mode_data(NULL, 0, bytes, sizeof(bytes), &capture), 8);
+	ASSERT_EQ_U(terminal_mode_data(NULL, 0, bytes, sizeof(bytes), &capture), 8);
+	ASSERT_EQ_U(atomic_load(&capture.count), 16);
+	ASSERT_MEM_EQ(capture.bytes, bytes, sizeof(bytes));
+	ASSERT_MEM_EQ(capture.bytes + 8, bytes, sizeof(bytes));
+	ASSERT_EQ_U(terminal_mode_data(NULL, 0, bytes, 1, &capture), 0);
+	ASSERT_TRUE(atomic_load(&capture.bad));
+	ASSERT_EQ_U(atomic_load(&capture.count), 16);
+	ASSERT_MEM_EQ(capture.bytes, bytes, sizeof(bytes));
+	ASSERT_MEM_EQ(capture.bytes + 8, bytes, sizeof(bytes));
+	atomic_store(&capture.count, 0);
+	atomic_store(&capture.bad, false);
+	ASSERT_EQ_U(terminal_mode_data(NULL, 0, NULL, 0, &capture), 0);
+	ASSERT_FALSE(atomic_load(&capture.bad));
+	ASSERT_EQ_U(terminal_mode_data(NULL, 0, NULL, 1, &capture), 0);
+	ASSERT_TRUE(atomic_load(&capture.bad));
+	atomic_store(&capture.bad, false);
+	ASSERT_EQ_U(terminal_mode_data(NULL, 1, bytes, 1, &capture), 0);
+	ASSERT_TRUE(atomic_load(&capture.bad));
+	atomic_store(&capture.bad, false);
+	ASSERT_EQ_U(terminal_mode_data(NULL, 0, bytes, SIZE_MAX, &capture), 0);
+	ASSERT_TRUE(atomic_load(&capture.bad));
+	ASSERT_EQ_U(atomic_load(&capture.count), 0);
+	atomic_store(&capture.count, UINT_MAX);
+	atomic_store(&capture.bad, false);
+	ASSERT_EQ_U(terminal_mode_data(NULL, 0, bytes, 1, &capture), 0);
+	ASSERT_TRUE(atomic_load(&capture.bad));
+	ASSERT_EQ_U(atomic_load(&capture.count), UINT_MAX);
+	ASSERT_TRUE(consume_checkpoint(CO_MODE_CAPTURE));
+	return TEST_PASS;
 }

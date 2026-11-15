@@ -172,7 +172,8 @@ test_break_handler_outcomes(void)
 			}
 		}
 	}
-	printf("break_handler_outcomes observations=%u valid=1\n", observations);
+	if (printf("break_handler_outcomes observations=%u valid=1\n", observations) < 0)
+		return TEST_FAIL;
 	return observations == 672 ? TEST_PASS : TEST_FAIL;
 }
 
@@ -211,16 +212,17 @@ test_break_handler_lifetime(void)
 		first.self_remove = kind == 3;
 		first.lifecycle = kind == 4;
 		ASSERT_TRUE(break_handler_setup(&fixture, &first, 0, 0, false));
-		/* Set after start is forbidden, so the fixture uses explicit native
-		 * descriptor closure below if the lifecycle case terminates. */
+		struct channel_workers workers;
+		channel_workers_init(&workers, &fixture.ctx);
+		workers.release = callback_release_flag;
+		workers.resource = &first.release;
 		bool valid = break_handler_send(&fixture, 500, 1);
-		struct close_channel_ctx close = {.ch = fixture.channel};
-		atomic_init(&close.started, false);
-		atomic_init(&close.done, false);
-		thrd_t closer;
+		struct close_channel_ctx close;
 		bool started = false;
 		if (kind < 3) {
 			valid = dssh_test_wait_bool(&first.entered, true) && valid;
+			ASSERT_TRUE(valid);
+			ASSERT_TRUE(callback_checkpoint(CALLBACK_GATE, kind));
 			mtx_t *locks[] = {&fixture.channel->buf_mtx, &fixture.channel->cb_mtx,
 			    &fixture.ctx.server->channel_mtx, &fixture.ctx.server->accept_mtx,
 			    &fixture.ctx.server->trans.tx_mtx, &fixture.ctx.server->trans.tx_queue_mtx};
@@ -238,9 +240,12 @@ test_break_handler_lifetime(void)
 			else if (kind == 1)
 				valid = dssh_chan_set_break_cb(fixture.channel, NULL, NULL) == 0 && valid;
 			else {
-				started = valid && thrd_create(&closer, close_channel_thread, &close) == thrd_success;
-				valid = started && dssh_test_wait_bool(&fixture.channel->closing, true) && valid;
-				valid = !atomic_load(&close.done) && valid;
+				ASSERT_TRUE(valid);
+				ASSERT_EQ(callback_start_close(&workers, &close, &fixture.channel), 0);
+				started = true;
+				ASSERT_TRUE(dssh_test_wait_bool(&close.waiting, true));
+				ASSERT_FALSE(atomic_load(&close.done));
+				ASSERT_TRUE(callback_checkpoint(CALLBACK_CLOSE, kind));
 			}
 			atomic_store(&first.release, true);
 		}
@@ -248,9 +253,9 @@ test_break_handler_lifetime(void)
 			break_handler_unblock(fixture.ctx.server, &fixture.ctx.io);
 		if (kind == 2) {
 			if (started) {
-				if (thrd_join(closer, NULL) != thrd_success)
-					abort();
-				fixture.channel = NULL;
+				channel_worker_join(&workers, 0);
+				ASSERT_EQ(workers.results[0], 0);
+				ASSERT_NULL(close.ch);
 				valid = close.result == 0 && valid;
 				uint8_t type;
 				uint8_t *payload;
@@ -275,13 +280,16 @@ test_break_handler_lifetime(void)
 			    && break_handler_reply(&fixture, 255, false) && valid;
 			valid = atomic_load(&second.count) == (kind == 0 ? 1U : 0U) && valid;
 		}
+		callback_release_flag(&first.release);
+		channel_workers_finish(&workers);
 		conn_cleanup(&fixture.ctx);
 		valid = atomic_load(&first.count) == 1 && !atomic_load(&first.bad)
 		    && !atomic_load(&second.bad) && valid;
 		ASSERT_TRUE(valid);
 		cases++;
 	}
-	printf("break_handler_lifetime cases=%u valid=1\n", cases);
+	if (printf("break_handler_lifetime cases=%u valid=1\n", cases) < 0)
+		return TEST_FAIL;
 	return cases == 5 ? TEST_PASS : TEST_FAIL;
 }
 
@@ -323,7 +331,8 @@ test_break_handler_failures(void)
 		ASSERT_TRUE(valid);
 		cases++;
 	}
-	printf("break_handler_failures cases=%u valid=1\n", cases);
+	if (printf("break_handler_failures cases=%u valid=1\n", cases) < 0)
+		return TEST_FAIL;
 	return cases == 5 ? TEST_PASS : TEST_FAIL;
 }
 
@@ -339,7 +348,7 @@ test_break_handler_positions(void)
 					window_test_gather = gather != 0;
 					int setup = conn_setup(&ctx);
 					window_test_gather = false;
-					ASSERT_OK(setup);
+					ASSERT_EQ(setup, 0);
 					struct open_exec_ctx channels = {.client = ctx.client, .server = ctx.server,
 					    .command = "break-positions", .cbs = &accept_cbs_all, .accept_timeout = 30000};
 					if (zc != 0) {
@@ -348,12 +357,12 @@ test_break_handler_positions(void)
 						channels = job.channels;
 					}
 					else
-						ASSERT_OK(open_exec_channel(&ctx, &channels));
+						ASSERT_EQ(open_exec_channel(&ctx, &channels), 0);
 					dssh_channel target = role == 0 ? channels.server_ch : channels.client_ch;
 					dssh_channel writer = role == 0 ? channels.client_ch : channels.server_ch;
 					struct break_handler_capture capture = {0};
 					break_handler_capture_init(&capture, true);
-					ASSERT_OK(dssh_chan_set_break_cb(target, break_handler_action, &capture));
+					ASSERT_EQ(dssh_chan_set_break_cb(target, break_handler_action, &capture), 0);
 					if (saturate != 0) {
 						if (mtx_lock(&target->buf_mtx) != thrd_success)
 							abort();
@@ -387,7 +396,8 @@ test_break_handler_positions(void)
 			}
 		}
 	}
-	printf("break_handler_positions cases=%u valid=1\n", cases);
+	if (printf("break_handler_positions cases=%u valid=1\n", cases) < 0)
+		return TEST_FAIL;
 	return cases == 16 ? TEST_PASS : TEST_FAIL;
 }
 
@@ -434,20 +444,26 @@ test_break_handler_queue(void)
 				struct break_handler_capture capture = {0};
 				break_handler_capture_init(&capture, true);
 				ASSERT_TRUE(break_handler_setup(&fixture, NULL, role, gather, zc != 0));
-				ASSERT_OK(dssh_chan_set_break_cb(fixture.channel, break_handler_alternate, &capture));
-				ASSERT_OK(tx_acquire(fixture.ctx.server, SSH_MSG_IGNORE));
+				ASSERT_EQ(dssh_chan_set_break_cb(fixture.channel, break_handler_alternate, &capture), 0);
+				struct callback_tx_gate gate = {.session = fixture.ctx.server, .result = -1};
+				struct channel_workers workers;
+				channel_workers_init(&workers, &fixture.ctx);
+				workers.release = callback_release_tx;
+				workers.resource = &gate;
+				ASSERT_EQ(tx_acquire(fixture.ctx.server, SSH_MSG_IGNORE), 0);
+				gate.held = true;
 				struct break_handler_queue_job job = {.fixture = &fixture};
-				thrd_t peer;
-				bool started = thrd_create(&peer, break_handler_queue_peer, &job) == thrd_success;
-				bool valid = started && break_handler_wait_count(&capture, 2)
+				ASSERT_EQ(channel_worker_start(&workers, 0, break_handler_queue_peer, &job), 0);
+				bool valid = break_handler_wait_count(&capture, 2)
 				    && dssh_test_wait_bool(&fixture.channel->chan_reply_slot.ready, true);
-				int released = tx_unlock_with_result(fixture.ctx.server, 0);
+				ASSERT_TRUE(valid);
+				ASSERT_TRUE(callback_checkpoint(CALLBACK_QUEUE, role * 4 + gather * 2 + zc));
+				callback_release_tx(&gate);
+				int released = gate.result;
 				if (!valid || released != 0)
 					break_handler_unblock(fixture.ctx.server, &fixture.ctx.io);
-				int result = 1;
-				if (started && thrd_join(peer, &result) != thrd_success)
-					abort();
-				valid = valid && released == 0 && started && result == 0 && job.valid
+				channel_workers_finish(&workers);
+				valid = valid && released == 0 && workers.results[0] == 0 && job.valid
 				    && atomic_load(&capture.count) == 2 && !atomic_load(&capture.bad)
 				    && capture.requests[0].length == 500 && capture.requests[1].length == 0
 				    && !dssh_session_is_terminated(fixture.ctx.server)
@@ -459,7 +475,8 @@ test_break_handler_queue(void)
 			}
 		}
 	}
-	printf("break_handler_queue cases=%u valid=1\n", cases);
+	if (printf("break_handler_queue cases=%u valid=1\n", cases) < 0)
+		return TEST_FAIL;
 	return cases == 8 ? TEST_PASS : TEST_FAIL;
 }
 
@@ -473,20 +490,20 @@ test_break_handler_setup(void)
 			window_test_gather = gather != 0;
 			int setup = conn_setup_mode(&ctx, false);
 			window_test_gather = false;
-			ASSERT_OK(setup);
+			ASSERT_EQ(setup, 0);
 			struct break_handler_capture capture = {0};
 			break_handler_capture_init(&capture, true);
-			ASSERT_OK(dssh_session_set_break_cb(ctx.server, break_handler_action, &capture));
-			ASSERT_OK(dssh_session_start(ctx.server));
+			ASSERT_EQ(dssh_session_set_break_cb(ctx.server, break_handler_action, &capture), 0);
+			ASSERT_EQ(dssh_session_start(ctx.server), 0);
 			struct incoming_control_open job = {.session = ctx.server, .zc = zc != 0};
-			thrd_t acceptor;
-			if (thrd_create(&acceptor, incoming_control_open_worker, &job) != thrd_success) {
-				conn_cleanup(&ctx);
-				return TEST_FAIL;
-			}
+			struct channel_workers workers;
+			channel_workers_init(&workers, &ctx);
+			ASSERT_EQ(channel_worker_start(&workers, 0, incoming_control_open_worker, &job), 0);
 			uint32_t remote = 0;
 			bool valid = accept_failure_open(ctx.client, 42) == 0
 			    && request_frame_receive(ctx.client, SSH_MSG_CHANNEL_OPEN_CONFIRMATION, 42, &remote);
+			ASSERT_TRUE(valid);
+			ASSERT_TRUE(callback_checkpoint(CALLBACK_SETUP, gather * 2 + zc));
 			static const uint8_t name[] = "break";
 			uint8_t body[4];
 			size_t pos = 0;
@@ -502,10 +519,8 @@ test_break_handler_setup(void)
 				valid = request_frame_exec(ctx.client, remote, 42);
 			if (!valid)
 				break_handler_unblock(ctx.server, &ctx.io);
-			int result;
-			if (thrd_join(acceptor, &result) != thrd_success)
-				abort();
-			valid = result == 0 && job.channel != NULL && valid;
+			channel_workers_finish(&workers);
+			valid = workers.results[0] == 0 && job.channel != NULL && valid;
 			if (valid) {
 				unsigned success = 0, failure = 0;
 				valid = request_frame_send(ctx.client, remote, name, sizeof(name) - 1, 1, body, sizeof(body)) == 0
@@ -518,6 +533,7 @@ test_break_handler_setup(void)
 			cases++;
 		}
 	}
-	printf("break_handler_setup cases=%u valid=1\n", cases);
+	if (printf("break_handler_setup cases=%u valid=1\n", cases) < 0)
+		return TEST_FAIL;
 	return cases == 4 ? TEST_PASS : TEST_FAIL;
 }

@@ -1837,6 +1837,18 @@ foreach(part IN ITEMS setup no_start)
 	set_tests_properties(dssh_conn_${part}_ownership PROPERTIES TIMEOUT 120
 		ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys)
 endforeach()
+foreach(consumer IN ITEMS close defaults atomic lifetime queue setup replacement incoming)
+	dssh_add_output_test(dssh_conn_callback_owner_${consumer} dssh_test_conn
+		"1 tests: 1 passed, 0 failed, 0 skipped" --exact release/callback_owner_${consumer})
+	set_tests_properties(dssh_conn_callback_owner_${consumer} PROPERTIES TIMEOUT 120
+		ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys)
+endforeach()
+foreach(part IN ITEMS capture packet)
+	dssh_add_output_test(dssh_conn_callback_${part}_bounds dssh_test_conn
+		"1 tests: 1 passed, 0 failed, 0 skipped" --exact release/callback_${part}_bounds)
+	set_tests_properties(dssh_conn_callback_${part}_bounds PROPERTIES TIMEOUT 120
+		ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys)
+endforeach()
 foreach(consumer IN ITEMS reject two accept independent concurrent terminate drop failure blocking callback credit deadline)
 	dssh_add_output_test(dssh_conn_actor_owner_${consumer} dssh_test_conn
 		"1 tests: 1 passed, 0 failed, 0 skipped" --exact release/actor_owner_${consumer})
@@ -1921,6 +1933,7 @@ set_tests_properties(dssh_conn_compression_test-growth_window_rekey PROPERTIES
 	FIXTURES_REQUIRED dssh_cached_keys
 	TIMEOUT 60)
 set(CONN_TESTS
+	release/callback_incoming_lifetime
 	queue_retry/packet_stream_callback queue_retry/gather_stream_callback
 	queue_retry/packet_ordinary queue_retry/packet_key_refusal queue_retry/packet_size_refusal queue_retry/packet_key_partial queue_retry/packet_size_partial queue_retry/packet_phase_pause queue_retry/packet_concurrent_key queue_retry/packet_channel_key_partial queue_retry/packet_window_size queue_retry/packet_concurrent_size queue_retry/packet_key_rekey queue_retry/packet_size_rekey queue_retry/packet_key_probe_send queue_retry/packet_key_probe_write queue_retry/packet_key_probe_slot queue_retry/packet_key_probe_rekey queue_retry/packet_size_probe_send queue_retry/packet_size_probe_write queue_retry/packet_size_probe_slot queue_retry/packet_size_probe_rekey queue_retry/gather_ordinary queue_retry/gather_key_refusal queue_retry/gather_size_refusal queue_retry/gather_key_partial queue_retry/gather_size_partial queue_retry/gather_phase_pause queue_retry/gather_concurrent_key queue_retry/gather_channel_key_partial queue_retry/gather_window_size queue_retry/gather_concurrent_size queue_retry/gather_key_rekey queue_retry/gather_size_rekey queue_retry/gather_key_probe_send queue_retry/gather_key_probe_write queue_retry/gather_key_probe_slot queue_retry/gather_key_probe_rekey queue_retry/gather_size_probe_send queue_retry/gather_size_probe_write queue_retry/gather_size_probe_slot queue_retry/gather_size_probe_rekey
 	control_frame/wire_normal_window control_frame/wire_normal_eof control_frame/wire_normal_close control_frame/wire_normal_success control_frame/wire_normal_failure control_frame/wire_setup_window control_frame/wire_setup_eof control_frame/wire_setup_close control_frame/wire_setup_success control_frame/wire_setup_failure control_frame/wire_pending_success control_frame/wire_pending_failure
@@ -2059,6 +2072,14 @@ if(UNIX)
 				$<TARGET_FILE:dssh_test_threads_shim_posix> ${operation})
 		endforeach()
 	endif()
+	foreach(operation IN ITEMS close-1 close-2 close-3 defaults-1 defaults-2 defaults-3 defaults-4 atomic-1 atomic-2 atomic-3 atomic-4 atomic-5 atomic-6 atomic-7 atomic-8 atomic-9 lifetime-1 lifetime-2 lifetime-3 lifetime-4 lifetime-5 lifetime-6 queue-1 queue-2 queue-3 queue-4 queue-5 queue-6 queue-7 queue-8 queue-9 queue-10 queue-11 queue-12 queue-13 queue-14 queue-15 queue-16 setup-1 setup-2 setup-3 setup-4 replacement-1 replacement-2 incoming-1 incoming-2 incoming-3 incoming-4 incoming-5 incoming-6 incoming-7 incoming-8 incoming-9 incoming-10 incoming-11 incoming-12)
+		foreach(mode IN ITEMS retained released)
+			dssh_add_output_test(dssh_channel_callback_fatal_${operation}_${mode} dssh_test_fatal_driver
+				"channel_join_fatal=1" $<TARGET_FILE:dssh_test_conn> --channel-fatal callback-${operation} ${mode})
+			set_tests_properties(dssh_channel_callback_fatal_${operation}_${mode} PROPERTIES TIMEOUT 120
+				ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys)
+		endforeach()
+	endforeach()
 	foreach(operation IN ITEMS reject-1 reject-2 two-1 accept-1 independent-1 concurrent-1 concurrent-2 concurrent-3 concurrent-4 terminate-1 terminate-2 terminate-3 drop-1 drop-2 drop-3 failure-1 blocking-1 callback-1 callback-2 credit-1 credit-2 credit-3 deadline-1 deadline-2 deadline-3)
 		foreach(mode IN ITEMS retained released)
 			dssh_add_output_test(dssh_channel_actor_fatal_${operation}_${mode} dssh_test_fatal_driver

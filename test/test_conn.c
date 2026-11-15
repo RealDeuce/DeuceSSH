@@ -771,6 +771,7 @@ open_exec_channel(struct conn_ctx *owner, struct open_exec_ctx *ctx)
 }
 
 #include "conn_zc_fixture.h"
+#include "conn_callback_fixture.h"
 
 /* ================================================================
  * Helper: open a shell channel concurrently
@@ -5266,24 +5267,6 @@ accept_subsys_blocking_zc(dssh_channel ch, const struct dssh_chan_params *p,
 	return 0;
 }
 
-struct close_channel_ctx {
-	dssh_channel ch;
-	atomic_bool  started;
-	atomic_bool  done;
-	int          result;
-};
-
-static int
-close_channel_thread(void *arg)
-{
-	struct close_channel_ctx *ctx = arg;
-
-	atomic_store(&ctx->started, true);
-	ctx->result = dssh_chan_close(ctx->ch, -1);
-	atomic_store(&ctx->done, true);
-	return 0;
-}
-
 static int
 test_close_during_zc_callback(void)
 {
@@ -8016,8 +7999,21 @@ test_compression_window_rekey(void)
 #include "break_handler_cases.h"
 #include "terminal_mode_cases.h"
 #include "notification_flag_cases.h"
+#include "conn_callback_cases.h"
 
 static struct dssh_test_entry tests[] = {
+	{ "release/callback_incoming_lifetime", test_callback_incoming_lifetime },
+	{ "release/callback_capture_bounds", test_callback_capture_bounds },
+	{ "release/callback_packet_bounds", test_callback_packet_bounds },
+	{ "release/callback_owner_close", test_callback_owner_close },
+	{ "release/callback_owner_defaults", test_callback_owner_defaults },
+	{ "release/callback_owner_atomic", test_callback_owner_atomic },
+	{ "release/callback_owner_lifetime", test_callback_owner_lifetime },
+	{ "release/callback_owner_queue", test_callback_owner_queue },
+	{ "release/callback_owner_setup", test_callback_owner_setup },
+	{ "release/callback_owner_replacement", test_callback_owner_replacement },
+	{ "release/callback_owner_incoming", test_callback_owner_incoming },
+
 	{ "release/actor_owner_reject", test_actor_owner_reject },
 	{ "release/actor_owner_two", test_actor_owner_two },
 	{ "release/actor_owner_accept", test_actor_owner_accept },
@@ -8633,6 +8629,9 @@ main(int argc, char *argv[])
 		return incoming_control_probe();
 	if (argc == 2 && strcmp(argv[1], "--audit-close-outcomes") == 0)
 		return close_outcome_probe();
+	if (argc == 4 && strcmp(argv[1], "--channel-fatal") == 0
+	    && strncmp(argv[2], "callback-", 9) == 0)
+		return callback_fatal_child(argv[2] + 9, argv[3]);
 	if (argc == 4 && strcmp(argv[1], "--channel-fatal") == 0
 	    && strncmp(argv[2], "actor-", 6) == 0)
 		return conn_actor_fatal_child(argv[2] + 6, argv[3]);

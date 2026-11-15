@@ -1,5 +1,6 @@
 #ifndef DSSH_TEST_CHANNEL_WORKER_CASES_H
 #define DSSH_TEST_CHANNEL_WORKER_CASES_H
+#define CHANNEL_WORKER_PROBE_CAP 16
 
 struct channel_worker_job {
 	thrd_start_t function;
@@ -15,7 +16,7 @@ struct channel_worker_probe {
 	bool creation_failed;
 	unsigned fatal_join;
 	bool fatal_released;
-	struct channel_worker_job jobs[4];
+	struct channel_worker_job jobs[CHANNEL_WORKER_PROBE_CAP];
 };
 static struct channel_worker_probe *channel_worker_probe;
 
@@ -32,14 +33,14 @@ static int
 channel_worker_probe_create(thrd_t *thread, thrd_start_t function, void *data)
 {
 	struct channel_worker_probe *probe = channel_worker_probe;
-	if (probe->calls >= 4)
+	if (probe->calls >= CHANNEL_WORKER_PROBE_CAP)
 		abort();
 	unsigned index = probe->calls++;
 	if (index == probe->fail_at) {
 		probe->creation_failed = true;
 		return thrd_error;
 	}
-	if (index >= 4)
+	if (index >= CHANNEL_WORKER_PROBE_CAP)
 		abort();
 	struct channel_worker_job *job = &probe->jobs[index];
 	job->function = function;
@@ -90,7 +91,7 @@ channel_worker_probe_join(thrd_t thread, int *result)
 static void
 channel_worker_probe_begin(struct channel_worker_probe *probe)
 {
-	for (size_t i = 0; i < 4; i++)
+	for (size_t i = 0; i < CHANNEL_WORKER_PROBE_CAP; i++)
 		atomic_init(&probe->jobs[i].done, false);
 	channel_worker_probe = probe;
 	channel_fixture_thread_create = channel_worker_probe_create;

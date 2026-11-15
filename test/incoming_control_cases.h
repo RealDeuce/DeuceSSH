@@ -49,9 +49,12 @@ static dssh_channel
 incoming_control_open(struct conn_ctx *ctx, bool zc)
 {
 	struct incoming_control_open job = {.session = ctx->server, .zc = zc};
-	thrd_t worker;
-	if (thrd_create(&worker, incoming_control_open_worker, &job) != thrd_success)
+	struct channel_workers workers;
+	channel_workers_init(&workers, ctx);
+	if (channel_worker_start(&workers, 0, incoming_control_open_worker, &job) != 0) {
+		channel_workers_finish(&workers);
 		return NULL;
+	}
 	bool valid;
 	if (!ctx->server->trans.client) {
 		uint32_t remote;
@@ -86,10 +89,8 @@ incoming_control_open(struct conn_ctx *ctx, bool zc)
 		mock_io_close_c2s(&ctx->io);
 		mock_io_close_s2c(&ctx->io);
 	}
-	int result;
-	if (thrd_join(worker, &result) != thrd_success)
-		abort();
-	return valid && result == 0 ? job.channel : NULL;
+	channel_workers_finish(&workers);
+	return valid && workers.results[0] == 0 ? job.channel : NULL;
 }
 
 static bool
@@ -221,22 +222,23 @@ incoming_control_run(struct conn_ctx *ctx, unsigned role, unsigned gather, unsig
 	struct incoming_break_capture actions = {0};
 	atomic_init(&actions.count, 0);
 	if (dssh_session_set_break_cb(ctx->server, incoming_break_perform, &actions) != 0)
-		return TEST_FAIL;
+		goto failed;
 	const char *expected_mac = test_using_hmac256() ? "hmac-sha2-256" : "hmac-sha2-512";
 	for (unsigned direction = 0; direction < 2; direction++) {
 		enum dssh_direction selected = direction == 0 ? DSSH_CLIENT_TO_SERVER : DSSH_SERVER_TO_CLIENT;
 		const char *mac = dssh_transport_get_mac_name(ctx->server, selected);
 		if (mac == NULL || strcmp(mac, expected_mac) != 0)
-			return TEST_FAIL;
+			goto failed;
 	}
-	printf("incoming_control_algorithms mac=%s\n", expected_mac);
+	if (printf("incoming_control_algorithms mac=%s\n", expected_mac) < 0)
+		goto failed;
 	if (delivery != 2 && dssh_session_set_event_cb(ctx->server, capture_event, &capture) != 0)
-		return TEST_FAIL;
+		goto failed;
 	if (dssh_session_start(ctx->server) != 0)
-		return TEST_FAIL;
+		goto failed;
 	dssh_channel channel = incoming_control_open(ctx, delivery == 1);
 	if (channel == NULL)
-		return TEST_FAIL;
+		goto failed;
 	static const uint8_t nul_signal[] = {'S', 0, 'G'};
 	static const uint8_t high_signal[] = {'S', 0xff, 'G'};
 	static const uint8_t binary_error[] = {0, 13, 10, 27, 0xff};
@@ -296,10 +298,10 @@ incoming_control_run(struct conn_ctx *ctx, unsigned role, unsigned gather, unsig
 			size_t length;
 			if (!incoming_control_packet(channel, &cases[i], flags[j], packet, sizeof(packet), &length)
 			    || send_packet(ctx->client, packet, length, NULL) != 0)
-				return TEST_FAIL;
+				goto failed;
 			unsigned success = 0, failure = 0;
 			if (!incoming_control_barrier(ctx->client, &success, &failure))
-				return TEST_FAIL;
+				goto failed;
 			bool verified, observed = false;
 			if (cases[i].type == TEST_CHANNEL_BREAK_REQUEST) {
 				unsigned count = atomic_load(&actions.count);
@@ -367,15 +369,26 @@ incoming_control_run(struct conn_ctx *ctx, unsigned role, unsigned gather, unsig
 			    && !dssh_session_is_terminated(ctx->server) && !dssh_session_is_terminated(ctx->client)
 			    && atomic_load(&channel->remote_window) == remote_window;
 			unsigned flag = flags[j];
-			printf("incoming_control role=%u gather=%u delivery=%u name=%s flag=%u delivered=%u success=%u failure=%u structural_valid=%u policy_accepted=0\n",
+			if (printf("incoming_control role=%u gather=%u delivery=%u name=%s flag=%u delivered=%u success=%u failure=%u structural_valid=%u policy_accepted=0\n",
 			    role, gather, delivery, cases[i].name, flag, observed ? 1U : 0U,
-			    success, failure, valid ? 1U : 0U);
-			if (!valid)
-				return TEST_FAIL;
+			    success, failure, valid ? 1U : 0U) < 0)
+				goto failed;
+			if (!valid || (observations == 0
+			    && !callback_checkpoint(CALLBACK_INCOMING, role * 6 + gather * 3 + delivery)))
+				goto failed;
 			observations++;
 		}
 	}
-	return observations == 105 ? TEST_PASS : TEST_FAIL;
+	int result = observations == 105 ? TEST_PASS : TEST_FAIL;
+	conn_cleanup(ctx);
+	if (callback_incoming_retirement_observer != NULL)
+		callback_incoming_retirement_observer(ctx, &capture.count, &actions.count);
+	return result;
+failed:
+	conn_cleanup(ctx);
+	if (callback_incoming_retirement_observer != NULL)
+		callback_incoming_retirement_observer(ctx, &capture.count, &actions.count);
+	return TEST_FAIL;
 }
 
 static int
@@ -397,14 +410,20 @@ incoming_control_probe(void)
 					ctx.client = ctx.server;
 					ctx.server = swap;
 				}
-				int result = algorithms ? incoming_control_run(&ctx, role, gather, delivery) : TEST_FAIL;
-				conn_cleanup(&ctx);
+				int result = TEST_FAIL;
+				if (algorithms)
+					result = incoming_control_run(&ctx, role, gather, delivery);
+				else
+					conn_cleanup(&ctx);
 				if (result != TEST_PASS)
 					return 1;
 				pairs++;
 			}
 		}
 	}
-	printf("incoming_controls pairs=%u observations=%u structural_valid=1 policy_accepted=0\n", pairs, pairs * 105);
+	if (printf("incoming_controls pairs=%u observations=%u structural_valid=1 policy_accepted=0\n", pairs, pairs * 105) < 0)
+		return 1;
+	if (fflush(stdout) != 0)
+		return 1;
 	return pairs == 12 ? 0 : 1;
 }

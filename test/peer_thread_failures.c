@@ -38,6 +38,20 @@ static unsigned join_index;
 static unsigned application_workers;
 static atomic_bool tx_failed;
 
+#ifdef DSSH_PEER_DEFER_CONTROL
+static atomic_bool controls_active;
+
+/* A rekey consumer first completes and joins an ordinary handshake. Enable
+ * only after that prefix retires; subsequent counters describe the rekey. */
+void
+dssh_test_peer_controls_begin(void)
+{
+	if (!configured || !controller || create_index != 0 || join_index != 0
+	    || application_workers != 0 || atomic_exchange(&controls_active, true))
+		abort();
+}
+#endif
+
 static void
 configure(void)
 {
@@ -63,6 +77,10 @@ WRAP_CREATE(thrd_t *thread, thrd_start_t start, void *arg)
 	 * therefore observes configured/mode after native thread startup. */
 	if (!configured)
 		configure();
+#ifdef DSSH_PEER_DEFER_CONTROL
+	if (!atomic_load(&controls_active))
+		return REAL_CREATE(thread, start, arg);
+#endif
 	if (controller) {
 		unsigned index = create_index;
 		if (create_index != UINT_MAX)
@@ -82,6 +100,10 @@ WRAP_CREATE(thrd_t *thread, thrd_start_t start, void *arg)
 int
 WRAP_JOIN(thrd_t thread, int *result)
 {
+#ifdef DSSH_PEER_DEFER_CONTROL
+	if (!atomic_load(&controls_active))
+		return REAL_JOIN(thread, result);
+#endif
 	if (!controller || join_index >= application_workers)
 		return REAL_JOIN(thread, result);
 	unsigned index = join_index;
@@ -104,6 +126,10 @@ WRAP_JOIN(thrd_t thread, int *result)
 int
 __wrap_mock_tx_client(uint8_t *buf, size_t len, dssh_session sess, void *opaque)
 {
+#ifdef DSSH_PEER_DEFER_CONTROL
+	if (!atomic_load(&controls_active))
+		return __real_mock_tx_client(buf, len, sess, opaque);
+#endif
 	if (strcmp(mode, "tx") == 0 && !atomic_exchange(&tx_failed, true)) {
 		fputs("PEER_TX_FAILURE\n", stderr);
 		return -1;

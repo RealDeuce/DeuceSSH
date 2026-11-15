@@ -8,7 +8,7 @@ transport_pair_prepare(struct test_session_pair *pair, unsigned kind)
 {
 	test_pair_begin(pair);
 	dssh_test_reset_global_config();
-	if (kind > 3)
+	if (kind > 4)
 		return DSSH_ERROR_INVALID;
 	int ret = 0;
 	if (kind == 2) {

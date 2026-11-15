@@ -1443,6 +1443,10 @@ foreach(suffix IN ITEMS "" _hmac256 _dhgex _rsa _rsa512 _dhgex_rsa _dhgex_rsa512
 	_sntrup _sntrup_rsa _sntrup_rsa512 _mlkem _mlkem_rsa _mlkem_rsa512
 	_rsa_hmac256 _dhgex_hmac256 _sntrup_hmac256)
 	get_test_property(dssh_transport${suffix} ENVIRONMENT transport_pair_environment)
+	dssh_add_output_test(dssh_rekey_fixture${suffix} dssh_test_transport
+		"1 tests: 1 passed, 0 failed, 0 skipped" --exact rekey/owned_roundtrip)
+	set_tests_properties(dssh_rekey_fixture${suffix} PROPERTIES
+		ENVIRONMENT "${transport_pair_environment}" TIMEOUT 120)
 	foreach(leaf IN LISTS transport_pair_leaves)
 		dssh_add_output_test(dssh_transport_pair_${leaf}${suffix} dssh_test_transport
 			"1 tests: 1 passed, 0 failed, 0 skipped" --exact ${leaf})
@@ -1450,6 +1454,14 @@ foreach(suffix IN ITEMS "" _hmac256 _dhgex _rsa _rsa512 _dhgex_rsa _dhgex_rsa512
 			ENVIRONMENT "${transport_pair_environment}" TIMEOUT 120)
 	endforeach()
 endforeach()
+foreach(method IN ITEMS group14 group16)
+	dssh_add_output_test(dssh_rekey_fixture_${method} dssh_test_transport
+		"1 tests: 1 passed, 0 failed, 0 skipped" --exact rekey/owned_roundtrip)
+	set_tests_properties(dssh_rekey_fixture_${method} PROPERTIES
+		ENVIRONMENT "DSSH_TEST_KEX=${method};${DSSH_TEST_KEY_ENV}" TIMEOUT 120)
+endforeach()
+dssh_add_output_test(dssh_rekey_fixture_oracle dssh_test_transport
+	"1 tests: 1 passed, 0 failed, 0 skipped" --exact rekey/sequence_oracle)
 foreach(suffix IN ITEMS "" _hmac256 _dhgex _rsa _rsa512 _dhgex_rsa _dhgex_rsa512
 	_sntrup _sntrup_rsa _sntrup_rsa512 _mlkem _mlkem_rsa _mlkem_rsa512
 	_rsa_hmac256 _dhgex_hmac256 _sntrup_hmac256)
@@ -2655,6 +2667,20 @@ if(Python3_Interpreter_FOUND AND UNIX AND NOT APPLE)
 			set_tests_properties(dssh_transport_pair_owner_${kind}_${mode} PROPERTIES
 				ENVIRONMENT "${DSSH_TEST_KEY_ENV}" TIMEOUT 120)
 		endforeach()
+	endforeach()
+	dssh_add_test(transport_rekey_owner test_transport.c)
+	target_sources(dssh_test_transport_rekey_owner PRIVATE peer_thread_failures.c dh_group_result_provider.c)
+	target_compile_definitions(dssh_test_transport_rekey_owner PRIVATE
+		DSSH_TRANSPORT_REKEY_CONTROLS DSSH_PEER_DEFER_CONTROL)
+	target_link_libraries(dssh_test_transport_rekey_owner PRIVATE dssh_mock_io dssh_mock_comp)
+	target_link_options(dssh_test_transport_rekey_owner PRIVATE
+		"-Wl,--wrap=${create_symbol},--wrap=${join_symbol},--wrap=mock_tx_client")
+	foreach(mode IN LISTS owner_modes)
+		add_test(NAME dssh_rekey_fixture_owner_${mode} COMMAND ${Python3_EXECUTABLE}
+			${CMAKE_CURRENT_SOURCE_DIR}/fixture_owner_controls.py
+			$<TARGET_FILE:dssh_test_transport_rekey_owner> ${mode})
+		set_tests_properties(dssh_rekey_fixture_owner_${mode} PROPERTIES
+			ENVIRONMENT "${DSSH_TEST_KEY_ENV}" TIMEOUT 120)
 	endforeach()
 endif()
 set_tests_properties(

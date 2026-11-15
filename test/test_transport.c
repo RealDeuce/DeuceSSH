@@ -2185,130 +2185,8 @@ rekey_server_recv_thread(void *arg)
 	return 0;
 }
 
-static int
-test_rekey_after_handshake(void)
-{
-	struct handshake_ctx ctx;
-	if (handshake_setup(&ctx) < 0) {
-		handshake_cleanup(&ctx);
-		return TEST_FAIL;
-	}
 
-	/* Save session ID for comparison after rekey */
-	size_t sid_sz = ctx.client->trans.session_id_sz;
-	uint8_t *sid_before = malloc(sid_sz);
-	ASSERT_NOT_NULL(sid_before);
-	memcpy(sid_before, ctx.client->trans.session_id, sid_sz);
 
-	/* Run rekey: client initiates, server handles via recv_packet */
-	struct rekey_thread_arg client_arg = { &ctx, -1 };
-	struct rekey_thread_arg server_arg = { &ctx, -1 };
-
-	thrd_t ct, st;
-	ASSERT_TRUE(thrd_create(&ct, rekey_client_thread, &client_arg) == thrd_success);
-	ASSERT_TRUE(thrd_create(&st, rekey_server_recv_thread, &server_arg) == thrd_success);
-
-	/* After rekey, client sends a message so server recv returns */
-	thrd_join(ct, NULL);
-	ASSERT_EQ(client_arg.result, 0);
-
-	uint8_t real_msg[] = { SSH_MSG_SERVICE_REQUEST, 0xEE };
-	ASSERT_OK(send_packet(ctx.client, real_msg, sizeof(real_msg), NULL));
-
-	thrd_join(st, NULL);
-	ASSERT_EQ(server_arg.result, 0);
-
-	/* Session ID should be stable across rekey */
-	ASSERT_EQ_U(ctx.client->trans.session_id_sz, sid_sz);
-	ASSERT_MEM_EQ(ctx.client->trans.session_id, sid_before, sid_sz);
-
-	/* Rekey counters should have been reset */
-	ASSERT_TRUE(ctx.client->trans.tx_since_rekey < 10);
-	ASSERT_TRUE(ctx.client->trans.rx_since_rekey < 10);
-
-	free(sid_before);
-	handshake_cleanup(&ctx);
-	return TEST_PASS;
-}
-
-static int
-test_rekey_session_id_stable(void)
-{
-	struct handshake_ctx ctx;
-	if (handshake_setup(&ctx) < 0) {
-		handshake_cleanup(&ctx);
-		return TEST_FAIL;
-	}
-
-	size_t sid_sz = ctx.server->trans.session_id_sz;
-	uint8_t *sid_before = malloc(sid_sz);
-	ASSERT_NOT_NULL(sid_before);
-	memcpy(sid_before, ctx.server->trans.session_id, sid_sz);
-
-	struct rekey_thread_arg client_arg = { &ctx, -1 };
-	struct rekey_thread_arg server_arg = { &ctx, -1 };
-
-	thrd_t ct, st;
-	ASSERT_TRUE(thrd_create(&ct, rekey_client_thread, &client_arg) == thrd_success);
-	ASSERT_TRUE(thrd_create(&st, rekey_server_recv_thread, &server_arg) == thrd_success);
-
-	thrd_join(ct, NULL);
-
-	uint8_t msg[] = { SSH_MSG_SERVICE_REQUEST, 0x01 };
-	ASSERT_OK(send_packet(ctx.client, msg, sizeof(msg), NULL));
-
-	thrd_join(st, NULL);
-
-	/* Server session ID should be unchanged */
-	ASSERT_EQ_U(ctx.server->trans.session_id_sz, sid_sz);
-	ASSERT_MEM_EQ(ctx.server->trans.session_id, sid_before, sid_sz);
-
-	free(sid_before);
-	handshake_cleanup(&ctx);
-	return TEST_PASS;
-}
-
-static int
-test_rekey_encrypted_roundtrip(void)
-{
-	struct handshake_ctx ctx;
-	if (handshake_setup(&ctx) < 0) {
-		handshake_cleanup(&ctx);
-		return TEST_FAIL;
-	}
-
-	/* Rekey */
-	struct rekey_thread_arg client_arg = { &ctx, -1 };
-	struct rekey_thread_arg server_arg = { &ctx, -1 };
-
-	thrd_t ct, st;
-	ASSERT_TRUE(thrd_create(&ct, rekey_client_thread, &client_arg) == thrd_success);
-	ASSERT_TRUE(thrd_create(&st, rekey_server_recv_thread, &server_arg) == thrd_success);
-
-	thrd_join(ct, NULL);
-	ASSERT_EQ(client_arg.result, 0);
-
-	/* Send a message after rekey so server recv returns */
-	uint8_t payload[] = { SSH_MSG_SERVICE_REQUEST, 0xDE, 0xAD, 0xBE, 0xEF };
-	ASSERT_OK(send_packet(ctx.client, payload, sizeof(payload), NULL));
-	thrd_join(st, NULL);
-	ASSERT_EQ(server_arg.result, 0);
-
-	/* Now send another message and verify roundtrip with new keys */
-	uint8_t payload2[] = { SSH_MSG_SERVICE_ACCEPT, 0x12, 0x34 };
-	ASSERT_OK(send_packet(ctx.server, payload2, sizeof(payload2), NULL));
-
-	uint8_t msg_type;
-	uint8_t *recv_payload;
-	size_t recv_len;
-	ASSERT_OK(recv_packet(ctx.client, &msg_type, &recv_payload, &recv_len));
-	ASSERT_EQ(msg_type, SSH_MSG_SERVICE_ACCEPT);
-	ASSERT_EQ_U(recv_len, sizeof(payload2));
-	ASSERT_MEM_EQ(recv_payload, payload2, sizeof(payload2));
-
-	handshake_cleanup(&ctx);
-	return TEST_PASS;
-}
 
 /* ================================================================
  * Session lifecycle tests
@@ -2421,48 +2299,6 @@ test_rekey_hard_limit_recv(void)
 }
 
 /* RFC 4253 s6.4-3: sequence numbers never reset across rekey */
-static int
-test_rekey_seq_preserved(void)
-{
-	struct handshake_ctx ctx;
-	if (handshake_setup(&ctx) < 0) {
-		handshake_cleanup(&ctx);
-		return TEST_FAIL;
-	}
-
-	/* Send a few packets to advance sequence numbers */
-	for (int i = 0; i < 5; i++) {
-		uint8_t msg[] = { SSH_MSG_IGNORE, 0 };
-		ASSERT_OK(send_packet(ctx.client, msg,
-		    sizeof(msg), NULL));
-	}
-
-	uint32_t pre_tx = ctx.client->trans.tx_seq;
-	uint32_t pre_rx = ctx.client->trans.rx_seq;
-	ASSERT_TRUE(pre_tx >= 5);
-
-	/* Run rekey */
-	struct rekey_thread_arg client_arg = { &ctx, -1 };
-	struct rekey_thread_arg server_arg = { &ctx, -1 };
-	thrd_t ct, st;
-	ASSERT_THRD_CREATE(&ct, rekey_client_thread, &client_arg);
-	ASSERT_THRD_CREATE(&st, rekey_server_recv_thread, &server_arg);
-	thrd_join(ct, NULL);
-
-	uint8_t msg2[] = { SSH_MSG_SERVICE_REQUEST, 0xEE };
-	send_packet(ctx.client, msg2, sizeof(msg2), NULL);
-	thrd_join(st, NULL);
-
-	/* Sequence numbers must NOT have been reset */
-	ASSERT_TRUE(ctx.client->trans.tx_seq > pre_tx);
-	ASSERT_TRUE(ctx.client->trans.rx_seq >= pre_rx);
-
-	/* But per-key counters WERE reset */
-	ASSERT_TRUE(ctx.client->trans.tx_since_rekey < pre_tx);
-
-	handshake_cleanup(&ctx);
-	return TEST_PASS;
-}
 
 /* RFC 4253 s6.4-2: MAC active after handshake */
 static int
@@ -7318,6 +7154,7 @@ test_rxline_from_rx_handshake(void)
 }
 
 #include "transport_pair_cases.h"
+#include "transport_rekey_cases.h"
 
 /* ================================================================
  * Test table
@@ -9058,7 +8895,11 @@ test_rekey_global_pipeline(void)
 #include "gather_batch_cases.h"
 
 static struct dssh_test_entry tests[] = {
-#ifdef DSSH_TRANSPORT_PAIR_CONTROLS
+	{ "rekey/owned_roundtrip", test_rekey_owned_roundtrip },
+	{ "rekey/sequence_oracle", test_rekey_sequence_oracle },
+#if defined(DSSH_TRANSPORT_REKEY_CONTROLS)
+	{ "fixture/ownership", test_transport_rekey_ownership },
+#elif defined(DSSH_TRANSPORT_PAIR_CONTROLS)
 	{ "fixture/ownership", test_transport_pair_ownership },
 #endif
 	{ "release/test_layout", test_transport_test_layout },
@@ -9254,14 +9095,10 @@ static struct dssh_test_entry tests[] = {
 	{ "rekey/seconds_disabled",          test_rekey_seconds_disabled },
 	{ "rekey/needed_below_threshold",    test_rekey_needed_below_threshold },
 	{ "rekey/bytes_per_direction",       test_rekey_bytes_per_direction },
-	{ "rekey/after_handshake",           test_rekey_after_handshake },
-	{ "rekey/session_id_stable",         test_rekey_session_id_stable },
-	{ "rekey/encrypted_roundtrip",       test_rekey_encrypted_roundtrip },
 
 	/* RFC conformance */
 	{ "rekey/hard_limit_send",           test_rekey_hard_limit_send },
 	{ "rekey/hard_limit_recv",           test_rekey_hard_limit_recv },
-	{ "rekey/seq_preserved",             test_rekey_seq_preserved },
 	{ "handshake/mac_active",            test_handshake_mac_active },
 
 	/* Session lifecycle */
@@ -9509,12 +9346,16 @@ DSSH_TEST_MAIN(tests)
 int
 main(int argc, char **argv)
 {
-#ifdef DSSH_TRANSPORT_PAIR_CONTROLS
+#if defined(DSSH_TRANSPORT_PAIR_CONTROLS) || defined(DSSH_TRANSPORT_REKEY_CONTROLS)
 	if (argc == 3 && strcmp(argv[1], "--fixture-assert") == 0) {
 		if (strlen(argv[2]) != 1 || argv[2][0] < '0' || argv[2][0] > '2')
 			return 2;
 		unsigned phase = (unsigned)(argv[2][0] - '0');
+#ifdef DSSH_TRANSPORT_REKEY_CONTROLS
+		return transport_rekey_assertion_control(phase);
+#else
 		return transport_pair_assertion_control(phase);
+#endif
 	}
 #endif
 	return transport_test_main(argc, argv);

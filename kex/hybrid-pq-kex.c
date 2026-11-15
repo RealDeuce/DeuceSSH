@@ -13,7 +13,7 @@
 #endif
 
 enum hybrid_slot { HYBRID_PUBLIC, HYBRID_REPLY, HYBRID_PQ_SECRET,
-	HYBRID_CLASSICAL_SECRET, HYBRID_PQ_KEY, HYBRID_SLOTS };
+	HYBRID_CLASSICAL_SECRET, HYBRID_PQ_KEY, HYBRID_HOSTKEY, HYBRID_SLOTS };
 
 struct hybrid_hash {
 	dssh_hash_ctx *context;
@@ -318,6 +318,14 @@ hybrid_pq_handler_impl(const struct dssh_kex_context *ctx, struct dssh_kex_resul
 			ret = DSSH_ERROR_INVALID;
 			goto done;
 		}
+		/* End the producer borrow before callbacks can reuse its storage.
+		 * The owned slot is cleared on every exit and retained for rekey. */
+		uint8_t *saved_hostkey = NULL;
+		ret = dssh_kex_workspace_get(state->workspace, HYBRID_HOSTKEY, hostkey.len, &saved_hostkey);
+		if (ret < 0)
+			goto done;
+		memcpy(saved_hostkey, hostkey.data, hostkey.len);
+		hostkey.data = saved_hostkey;
 		ret = ctx->recv(&type, &payload, &length, ctx->io_ctx);
 		if (ret != 0)
 			goto done;

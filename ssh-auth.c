@@ -1859,6 +1859,7 @@ auth_publickey_impl(struct dssh_session_s *sess, const char *username, const cha
 	DSSH_PUT_U32((uint32_t)sess->trans.session_id_sz, sign_data, &sp);
 	memcpy(&sign_data[sp], sess->trans.session_id, sess->trans.session_id_sz);
 	sp += sess->trans.session_id_sz;
+	size_t request_start = sp;
 	sp += build_userauth_request(&sign_data[sp], username, ulen, method_publickey,
 	    DSSH_STRLEN(method_publickey));
 	sign_data[sp++] = 1; /* TRUE */
@@ -1877,8 +1878,8 @@ auth_publickey_impl(struct dssh_session_s *sess, const char *username, const cha
 	res = ka->sign(&signature, sign_data, sp, ka->ctx);
 	if (res > 0)
 		res = DSSH_ERROR_INVALID;
-	free(sign_data);
 	if (res < 0) {
+		free(sign_data);
 		dssh_result_release(&signature.lease);
 		return res;
 	}
@@ -1886,6 +1887,7 @@ auth_publickey_impl(struct dssh_session_s *sess, const char *username, const cha
 	sig_len = signature.bytes.len;
 	if (signature.lease.release == NULL || sig_buf == NULL || sig_len == 0 || (sig_len > UINT32_MAX)
 	    || (sig_len > SIZE_MAX - AUTH_PUBLICKEY_FIXED - ulen - alen - pubkey_len)) {
+		free(sign_data);
 		dssh_result_release(&signature.lease);
 		return DSSH_ERROR_INVALID;
 	}
@@ -1906,19 +1908,16 @@ auth_publickey_impl(struct dssh_session_s *sess, const char *username, const cha
 	    AUTH_PUBLICKEY_FIXED + ulen + alen + pubkey_len + sig_len, &err);
 
 	if (msg == NULL) {
+		free(sign_data);
 		dssh_result_release(&signature.lease);
 		return err;
 	}
 
-	size_t pos = build_userauth_request(msg, username, ulen, method_publickey, DSSH_STRLEN(method_publickey));
-
-	msg[pos++] = 1; /* TRUE */
-	DSSH_PUT_U32((uint32_t)alen, msg, &pos);
-	memcpy(&msg[pos], algo_name, alen);
-	pos += alen;
-	DSSH_PUT_U32((uint32_t)pubkey_len, msg, &pos);
-	memcpy(&msg[pos], pubkey_buf, pubkey_len);
-	pos += pubkey_len;
+	/* Emit the exact request prefix that was signed. No producer export
+	 * borrow survives a later callback, and no second serialization is needed. */
+	size_t pos = sp - request_start;
+	memcpy(msg, &sign_data[request_start], pos);
+	free(sign_data);
 	DSSH_PUT_U32((uint32_t)sig_len, msg, &pos);
 	memcpy(&msg[pos], sig_buf, sig_len);
 	pos += sig_len;

@@ -9573,8 +9573,11 @@ test_rekey_global_pipeline(void)
 #include "receive_entry_cases.h"
 #include "transport_ext_info_cases.h"
 #include "language_cases.h"
+#include "key_borrow_cases.h"
 
 static struct dssh_test_entry tests[] = {
+	{ "release/key_borrow_kex", test_key_borrow_kex },
+	{ "release/key_borrow_auth", test_key_borrow_auth },
 	{ "language/local", test_language_local },
 	{ "language/bounds", test_language_bounds },
 	{ "language/concurrent", test_language_concurrent },

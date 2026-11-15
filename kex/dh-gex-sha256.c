@@ -10,7 +10,7 @@
  #include "ssh-internal.h"
 #endif
 
-enum dhgex_slot { GEX_GROUP, GEX_PUBLIC, GEX_REPLY, GEX_SLOTS };
+enum dhgex_slot { GEX_GROUP, GEX_PUBLIC, GEX_REPLY, GEX_HOSTKEY, GEX_SLOTS };
 struct dhgex_state {
 	struct dssh_kex_workspace *workspace;
 	dssh_hash_ctx *hash;
@@ -387,6 +387,14 @@ dhgex_handler_impl(const struct dssh_kex_context *ctx, struct dssh_kex_result *o
 			ret = DSSH_ERROR_INVALID;
 			goto done;
 		}
+		/* Keep the hashed and emitted key independent of later producer
+		 * callbacks. The workspace retains this capacity for rekey. */
+		uint8_t *saved_hostkey = NULL;
+		ret = dssh_kex_workspace_get(state->workspace, GEX_HOSTKEY, host.len, &saved_hostkey);
+		if (ret < 0)
+			goto done;
+		memcpy(saved_hostkey, host.data, host.len);
+		host.data = saved_hostkey;
 	}
 	if (state->fixed != NULL) {
 		static const uint8_t generator = 2;

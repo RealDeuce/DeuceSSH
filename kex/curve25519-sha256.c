@@ -12,7 +12,7 @@
  #include "ssh-internal.h"
 #endif
 
-enum curve_slot { CURVE_MPINT, CURVE_REPLY, CURVE_SLOTS };
+enum curve_slot { CURVE_MPINT, CURVE_REPLY, CURVE_HOSTKEY, CURVE_SLOTS };
 #define CURVE_MPINT_CAPACITY (4 + 1 + DSSH_X25519_LEN)
 
 struct curve_state {
@@ -290,6 +290,14 @@ curve25519_handler_impl(const struct dssh_kex_context *ctx, struct dssh_kex_resu
 			ret = DSSH_ERROR_INVALID;
 			goto done;
 		}
+		/* Capture a non-leased producer view before any later callback.
+		 * Reuse the session's retained slot on subsequent exchanges. */
+		uint8_t *saved_hostkey = NULL;
+		ret = dssh_kex_workspace_get(state->workspace, CURVE_HOSTKEY, hostkey.len, &saved_hostkey);
+		if (ret < 0)
+			goto done;
+		memcpy(saved_hostkey, hostkey.data, hostkey.len);
+		hostkey.data = saved_hostkey;
 		ret = ctx->recv(&type, &payload, &length, ctx->io_ctx);
 		if (ret != 0)
 			goto done;
@@ -408,6 +416,9 @@ done:
 	if (drop < 0 && ret == 0)
 		ret = drop;
 	drop = dssh_kex_workspace_drop(state->workspace, CURVE_REPLY);
+	if (drop < 0 && ret == 0)
+		ret = drop;
+	drop = dssh_kex_workspace_drop(state->workspace, CURVE_HOSTKEY);
 	if (drop < 0 && ret == 0)
 		ret = drop;
 	if (ret > 0)

@@ -1435,6 +1435,17 @@ foreach(part IN ITEMS group_selection group_validation peer_validation mpint_val
 		ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys)
 endforeach()
 dssh_add_variant_tests(dssh_transport dssh_test_transport)
+foreach(method IN ITEMS curve25519 dh-gex group14 group16 sntrup mlkem)
+	foreach(key IN ITEMS ed25519 rsa rsa512)
+		foreach(part IN ITEMS kex auth)
+			dssh_add_output_test(dssh_key_borrow_${part}_${method}_${key} dssh_test_transport
+				"1 tests: 1 passed, 0 failed, 0 skipped" --exact release/key_borrow_${part})
+			set_tests_properties(dssh_key_borrow_${part}_${method}_${key} PROPERTIES
+				ENVIRONMENT "DSSH_TEST_KEX=${method};DSSH_TEST_KEY=${key};${DSSH_TEST_KEY_ENV}"
+				FIXTURES_REQUIRED dssh_cached_keys TIMEOUT 120)
+		endforeach()
+	endforeach()
+endforeach()
 foreach(part IN ITEMS local bounds storage wire handshake_rekey concurrent entry_failures)
 	dssh_add_output_test(dssh_language_${part} dssh_test_transport
 		"1 tests: 1 passed, 0 failed, 0 skipped" --exact language/${part})

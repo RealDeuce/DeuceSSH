@@ -2050,6 +2050,13 @@ foreach(case IN LISTS queue_retry_tests)
 endforeach()
 
 
+foreach(part IN ITEMS wait_contract owner_accept_failure owner_request_frame owner_control_frame owner_accept_callback)
+	dssh_add_output_test(dssh_conn_wire_${part} dssh_test_conn
+		"1 tests: 1 passed, 0 failed, 0 skipped" --exact release/wire_${part})
+	set_tests_properties(dssh_conn_wire_${part} PROPERTIES TIMEOUT 120
+		ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys)
+endforeach()
+
 # Actual SIGABRT checks run in a fresh exec, with no inherited library workers.
 if(UNIX)
 	add_executable(dssh_test_fatal_driver test_fatal_driver.c)
@@ -2072,6 +2079,16 @@ if(UNIX)
 				$<TARGET_FILE:dssh_test_threads_shim_posix> ${operation})
 		endforeach()
 	endif()
+	foreach(consumer RANGE 0 79)
+		foreach(join RANGE 1 2)
+			foreach(mode IN ITEMS retained released)
+				dssh_add_output_test(dssh_channel_wire_fatal_${consumer}-${join}_${mode} dssh_test_fatal_driver
+					"channel_join_fatal=1" $<TARGET_FILE:dssh_test_conn> --channel-fatal wire-${consumer}-${join} ${mode})
+				set_tests_properties(dssh_channel_wire_fatal_${consumer}-${join}_${mode} PROPERTIES TIMEOUT 120
+					ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys)
+			endforeach()
+		endforeach()
+	endforeach()
 	foreach(operation IN ITEMS close-1 close-2 close-3 defaults-1 defaults-2 defaults-3 defaults-4 atomic-1 atomic-2 atomic-3 atomic-4 atomic-5 atomic-6 atomic-7 atomic-8 atomic-9 lifetime-1 lifetime-2 lifetime-3 lifetime-4 lifetime-5 lifetime-6 queue-1 queue-2 queue-3 queue-4 queue-5 queue-6 queue-7 queue-8 queue-9 queue-10 queue-11 queue-12 queue-13 queue-14 queue-15 queue-16 setup-1 setup-2 setup-3 setup-4 replacement-1 replacement-2 incoming-1 incoming-2 incoming-3 incoming-4 incoming-5 incoming-6 incoming-7 incoming-8 incoming-9 incoming-10 incoming-11 incoming-12)
 		foreach(mode IN ITEMS retained released)
 			dssh_add_output_test(dssh_channel_callback_fatal_${operation}_${mode} dssh_test_fatal_driver

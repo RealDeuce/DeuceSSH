@@ -6,6 +6,7 @@ struct accept_callback_fixture {
 	atomic_bool server_done;
 	atomic_bool peer_done;
 	atomic_bool normal_done;
+	atomic_bool publish_release;
 	bool normal_valid;
 	unsigned grant_sends;
 	unsigned kind;
@@ -55,7 +56,8 @@ accept_callback_grant(dssh_session sess)
 	(void)sess;
 	struct accept_callback_fixture *f = accept_callback_current;
 	f->grant_sends++;
-	if (f->grant_sends == 2 && !dssh_test_wait_bool(&f->normal_done, true))
+	if (f->grant_sends == 2 && (!wire_wait(f->ctx.server, &f->normal_done)
+	    || !wire_wait(f->ctx.server, &f->publish_release)))
 		return DSSH_ERROR_TERMINATED;
 	return 0;
 }
@@ -122,8 +124,9 @@ accept_callback_request(dssh_channel ch, const struct dssh_chan_params *params, 
 		valid = valid && params->term != NULL && strcmp(params->term, "vt100") == 0
 		    && params->cols == 80 && params->rows == 24;
 	if (f->kind == 1)
-		valid = valid && params->env_count == 1 && strcmp(params->env[0].name, "A") == 0
-		    && strcmp(params->env[0].value, "B") == 0;
+		valid = valid && params->env_count == 1 && params->env != NULL
+		    && params->env[0].name != NULL && strcmp(params->env[0].name, "A") == 0
+		    && params->env[0].value != NULL && strcmp(params->env[0].value, "B") == 0;
 	if (f->cancel)
 		valid = valid && dssh_chan_close(ch, INT64_MAX) == 0;
 	else if (f->kind == 6)
@@ -163,9 +166,11 @@ accept_callback_server(void *opaque)
 	f->accepted = dssh_chan_accept(f->ctx.server, &f->cbs, 3000);
 	accept_phase_test_hook = NULL;
 	f->valid = f->valid && !dssh_setup_callback_active(f->ctx.server);
-	if (f->accepted != NULL)
+	if (f->accepted != NULL) {
+		const char *command = dssh_chan_get_command(f->accepted);
 		f->valid = f->valid && dssh_chan_get_type(f->accepted) == DSSH_CHAN_EXEC
-		    && strcmp(dssh_chan_get_command(f->accepted), "test") == 0;
+		    && command != NULL && strcmp(command, "test") == 0;
+	}
 	atomic_store(&f->server_done, true);
 	return 0;
 }
@@ -249,6 +254,13 @@ accept_callback_peer(void *opaque)
 	return 0;
 }
 
+static void
+accept_callback_release(void *data)
+{
+	struct accept_callback_fixture *fixture = data;
+	atomic_store(&fixture->publish_release, true);
+}
+
 static int
 accept_callback_case(unsigned kind, bool reply, bool negative, bool cancel)
 {
@@ -257,11 +269,12 @@ accept_callback_case(unsigned kind, bool reply, bool negative, bool cancel)
 	atomic_init(&f.server_done, false);
 	atomic_init(&f.peer_done, false);
 	atomic_init(&f.normal_done, false);
-	ASSERT_OK(conn_setup_no_start(&f.ctx));
-	ASSERT_OK(dssh_session_set_timeout(f.ctx.server, 3000));
+	atomic_init(&f.publish_release, false);
+	ASSERT_EQ(conn_setup_no_start(&f.ctx), 0);
+	ASSERT_EQ(dssh_session_set_timeout(f.ctx.server, 3000), 0);
 	if (kind >= 6)
-		ASSERT_OK(dssh_session_set_terminate_cb(f.ctx.server, accept_callback_terminate, &f));
-	ASSERT_OK(dssh_session_start(f.ctx.server));
+		ASSERT_EQ(dssh_session_set_terminate_cb(f.ctx.server, accept_callback_terminate, &f), 0);
+	ASSERT_EQ(dssh_session_start(f.ctx.server), 0);
 	f.cbs = accept_cbs_all;
 	f.cbs.pty_req = accept_callback_request;
 	f.cbs.env = accept_callback_request;
@@ -269,19 +282,30 @@ accept_callback_case(unsigned kind, bool reply, bool negative, bool cancel)
 	f.cbs.exec = accept_callback_terminal;
 	f.cbs.subsystem = accept_callback_terminal;
 	f.cbs.cbdata = &f;
-	thrd_t server, peer;
-	ASSERT_EQ(thrd_create(&server, accept_callback_server, &f), thrd_success);
-	bool started = thrd_create(&peer, accept_callback_peer, &f) == thrd_success;
-	bool valid = started && dssh_test_wait_bool(&f.peer_done, true)
+	struct channel_workers workers;
+	channel_workers_init(&workers, &f.ctx);
+	workers.release = accept_callback_release;
+	workers.resource = &f;
+	ASSERT_EQ(channel_worker_start(&workers, 0, accept_callback_server, &f), 0);
+	ASSERT_EQ(channel_worker_start(&workers, 1, accept_callback_peer, &f), 0);
+	unsigned variant = kind * 8 + (reply ? 4U : 0U)
+	    + (negative ? 2U : 0U) + (cancel ? 1U : 0U);
+	ASSERT_TRUE(wire_checkpoint(WIRE_ACCEPT_CALLBACK, variant, WIRE_STARTED));
+	if (kind == 5) {
+		ASSERT_TRUE(wire_wait(f.ctx.server, &f.normal_done));
+		ASSERT_FALSE(atomic_load(&f.server_done));
+		ASSERT_TRUE(wire_checkpoint(WIRE_ACCEPT_CALLBACK, variant, WIRE_PUBLISHED));
+	}
+	accept_callback_release(&f);
+	bool valid = dssh_test_wait_bool(&f.peer_done, true)
 	    && dssh_test_wait_bool(&f.server_done, true);
 	if (!valid || !f.peer_valid) {
 		mock_io_close_c2s(&f.ctx.io);
 		mock_io_close_s2c(&f.ctx.io);
 	}
-	if (started && thrd_join(peer, NULL) != thrd_success)
-		abort();
-	if (thrd_join(server, NULL) != thrd_success)
-		abort();
+	channel_workers_finish(&workers);
+	ASSERT_EQ(workers.results[0], 0);
+	ASSERT_EQ(workers.results[1], 0);
 	valid = valid && f.valid && f.peer_valid && (f.accepted != NULL) == (kind < 6) && f.callbacks == 1;
 	if (kind < 6)
 		valid = valid && !dssh_session_is_terminated(f.ctx.server) && !dssh_session_is_terminated(f.ctx.client);
@@ -294,7 +318,7 @@ accept_callback_case(unsigned kind, bool reply, bool negative, bool cancel)
 		    kind, reply ? 1U : 0U, negative ? 1U : 0U, cancel ? 1U : 0U,
 		    f.valid ? 1U : 0U, f.peer_valid ? 1U : 0U, f.callbacks, f.accepted != NULL ? 1U : 0U);
 	if (f.accepted != NULL)
-		(void)dssh_chan_close(f.accepted, -1);
+		ASSERT_EQ(dssh_chan_close(f.accepted, -1), 0);
 	conn_cleanup(&f.ctx);
 	ASSERT_TRUE(valid);
 	return TEST_PASS;

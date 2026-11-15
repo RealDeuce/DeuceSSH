@@ -208,27 +208,28 @@ request_frame_case(bool setup, unsigned kind)
 	atomic_init(&fixture.server_done, false);
 	atomic_init(&fixture.events, 0);
 	atomic_init(&fixture.callbacks, 0);
-	ASSERT_OK(conn_setup_no_start(&fixture.ctx));
-	ASSERT_OK(dssh_session_set_timeout(fixture.ctx.server, 3000));
-	ASSERT_OK(dssh_session_set_event_cb(fixture.ctx.server, request_frame_event, &fixture));
-	ASSERT_OK(dssh_session_start(fixture.ctx.server));
+	ASSERT_EQ(conn_setup_no_start(&fixture.ctx), 0);
+	ASSERT_EQ(dssh_session_set_timeout(fixture.ctx.server, 3000), 0);
+	ASSERT_EQ(dssh_session_set_event_cb(fixture.ctx.server, request_frame_event, &fixture), 0);
+	ASSERT_EQ(dssh_session_start(fixture.ctx.server), 0);
 	fixture.cbs = accept_cbs_all;
 	fixture.cbs.shell = request_frame_terminal;
 	fixture.cbs.exec = request_frame_terminal;
 	fixture.cbs.cbdata = &fixture;
-	thrd_t server, peer;
-	ASSERT_EQ(thrd_create(&server, request_frame_server, &fixture), thrd_success);
-	bool started = thrd_create(&peer, request_frame_peer, &fixture) == thrd_success;
-	bool valid = started && dssh_test_wait_bool(&fixture.peer_done, true)
+	struct channel_workers workers;
+	channel_workers_init(&workers, &fixture.ctx);
+	ASSERT_EQ(channel_worker_start(&workers, 0, request_frame_server, &fixture), 0);
+	ASSERT_EQ(channel_worker_start(&workers, 1, request_frame_peer, &fixture), 0);
+	ASSERT_TRUE(wire_checkpoint(WIRE_REQUEST_FRAME, kind * 2 + (setup ? 1U : 0U), WIRE_STARTED));
+	bool valid = dssh_test_wait_bool(&fixture.peer_done, true)
 	    && dssh_test_wait_bool(&fixture.server_done, true);
 	if (!valid || !fixture.peer_valid) {
 		mock_io_close_c2s(&fixture.ctx.io);
 		mock_io_close_s2c(&fixture.ctx.io);
 	}
-	if (started && thrd_join(peer, NULL) != thrd_success)
-		abort();
-	if (thrd_join(server, NULL) != thrd_success)
-		abort();
+	channel_workers_finish(&workers);
+	ASSERT_EQ(workers.results[0], 0);
+	ASSERT_EQ(workers.results[1], 0);
 	valid = valid && fixture.peer_valid && atomic_load(&fixture.events) == 0;
 	if (kind < 8)
 		valid = valid && dssh_test_wait_bool(&fixture.ctx.client->terminate, true)
@@ -236,8 +237,10 @@ request_frame_case(bool setup, unsigned kind)
 	else
 		valid = valid && !dssh_session_is_terminated(fixture.ctx.client)
 		    && !dssh_session_is_terminated(fixture.ctx.server) && fixture.accepted[0] != NULL;
-	if (kind == 10)
-		valid = valid && atomic_load(&fixture.callbacks) == 1;
+	unsigned callbacks = kind == 11 && !setup ? 2U : kind < 8 && setup ? 0U : 1U;
+	valid = valid && atomic_load(&fixture.callbacks) == callbacks;
+	if (kind == 11 && !setup)
+		valid = valid && fixture.accepted[1] != NULL && fixture.accepted[0] != fixture.accepted[1];
 	conn_cleanup(&fixture.ctx);
 	if (!valid)
 		fprintf(stderr, "request framing setup=%u kind=%u peer=%u events=%u callbacks=%u\n",
@@ -284,7 +287,7 @@ request_event_length_case(bool zc)
 	event_capture_init(&capture, false);
 	struct event_fixture fixture = {0};
 	ASSERT_TRUE(event_setup(&fixture, &capture, zc));
-	ASSERT_OK(dssh_chan_set_event_cb(fixture.open.client_ch, capture_event, &capture));
+	ASSERT_EQ(dssh_chan_set_event_cb(fixture.open.client_ch, capture_event, &capture), 0);
 	int types[] = {DSSH_EVENT_SIGNAL, DSSH_EVENT_WINDOW_CHANGE, TEST_CHANNEL_BREAK_REQUEST,
 	    DSSH_EVENT_EXIT_STATUS, DSSH_EVENT_EXIT_SIGNAL};
 	bool valid = true;
@@ -293,7 +296,8 @@ request_event_length_case(bool zc)
 		    ? fixture.open.client_ch : fixture.open.server_ch;
 		uint8_t packet[128];
 		size_t length = 0;
-		ASSERT_OK(event_packet(target, types[i], packet, sizeof(packet), &length));
+		ASSERT_EQ(event_packet(target, types[i], packet, sizeof(packet), &length), 0);
+		ASSERT_TRUE(length > 0 && length < sizeof(packet));
 		packet[length] = 0;
 		int ret = dssh_test_demux_dispatch(target->sess, packet[0], packet, length + 1);
 		if (mtx_lock(&fixture.open.client_ch->buf_mtx) != thrd_success)
@@ -308,7 +312,8 @@ request_event_length_case(bool zc)
 		    ? fixture.open.client_ch : fixture.open.server_ch;
 		uint8_t packet[128];
 		size_t length = 0;
-		ASSERT_OK(event_packet(target, types[i], packet, sizeof(packet), &length));
+		ASSERT_EQ(event_packet(target, types[i], packet, sizeof(packet), &length), 0);
+		ASSERT_TRUE(length > 0 && length <= sizeof(packet));
 		int ret = dssh_test_demux_dispatch(target->sess, packet[0], packet, length);
 		valid = ret == 0 && valid;
 	}
@@ -366,7 +371,7 @@ test_request_name_byte_and_boolean(void)
 		bool reply;
 		const uint8_t *body;
 		size_t body_len;
-		ASSERT_OK(parse_channel_request(packet, pos, &name, &length, &reply, &body, &body_len));
+		ASSERT_EQ(parse_channel_request(packet, pos, &name, &length, &reply, &body, &body_len), 0);
 		ASSERT_EQ(reply, value != 0);
 	}
 	return TEST_PASS;

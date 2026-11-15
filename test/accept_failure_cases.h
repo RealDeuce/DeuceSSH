@@ -77,8 +77,8 @@ accept_phase_fault(dssh_session sess)
 		return 0;
 	/* Keep the successful preceding response observable before the
 	 * application termination callback closes both mock read ends. */
-	if (fixture->kind == 20)
-		(void)dssh_test_wait_bool(&fixture->success_received, true);
+	if (fixture->kind == 20 && !wire_wait(sess, &fixture->success_received))
+		return DSSH_ERROR_TERMINATED;
 	fixture->fired = true;
 	fixture->target_hit++;
 	return DSSH_ERROR_TERMINATED;
@@ -292,15 +292,22 @@ accept_failure_peer(void *opaque)
 	return 0;
 }
 
+static void
+accept_failure_release(void *data)
+{
+	struct accept_failure_fixture *fixture = data;
+	atomic_store(&fixture->acknowledge, true);
+}
+
 static int
 accept_failure_case(unsigned kind)
 {
 	struct accept_failure_fixture fixture = {.kind = kind};
-	ASSERT_OK(conn_setup_no_start(&fixture.ctx));
-	ASSERT_OK(dssh_session_set_timeout(fixture.ctx.server, 3000));
+	ASSERT_EQ(conn_setup_no_start(&fixture.ctx), 0);
+	ASSERT_EQ(dssh_session_set_timeout(fixture.ctx.server, 3000), 0);
 	if (kind >= 18)
-		ASSERT_OK(dssh_session_set_terminate_cb(fixture.ctx.server, accept_failure_terminate, &fixture));
-	ASSERT_OK(dssh_session_start(fixture.ctx.server));
+		ASSERT_EQ(dssh_session_set_terminate_cb(fixture.ctx.server, accept_failure_terminate, &fixture), 0);
+	ASSERT_EQ(dssh_session_start(fixture.ctx.server), 0);
 	fixture.cbs = accept_cbs_all;
 	fixture.cbs.exec = accept_failure_terminal;
 	fixture.cbs.shell = accept_failure_terminal;
@@ -314,14 +321,17 @@ accept_failure_case(unsigned kind)
 	atomic_init(&fixture.close_seen, false);
 	atomic_init(&fixture.acknowledge, false);
 	atomic_init(&fixture.success_received, false);
-	thrd_t server, peer;
-	ASSERT_EQ(thrd_create(&server, accept_failure_server, &fixture), thrd_success);
-	bool peer_started = thrd_create(&peer, accept_failure_peer, &fixture) == thrd_success;
-	bool valid = peer_started;
+	struct channel_workers workers;
+	channel_workers_init(&workers, &fixture.ctx);
+	workers.release = accept_failure_release;
+	workers.resource = &fixture;
+	ASSERT_EQ(channel_worker_start(&workers, 0, accept_failure_server, &fixture), 0);
+	ASSERT_EQ(channel_worker_start(&workers, 1, accept_failure_peer, &fixture), 0);
+	ASSERT_TRUE(wire_checkpoint(WIRE_ACCEPT_FAILURE, kind, WIRE_STARTED));
+	bool valid = true;
 	if (valid && kind < 18 && !accept_failure_preopen(kind)) {
 		struct timespec begin;
-		if (clock_gettime(CLOCK_MONOTONIC, &begin) != 0)
-			abort();
+		ASSERT_EQ(clock_gettime(CLOCK_MONOTONIC, &begin), 0);
 		while (!atomic_load(&fixture.close_seen) && !atomic_load(&fixture.peer_done)) {
 			if (!dssh_test_wait_tick(&begin)) {
 				valid = false;
@@ -336,7 +346,10 @@ accept_failure_case(unsigned kind)
 		if (mtx_unlock(&fixture.ctx.server->channel_mtx) != thrd_success)
 			abort();
 	}
-	atomic_store(&fixture.acknowledge, true);
+	if (valid && kind < 18 && !accept_failure_preopen(kind)) {
+		ASSERT_TRUE(wire_checkpoint(WIRE_ACCEPT_FAILURE, kind, WIRE_CLOSE_WAIT));
+	}
+	accept_failure_release(&fixture);
 	if (valid)
 		valid = dssh_test_wait_bool(&fixture.peer_done, true)
 		    && dssh_test_wait_bool(&fixture.server_done, true);
@@ -346,17 +359,16 @@ accept_failure_case(unsigned kind)
 		mock_io_close_c2s(&fixture.ctx.io);
 		mock_io_close_s2c(&fixture.ctx.io);
 	}
-	if (peer_started && thrd_join(peer, NULL) != thrd_success)
-		abort();
-	if (thrd_join(server, NULL) != thrd_success)
-		abort();
+	channel_workers_finish(&workers);
+	ASSERT_EQ(workers.results[0], 0);
+	ASSERT_EQ(workers.results[1], 0);
 	valid = valid && fixture.peer_valid && fixture.server_valid
 	    && dssh_session_is_terminated(fixture.ctx.client) == (kind >= 18)
 	    && dssh_session_is_terminated(fixture.ctx.server) == (kind >= 18);
 	if (!accept_failure_loops(kind))
 		valid = valid && fixture.fired && fixture.target_hit == 1;
 	if (fixture.accepted != NULL)
-		dssh_chan_close(fixture.accepted, -1);
+		ASSERT_EQ(dssh_chan_close(fixture.accepted, -1), 0);
 	conn_cleanup(&fixture.ctx);
 	if (!valid)
 		fprintf(stderr, "accept failure kind=%u peer=%u server=%u fired=%u target=%u callbacks=%u\n",
@@ -397,14 +409,14 @@ static int
 test_accept_close_deadline(void)
 {
 	struct event_fixture fixture = {0};
-	ASSERT_OK(conn_setup_no_start(&fixture.ctx));
-	ASSERT_OK(dssh_session_set_timeout(fixture.ctx.server, 3000));
-	ASSERT_OK(dssh_session_start(fixture.ctx.client));
-	ASSERT_OK(dssh_session_start(fixture.ctx.server));
+	ASSERT_EQ(conn_setup_no_start(&fixture.ctx), 0);
+	ASSERT_EQ(dssh_session_set_timeout(fixture.ctx.server, 3000), 0);
+	ASSERT_EQ(dssh_session_start(fixture.ctx.client), 0);
+	ASSERT_EQ(dssh_session_start(fixture.ctx.server), 0);
 	fixture.open = (struct open_exec_ctx){.client = fixture.ctx.client,
 	    .server = fixture.ctx.server, .command = "close-deadline",
 	    .cbs = &accept_cbs_all, .accept_timeout = 3000};
-	ASSERT_OK(open_exec_channel(&fixture.ctx, &fixture.open));
+	ASSERT_EQ(open_exec_channel(&fixture.ctx, &fixture.open), 0);
 	dssh_channel ch = fixture.open.server_ch;
 	struct timespec first;
 	if (timespec_get(&first, TIME_UTC) != TIME_UTC)
@@ -417,7 +429,8 @@ test_accept_close_deadline(void)
 	ch->setup_ready = true;
 	ch->setup_msg_type = SSH_MSG_CHANNEL_WINDOW_ADJUST;
 	ch->setup_payload_len = 9;
-	ASSERT_EQ(mtx_unlock(&ch->buf_mtx), thrd_success);
+	if (mtx_unlock(&ch->buf_mtx) != thrd_success)
+		abort();
 	atomic_bool *waited = dssh_test_thrd_watch_condition(&ch->poll_cnd);
 	/* Deadline creation and the first queued-message iteration see first;
 	 * the next iteration sees a time after that same deadline. */

@@ -772,6 +772,7 @@ open_exec_channel(struct conn_ctx *owner, struct open_exec_ctx *ctx)
 
 #include "conn_zc_fixture.h"
 #include "conn_callback_fixture.h"
+#include "conn_wire_fixture.h"
 
 /* ================================================================
  * Helper: open a shell channel concurrently
@@ -8000,8 +8001,15 @@ test_compression_window_rekey(void)
 #include "terminal_mode_cases.h"
 #include "notification_flag_cases.h"
 #include "conn_callback_cases.h"
+#include "conn_wire_cases.h"
 
 static struct dssh_test_entry tests[] = {
+	{ "release/wire_wait_contract", test_wire_wait_contract },
+	{ "release/wire_owner_accept_failure", test_wire_owner_accept_failure },
+	{ "release/wire_owner_request_frame", test_wire_owner_request_frame },
+	{ "release/wire_owner_control_frame", test_wire_owner_control_frame },
+	{ "release/wire_owner_accept_callback", test_wire_owner_accept_callback },
+
 	{ "release/callback_incoming_lifetime", test_callback_incoming_lifetime },
 	{ "release/callback_capture_bounds", test_callback_capture_bounds },
 	{ "release/callback_packet_bounds", test_callback_packet_bounds },
@@ -8629,6 +8637,9 @@ main(int argc, char *argv[])
 		return incoming_control_probe();
 	if (argc == 2 && strcmp(argv[1], "--audit-close-outcomes") == 0)
 		return close_outcome_probe();
+	if (argc == 4 && strcmp(argv[1], "--channel-fatal") == 0
+	    && strncmp(argv[2], "wire-", 5) == 0)
+		return wire_fatal_child(argv[2] + 5, argv[3]);
 	if (argc == 4 && strcmp(argv[1], "--channel-fatal") == 0
 	    && strncmp(argv[2], "callback-", 9) == 0)
 		return callback_fatal_child(argv[2] + 9, argv[3]);

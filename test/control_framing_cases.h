@@ -60,7 +60,8 @@ control_frame_direct(unsigned kind, bool setup, bool zc)
 	ch->request_responded = false;
 	ch->request_success = false;
 	uint32_t window = atomic_load(&ch->remote_window);
-	ASSERT_EQ(mtx_unlock(&ch->buf_mtx), thrd_success);
+	if (mtx_unlock(&ch->buf_mtx) != thrd_success)
+		abort();
 	bool valid = true;
 	unsigned rejected = 0;
 	unsigned allocations = 0;
@@ -113,9 +114,9 @@ control_frame_absent(bool stale)
 	ASSERT_TRUE(event_setup(&fixture, NULL, false));
 	uint32_t recipient = stale ? fixture.open.server_ch->local_id : UINT32_MAX;
 	if (stale) {
-		ASSERT_OK(dssh_chan_close(fixture.open.server_ch, -1));
+		ASSERT_EQ(dssh_chan_close(fixture.open.server_ch, -1), 0);
 		fixture.open.server_ch = NULL;
-		ASSERT_OK(dssh_chan_close(fixture.open.client_ch, -1));
+		ASSERT_EQ(dssh_chan_close(fixture.open.client_ch, -1), 0);
 		fixture.open.client_ch = NULL;
 	}
 	bool valid = true;
@@ -147,6 +148,7 @@ control_frame_valid(bool setup, bool zc)
 	ASSERT_TRUE(setup_test_mode(ch, setup));
 	bool valid = true;
 	uint32_t window = atomic_load(&ch->remote_window);
+	ASSERT_TRUE(window <= UINT32_MAX - 17);
 	for (unsigned kind = 0; kind < 5; kind++) {
 		uint8_t packet[32];
 		uint8_t type = control_frame_type(kind);
@@ -456,26 +458,28 @@ control_frame_wire(unsigned kind, bool setup, bool reply_case)
 	atomic_init(&f.server_done, false);
 	atomic_init(&f.peer_done, false);
 	atomic_init(&f.events, 0);
-	ASSERT_OK(conn_setup_no_start(&f.ctx));
-	ASSERT_OK(dssh_session_set_timeout(f.ctx.server, 3000));
-	ASSERT_OK(dssh_session_set_event_cb(f.ctx.server, control_wire_event, &f));
-	ASSERT_OK(dssh_session_start(f.ctx.server));
+	ASSERT_EQ(conn_setup_no_start(&f.ctx), 0);
+	ASSERT_EQ(dssh_session_set_timeout(f.ctx.server, 3000), 0);
+	ASSERT_EQ(dssh_session_set_event_cb(f.ctx.server, control_wire_event, &f), 0);
+	ASSERT_EQ(dssh_session_start(f.ctx.server), 0);
 	f.cbs = accept_cbs_all;
 	f.cbs.exec = control_wire_terminal;
 	f.cbs.cbdata = &f;
-	thrd_t server, peer;
-	ASSERT_EQ(thrd_create(&server, control_wire_server, &f), thrd_success);
-	bool started = thrd_create(&peer, control_wire_peer, &f) == thrd_success;
-	bool valid = started && dssh_test_wait_bool(&f.peer_done, true)
+	struct channel_workers workers;
+	channel_workers_init(&workers, &f.ctx);
+	ASSERT_EQ(channel_worker_start(&workers, 0, control_wire_server, &f), 0);
+	ASSERT_EQ(channel_worker_start(&workers, 1, control_wire_peer, &f), 0);
+	unsigned variant = kind * 4 + (setup ? 2U : 0U) + (reply_case ? 1U : 0U);
+	ASSERT_TRUE(wire_checkpoint(WIRE_CONTROL_FRAME, variant, WIRE_STARTED));
+	bool valid = dssh_test_wait_bool(&f.peer_done, true)
 	    && dssh_test_wait_bool(&f.server_done, true);
 	if (!valid || !f.peer_valid) {
 		mock_io_close_c2s(&f.ctx.io);
 		mock_io_close_s2c(&f.ctx.io);
 	}
-	if (started && thrd_join(peer, NULL) != thrd_success)
-		abort();
-	if (thrd_join(server, NULL) != thrd_success)
-		abort();
+	channel_workers_finish(&workers);
+	ASSERT_EQ(workers.results[0], 0);
+	ASSERT_EQ(workers.results[1], 0);
 	valid = valid && f.peer_valid && f.accepted != NULL && atomic_load(&f.events) == 0
 	    && !dssh_session_is_terminated(f.ctx.server) && !dssh_session_is_terminated(f.ctx.client);
 	if (f.accepted != NULL) {

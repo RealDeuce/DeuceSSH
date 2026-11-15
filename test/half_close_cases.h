@@ -15,8 +15,7 @@ half_close_algorithms(struct conn_ctx *ctx)
 	const char *comp = dssh_transport_get_comp_name(ctx->client, DSSH_CLIENT_TO_SERVER);
 	if (comp == NULL || !compression_fixture_selected(ctx->client, ctx->server))
 		return false;
-	printf("half_close_algorithms kex=%s key=%s comp=%s\n", expected_kex, expected_key, comp);
-	return true;
+	return printf("half_close_algorithms kex=%s key=%s comp=%s\n", expected_kex, expected_key, comp) >= 0;
 }
 
 static bool
@@ -68,7 +67,7 @@ half_close_open_worker(void *opaque)
 	int ret = dssh_chan_params_init(&params, DSSH_CHAN_EXEC);
 	if (ret != 0) {
 		job->result = ret;
-		return 0;
+		return ret;
 	}
 	ret = dssh_chan_params_set_command(&params, "half-close");
 	if (ret == 0)
@@ -80,7 +79,7 @@ half_close_open_worker(void *opaque)
 	}
 	dssh_chan_params_free(&params);
 	job->result = ret;
-	return 0;
+	return ret;
 }
 
 static dssh_channel
@@ -92,9 +91,13 @@ half_close_accept(struct conn_ctx *ctx, uint32_t number)
 	 * server peer supplies OPEN/exec replies; it never opens a server-origin
 	 * session channel, which this implementation correctly refuses. */
 	struct half_close_open_job job = {.session = ctx->server};
-	thrd_t opener;
-	if (thrd_create(&opener, half_close_open_worker, &job) != thrd_success)
+	struct flow_fixture flow;
+	flow_init(&flow, ctx, NULL, NULL);
+	if (channel_worker_start(&flow.workers, 0, half_close_open_worker, &job) != 0) {
+		flow_finish(&flow);
 		return NULL;
+	}
+	ASSERT_TRUE(lifecycle_checkpoint(LC_HALF_OPEN_STARTED));
 	uint8_t type;
 	uint8_t *payload;
 	size_t length;
@@ -122,9 +125,8 @@ half_close_accept(struct conn_ctx *ctx, uint32_t number)
 		mock_io_close_c2s(&ctx->io);
 		mock_io_close_s2c(&ctx->io);
 	}
-	if (thrd_join(opener, NULL) != thrd_success)
-		abort();
-	return valid && job.result == 0 ? job.channel : NULL;
+	flow_finish(&flow);
+	return valid && flow.workers.results[0] == 0 && job.result == 0 ? job.channel : NULL;
 }
 
 static int
@@ -138,14 +140,14 @@ test_half_close_retry(void)
 				window_test_gather = gather != 0;
 				int setup = conn_setup_mode(&ctx, false);
 				window_test_gather = false;
-				ASSERT_OK(setup);
+				ASSERT_EQ(setup, 0);
 				ASSERT_TRUE(half_close_algorithms(&ctx));
 				if (role != 0) {
 					dssh_session swap = ctx.client;
 					ctx.client = ctx.server;
 					ctx.server = swap;
 				}
-				ASSERT_OK(dssh_session_start(ctx.server));
+				ASSERT_EQ(dssh_session_start(ctx.server), 0);
 				const uint32_t number = UINT32_MAX;
 				dssh_channel ch = half_close_accept(&ctx, number);
 				ASSERT_NOT_NULL(ch);
@@ -162,9 +164,11 @@ test_half_close_retry(void)
 				    && published == (refusal == 0) && retry == 0 && repeated == 0
 				    && wire == 1 && half_close_sent(ch)
 				    && !dssh_session_is_terminated(ctx.server);
-				printf("half_close_retry role=%u gather=%u refusal=%u first=%d published=%u retry=%d repeated=%d wire=%d valid=%u\n",
+				ASSERT_TRUE(printf("half_close_retry role=%u gather=%u refusal=%u first=%d published=%u retry=%d repeated=%d wire=%d valid=%u\n",
 				    role, gather, refusal, first, published ? 1U : 0U, retry, repeated,
-				    wire, valid ? 1U : 0U);
+				    wire, valid ? 1U : 0U) >= 0);
+				ASSERT_TRUE(valid);
+				ASSERT_TRUE(lifecycle_checkpoint(LC_HALF_RETRY));
 				cases++;
 				if (!valid)
 					mismatches++;
@@ -172,7 +176,7 @@ test_half_close_retry(void)
 			}
 		}
 	}
-	printf("half_close_retry cases=%u mismatches=%u\n", cases, mismatches);
+	ASSERT_TRUE(printf("half_close_retry cases=%u mismatches=%u\n", cases, mismatches) >= 0);
 	ASSERT_EQ_U(cases, 8);
 	ASSERT_EQ_U(mismatches, 0);
 	return TEST_PASS;
@@ -192,7 +196,7 @@ half_close_pause_tx(dssh_session sess)
 	(void)sess;
 	struct half_close_job *job = half_close_active;
 	atomic_store(&job->entered, true);
-	return dssh_test_wait_bool(&job->resume, true) ? 0 : DSSH_ERROR_INIT;
+	return wire_wait(sess, &job->resume) ? 0 : DSSH_ERROR_INIT;
 }
 
 static int
@@ -207,7 +211,7 @@ half_close_worker(void *opaque)
 	window_tx_return_test_hook = NULL;
 	half_close_active = NULL;
 	atomic_store(&job->finished, true);
-	return 0;
+	return job->result;
 }
 
 static bool
@@ -223,39 +227,56 @@ half_close_wait_observation(struct half_close_job *job, const atomic_bool *waiti
 	return true;
 }
 
+static void
+half_close_release(void *data)
+{
+	struct half_close_job *jobs = data;
+	for (size_t i = 0; i < 2; i++)
+		atomic_store(&jobs[i].resume, true);
+}
+
 static int
 half_close_concurrent_run(struct conn_ctx *ctx, unsigned role, unsigned gather)
 {
-	ASSERT_OK(dssh_session_start(ctx->server));
+	ASSERT_EQ(dssh_session_start(ctx->server), 0);
 	const uint32_t number = 23;
 	dssh_channel ch = half_close_accept(ctx, number);
 	ASSERT_NOT_NULL(ch);
-	struct half_close_job first = {.channel = ch, .pause = true};
-	struct half_close_job second = {.channel = ch};
+	struct half_close_job jobs[2] = {{.channel = ch, .pause = true}, {.channel = ch}};
+	for (size_t i = 0; i < 2; i++) {
+		atomic_init(&jobs[i].entered, false);
+		atomic_init(&jobs[i].resume, false);
+		atomic_init(&jobs[i].finished, false);
+	}
+	struct flow_fixture flow;
+	flow_init(&flow, ctx, half_close_release, jobs);
 	atomic_bool *waiting = dssh_test_thrd_watch_condition(&ctx->server->trans.rekey_cnd);
-	thrd_t a, b;
-	bool a_started = thrd_create(&a, half_close_worker, &first) == thrd_success;
-	bool b_started = false;
-	bool valid = a_started && dssh_test_wait_bool(&first.entered, true);
+	flow.watching = true;
+	ASSERT_EQ(channel_worker_start(&flow.workers, 0, half_close_worker, &jobs[0]), 0);
+	ASSERT_TRUE(lifecycle_checkpoint(LC_HALF_FIRST));
+	bool valid = dssh_test_wait_bool(&jobs[0].entered, true);
 	bool early = valid && half_close_sent(ch);
-	if (valid)
-		b_started = thrd_create(&b, half_close_worker, &second) == thrd_success;
-	valid = valid && b_started && half_close_wait_observation(&second, waiting);
-	bool premature = atomic_load(&second.finished);
+	ASSERT_TRUE(valid && !early);
+	ASSERT_TRUE(lifecycle_checkpoint(LC_HALF_PAUSED));
+	ASSERT_EQ(channel_worker_start(&flow.workers, 1, half_close_worker, &jobs[1]), 0);
+	ASSERT_TRUE(lifecycle_checkpoint(LC_HALF_SECOND));
+	valid = half_close_wait_observation(&jobs[1], waiting);
+	bool premature = atomic_load(&jobs[1].finished);
 	bool blocked = atomic_load(waiting);
-	/* Retire both real workers before any assertion can return their storage. */
-	atomic_store(&first.resume, true);
-	if (a_started && thrd_join(a, NULL) != thrd_success)
-		abort();
-	if (b_started && thrd_join(b, NULL) != thrd_success)
-		abort();
-	dssh_test_thrd_watch_condition(NULL);
+	valid = valid && !premature && blocked;
+	ASSERT_TRUE(valid);
+	ASSERT_TRUE(conn_actor_waiting(waiting, &ctx->server->trans.tx_mtx));
+	ASSERT_TRUE(lifecycle_checkpoint(LC_HALF_WAITING));
+	half_close_release(jobs);
+	flow_finish(&flow);
+	ASSERT_EQ(flow.workers.results[0], 0);
+	ASSERT_EQ(flow.workers.results[1], 0);
 	int wire = half_close_count_wire(ctx->client, number);
-	valid = valid && !early && !premature && blocked && first.result == 0 && second.result == 0
+	valid = valid && !early && !premature && blocked && jobs[0].result == 0 && jobs[1].result == 0
 	    && wire == 1 && half_close_sent(ch) && !dssh_session_is_terminated(ctx->server);
-	printf("half_close_concurrent role=%u gather=%u early=%u premature=%u blocked=%u first=%d second=%d wire=%d valid=%u\n",
+	ASSERT_TRUE(printf("half_close_concurrent role=%u gather=%u early=%u premature=%u blocked=%u first=%d second=%d wire=%d valid=%u\n",
 	    role, gather, early ? 1U : 0U, premature ? 1U : 0U, blocked ? 1U : 0U,
-	    first.result, second.result, wire, valid ? 1U : 0U);
+	    jobs[0].result, jobs[1].result, wire, valid ? 1U : 0U) >= 0);
 	return valid ? TEST_PASS : TEST_FAIL;
 }
 
@@ -280,7 +301,7 @@ half_close_reject_publication(dssh_session sess)
 static int
 half_close_failure_run(struct conn_ctx *ctx, unsigned role, unsigned gather, bool publication)
 {
-	ASSERT_OK(dssh_session_start(ctx->server));
+	ASSERT_EQ(dssh_session_start(ctx->server), 0);
 	dssh_channel ch = half_close_accept(ctx, 41);
 	ASSERT_NOT_NULL(ch);
 	if (publication) {
@@ -309,12 +330,14 @@ half_close_failure_run(struct conn_ctx *ctx, unsigned role, unsigned gather, boo
 	size_t length;
 	int end = recv_packet(ctx->client, &type, &payload, &length);
 	bool valid = first == (publication ? DSSH_ERROR_TERMINATED : DSSH_ERROR_INIT)
-	    && !published && repeated == DSSH_ERROR_TERMINATED && wire && end < 0
+	    && !published && repeated == DSSH_ERROR_TERMINATED && wire && end == -1
 	    && unowned_unlocks == 0 && !atomic_load(&ctx->server->trans.tx_owner_active)
 	    && dssh_session_is_terminated(ctx->server);
-	printf("half_close_%s role=%u gather=%u first=%d published=%u repeated=%d wire=%u end=%d unowned_unlocks=%u valid=%u\n",
+	ASSERT_TRUE(printf("half_close_%s role=%u gather=%u first=%d published=%u repeated=%d wire=%u end=%d unowned_unlocks=%u valid=%u\n",
 	    publication ? "publication" : "failure", role, gather, first, published ? 1U : 0U,
-	    repeated, publication && wire ? 1U : 0U, end, unowned_unlocks, valid ? 1U : 0U);
+	    repeated, publication && wire ? 1U : 0U, end, unowned_unlocks, valid ? 1U : 0U) >= 0);
+	ASSERT_TRUE(valid);
+	ASSERT_TRUE(lifecycle_checkpoint(LC_HALF_FAILURE));
 	return valid ? TEST_PASS : TEST_FAIL;
 }
 
@@ -328,7 +351,7 @@ half_close_profiles(bool concurrent, bool publication)
 			window_test_gather = gather != 0;
 			int setup = conn_setup_mode(&ctx, false);
 			window_test_gather = false;
-			ASSERT_OK(setup);
+			ASSERT_EQ(setup, 0);
 			ASSERT_TRUE(half_close_algorithms(&ctx));
 			if (role != 0) {
 				dssh_session swap = ctx.client;
@@ -340,10 +363,10 @@ half_close_profiles(bool concurrent, bool publication)
 			conn_cleanup(&ctx);
 			cases++;
 			if (ret != TEST_PASS)
-				mismatches++;
+				return TEST_FAIL;
 		}
 	}
-	printf("half_close_%s cases=%u mismatches=%u\n", concurrent ? "concurrent" : publication ? "publication" : "failure", cases, mismatches);
+	ASSERT_TRUE(printf("half_close_%s cases=%u mismatches=%u\n", concurrent ? "concurrent" : publication ? "publication" : "failure", cases, mismatches) >= 0);
 	ASSERT_EQ_U(cases, 4);
 	ASSERT_EQ_U(mismatches, 0);
 	return TEST_PASS;

@@ -30,26 +30,26 @@ static int
 peer_id_open_stage_run(struct conn_ctx *ctx, enum peer_id_open_stage stage)
 {
 	static const uint32_t numbers[] = {0, UINT32_MAX};
-	ASSERT_OK(dssh_session_start(ctx->server));
+	ASSERT_EQ(dssh_session_start(ctx->server), 0);
 	if (stage == PEER_ID_QUEUED) {
 		dssh_test_alloc_fail_after(0);
 		int ret = peer_id_dispatch_open(ctx->server, "session", numbers[0]);
 		int allocations = dssh_test_alloc_count();
 		dssh_test_alloc_reset();
-		ASSERT_OK(ret);
+		ASSERT_EQ(ret, 0);
 		ASSERT_EQ(allocations, 1);
 		ASSERT_TRUE(peer_id_receive_control(ctx->client, SSH_MSG_CHANNEL_OPEN_FAILURE,
 		    17, numbers[0]));
 	}
 	for (size_t i = 0; i < sizeof(numbers) / sizeof(numbers[0]); i++)
-		ASSERT_OK(peer_id_dispatch_open(ctx->server, "session", numbers[i]));
+		ASSERT_EQ(peer_id_dispatch_open(ctx->server, "session", numbers[i]), 0);
 
 	if (stage != PEER_ID_QUEUED) {
 		/* Keep both pops alive through the ownership check. Each represents
 		 * a different acceptor after leaving the FIFO. */
 		struct dssh_incoming_open incoming[2];
 		for (size_t i = 0; i < sizeof(incoming) / sizeof(incoming[0]); i++) {
-			ASSERT_OK(accept_incoming(ctx->server, &incoming[i], 0));
+			ASSERT_EQ(accept_incoming(ctx->server, &incoming[i], 0), 0);
 			ASSERT_EQ_U(incoming[i].peer_channel, numbers[i]);
 		}
 		if (stage == PEER_ID_CONFIRMED) {
@@ -61,25 +61,27 @@ peer_id_open_stage_run(struct conn_ctx *ctx, enum peer_id_open_stage stage)
 		}
 	}
 
+	ASSERT_TRUE(lifecycle_checkpoint(LC_PEER_PHASE));
 	int zero = peer_id_dispatch_open(ctx->server, "session", numbers[0]);
 	int maximum = peer_id_dispatch_open(ctx->server, "session", numbers[1]);
 	int unsupported = peer_id_dispatch_open(ctx->server, "unknown", numbers[1]);
 	int distinct = peer_id_dispatch_open(ctx->server, "session", 1);
-	printf("peer_id_open stage=%d zero=%d maximum=%d unsupported=%d distinct=%d\n",
-	    stage, zero, maximum, unsupported, distinct);
+	unsigned stage_number = (unsigned)stage;
+	ASSERT_TRUE(printf("peer_id_open stage=%u zero=%d maximum=%d unsupported=%d distinct=%d\n",
+	    stage_number, zero, maximum, unsupported, distinct) >= 0);
 	ASSERT_EQ(zero, DSSH_ERROR_PARSE);
 	ASSERT_EQ(maximum, DSSH_ERROR_PARSE);
 	ASSERT_EQ(unsupported, DSSH_ERROR_PARSE);
-	ASSERT_OK(distinct);
+	ASSERT_EQ(distinct, 0);
 
 	struct dssh_incoming_open next;
 	if (stage == PEER_ID_QUEUED) {
 		for (size_t i = 0; i < sizeof(numbers) / sizeof(numbers[0]); i++) {
-			ASSERT_OK(accept_incoming(ctx->server, &next, 0));
+			ASSERT_EQ(accept_incoming(ctx->server, &next, 0), 0);
 			ASSERT_EQ_U(next.peer_channel, numbers[i]);
 		}
 	}
-	ASSERT_OK(accept_incoming(ctx->server, &next, 0));
+	ASSERT_EQ(accept_incoming(ctx->server, &next, 0), 0);
 	ASSERT_EQ_U(next.peer_channel, 1);
 	ASSERT_EQ(accept_incoming(ctx->server, &next, 0), DSSH_ERROR_NOMORE);
 	return TEST_PASS;
@@ -89,7 +91,7 @@ static int
 peer_id_open_stage_test(enum peer_id_open_stage stage)
 {
 	struct conn_ctx ctx;
-	if (conn_setup_mode(&ctx, false) < 0)
+	if (conn_setup_mode(&ctx, false) != 0)
 		return TEST_FAIL;
 	int ret = peer_id_open_stage_run(&ctx, stage);
 	conn_cleanup(&ctx);
@@ -125,23 +127,24 @@ peer_id_dispatch_confirmation(dssh_session receiver, uint32_t local, uint32_t re
 static int
 peer_id_late_confirmation_run(struct conn_ctx *ctx)
 {
-	ASSERT_OK(dssh_session_set_timeout(ctx->client, 10));
-	ASSERT_OK(dssh_session_start(ctx->client));
+	ASSERT_EQ(dssh_session_set_timeout(ctx->client, 10), 0);
+	ASSERT_EQ(dssh_session_start(ctx->client), 0);
 	uint32_t first;
 	uint32_t second;
-	ASSERT_OK(channel_id_open_without_reply(ctx));
+	ASSERT_EQ(channel_id_open_without_reply(ctx), 0);
 	ASSERT_TRUE(channel_id_receive_open(ctx->server, &first));
-	ASSERT_OK(channel_id_open_without_reply(ctx));
+	ASSERT_EQ(channel_id_open_without_reply(ctx), 0);
 	ASSERT_TRUE(channel_id_receive_open(ctx->server, &second));
 	ASSERT_EQ_U(channel_id_pending_count(ctx->client), 2);
 
-	ASSERT_OK(peer_id_dispatch_confirmation(ctx->client, first, UINT32_MAX));
+	ASSERT_EQ(peer_id_dispatch_confirmation(ctx->client, first, UINT32_MAX), 0);
 	ASSERT_TRUE(peer_id_receive_control(ctx->server, SSH_MSG_CHANNEL_CLOSE, 5, UINT32_MAX));
+	ASSERT_TRUE(lifecycle_checkpoint(LC_PEER_LATE));
 	int duplicate = peer_id_dispatch_confirmation(ctx->client, second, UINT32_MAX);
 	int distinct = peer_id_dispatch_confirmation(ctx->client, second, 0);
-	printf("peer_id_late_confirmation duplicate=%d distinct=%d\n", duplicate, distinct);
+	ASSERT_TRUE(printf("peer_id_late_confirmation duplicate=%d distinct=%d\n", duplicate, distinct) >= 0);
 	ASSERT_EQ(duplicate, DSSH_ERROR_PARSE);
-	ASSERT_OK(distinct);
+	ASSERT_EQ(distinct, 0);
 	ASSERT_TRUE(peer_id_receive_control(ctx->server, SSH_MSG_CHANNEL_CLOSE, 5, 0));
 	return TEST_PASS;
 }
@@ -150,7 +153,7 @@ static int
 test_peer_id_late_confirmation(void)
 {
 	struct conn_ctx ctx;
-	if (conn_setup_mode(&ctx, false) < 0)
+	if (conn_setup_mode(&ctx, false) != 0)
 		return TEST_FAIL;
 	int ret = peer_id_late_confirmation_run(&ctx);
 	conn_cleanup(&ctx);
@@ -192,7 +195,7 @@ peer_id_accept_worker(void *opaque)
 	struct peer_id_accept_job *job = opaque;
 	struct dssh_incoming_open incoming;
 	int ret = accept_incoming(job->sess, &incoming, 3000);
-	if (ret < 0)
+	if (ret != 0)
 		return ret;
 	job->remote = incoming.peer_channel;
 	dssh_test_alloc_observe_allocations(peer_id_pause_allocation, job);
@@ -201,24 +204,34 @@ peer_id_accept_worker(void *opaque)
 	return job->channel == NULL ? DSSH_ERROR_INIT : 0;
 }
 
+static void
+peer_id_release_accept(void *data)
+{
+	struct peer_id_accept_job *jobs = data;
+	for (size_t i = 0; i < 2; i++)
+		atomic_store(&jobs[i].resume, true);
+}
+
 static int
 peer_id_concurrent_accept_run(struct conn_ctx *ctx)
 {
-	ASSERT_OK(dssh_session_start(ctx->server));
-	ASSERT_OK(peer_id_send_open(ctx->client, 0));
-	ASSERT_OK(peer_id_send_open(ctx->client, UINT32_MAX));
+	ASSERT_EQ(dssh_session_start(ctx->server), 0);
+	ASSERT_EQ(peer_id_send_open(ctx->client, 0), 0);
+	ASSERT_EQ(peer_id_send_open(ctx->client, UINT32_MAX), 0);
 	struct peer_id_accept_job jobs[2] = {{.sess = ctx->server}, {.sess = ctx->server}};
-	thrd_t threads[2];
-	size_t started = 0;
 	for (size_t i = 0; i < 2; i++) {
 		atomic_init(&jobs[i].paused, false);
 		atomic_init(&jobs[i].resume, false);
-		if (thrd_create(&threads[i], peer_id_accept_worker, &jobs[i]) != thrd_success)
-			break;
-		started++;
 	}
-	bool valid = started == 2 && dssh_test_wait_bool(&jobs[0].paused, true)
+	struct flow_fixture flow;
+	flow_init(&flow, ctx, peer_id_release_accept, jobs);
+	for (unsigned i = 0; i < 2; i++)
+		ASSERT_EQ(channel_worker_start(&flow.workers, i, peer_id_accept_worker, &jobs[i]), 0);
+	ASSERT_TRUE(lifecycle_checkpoint(LC_PEER_ACCEPT_STARTED));
+	bool valid = dssh_test_wait_bool(&jobs[0].paused, true)
 	    && dssh_test_wait_bool(&jobs[1].paused, true) && jobs[0].remote != jobs[1].remote;
+	ASSERT_TRUE(valid);
+	ASSERT_TRUE(lifecycle_checkpoint(LC_PEER_ACCEPT_PAUSED));
 	if (valid) {
 		struct dssh_incoming_open next;
 		valid = peer_id_send_open(ctx->client, 0) == 0
@@ -227,21 +240,16 @@ peer_id_concurrent_accept_run(struct conn_ctx *ctx)
 		    && accept_incoming(ctx->server, &next, 3000) == 0
 		    && next.peer_channel == 1;
 	}
-	for (size_t i = 0; i < started; i++)
-		atomic_store(&jobs[i].resume, true);
-	for (size_t i = 0; i < started; i++) {
-		int ret;
-		if (thrd_join(threads[i], &ret) != thrd_success)
-			abort();
-		valid = valid && ret == 0;
-	}
+	peer_id_release_accept(jobs);
+	flow_finish(&flow);
+	valid = valid && flow.workers.results[0] == 0 && flow.workers.results[1] == 0;
 	ASSERT_TRUE(valid);
 	uint32_t received[2];
 	for (size_t i = 0; i < 2; i++) {
 		uint8_t type;
 		uint8_t *payload;
 		size_t len;
-		ASSERT_OK(recv_packet(ctx->client, &type, &payload, &len));
+		ASSERT_EQ(recv_packet(ctx->client, &type, &payload, &len), 0);
 		ASSERT_EQ(type, SSH_MSG_CHANNEL_OPEN_CONFIRMATION);
 		ASSERT_EQ_U(len, 17);
 		received[i] = DSSH_GET_U32(&payload[1]);
@@ -255,7 +263,7 @@ static int
 test_peer_id_concurrent_accept(void)
 {
 	struct conn_ctx ctx;
-	if (conn_setup_mode(&ctx, false) < 0)
+	if (conn_setup_mode(&ctx, false) != 0)
 		return TEST_FAIL;
 	int ret = peer_id_concurrent_accept_run(&ctx);
 	conn_cleanup(&ctx);
@@ -307,22 +315,31 @@ peer_id_terminal_worker(void *opaque)
 	}
 	window_tx_return_test_hook = NULL;
 	peer_id_terminal = NULL;
+	(void)dssh_test_thrd_pause_mutex_after(NULL, 0);
 	return ret;
+}
+
+static void
+peer_id_release_terminal(void *data)
+{
+	struct peer_id_terminal_job *job = data;
+	atomic_store(&job->resume, true);
+	dssh_test_thrd_resume_mutex();
 }
 
 static int
 peer_id_ordered_terminal_run(struct conn_ctx *ctx, bool close)
 {
 	const uint32_t remote = UINT32_MAX;
-	ASSERT_OK(dssh_session_start(ctx->server));
-	ASSERT_OK(peer_id_send_open(ctx->client, remote));
+	ASSERT_EQ(dssh_session_start(ctx->server), 0);
+	ASSERT_EQ(peer_id_send_open(ctx->client, remote), 0);
 	/* Finish admission before arming the process-wide allocation failure.
 	 * The failure must belong to the acceptor's channel construction. */
 	ASSERT_TRUE(channel_id_wire_barrier(ctx->client));
 	struct peer_id_terminal_job job = {.sess = ctx->server};
 	if (close) {
 		struct dssh_incoming_open incoming;
-		ASSERT_OK(accept_incoming(ctx->server, &incoming, 3000));
+		ASSERT_EQ(accept_incoming(ctx->server, &incoming, 3000), 0);
 		job.closing = accept_channel_init(ctx->server, &incoming);
 		ASSERT_NOT_NULL(job.closing);
 		ASSERT_TRUE(peer_id_receive_control(ctx->client, SSH_MSG_CHANNEL_OPEN_CONFIRMATION,
@@ -331,14 +348,17 @@ peer_id_ordered_terminal_run(struct conn_ctx *ctx, bool close)
 		size_t pos = 0;
 		message[pos++] = SSH_MSG_CHANNEL_CLOSE;
 		DSSH_PUT_U32(job.closing->local_id, message, &pos);
-		ASSERT_OK(send_packet(ctx->client, message, pos, NULL));
+		ASSERT_EQ(send_packet(ctx->client, message, pos, NULL), 0);
 		ASSERT_TRUE(channel_id_wire_barrier(ctx->client));
 	}
 	atomic_init(&job.armed, false);
 	atomic_init(&job.returning, false);
 	atomic_init(&job.resume, false);
-	thrd_t thread;
-	ASSERT_EQ(thrd_create(&thread, peer_id_terminal_worker, &job), thrd_success);
+	struct flow_fixture flow;
+	flow_init(&flow, ctx, peer_id_release_terminal, &job);
+	flow.paused = true;
+	ASSERT_EQ(channel_worker_start(&flow.workers, 0, peer_id_terminal_worker, &job), 0);
+	ASSERT_TRUE(lifecycle_checkpoint(LC_PEER_TERMINAL_STARTED));
 	bool valid = true;
 	bool acquiring = true;
 	if (close) {
@@ -351,12 +371,14 @@ peer_id_ordered_terminal_run(struct conn_ctx *ctx, bool close)
 		    && peer_id_send_open(ctx->client, 0) == 0
 		    && accept_incoming(ctx->server, &next, 3000) == 0
 		    && next.peer_channel == 0;
-		if (!valid)
-			atomic_store(&job.resume, true);
+		ASSERT_TRUE(valid);
+		ASSERT_TRUE(lifecycle_checkpoint(LC_PEER_ACQUIRING));
 		acquiring = valid;
 		dssh_test_thrd_resume_mutex();
 	}
 	bool returning = valid && dssh_test_wait_bool(&job.returning, true);
+	ASSERT_TRUE(returning);
+	ASSERT_TRUE(lifecycle_checkpoint(LC_PEER_RETURNING));
 	bool received = returning && peer_id_receive_control(ctx->client, close ? SSH_MSG_CHANNEL_CLOSE
 	        : SSH_MSG_CHANNEL_OPEN_FAILURE, close ? 5 : 17, remote);
 	valid = received;
@@ -366,14 +388,13 @@ peer_id_ordered_terminal_run(struct conn_ctx *ctx, bool close)
 		    && accept_incoming(ctx->server, &replacement, 3000) == 0
 		    && replacement.peer_channel == remote;
 	}
-	atomic_store(&job.resume, true);
-	int ret;
-	if (thrd_join(thread, &ret) != thrd_success)
-		abort();
-	printf("peer_id_terminal close=%d acquiring=%d returning=%d received=%d replacement=%d worker=%d\n",
-	    close, acquiring, returning, received, valid, ret);
+	peer_id_release_terminal(&job);
+	flow_finish(&flow);
+	int ret = flow.workers.results[0];
+	ASSERT_TRUE(printf("peer_id_terminal close=%d acquiring=%d returning=%d received=%d replacement=%d worker=%d\n",
+	    close, acquiring, returning, received, valid, ret) >= 0);
 	ASSERT_TRUE(valid);
-	ASSERT_OK(ret);
+	ASSERT_EQ(ret, 0);
 	ASSERT_FALSE(dssh_session_is_terminated(ctx->server));
 	ASSERT_NOT_NULL(accept_channel_init(ctx->server, &replacement));
 	ASSERT_TRUE(peer_id_receive_control(ctx->client, SSH_MSG_CHANNEL_OPEN_CONFIRMATION, 17, remote));
@@ -397,9 +418,9 @@ static int
 peer_id_required_refusal(struct conn_ctx *ctx, struct peer_id_required_notice *notice)
 {
 	dssh_session sess = ctx->server;
-	ASSERT_OK(dssh_session_set_terminate_cb(sess, peer_id_required_terminated, notice));
+	ASSERT_EQ(dssh_session_set_terminate_cb(sess, peer_id_required_terminated, notice), 0);
 	size_t capacity;
-	int ret;
+	int ret = DSSH_ERROR_INIT;
 	uint8_t *packet = send_begin(sess, SSH_MSG_CHANNEL_CLOSE, &capacity, &ret);
 	if (packet == NULL)
 		return TEST_FAIL;
@@ -418,6 +439,7 @@ peer_id_required_refusal(struct conn_ctx *ctx, struct peer_id_required_notice *n
 	ASSERT_TRUE(dssh_session_is_terminated(sess));
 	ASSERT_FALSE(atomic_load(&sess->trans.tx_owner_active));
 	ASSERT_EQ_U(sess->trans.tx_seq, seq);
+	ASSERT_TRUE(lifecycle_checkpoint(LC_PEER_REQUIRED));
 	return TEST_PASS;
 }
 
@@ -429,7 +451,7 @@ test_peer_id_ordered_terminal(void)
 		window_test_gather = mode >= 2;
 		int setup = conn_setup_mode(&ctx, false);
 		window_test_gather = false;
-		ASSERT_OK(setup);
+		ASSERT_EQ(setup, 0);
 		int ret = peer_id_ordered_terminal_run(&ctx, mode % 2 != 0);
 		conn_cleanup(&ctx);
 		if (ret != TEST_PASS)
@@ -437,7 +459,7 @@ test_peer_id_ordered_terminal(void)
 	}
 	struct conn_ctx ctx;
 	struct peer_id_required_notice notice = {0};
-	ASSERT_OK(conn_setup_mode(&ctx, false));
+	ASSERT_EQ(conn_setup_mode(&ctx, false), 0);
 	int ret = peer_id_required_refusal(&ctx, &notice);
 	conn_cleanup(&ctx);
 	return ret;

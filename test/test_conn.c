@@ -774,6 +774,7 @@ open_exec_channel(struct conn_ctx *owner, struct open_exec_ctx *ctx)
 #include "conn_callback_fixture.h"
 #include "conn_wire_fixture.h"
 #include "conn_flow_fixture.h"
+#include "conn_lifecycle_fixture.h"
 
 /* ================================================================
  * Helper: open a shell channel concurrently
@@ -8004,8 +8005,13 @@ test_compression_window_rekey(void)
 #include "conn_callback_cases.h"
 #include "conn_wire_cases.h"
 #include "conn_flow_cases.h"
+#include "conn_lifecycle_cases.h"
 
 static struct dssh_test_entry tests[] = {
+	{ "release/lifecycle_owner_ids", test_lifecycle_owner_ids },
+	{ "release/lifecycle_owner_peer_ids", test_lifecycle_owner_peer_ids },
+	{ "release/lifecycle_owner_half_close", test_lifecycle_owner_half_close },
+	{ "release/lifecycle_owner_setup", test_lifecycle_owner_setup },
 	{ "release/flow_bytes", test_flow_bytes },
 	{ "release/flow_owner_tx", test_flow_owner_tx },
 	{ "release/flow_owner_rekey", test_flow_owner_rekey },
@@ -8369,6 +8375,7 @@ static struct dssh_test_entry tests[] = {
 	{ "accept_failure/slot_second", test_accept_slot_second },
 	{ "accept_failure/stream_first_no_reply", test_accept_stream_first_no_reply },
 	{ "accept_failure/stream_second_no_reply", test_accept_stream_second_no_reply },
+	{ "setup/packet_bounds", test_setup_packet_bounds },
 	{ "setup/confirmation_cleanup", test_setup_confirmation_cleanup },
 	{ "setup/mailbox_no_allocation", test_setup_mailbox_no_allocation },
 	{ "setup/gap_disable", test_setup_gap_disable },
@@ -8645,6 +8652,9 @@ main(int argc, char *argv[])
 		return incoming_control_probe();
 	if (argc == 2 && strcmp(argv[1], "--audit-close-outcomes") == 0)
 		return close_outcome_probe();
+	if (argc == 4 && strcmp(argv[1], "--channel-fatal") == 0
+	    && strncmp(argv[2], "lifecycle-", 10) == 0)
+		return lifecycle_fatal_child(argv[2] + 10, argv[3]);
 	if (argc == 4 && strcmp(argv[1], "--channel-fatal") == 0
 	    && strncmp(argv[2], "flow-", 5) == 0)
 		return flow_fatal_child(argv[2] + 5, argv[3]);

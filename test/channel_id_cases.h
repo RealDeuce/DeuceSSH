@@ -67,45 +67,53 @@ channel_id_lifetime_run(struct conn_ctx *ctx)
 	    .command = "first-id", .cbs = &accept_cbs_all, .accept_timeout = 30000};
 	struct open_exec_ctx marker = {.client = ctx->client, .server = ctx->server,
 	    .command = "marker-id", .cbs = &accept_cbs_all, .accept_timeout = 30000};
-	ASSERT_OK(open_exec_channel(ctx, &first));
-	ASSERT_OK(open_exec_channel(ctx, &marker));
+	ASSERT_EQ(open_exec_channel(ctx, &first), 0);
+	ASSERT_TRUE(lifecycle_checkpoint(LC_ID_LIVE));
+	ASSERT_EQ(open_exec_channel(ctx, &marker), 0);
+	ASSERT_TRUE(lifecycle_checkpoint(LC_ID_LIVE));
 	uint32_t id = first.client_ch->local_id;
-	ASSERT_OK(dssh_chan_close(first.client_ch, -1));
+	ASSERT_EQ(dssh_chan_close(first.client_ch, -1), 0);
 	first.client_ch = NULL;
 	bool observed_close = false;
 	for (unsigned i = 0; i < 2; i++) {
 		ASSERT_EQ(dssh_chan_poll(first.server_ch, DSSH_POLL_EVENT, 5000), DSSH_POLL_EVENT);
 		struct dssh_chan_event event;
-		ASSERT_OK(dssh_chan_read_event(first.server_ch, &event));
+		ASSERT_EQ(dssh_chan_read_event(first.server_ch, &event), 0);
 		observed_close = observed_close || event.type == DSSH_EVENT_CLOSE;
 	}
 	int64_t before_reply = channel_id_candidate(ctx->client, id);
-	ASSERT_OK(dssh_chan_close(first.server_ch, -1));
+	ASSERT_EQ(dssh_chan_close(first.server_ch, -1), 0);
 	first.server_ch = NULL;
 	/* This packet follows the reciprocal CLOSE on the same transport.
 	 * Receiving it proves that the earlier CLOSE has been dispatched. */
 	uint8_t expected = 47;
 	uint8_t received = 0;
 	ASSERT_EQ(dssh_chan_write(marker.server_ch, 0, &expected, 1), 1);
-	ASSERT_TRUE(dssh_chan_poll(marker.client_ch, DSSH_POLL_READ, 5000) & DSSH_POLL_READ);
+	int polled = dssh_chan_poll(marker.client_ch, DSSH_POLL_READ, 5000);
+	ASSERT_TRUE(polled >= 0 && (polled & DSSH_POLL_READ) != 0);
 	ASSERT_EQ(dssh_chan_read(marker.client_ch, 0, &received, 1), 1);
 	int64_t after_reply = channel_id_candidate(ctx->client, id);
 	ASSERT_EQ(mtx_lock(&ctx->client->channel_mtx), thrd_success);
 	ctx->client->next_channel_id = id;
-	ASSERT_EQ(mtx_unlock(&ctx->client->channel_mtx), thrd_success);
+	if (mtx_unlock(&ctx->client->channel_mtx) != thrd_success)
+		abort();
 	struct open_exec_ctx reused = {.client = ctx->client, .server = ctx->server,
 	    .command = "reused-id", .cbs = &accept_cbs_all, .accept_timeout = 30000};
 	int ret = open_exec_channel(ctx, &reused);
+	ASSERT_EQ(ret, 0);
+	ASSERT_TRUE(lifecycle_checkpoint(LC_ID_LIVE));
 	bool valid = observed_close && before_reply >= 0 && before_reply != id
 	    && after_reply == id && received == expected && ret == 0;
-	if (ret == 0)
+	if (ret == 0) {
 		valid = valid && reused.client_ch->local_id == id
-		    && dssh_chan_write(reused.client_ch, 0, &expected, 1) == 1
-		    && (dssh_chan_poll(reused.server_ch, DSSH_POLL_READ, 5000) & DSSH_POLL_READ) != 0
+		    && dssh_chan_write(reused.client_ch, 0, &expected, 1) == 1;
+		polled = valid ? dssh_chan_poll(reused.server_ch, DSSH_POLL_READ, 5000) : 0;
+		valid = valid && polled >= 0 && (polled & DSSH_POLL_READ) != 0
 		    && dssh_chan_read(reused.server_ch, 0, &received, 1) == 1 && received == expected;
-	printf("channel_id_lifetime before=%" PRId64 " after=%" PRId64
+	}
+	ASSERT_TRUE(printf("channel_id_lifetime before=%" PRId64 " after=%" PRId64
 	    " original=%" PRIu32 " peer_close=%d reused=%d data=%d\n",
-	    before_reply, after_reply, id, observed_close, ret == 0, received == expected);
+	    before_reply, after_reply, id, observed_close, ret == 0, received == expected) >= 0);
 	ASSERT_TRUE(valid);
 	return TEST_PASS;
 }
@@ -220,17 +228,21 @@ channel_id_queue_reply(struct conn_ctx *ctx, const uint8_t *reply, size_t len)
 	if (tx_acquire(ctx->client, SSH_MSG_IGNORE) != 0)
 		return false;
 	struct channel_id_reply_job job = {.peer = ctx->server, .reply = reply, .len = len};
-	thrd_t thread;
-	int result = DSSH_ERROR_INIT;
-	if (thrd_create(&thread, channel_id_send_reply_and_probe, &job) == thrd_success) {
-		if (thrd_join(thread, &result) != thrd_success)
-			abort();
-	}
-	bool queued = result == 0
+	struct flow_fixture flow;
+	flow_init(&flow, ctx, NULL, NULL);
+	flow.tx.session = ctx->client;
+	flow.tx.held = true;
+	ASSERT_EQ(channel_worker_start(&flow.workers, 0, channel_id_send_reply_and_probe, &job), 0);
+	ASSERT_TRUE(lifecycle_checkpoint(LC_ID_QUEUE_STARTED));
+	channel_worker_join(&flow.workers, 0);
+	bool queued = flow.workers.results[0] == 0
 	    && dssh_test_wait_bool(&ctx->client->trans.global_reply_slot.ready, true)
 	    && atomic_load(&ctx->client->trans.open_fail_slot.ready);
-	tx_unlock_with_slots(ctx->client);
-	return queued && channel_id_receive_probe_reply(ctx->server);
+	ASSERT_TRUE(queued);
+	ASSERT_TRUE(lifecycle_checkpoint(LC_ID_QUEUED));
+	callback_release_tx(&flow.tx);
+	flow_finish(&flow);
+	return queued && flow.tx.result == 0 && channel_id_receive_probe_reply(ctx->server);
 }
 
 static bool
@@ -240,8 +252,10 @@ channel_id_acknowledge_close(struct conn_ctx *ctx, uint32_t local, uint32_t remo
 	uint8_t *payload;
 	size_t len;
 	if (recv_packet(ctx->server, &type, &payload, &len) != 0
-	    || type != SSH_MSG_CHANNEL_CLOSE || len != 5 || DSSH_GET_U32(&payload[1]) != remote
-	    || channel_id_candidate(ctx->client, local) == local)
+	    || type != SSH_MSG_CHANNEL_CLOSE || len != 5 || DSSH_GET_U32(&payload[1]) != remote)
+		return false;
+	int64_t candidate = channel_id_candidate(ctx->client, local);
+	if (candidate < 0 || candidate == local)
 		return false;
 	uint8_t close[5];
 	size_t pos = 0;
@@ -253,36 +267,38 @@ channel_id_acknowledge_close(struct conn_ctx *ctx, uint32_t local, uint32_t remo
 static int
 channel_id_late_reply_run(struct conn_ctx *ctx, bool accept, bool queue)
 {
-	ASSERT_OK(dssh_session_set_timeout(ctx->client, 10));
-	ASSERT_OK(dssh_session_start(ctx->client));
+	ASSERT_EQ(dssh_session_set_timeout(ctx->client, 10), 0);
+	ASSERT_EQ(dssh_session_start(ctx->client), 0);
 	if (!accept) {
 		/* The packet engine refuses an OPEN before changing stream state. */
 		uint_fast32_t saved = atomic_exchange(&ctx->client->trans.tx_since_rekey, UINT_FAST32_MAX);
 		uint32_t seq = ctx->client->trans.tx_seq;
 		int ret = channel_id_open_without_reply(ctx);
 		atomic_store(&ctx->client->trans.tx_since_rekey, saved);
-		ASSERT_OK(ret);
+		ASSERT_EQ(ret, 0);
 		ASSERT_EQ_U(ctx->client->trans.tx_seq, seq);
 		ASSERT_EQ_U(channel_id_pending_count(ctx->client), 0);
 		ASSERT_EQ(channel_id_candidate(ctx->client, 0), 0);
 	}
-	ASSERT_OK(channel_id_open_without_reply(ctx));
+	ASSERT_EQ(channel_id_open_without_reply(ctx), 0);
 	ASSERT_EQ_U(channel_id_pending_count(ctx->client), 1);
 	uint32_t id;
 	ASSERT_TRUE(channel_id_receive_open(ctx->server, &id));
-	ASSERT_NE(channel_id_candidate(ctx->client, id), id);
+	int64_t candidate = channel_id_candidate(ctx->client, id);
+	ASSERT_TRUE(candidate >= 0 && candidate != id);
 	uint8_t reply[17];
 	uint32_t peer_id = UINT32_MAX;
 	size_t len = channel_id_build_reply(reply, id, accept, peer_id);
 	/* A truncated response must not release the pending number. */
-	ASSERT_OK(send_packet(ctx->server, reply, len - 1, NULL));
+	ASSERT_EQ(send_packet(ctx->server, reply, len - 1, NULL), 0);
 	ASSERT_TRUE(channel_id_wire_barrier(ctx->server));
-	ASSERT_NE(channel_id_candidate(ctx->client, id), id);
+	candidate = channel_id_candidate(ctx->client, id);
+	ASSERT_TRUE(candidate >= 0 && candidate != id);
 	if (queue) {
 		ASSERT_TRUE(channel_id_queue_reply(ctx, reply, len));
 	}
 	else {
-		ASSERT_OK(send_packet(ctx->server, reply, len, NULL));
+		ASSERT_EQ(send_packet(ctx->server, reply, len, NULL), 0);
 	}
 	if (accept)
 		ASSERT_TRUE(channel_id_acknowledge_close(ctx, id, peer_id));
@@ -324,21 +340,35 @@ channel_id_open_worker(void *arg)
 	int ret = channel_id_open_without_reply(job->ctx);
 	window_tx_return_test_hook = NULL;
 	channel_id_open_job = NULL;
+	(void)dssh_test_thrd_pause_mutex_after(NULL, 0);
 	return ret;
+}
+
+static void
+channel_id_release_open(void *data)
+{
+	struct channel_id_open_job *job = data;
+	atomic_store(&job->cancelled, true);
+	dssh_test_thrd_resume_mutex();
 }
 
 static int
 channel_id_confirm_before_detach(struct conn_ctx *ctx)
 {
-	ASSERT_OK(dssh_session_set_timeout(ctx->client, 10));
-	ASSERT_OK(dssh_session_start(ctx->client));
+	ASSERT_EQ(dssh_session_set_timeout(ctx->client, 10), 0);
+	ASSERT_EQ(dssh_session_start(ctx->client), 0);
 	struct channel_id_open_job job = {.ctx = ctx};
 	atomic_init(&job.armed, false);
 	atomic_init(&job.cancelled, false);
-	thrd_t thread;
-	ASSERT_EQ(thrd_create(&thread, channel_id_open_worker, &job), thrd_success);
+	struct flow_fixture flow;
+	flow_init(&flow, ctx, channel_id_release_open, &job);
+	flow.paused = true;
+	ASSERT_EQ(channel_worker_start(&flow.workers, 0, channel_id_open_worker, &job), 0);
+	ASSERT_TRUE(lifecycle_checkpoint(LC_ID_OPEN_STARTED));
 	bool valid = dssh_test_wait_bool(&job.armed, true)
 	    && dssh_test_wait_bool(job.detaching, true);
+	ASSERT_TRUE(valid);
+	ASSERT_TRUE(lifecycle_checkpoint(LC_ID_DETACH_PAUSED));
 	uint32_t id = 0;
 	uint32_t peer_id = UINT32_MAX;
 	if (valid) {
@@ -357,13 +387,10 @@ channel_id_confirm_before_detach(struct conn_ctx *ctx)
 		valid = send_packet(ctx->server, reply, len, NULL) == 0
 		    && channel_id_wire_barrier(ctx->server);
 	}
-	atomic_store(&job.cancelled, true);
-	dssh_test_thrd_resume_mutex();
-	int result;
-	if (thrd_join(thread, &result) != thrd_success)
-		abort();
+	channel_id_release_open(&job);
+	flow_finish(&flow);
 	ASSERT_TRUE(valid);
-	ASSERT_OK(result);
+	ASSERT_EQ(flow.workers.results[0], 0);
 	ASSERT_EQ_U(channel_id_pending_count(ctx->client), 1);
 	ASSERT_TRUE(channel_id_acknowledge_close(ctx, id, peer_id));
 	ASSERT_TRUE(channel_id_wire_barrier(ctx->server));
@@ -393,20 +420,21 @@ test_channel_id_late_reply(void)
 static int
 channel_id_backpressure_run(struct conn_ctx *ctx)
 {
-	ASSERT_OK(dssh_session_set_timeout(ctx->client, 1));
-	ASSERT_OK(dssh_session_start(ctx->client));
+	ASSERT_EQ(dssh_session_set_timeout(ctx->client, 1), 0);
+	ASSERT_EQ(dssh_session_start(ctx->client), 0);
 	uint32_t first_id = 0;
 	for (size_t i = 0; i < DSSH_RETIRED_CHANNEL_ID_CAP; i++) {
-		ASSERT_OK(channel_id_open_without_reply(ctx));
+		ASSERT_EQ(channel_id_open_without_reply(ctx), 0);
 		ASSERT_EQ_U(channel_id_pending_count(ctx->client), i + 1);
 		uint32_t id;
 		ASSERT_TRUE(channel_id_receive_open(ctx->server, &id));
 		if (i == 0)
 			first_id = id;
 	}
+	ASSERT_TRUE(lifecycle_checkpoint(LC_ID_PRESSURE));
 	uint32_t seq = ctx->client->trans.tx_seq;
 	struct dssh_chan_params params;
-	ASSERT_OK(dssh_chan_params_init(&params, DSSH_CHAN_SHELL));
+	ASSERT_EQ(dssh_chan_params_init(&params, DSSH_CHAN_SHELL), 0);
 	params.max_window = 128;
 	dssh_test_alloc_fail_after(0);
 	dssh_channel refused = dssh_chan_open(ctx->client, &params);
@@ -420,15 +448,16 @@ channel_id_backpressure_run(struct conn_ctx *ctx)
 	ASSERT_EQ_U(ctx->client->trans.tx_seq, seq);
 	uint8_t reply[17];
 	size_t len = channel_id_build_reply(reply, first_id, false, 0);
-	ASSERT_OK(send_packet(ctx->server, reply, len, NULL));
+	ASSERT_EQ(send_packet(ctx->server, reply, len, NULL), 0);
 	ASSERT_TRUE(channel_id_wire_barrier(ctx->server));
 	ASSERT_EQ_U(channel_id_pending_count(ctx->client), DSSH_RETIRED_CHANNEL_ID_CAP - 1);
 	ASSERT_TRUE(dssh_test_wait_bool(&ctx->client->trans.tx_owner_active, false));
 	ASSERT_EQ(channel_id_candidate(ctx->client, first_id), first_id);
 	ASSERT_EQ(mtx_lock(&ctx->client->channel_mtx), thrd_success);
 	ctx->client->next_channel_id = first_id;
-	ASSERT_EQ(mtx_unlock(&ctx->client->channel_mtx), thrd_success);
-	ASSERT_OK(channel_id_open_without_reply(ctx));
+	if (mtx_unlock(&ctx->client->channel_mtx) != thrd_success)
+		abort();
+	ASSERT_EQ(channel_id_open_without_reply(ctx), 0);
 	ASSERT_EQ_U(channel_id_pending_count(ctx->client), DSSH_RETIRED_CHANNEL_ID_CAP);
 	uint32_t reopened;
 	ASSERT_TRUE(channel_id_receive_open(ctx->server, &reopened));

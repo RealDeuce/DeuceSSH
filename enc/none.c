@@ -3,6 +3,9 @@
 
 #include "deucessh-enc.h"
 #include "deucessh.h"
+#ifdef DSSH_TESTING
+ #include "ssh-internal.h"
+#endif
 
 static int
 encrypt(uint8_t *buf, size_t bufsz, dssh_enc_ctx *ctx)

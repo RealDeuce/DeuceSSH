@@ -8,6 +8,9 @@
 #include "deucessh-kex.h"
 #include "hybrid-pq-kex-ops.h"
 #include "deucessh.h"
+#ifdef DSSH_TESTING
+ #include "ssh-internal.h"
+#endif
 
 #define KEX_NAME     "sntrup761x25519-sha512"
 #define KEX_NAME_LEN 22

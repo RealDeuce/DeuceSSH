@@ -8,6 +8,9 @@
 #include "deucessh-key-algo.h"
 #include "deucessh.h"
 #include "key-wire.h"
+#ifdef DSSH_TESTING
+ #include "ssh-internal.h"
+#endif
 
 #define RSA_SHA2_256_NAME     "rsa-sha2-256"
 #define RSA_SHA2_256_NAME_LEN 12

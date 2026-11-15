@@ -3,6 +3,9 @@
 
 #include "deucessh-comp.h"
 #include "deucessh.h"
+#ifdef DSSH_TESTING
+ #include "ssh-internal.h"
+#endif
 
 static int
 init(bool compress, dssh_comp_ctx **ctx)

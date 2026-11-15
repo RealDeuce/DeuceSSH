@@ -3096,116 +3096,47 @@ test_version_exchange_extra_line_error(void)
  * branches in register_kex/key_algo/enc/mac/comp.
  * ================================================================ */
 
+#include "registration_cases.h"
+
 static int
 test_register_kex_toolate(void)
 {
-	dssh_test_reset_global_config();
-	ASSERT_EQ(register_all_algorithms(), 0);
-	dssh_transport_set_callbacks(mock_tx_dispatch, mock_rx_dispatch,
-	    mock_rxline_dispatch, mock_extra_line_cb);
-
-	dssh_session sess = dssh_session_init(true, 0);
-	ASSERT_NOT_NULL(sess);
-
-	/* gconf.used is now true -- registration should fail */
-	uint8_t kbuf[sizeof(struct dssh_kex_s) + 16];
-	memset(kbuf, 0, sizeof(kbuf));
-	struct dssh_kex_s *late_kex = (struct dssh_kex_s *)kbuf;
-	strcpy(late_kex->name, "late-kex");
-	ASSERT_EQ(dssh_transport_register_kex(late_kex), DSSH_ERROR_TOOLATE);
-
-	dssh_session_cleanup(sess);
-	dssh_test_reset_global_config();
+	ASSERT_TRUE(registration_case(REG_KEX, REG_LATE));
 	return TEST_PASS;
 }
 
 static int
 test_register_kex_empty_name(void)
 {
-	dssh_test_reset_global_config();
-
-	uint8_t kbuf[sizeof(struct dssh_kex_s) + 4];
-	memset(kbuf, 0, sizeof(kbuf));
-	struct dssh_kex_s *bad = (struct dssh_kex_s *)kbuf;
-	bad->name[0] = '\0';
-	ASSERT_EQ(dssh_transport_register_kex(bad), DSSH_ERROR_INVALID);
-
-	dssh_test_reset_global_config();
+	ASSERT_TRUE(registration_case(REG_KEX, REG_EMPTY));
 	return TEST_PASS;
 }
 
 static int
 test_register_kex_next_not_null(void)
 {
-	dssh_test_reset_global_config();
-
-	uint8_t kbuf[sizeof(struct dssh_kex_s) + 16];
-	memset(kbuf, 0, sizeof(kbuf));
-	struct dssh_kex_s *bad = (struct dssh_kex_s *)kbuf;
-	bad->next = (struct dssh_kex_s *)0x1;  /* non-NULL */
-	strcpy(bad->name, "bad-kex");
-	ASSERT_EQ(dssh_transport_register_kex(bad), DSSH_ERROR_MUST_BE_NULL);
-
-	dssh_test_reset_global_config();
+	ASSERT_TRUE(registration_case(REG_KEX, REG_NEXT));
 	return TEST_PASS;
 }
 
 static int
 test_register_enc_toolate(void)
 {
-	dssh_test_reset_global_config();
-	ASSERT_EQ(register_all_algorithms(), 0);
-	dssh_transport_set_callbacks(mock_tx_dispatch, mock_rx_dispatch,
-	    mock_rxline_dispatch, mock_extra_line_cb);
-
-	dssh_session sess = dssh_session_init(true, 0);
-	ASSERT_NOT_NULL(sess);
-
-	uint8_t ebuf[sizeof(struct dssh_enc_s) + 16];
-	memset(ebuf, 0, sizeof(ebuf));
-	struct dssh_enc_s *late_enc = (struct dssh_enc_s *)ebuf;
-	strcpy(late_enc->name, "late-enc");
-	ASSERT_EQ(dssh_transport_register_enc(late_enc), DSSH_ERROR_TOOLATE);
-
-	dssh_session_cleanup(sess);
-	dssh_test_reset_global_config();
+	ASSERT_TRUE(registration_case(REG_ENC, REG_LATE));
 	return TEST_PASS;
 }
 
 static int
 test_register_mac_toolate(void)
 {
-	dssh_test_reset_global_config();
-	ASSERT_EQ(register_all_algorithms(), 0);
-	dssh_transport_set_callbacks(mock_tx_dispatch, mock_rx_dispatch,
-	    mock_rxline_dispatch, mock_extra_line_cb);
-
-	dssh_session sess = dssh_session_init(true, 0);
-	ASSERT_NOT_NULL(sess);
-
-	uint8_t mbuf[sizeof(struct dssh_mac_s) + 16];
-	memset(mbuf, 0, sizeof(mbuf));
-	struct dssh_mac_s *late_mac = (struct dssh_mac_s *)mbuf;
-	strcpy(late_mac->name, "late-mac");
-	ASSERT_EQ(dssh_transport_register_mac(late_mac), DSSH_ERROR_TOOLATE);
-
-	dssh_session_cleanup(sess);
-	dssh_test_reset_global_config();
+	ASSERT_TRUE(registration_case(REG_MAC, REG_LATE));
 	return TEST_PASS;
 }
 
 static int
 test_register_comp_empty_name(void)
 {
-	dssh_test_reset_global_config();
-
-	uint8_t cbuf[sizeof(struct dssh_comp_s) + 4];
-	memset(cbuf, 0, sizeof(cbuf));
-	struct dssh_comp_s *bad = (struct dssh_comp_s *)cbuf;
-	bad->name[0] = '\0';
-	ASSERT_EQ(dssh_transport_register_comp(bad), DSSH_ERROR_INVALID);
-
-	dssh_test_reset_global_config();
+	ASSERT_TRUE(registration_case(REG_COMP, REG_EMPTY));
 	return TEST_PASS;
 }
 
@@ -3223,22 +3154,7 @@ test_register_comp_empty_name(void)
 static int
 test_register_key_algo_toolate(void)
 {
-	dssh_test_reset_global_config();
-	ASSERT_EQ(register_all_algorithms(), 0);
-	dssh_transport_set_callbacks(mock_tx_dispatch, mock_rx_dispatch,
-	    mock_rxline_dispatch, mock_extra_line_cb);
-
-	dssh_session sess = dssh_session_init(true, 0);
-	ASSERT_NOT_NULL(sess);
-
-	uint8_t buf[sizeof(struct dssh_key_algo_s) + 16];
-	memset(buf, 0, sizeof(buf));
-	struct dssh_key_algo_s *ka = (struct dssh_key_algo_s *)buf;
-	strcpy(ka->name, "late-key");
-	ASSERT_EQ(dssh_transport_register_key_algo(ka), DSSH_ERROR_TOOLATE);
-
-	dssh_session_cleanup(sess);
-	dssh_test_reset_global_config();
+	ASSERT_TRUE(registration_case(REG_KEY, REG_LATE));
 	return TEST_PASS;
 }
 
@@ -3268,144 +3184,56 @@ test_set_ctx_toolate(void)
 static int
 test_register_key_algo_toolong(void)
 {
-	dssh_test_reset_global_config();
-
-	uint8_t buf[sizeof(struct dssh_key_algo_s) + 128];
-	memset(buf, 0, sizeof(buf));
-	struct dssh_key_algo_s *ka = (struct dssh_key_algo_s *)buf;
-	memset(ka->name, 'x', 65);
-	ka->name[65] = '\0';
-	ASSERT_EQ(dssh_transport_register_key_algo(ka), DSSH_ERROR_TOOLONG);
-
-	/* Empty name */
-	ka->name[0] = '\0';
-	ASSERT_EQ(dssh_transport_register_key_algo(ka), DSSH_ERROR_INVALID);
-
-	dssh_test_reset_global_config();
+	ASSERT_TRUE(registration_case(REG_KEY, REG_LONG_EMPTY));
 	return TEST_PASS;
 }
 
 static int
 test_register_key_algo_next_not_null(void)
 {
-	dssh_test_reset_global_config();
-
-	uint8_t buf[sizeof(struct dssh_key_algo_s) + 16];
-	memset(buf, 0, sizeof(buf));
-	struct dssh_key_algo_s *ka = (struct dssh_key_algo_s *)buf;
-	strcpy(ka->name, "test-ka");
-	ka->next = (void *)1;
-	ASSERT_EQ(dssh_transport_register_key_algo(ka), DSSH_ERROR_MUST_BE_NULL);
-
-	dssh_test_reset_global_config();
+	ASSERT_TRUE(registration_case(REG_KEY, REG_NEXT));
 	return TEST_PASS;
 }
 
 static int
 test_register_enc_toolong(void)
 {
-	dssh_test_reset_global_config();
-
-	uint8_t buf[sizeof(struct dssh_enc_s) + 128];
-	memset(buf, 0, sizeof(buf));
-	struct dssh_enc_s *enc = (struct dssh_enc_s *)buf;
-	memset(enc->name, 'x', 65);
-	enc->name[65] = '\0';
-	ASSERT_EQ(dssh_transport_register_enc(enc), DSSH_ERROR_TOOLONG);
-
-	enc->name[0] = '\0';
-	ASSERT_EQ(dssh_transport_register_enc(enc), DSSH_ERROR_INVALID);
-
-	dssh_test_reset_global_config();
+	ASSERT_TRUE(registration_case(REG_ENC, REG_LONG_EMPTY));
 	return TEST_PASS;
 }
 
 static int
 test_register_enc_next_not_null(void)
 {
-	dssh_test_reset_global_config();
-
-	uint8_t buf[sizeof(struct dssh_enc_s) + 16];
-	memset(buf, 0, sizeof(buf));
-	struct dssh_enc_s *enc = (struct dssh_enc_s *)buf;
-	strcpy(enc->name, "test-enc");
-	enc->next = (void *)1;
-	ASSERT_EQ(dssh_transport_register_enc(enc), DSSH_ERROR_MUST_BE_NULL);
-
-	dssh_test_reset_global_config();
+	ASSERT_TRUE(registration_case(REG_ENC, REG_NEXT));
 	return TEST_PASS;
 }
 
 static int
 test_register_mac_toolong(void)
 {
-	dssh_test_reset_global_config();
-
-	uint8_t buf[sizeof(struct dssh_mac_s) + 128];
-	memset(buf, 0, sizeof(buf));
-	struct dssh_mac_s *mac = (struct dssh_mac_s *)buf;
-	memset(mac->name, 'x', 65);
-	mac->name[65] = '\0';
-	ASSERT_EQ(dssh_transport_register_mac(mac), DSSH_ERROR_TOOLONG);
-
-	mac->name[0] = '\0';
-	ASSERT_EQ(dssh_transport_register_mac(mac), DSSH_ERROR_INVALID);
-
-	dssh_test_reset_global_config();
+	ASSERT_TRUE(registration_case(REG_MAC, REG_LONG_EMPTY));
 	return TEST_PASS;
 }
 
 static int
 test_register_mac_next_not_null(void)
 {
-	dssh_test_reset_global_config();
-
-	uint8_t buf[sizeof(struct dssh_mac_s) + 16];
-	memset(buf, 0, sizeof(buf));
-	struct dssh_mac_s *mac = (struct dssh_mac_s *)buf;
-	strcpy(mac->name, "test-mac");
-	mac->next = (void *)1;
-	ASSERT_EQ(dssh_transport_register_mac(mac), DSSH_ERROR_MUST_BE_NULL);
-
-	dssh_test_reset_global_config();
+	ASSERT_TRUE(registration_case(REG_MAC, REG_NEXT));
 	return TEST_PASS;
 }
 
 static int
 test_register_comp_toolate(void)
 {
-	dssh_test_reset_global_config();
-	ASSERT_EQ(register_all_algorithms(), 0);
-	dssh_transport_set_callbacks(mock_tx_dispatch, mock_rx_dispatch,
-	    mock_rxline_dispatch, mock_extra_line_cb);
-
-	dssh_session sess = dssh_session_init(true, 0);
-	ASSERT_NOT_NULL(sess);
-
-	uint8_t buf[sizeof(struct dssh_comp_s) + 16];
-	memset(buf, 0, sizeof(buf));
-	struct dssh_comp_s *comp = (struct dssh_comp_s *)buf;
-	strcpy(comp->name, "late-comp");
-	ASSERT_EQ(dssh_transport_register_comp(comp), DSSH_ERROR_TOOLATE);
-
-	dssh_session_cleanup(sess);
-	dssh_test_reset_global_config();
+	ASSERT_TRUE(registration_case(REG_COMP, REG_LATE));
 	return TEST_PASS;
 }
 
 static int
 test_register_comp_next_not_null(void)
 {
-	dssh_test_reset_global_config();
-
-	uint8_t buf[sizeof(struct dssh_comp_s) + 16];
-	memset(buf, 0, sizeof(buf));
-	struct dssh_comp_s *comp = (struct dssh_comp_s *)buf;
-	strcpy(comp->name, "test-comp");
-	comp->next = (void *)1;
-	ASSERT_EQ(dssh_transport_register_comp(comp), DSSH_ERROR_MUST_BE_NULL);
-
-	dssh_test_reset_global_config();
+	ASSERT_TRUE(registration_case(REG_COMP, REG_NEXT));
 	return TEST_PASS;
 }
 
@@ -6162,42 +5990,39 @@ test_first_name_small_buf(void)
 static int
 test_register_two_kex(void)
 {
-	/* Covers kex_tail->next assignment (line 1602) */
 	dssh_test_reset_global_config();
-
+	int first;
+	int second = DSSH_ERROR_INIT;
+	const char *head_name;
+	const char *tail_name;
 	if (test_using_dhgex()) {
-		ASSERT_EQ(dssh_register_dh_gex_sha256(), 0);
-		ASSERT_EQ(dssh_register_curve25519_sha256(), 0);
+		first = dssh_register_dh_gex_sha256();
+		if (first == 0)
+			second = dssh_register_curve25519_sha256();
+		head_name = "diffie-hellman-group-exchange-sha256";
+		tail_name = "curve25519-sha256";
 	}
 	else {
-		ASSERT_EQ(dssh_register_curve25519_sha256(), 0);
-		ASSERT_EQ(dssh_register_dh_gex_sha256(), 0);
+		first = dssh_register_curve25519_sha256();
+		if (first == 0)
+			second = dssh_register_dh_gex_sha256();
+		head_name = "curve25519-sha256";
+		tail_name = "diffie-hellman-group-exchange-sha256";
 	}
-
+	bool valid = first == 0 && second == 0 && gconf.kex_entries == 2
+	    && gconf.kex_head != NULL && gconf.kex_tail != NULL
+	    && gconf.kex_head->next == gconf.kex_tail && gconf.kex_tail->next == NULL
+	    && strcmp(gconf.kex_head->name, head_name) == 0
+	    && strcmp(gconf.kex_tail->name, tail_name) == 0;
 	dssh_test_reset_global_config();
+	ASSERT_TRUE(valid);
 	return TEST_PASS;
 }
 
 static int
 test_register_two_comp(void)
 {
-	/* Covers comp_tail->next assignment (line 1682) */
-	dssh_test_reset_global_config();
-
-	ASSERT_EQ(dssh_register_none_comp(), 0);
-
-	size_t sz = sizeof(struct dssh_comp_s) + 8;
-	struct dssh_comp_s *comp2 = calloc(1, sz);
-	ASSERT_NOT_NULL(comp2);
-	strcpy(comp2->name, "zlib");
-	comp2->init = gconf.comp_head->init;
-	comp2->bound = gconf.comp_head->bound;
-	comp2->compress = gconf.comp_head->compress;
-	comp2->uncompress = gconf.comp_head->uncompress;
-	comp2->cleanup = gconf.comp_head->cleanup;
-	ASSERT_EQ(dssh_transport_register_comp(comp2), 0);
-
-	dssh_test_reset_global_config();
+	ASSERT_TRUE(registration_case(REG_COMP, REG_ACCEPT));
 	return TEST_PASS;
 }
 
@@ -6645,32 +6470,14 @@ test_hmac_sha2_256_generate_failure(void)
 static int
 test_register_kex_toolong(void)
 {
-	dssh_test_reset_global_config();
-
-	uint8_t buf[sizeof(struct dssh_kex_s) + 128];
-	memset(buf, 0, sizeof(buf));
-	struct dssh_kex_s *kex = (struct dssh_kex_s *)buf;
-	memset(kex->name, 'x', 65);
-	kex->name[65] = '\0';
-	ASSERT_EQ(dssh_transport_register_kex(kex), DSSH_ERROR_TOOLONG);
-
-	dssh_test_reset_global_config();
+	ASSERT_TRUE(registration_case(REG_KEX, REG_LONG));
 	return TEST_PASS;
 }
 
 static int
 test_register_comp_toolong(void)
 {
-	dssh_test_reset_global_config();
-
-	uint8_t buf[sizeof(struct dssh_comp_s) + 128];
-	memset(buf, 0, sizeof(buf));
-	struct dssh_comp_s *comp = (struct dssh_comp_s *)buf;
-	memset(comp->name, 'x', 65);
-	comp->name[65] = '\0';
-	ASSERT_EQ(dssh_transport_register_comp(comp), DSSH_ERROR_TOOLONG);
-
-	dssh_test_reset_global_config();
+	ASSERT_TRUE(registration_case(REG_COMP, REG_LONG));
 	return TEST_PASS;
 }
 
@@ -6683,122 +6490,35 @@ test_register_comp_toolong(void)
 static int
 test_register_kex_toomany(void)
 {
-	dssh_test_reset_global_config();
-
-	/* Register one valid entry so gconf.used stays false */
-	size_t sz = sizeof(struct dssh_kex_s) + 8;
-	struct dssh_kex_s *k1 = calloc(1, sz);
-	ASSERT_NOT_NULL(k1);
-	strcpy(k1->name, "kex-1");
-	k1->init = test_kex_stateless_init;
-	k1->handler = test_kex_static_handler;
-	k1->cleanup = test_kex_stateless_cleanup;
-	k1->hash_name = "SHA-256";
-	ASSERT_EQ(dssh_transport_register_kex(k1), 0);
-
-	/* Forge the entries counter to SIZE_MAX - 1 */
-	gconf.kex_entries = SIZE_MAX - 1;
-
-	uint8_t buf[sizeof(struct dssh_kex_s) + 8];
-	memset(buf, 0, sizeof(buf));
-	struct dssh_kex_s *k2 = (struct dssh_kex_s *)buf;
-	strcpy(k2->name, "kex-2");
-	ASSERT_EQ(dssh_transport_register_kex(k2), DSSH_ERROR_TOOMANY);
-
-	gconf.kex_entries = 1; /* restore before reset frees the list */
-	dssh_test_reset_global_config();
+	ASSERT_TRUE(registration_case(REG_KEX, REG_MANY));
 	return TEST_PASS;
 }
 
 static int
 test_register_key_algo_toomany(void)
 {
-	dssh_test_reset_global_config();
-
-	size_t sz = sizeof(struct dssh_key_algo_s) + 8;
-	struct dssh_key_algo_s *ka1 = calloc(1, sz);
-	ASSERT_NOT_NULL(ka1);
-	strcpy(ka1->name, "ka-1");
-	ASSERT_EQ(dssh_transport_register_key_algo(ka1), 0);
-
-	gconf.key_algo_entries = SIZE_MAX - 1;
-
-	uint8_t buf[sizeof(struct dssh_key_algo_s) + 8];
-	memset(buf, 0, sizeof(buf));
-	struct dssh_key_algo_s *ka2 = (struct dssh_key_algo_s *)buf;
-	strcpy(ka2->name, "ka-2");
-	ASSERT_EQ(dssh_transport_register_key_algo(ka2), DSSH_ERROR_TOOMANY);
-
-	gconf.key_algo_entries = 1;
-	dssh_test_reset_global_config();
+	ASSERT_TRUE(registration_case(REG_KEY, REG_MANY));
 	return TEST_PASS;
 }
 
 static int
 test_register_enc_toomany(void)
 {
-	dssh_test_reset_global_config();
-
-	size_t sz = sizeof(struct dssh_enc_s) + 8;
-	struct dssh_enc_s *e1 = calloc(1, sz);
-	ASSERT_NOT_NULL(e1);
-	strcpy(e1->name, "enc-1");
-	ASSERT_EQ(dssh_transport_register_enc(e1), 0);
-
-	gconf.enc_entries = SIZE_MAX - 1;
-
-	uint8_t buf[sizeof(struct dssh_enc_s) + 8];
-	memset(buf, 0, sizeof(buf));
-	struct dssh_enc_s *e2 = (struct dssh_enc_s *)buf;
-	strcpy(e2->name, "enc-2");
-	ASSERT_EQ(dssh_transport_register_enc(e2), DSSH_ERROR_TOOMANY);
-
-	gconf.enc_entries = 1;
-	dssh_test_reset_global_config();
+	ASSERT_TRUE(registration_case(REG_ENC, REG_MANY));
 	return TEST_PASS;
 }
 
 static int
 test_register_mac_toomany(void)
 {
-	dssh_test_reset_global_config();
-
-	size_t sz = sizeof(struct dssh_mac_s) + 8;
-	struct dssh_mac_s *m1 = calloc(1, sz);
-	ASSERT_NOT_NULL(m1);
-	strcpy(m1->name, "mac-1");
-	ASSERT_EQ(dssh_transport_register_mac(m1), 0);
-
-	gconf.mac_entries = SIZE_MAX - 1;
-
-	uint8_t buf[sizeof(struct dssh_mac_s) + 8];
-	memset(buf, 0, sizeof(buf));
-	struct dssh_mac_s *m2 = (struct dssh_mac_s *)buf;
-	strcpy(m2->name, "mac-2");
-	ASSERT_EQ(dssh_transport_register_mac(m2), DSSH_ERROR_TOOMANY);
-
-	gconf.mac_entries = 1;
-	dssh_test_reset_global_config();
+	ASSERT_TRUE(registration_case(REG_MAC, REG_MANY));
 	return TEST_PASS;
 }
 
 static int
 test_register_comp_toomany(void)
 {
-	dssh_test_reset_global_config();
-
-	ASSERT_OK(dssh_register_none_comp());
-
-	gconf.comp_entries = SIZE_MAX - 1;
-
-	uint8_t buf[sizeof(struct dssh_comp_s) + 8];
-	memset(buf, 0, sizeof(buf));
-	struct dssh_comp_s *c2 = (struct dssh_comp_s *)buf;
-	strcpy(c2->name, "comp-2");
-	ASSERT_EQ(dssh_transport_register_comp(c2), DSSH_ERROR_TOOMANY);
-
-	gconf.comp_entries = 1;
-	dssh_test_reset_global_config();
+	ASSERT_TRUE(registration_case(REG_COMP, REG_MANY));
 	return TEST_PASS;
 }
 
@@ -9810,6 +9530,9 @@ static struct dssh_test_entry tests[] = {
 	{ "packet/recv_too_small",           test_packet_recv_too_small },
 
 	/* Registration validation */
+	{ "register/fixture_refusal", test_registration_fixture_refusal },
+	{ "register/usable_probes", test_registration_usable_probes },
+	{ "release/registration_module_allocation", test_registration_module_allocation },
 	{ "register/kex_toolate",            test_register_kex_toolate },
 	{ "register/kex_empty_name",         test_register_kex_empty_name },
 	{ "register/kex_next_not_null",      test_register_kex_next_not_null },

@@ -10,6 +10,9 @@
 
 #include "deucessh-enc.h"
 #include "deucessh.h"
+#ifdef DSSH_TESTING
+ #include "ssh-internal.h"
+#endif
 
 #define AES256_CTR_BLOCK_SIZE 16
 #define AES256_CTR_KEY_SIZE   32

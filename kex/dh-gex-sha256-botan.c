@@ -10,6 +10,9 @@
 #include "dh-gex-sha256-ops.h"
 #include "kex/dh-gex-groups.h"
 #include "kex/dh-gex-sha256.h"
+#ifdef DSSH_TESTING
+ #include "ssh-internal.h"
+#endif
 
 extern int  dssh_botan_dhgex_handler(const struct dssh_kex_context *kctx, struct dssh_kex_result *out);
 

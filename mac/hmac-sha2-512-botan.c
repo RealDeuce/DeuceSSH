@@ -7,6 +7,9 @@
 
 #include "deucessh-mac.h"
 #include "deucessh.h"
+#ifdef DSSH_TESTING
+ #include "ssh-internal.h"
+#endif
 
 #define HMAC_SHA2_512_DIGEST_SIZE 64
 #define HMAC_SHA2_512_KEY_SIZE    64

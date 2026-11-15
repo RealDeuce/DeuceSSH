@@ -1437,6 +1437,17 @@ foreach(part IN ITEMS group_selection group_validation peer_validation mpint_val
 		ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys)
 endforeach()
 dssh_add_variant_tests(dssh_transport dssh_test_transport)
+foreach(suffix IN ITEMS "" _hmac256 _dhgex _rsa _rsa512 _dhgex_rsa _dhgex_rsa512
+	_sntrup _sntrup_rsa _sntrup_rsa512 _mlkem _mlkem_rsa _mlkem_rsa512
+	_rsa_hmac256 _dhgex_hmac256 _sntrup_hmac256)
+	get_test_property(dssh_transport${suffix} ENVIRONMENT registration_environment)
+	dssh_add_output_test(dssh_transport_registration${suffix} dssh_test_transport
+		"27 tests: 27 passed, 0 failed, 0 skipped" "register/")
+	set_tests_properties(dssh_transport_registration${suffix} PROPERTIES
+		ENVIRONMENT "${registration_environment}" TIMEOUT 120)
+endforeach()
+dssh_add_output_test(dssh_transport_registration_alloc dssh_test_transport
+	"1 tests: 1 passed, 0 failed, 0 skipped" --exact release/registration_module_allocation)
 dssh_add_output_test(dssh_transport_test_layout dssh_test_transport
 	"1 tests: 1 passed, 0 failed, 0 skipped" --exact release/test_layout)
 set_tests_properties(dssh_transport_test_layout PROPERTIES FIXTURES_SETUP dssh_internal_test_layout)
@@ -2326,6 +2337,8 @@ if(NOT APPLE)
 dssh_add_test(alloc test_alloc.c)
 target_link_libraries(dssh_test_alloc PRIVATE dssh_mock_io dssh_mock_alloc)
 target_link_options(dssh_test_alloc PRIVATE ${DSSH_WRAP_FLAGS} "-Wl,--wrap=dssh_hash_final")
+dssh_add_output_test(dssh_registration_heap dssh_test_alloc
+	"16 tests: 16 passed, 0 failed, 0 skipped" "alloc/register_")
 add_test(NAME dssh_unit_alloc COMMAND dssh_test_alloc)
 set_tests_properties(dssh_unit_alloc PROPERTIES
 	ENVIRONMENT "${DSSH_TEST_KEY_ENV}")

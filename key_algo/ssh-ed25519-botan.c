@@ -8,6 +8,9 @@
 #include "deucessh-key-algo.h"
 #include "deucessh.h"
 #include "key-wire.h"
+#ifdef DSSH_TESTING
+ #include "ssh-internal.h"
+#endif
 
 #define ED25519_NAME     "ssh-ed25519"
 #define ED25519_NAME_LEN 11

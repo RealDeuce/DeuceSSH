@@ -8,6 +8,9 @@
 #include "curve25519-sha256-ops.h"
 #include "deucessh-kex.h"
 #include "deucessh.h"
+#ifdef DSSH_TESTING
+ #include "ssh-internal.h"
+#endif
 
 /* Implemented in curve25519-sha256-botan.cpp */
 extern int  dssh_botan_curve25519_handler(const struct dssh_kex_context *kctx, struct dssh_kex_result *out);

@@ -2091,6 +2091,23 @@ dssh_add_output_test(dssh_conn_setup_packet_bounds dssh_test_conn
 set_tests_properties(dssh_conn_setup_packet_bounds PROPERTIES TIMEOUT 120
 	ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys)
 
+foreach(part IN ITEMS text params overflow)
+	foreach(profile IN ITEMS ordinary growth)
+		set(extra "")
+		if(profile STREQUAL "growth")
+			set(extra "DSSH_TEST_COMPRESSION=test-growth")
+		endif()
+		dssh_add_output_test(dssh_conn_storage_owner_${part}_${profile} dssh_test_conn
+			"1 tests: 1 passed, 0 failed, 0 skipped" --exact release/storage_owner_${part})
+		set_tests_properties(dssh_conn_storage_owner_${part}_${profile} PROPERTIES TIMEOUT 120
+			ENVIRONMENT "${DSSH_TEST_KEY_ENV};${extra}" FIXTURES_REQUIRED dssh_cached_keys)
+	endforeach()
+endforeach()
+dssh_add_output_test(dssh_conn_storage_text_pattern dssh_test_conn
+	"1 tests: 1 passed, 0 failed, 0 skipped" --exact release/storage_text_pattern)
+set_tests_properties(dssh_conn_storage_text_pattern PROPERTIES TIMEOUT 120
+	ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys)
+
 # Actual SIGABRT checks run in a fresh exec, with no inherited library workers.
 if(UNIX)
 	add_executable(dssh_test_fatal_driver test_fatal_driver.c)
@@ -2113,6 +2130,21 @@ if(UNIX)
 				$<TARGET_FILE:dssh_test_threads_shim_posix> ${operation})
 		endforeach()
 	endif()
+	set(storage_worker_counts 2 2 2 2 2 0 2 3 2 2 1 1 1 1 1 1 1 1 1 1 1 0 1 1 1 1 1 1 1 1 1 1 1 0 6 3 3 6 3 3 6 3 3)
+	set(storage_consumer 0)
+	foreach(workers IN LISTS storage_worker_counts)
+		if(workers GREATER 0)
+			foreach(join RANGE 1 ${workers})
+				foreach(mode IN ITEMS retained released)
+					dssh_add_output_test(dssh_channel_storage_fatal_${storage_consumer}-${join}_${mode} dssh_test_fatal_driver
+						"channel_join_fatal=1" $<TARGET_FILE:dssh_test_conn> --channel-fatal storage-${storage_consumer}-${join} ${mode})
+					set_tests_properties(dssh_channel_storage_fatal_${storage_consumer}-${join}_${mode} PROPERTIES TIMEOUT 120
+						ENVIRONMENT "${DSSH_TEST_KEY_ENV};DSSH_TEST_COMPRESSION=test-growth" FIXTURES_REQUIRED dssh_cached_keys)
+				endforeach()
+			endforeach()
+		endif()
+		math(EXPR storage_consumer "${storage_consumer} + 1")
+	endforeach()
 	set(lifecycle_worker_counts 6 2 0 0 0 0 0 2 4 4 10 2 2 2 2 2 2 2 2 2 2 0 3 4 3 3 2)
 	set(lifecycle_consumer 0)
 	foreach(workers IN LISTS lifecycle_worker_counts)

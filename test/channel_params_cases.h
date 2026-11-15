@@ -6,6 +6,8 @@ static const char *snapshot_names[] = {"COPY_ALPHA", "COPY_BETA"};
 static const char *snapshot_values[] = {"value-alpha", "value-beta"};
 
 struct params_snapshot_fixture {
+	struct flow_fixture flow;
+	bool retired;
 	struct conn_ctx ctx;
 	struct dssh_chan_accept_cbs cbs;
 	struct dssh_chan_params params;
@@ -23,6 +25,27 @@ struct params_snapshot_fixture {
 };
 
 static _Thread_local struct params_snapshot_fixture *params_snapshot_current;
+
+static void
+params_snapshot_retire(void *data)
+{
+	struct flow_fixture *flow = data;
+	struct params_snapshot_fixture *fixture = flow->data;
+	flow_retire(flow);
+	accept_phase_test_hook = NULL;
+	params_snapshot_current = NULL;
+	dssh_test_alloc_reset();
+	dssh_test_ossl_reset();
+	dssh_chan_params_free(&fixture->params);
+	fixture->retired = true;
+}
+
+static void
+params_snapshot_own(struct params_snapshot_fixture *fixture)
+{
+	flow_init(&fixture->flow, &fixture->ctx, NULL, fixture);
+	fixture->flow.workers.retire = params_snapshot_retire;
+}
 
 static int
 params_snapshot_tx(dssh_session sess)
@@ -74,9 +97,11 @@ params_snapshot_env(dssh_channel ch, const struct dssh_chan_params *params, void
 {
 	(void)ch;
 	(void)opaque;
-	if (params->env_count == 0 || params->env_count > 2)
+	if (params == NULL || params->env == NULL || params->env_count == 0 || params->env_count > 2)
 		return DSSH_ERROR_REJECTED;
 	size_t i = params->env_count - 1;
+	if (params->env[i].name == NULL || params->env[i].value == NULL)
+		return DSSH_ERROR_REJECTED;
 	return strcmp(params->env[i].name, snapshot_names[i]) == 0
 	    && strcmp(params->env[i].value, snapshot_values[i]) == 0 ? 0 : DSSH_ERROR_REJECTED;
 }
@@ -115,11 +140,10 @@ params_snapshot_values_valid(dssh_channel ch, const struct dssh_chan_params *sou
 	    || copy->max_window != 4096 || copy->cols != 101 || copy->rows != 47
 	    || copy->wpx != 808 || copy->hpx != 752 || copy->mode_count != 3 || copy->env_count != 2)
 		return false;
-	if (source->type == DSSH_CHAN_EXEC) {
-		if (strcmp(dssh_chan_get_command(ch), snapshot_command) != 0)
-			return false;
-	}
-	else if (strcmp(dssh_chan_get_subsystem(ch), snapshot_subsystem) != 0)
+	const char *retained = source->type == DSSH_CHAN_EXEC
+	    ? dssh_chan_get_command(ch) : dssh_chan_get_subsystem(ch);
+	const char *expected = source->type == DSSH_CHAN_EXEC ? snapshot_command : snapshot_subsystem;
+	if (retained == NULL || strcmp(retained, expected) != 0)
 		return false;
 	for (size_t i = 0; i < copy->mode_count; i++) {
 		if (copy->modes[i].opcode != source->modes[i].opcode
@@ -127,7 +151,8 @@ params_snapshot_values_valid(dssh_channel ch, const struct dssh_chan_params *sou
 			return false;
 	}
 	for (size_t i = 0; i < copy->env_count; i++) {
-		if (copy->env[i].name == source->env[i].name || copy->env[i].value == source->env[i].value
+		if (copy->env[i].name == NULL || copy->env[i].value == NULL
+		    || copy->env[i].name == source->env[i].name || copy->env[i].value == source->env[i].value
 		    || strcmp(copy->env[i].name, snapshot_names[i]) != 0
 		    || strcmp(copy->env[i].value, snapshot_values[i]) != 0)
 			return false;
@@ -139,28 +164,31 @@ static int
 params_snapshot_case(bool zc, unsigned target)
 {
 	struct params_snapshot_fixture fixture = {.target = target, .fail = target < 9, .sync = target == 10, .sizes_valid = true};
-	ASSERT_OK(conn_setup_no_start(&fixture.ctx));
-	ASSERT_OK(dssh_session_set_timeout(fixture.ctx.client, 3000));
-	ASSERT_OK(dssh_session_set_timeout(fixture.ctx.server, 3000));
+	ASSERT_EQ(conn_setup_no_start(&fixture.ctx), 0);
+	params_snapshot_own(&fixture);
+	ASSERT_TRUE(storage_checkpoint(ST_PARAMS_EMPTY));
+	ASSERT_EQ(dssh_session_set_timeout(fixture.ctx.client, 3000), 0);
+	ASSERT_EQ(dssh_session_set_timeout(fixture.ctx.server, 3000), 0);
 	dssh_test_alloc_exclude_new_threads();
-	ASSERT_OK(dssh_session_start(fixture.ctx.client));
-	ASSERT_OK(dssh_session_start(fixture.ctx.server));
-	ASSERT_OK(dssh_chan_params_init(&fixture.params, zc ? DSSH_CHAN_SUBSYSTEM : DSSH_CHAN_EXEC));
-	ASSERT_OK(dssh_chan_params_set_pty(&fixture.params, true));
-	ASSERT_OK(dssh_chan_params_set_max_window(&fixture.params, 4096));
-	ASSERT_OK(dssh_chan_params_set_term(&fixture.params, snapshot_term));
-	ASSERT_OK(dssh_chan_params_set_command(&fixture.params, snapshot_command));
-	ASSERT_OK(dssh_chan_params_set_subsystem(&fixture.params, snapshot_subsystem));
-	ASSERT_OK(dssh_chan_params_set_size(&fixture.params, 101, 47, 808, 752));
-	ASSERT_OK(dssh_chan_params_set_mode(&fixture.params, 1, UINT32_MAX));
-	ASSERT_OK(dssh_chan_params_set_mode(&fixture.params, 53, 1));
-	ASSERT_OK(dssh_chan_params_set_mode(&fixture.params, 128, 9600));
+	ASSERT_EQ(dssh_session_start(fixture.ctx.client), 0);
+	ASSERT_EQ(dssh_session_start(fixture.ctx.server), 0);
+	ASSERT_EQ(dssh_chan_params_init(&fixture.params, zc ? DSSH_CHAN_SUBSYSTEM : DSSH_CHAN_EXEC), 0);
+	ASSERT_EQ(dssh_chan_params_set_pty(&fixture.params, true), 0);
+	ASSERT_EQ(dssh_chan_params_set_max_window(&fixture.params, 4096), 0);
+	ASSERT_EQ(dssh_chan_params_set_term(&fixture.params, snapshot_term), 0);
+	ASSERT_EQ(dssh_chan_params_set_command(&fixture.params, snapshot_command), 0);
+	ASSERT_EQ(dssh_chan_params_set_subsystem(&fixture.params, snapshot_subsystem), 0);
+	ASSERT_EQ(dssh_chan_params_set_size(&fixture.params, 101, 47, 808, 752), 0);
+	ASSERT_EQ(dssh_chan_params_set_mode(&fixture.params, 1, UINT32_MAX), 0);
+	ASSERT_EQ(dssh_chan_params_set_mode(&fixture.params, 53, 1), 0);
+	ASSERT_EQ(dssh_chan_params_set_mode(&fixture.params, 128, 9600), 0);
 	for (size_t i = 0; i < 2; i++)
-		ASSERT_OK(dssh_chan_params_add_env(&fixture.params, snapshot_names[i], snapshot_values[i]));
+		ASSERT_EQ(dssh_chan_params_add_env(&fixture.params, snapshot_names[i], snapshot_values[i]), 0);
+	ASSERT_TRUE(storage_checkpoint(ST_PARAMS_BUILT));
 	fixture.cbs = accept_cbs_all;
 	fixture.cbs.env = params_snapshot_env;
-	thrd_t worker;
-	ASSERT_EQ(thrd_create(&worker, params_snapshot_server, &fixture), thrd_success);
+	ASSERT_EQ(channel_worker_start(&fixture.flow.workers, 0, params_snapshot_server, &fixture), 0);
+	ASSERT_TRUE(storage_checkpoint(ST_PARAMS_STARTED));
 	params_snapshot_current = &fixture;
 	accept_phase_test_hook = params_snapshot_tx;
 	dssh_test_alloc_observe_allocations(params_snapshot_alloc, &fixture);
@@ -182,6 +210,8 @@ params_snapshot_case(bool zc, unsigned target)
 		valid = valid && ch != NULL && attempts >= 9;
 	dssh_test_alloc_reset();
 	dssh_test_ossl_reset();
+	ASSERT_TRUE(valid);
+	ASSERT_TRUE(storage_checkpoint(ST_PARAMS_ATTEMPT));
 	if (valid && (fixture.fail || fixture.sync))
 		ch = zc ? dssh_chan_zc_open(fixture.ctx.client, &fixture.params, params_snapshot_zc, NULL)
 		    : dssh_chan_open(fixture.ctx.client, &fixture.params);
@@ -189,13 +219,16 @@ params_snapshot_case(bool zc, unsigned target)
 		mock_io_close_c2s(&fixture.ctx.io);
 		mock_io_close_s2c(&fixture.ctx.io);
 	}
-	if (thrd_join(worker, NULL) != thrd_success)
-		abort();
+	channel_worker_join(&fixture.flow.workers, 0);
+	ASSERT_EQ(fixture.flow.workers.results[0], 0);
+	ASSERT_TRUE(storage_checkpoint(ST_PARAMS_JOINED));
 	valid = valid && ch != NULL && fixture.server_ch != NULL
 	    && !dssh_session_is_terminated(fixture.ctx.client)
 	    && !dssh_session_is_terminated(fixture.ctx.server);
 	if (valid) {
 		valid = params_snapshot_values_valid(ch, &fixture.params);
+		ASSERT_TRUE(valid);
+		ASSERT_TRUE(storage_checkpoint(ST_PARAMS_COPIED));
 		/* Mutating and releasing the caller's builder must leave the retained
 		 * command/subsystem, environment and modes completely independent. */
 		fixture.params.term[0] = 'q';
@@ -205,18 +238,17 @@ params_snapshot_case(bool zc, unsigned target)
 		fixture.params.modes[0].value = 0;
 		dssh_chan_params_free(&fixture.params);
 		const struct dssh_chan_params *copy = dssh_chan_get_pty(ch);
-		valid = valid && copy != NULL && strcmp(copy->term, snapshot_term) == 0
+		valid = valid && copy != NULL && copy->term != NULL && copy->command != NULL
+		    && copy->subsystem != NULL && strcmp(copy->term, snapshot_term) == 0
 		    && strcmp(copy->command, snapshot_command) == 0 && strcmp(copy->subsystem, snapshot_subsystem) == 0
-		    && copy->env_count == 2 && strcmp(copy->env[0].name, snapshot_names[0]) == 0
-		    && copy->mode_count == 3 && copy->modes[0].value == UINT32_MAX;
+		    && copy->env_count == 2 && copy->env != NULL && copy->env[0].name != NULL
+		    && strcmp(copy->env[0].name, snapshot_names[0]) == 0
+		    && copy->mode_count == 3 && copy->modes != NULL && copy->modes[0].value == UINT32_MAX;
 	}
-	dssh_chan_params_free(&fixture.params);
-	conn_cleanup(&fixture.ctx);
-	if (!valid)
-		fprintf(stderr, "snapshot zc=%u target=%u armed=%u fired=%u before=%u sizes=%u attempts=%u frees=%u sends=%u\n",
-		    zc ? 1U : 0U, target, fixture.armed ? 1U : 0U, fixture.fired ? 1U : 0U,
-		    fixture.before_io ? 1U : 0U, fixture.sizes_valid ? 1U : 0U, attempts, frees, sends);
 	ASSERT_TRUE(valid);
+	flow_finish(&fixture.flow);
+	ASSERT_TRUE(fixture.retired);
+	conn_cleanup(&fixture.ctx);
 	return TEST_PASS;
 }
 
@@ -253,13 +285,16 @@ static int
 params_input_case(bool zc)
 {
 	struct params_snapshot_fixture fixture = {0};
-	ASSERT_OK(conn_setup_no_start(&fixture.ctx));
-	ASSERT_OK(dssh_session_set_timeout(fixture.ctx.client, 3000));
-	ASSERT_OK(dssh_session_set_timeout(fixture.ctx.server, 3000));
-	ASSERT_OK(dssh_session_start(fixture.ctx.client));
-	ASSERT_OK(dssh_session_start(fixture.ctx.server));
-	ASSERT_OK(dssh_chan_params_init(&fixture.params, DSSH_CHAN_EXEC));
-	ASSERT_OK(dssh_chan_params_set_command(&fixture.params, snapshot_command));
+	ASSERT_EQ(conn_setup_no_start(&fixture.ctx), 0);
+	params_snapshot_own(&fixture);
+	ASSERT_TRUE(storage_checkpoint(ST_PARAMS_EMPTY));
+	ASSERT_EQ(dssh_session_set_timeout(fixture.ctx.client, 3000), 0);
+	ASSERT_EQ(dssh_session_set_timeout(fixture.ctx.server, 3000), 0);
+	ASSERT_EQ(dssh_session_start(fixture.ctx.client), 0);
+	ASSERT_EQ(dssh_session_start(fixture.ctx.server), 0);
+	ASSERT_EQ(dssh_chan_params_init(&fixture.params, DSSH_CHAN_EXEC), 0);
+	ASSERT_EQ(dssh_chan_params_set_command(&fixture.params, snapshot_command), 0);
+	ASSERT_TRUE(storage_checkpoint(ST_PARAMS_BUILT));
 	struct dssh_chan_env env[] = {{NULL, NULL}};
 	enum dssh_chan_type invalid_type = (enum dssh_chan_type)999;
 	bool valid = true;
@@ -331,9 +366,11 @@ params_input_case(bool zc)
 	    && fixture.params.term == term;
 	dssh_test_alloc_reset();
 	accept_phase_test_hook = NULL;
-	dssh_chan_params_free(&fixture.params);
-	conn_cleanup(&fixture.ctx);
 	ASSERT_TRUE(valid);
+	ASSERT_TRUE(storage_checkpoint(ST_PARAMS_INPUT));
+	flow_finish(&fixture.flow);
+	ASSERT_TRUE(fixture.retired);
+	conn_cleanup(&fixture.ctx);
 	return TEST_PASS;
 }
 

@@ -775,6 +775,7 @@ open_exec_channel(struct conn_ctx *owner, struct open_exec_ctx *ctx)
 #include "conn_wire_fixture.h"
 #include "conn_flow_fixture.h"
 #include "conn_lifecycle_fixture.h"
+#include "conn_storage_fixture.h"
 
 /* ================================================================
  * Helper: open a shell channel concurrently
@@ -8006,8 +8007,13 @@ test_compression_window_rekey(void)
 #include "conn_wire_cases.h"
 #include "conn_flow_cases.h"
 #include "conn_lifecycle_cases.h"
+#include "conn_storage_cases.h"
 
 static struct dssh_test_entry tests[] = {
+	{ "release/storage_owner_text", test_storage_owner_text },
+	{ "release/storage_owner_params", test_storage_owner_params },
+	{ "release/storage_owner_overflow", test_storage_owner_overflow },
+	{ "release/storage_text_pattern", test_storage_text_pattern },
 	{ "release/lifecycle_owner_ids", test_lifecycle_owner_ids },
 	{ "release/lifecycle_owner_peer_ids", test_lifecycle_owner_peer_ids },
 	{ "release/lifecycle_owner_half_close", test_lifecycle_owner_half_close },
@@ -8652,6 +8658,9 @@ main(int argc, char *argv[])
 		return incoming_control_probe();
 	if (argc == 2 && strcmp(argv[1], "--audit-close-outcomes") == 0)
 		return close_outcome_probe();
+	if (argc == 4 && strcmp(argv[1], "--channel-fatal") == 0
+	    && strncmp(argv[2], "storage-", 8) == 0)
+		return storage_fatal_child(argv[2] + 8, argv[3]);
 	if (argc == 4 && strcmp(argv[1], "--channel-fatal") == 0
 	    && strncmp(argv[2], "lifecycle-", 10) == 0)
 		return lifecycle_fatal_child(argv[2] + 10, argv[3]);

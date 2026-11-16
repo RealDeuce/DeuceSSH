@@ -2954,75 +2954,13 @@ test_register_comp_next_not_null(void)
  * get_kex_name, get_hostkey_name, get_enc_name, get_mac_name.
  * ================================================================ */
 
-static int
-test_get_names_before_handshake(void)
-{
-	dssh_test_reset_global_config();
-	ASSERT_EQ(register_all_algorithms(), 0);
-	dssh_transport_set_callbacks(mock_tx_dispatch, mock_rx_dispatch,
-	    mock_rxline_dispatch, mock_extra_line_cb);
-
-	dssh_session sess = dssh_session_init(true, 0);
-	ASSERT_NOT_NULL(sess);
-
-	ASSERT_NULL(dssh_transport_get_kex_name(sess));
-	ASSERT_NULL(dssh_transport_get_hostkey_name(sess));
-	ASSERT_NULL(dssh_transport_get_enc_name(sess, DSSH_CLIENT_TO_SERVER));
-	ASSERT_NULL(dssh_transport_get_mac_name(sess, DSSH_CLIENT_TO_SERVER));
-
-	dssh_session_cleanup(sess);
-	dssh_test_reset_global_config();
-	return TEST_PASS;
-}
-
 /* ================================================================
  * set_callbacks after session -- covers TOOLATE branch.
  * ================================================================ */
 
-static int
-test_set_callbacks_after_session(void)
-{
-	dssh_test_reset_global_config();
-	ASSERT_EQ(register_all_algorithms(), 0);
-	dssh_transport_set_callbacks(mock_tx_dispatch, mock_rx_dispatch,
-	    mock_rxline_dispatch, mock_extra_line_cb);
-
-	dssh_session sess = dssh_session_init(true, 0);
-	ASSERT_NOT_NULL(sess);
-
-	ASSERT_EQ(dssh_transport_set_callbacks(mock_tx_dispatch,
-	    mock_rx_dispatch, mock_rxline_dispatch, mock_extra_line_cb),
-	    DSSH_ERROR_TOOLATE);
-
-	dssh_session_cleanup(sess);
-	dssh_test_reset_global_config();
-	return TEST_PASS;
-}
-
 /* ================================================================
  * set_global_request_cb -- covers ssh.c:98-103 (never called).
  * ================================================================ */
-
-static int
-test_set_global_request_cb(void)
-{
-	dssh_test_reset_global_config();
-	ASSERT_EQ(register_all_algorithms(), 0);
-	dssh_transport_set_callbacks(mock_tx_dispatch, mock_rx_dispatch,
-	    mock_rxline_dispatch, mock_extra_line_cb);
-
-	dssh_session sess = dssh_session_init(true, 0);
-	ASSERT_NOT_NULL(sess);
-
-	int dummy = 42;
-	dssh_session_set_global_request_cb(sess, (dssh_global_request_cb)0x1, &dummy);
-	/* Just verify it doesn't crash -- the callback pointer is
-	 * stored in the session struct for later dispatch. */
-
-	dssh_session_cleanup(sess);
-	dssh_test_reset_global_config();
-	return TEST_PASS;
-}
 
 /* ================================================================
  * GLOBAL_REQUEST handling -- covers ssh-trans.c:753-787 (8+ branches)
@@ -4846,23 +4784,6 @@ test_c25519_encode_shared_secret_storage(void)
  * aes256-ctr / hmac-sha2-256 edge cases -- NULL ctx, alloc failure
  * ================================================================ */
 
-static int
-test_aes256_ctr_null_ctx(void)
-{
-	dssh_test_reset_global_config();
-	ASSERT_EQ(dssh_register_aes256_ctr(), 0);
-
-	dssh_enc enc = gconf.enc_head;
-	ASSERT_NOT_NULL(enc);
-
-	uint8_t buf[16] = {0};
-	ASSERT_EQ(enc->encrypt(buf, sizeof(buf), NULL), DSSH_ERROR_INIT);
-	ASSERT_EQ(enc->decrypt(buf, sizeof(buf), NULL), DSSH_ERROR_INIT);
-
-	dssh_test_reset_global_config();
-	return TEST_PASS;
-}
-
 #ifdef DSSH_CRYPTO_OPENSSL /* OpenSSL alloc injection tests */
 static int
 test_aes256_ctr_alloc_fail(void)
@@ -5179,55 +5100,6 @@ test_clock_transport(void)
 	ASSERT_FALSE(clock_failed);
 	ASSERT_TRUE(dssh_session_is_terminated(ctx.client));
 	handshake_cleanup(&ctx);
-	return TEST_PASS;
-}
-
-static int
-test_blocksize_lt8(void)
-{
-	/* Register an enc with blocksize < 8 -- tx/rx_block_size clamps to 8 */
-	dssh_test_reset_global_config();
-
-	static const char name[] = "tiny-enc";
-	struct dssh_enc_s *enc = calloc(1, sizeof(*enc) + sizeof(name));
-	ASSERT_NOT_NULL(enc);
-	enc->blocksize = 1;
-	enc->key_size = 0;
-	memcpy(enc->name, name, sizeof(name));
-	ASSERT_EQ(dssh_transport_register_enc(enc), 0);
-	ASSERT_EQ(dssh_register_none_comp(), 0);
-
-	dssh_transport_set_callbacks(mock_tx_dispatch, mock_rx_dispatch,
-	    mock_rxline_dispatch, mock_extra_line_cb);
-
-	struct mock_io_state io;
-	ASSERT_OK(mock_io_init(&io, 0));
-	dssh_session sess = dssh_session_init(true, 0);
-	ASSERT_NOT_NULL(sess);
-	dssh_session_set_cbdata(sess, &io, &io, &io, &io);
-
-	/* Set enc_c2s_selected to our tiny enc with a non-NULL ctx */
-	sess->trans.enc_c2s_selected = enc;
-	sess->trans.enc_c2s_ctx = (dssh_enc_ctx *)1; /* non-NULL sentinel */
-	sess->trans.enc_s2c_selected = enc;
-	sess->trans.enc_s2c_ctx = (dssh_enc_ctx *)1;
-
-	/* send_packet / recv_packet use tx/rx_block_size which should clamp to 8.
-	 * We can't easily call them here without a full handshake, but we can
-	 * verify the behavior by sending a packet -- if blocksize were 1,
-	 * the padding calculation would differ from blocksize=8. Just verify
-	 * the session setup doesn't crash. */
-
-	/* Reset the ctx pointers before cleanup to avoid calling cleanup
-	 * on our sentinel */
-	sess->trans.enc_c2s_ctx = NULL;
-	sess->trans.enc_s2c_ctx = NULL;
-	sess->trans.enc_c2s_selected = NULL;
-	sess->trans.enc_s2c_selected = NULL;
-
-	dssh_session_cleanup(sess);
-	mock_io_free(&io);
-	dssh_test_reset_global_config();
 	return TEST_PASS;
 }
 
@@ -5756,81 +5628,6 @@ test_encode_k_string_empty(void)
 }
 
 /* ================================================================
- * Coverage: aes256-ctr cbd->ctx==NULL, EVP_EncryptUpdate failure
- * ================================================================ */
-
-#include "dssh_test_ossl.h"
-
-#ifdef DSSH_CRYPTO_OPENSSL
-static int
-test_aes256_ctr_ctx_member_null(void)
-{
-	/* cbd non-NULL but cbd->ctx is NULL -- second half of OR at line 46 */
-	dssh_test_reset_global_config();
-	ASSERT_EQ(dssh_register_aes256_ctr(), 0);
-
-	dssh_enc enc = gconf.enc_head;
-	ASSERT_NOT_NULL(enc);
-
-	/* Allocate a real enc ctx via init, then NULL out the inner ctx */
-	uint8_t key[32], iv[16];
-	memset(key, 0x42, sizeof(key));
-	memset(iv, 0x00, sizeof(iv));
-	dssh_enc_ctx *ectx = NULL;
-	ASSERT_EQ(enc->init(key, iv, true, &ectx), 0);
-	ASSERT_NOT_NULL(ectx);
-
-	/* Save and NULL the inner OpenSSL ctx */
-	/* The enc_ctx struct's first member is EVP_CIPHER_CTX* */
-	void **inner = (void **)ectx;
-	void *saved = *inner;
-	*inner = NULL;
-
-	uint8_t buf[16] = {0};
-	ASSERT_EQ(enc->encrypt(buf, sizeof(buf), ectx), DSSH_ERROR_INIT);
-
-	/* Restore for proper cleanup */
-	*inner = saved;
-	enc->cleanup(ectx);
-
-	dssh_test_reset_global_config();
-	return TEST_PASS;
-}
-#endif
-
-#ifdef DSSH_CRYPTO_OPENSSL /* OpenSSL encrypt/MAC injection tests */
-static int
-test_aes256_ctr_encrypt_update_failure(void)
-{
-	/* Init succeeds, then EVP_EncryptUpdate fails */
-	dssh_test_reset_global_config();
-	ASSERT_EQ(dssh_register_aes256_ctr(), 0);
-
-	dssh_enc enc = gconf.enc_head;
-	ASSERT_NOT_NULL(enc);
-
-	uint8_t key[32], iv[16];
-	memset(key, 0x42, sizeof(key));
-	memset(iv, 0x00, sizeof(iv));
-
-	/* Init with ossl injection disabled */
-	dssh_enc_ctx *ectx = NULL;
-	ASSERT_EQ(enc->init(key, iv, true, &ectx), 0);
-
-	/* Now arm ossl to fail the next call (EVP_EncryptUpdate) */
-	dssh_test_ossl_fail_after(0);
-	uint8_t buf[16] = {0};
-	int res = enc->encrypt(buf, sizeof(buf), ectx);
-	dssh_test_ossl_reset();
-	ASSERT_EQ(res, DSSH_ERROR_INIT);
-
-	enc->cleanup(ectx);
-	dssh_test_reset_global_config();
-	return TEST_PASS;
-}
-#endif /* DSSH_CRYPTO_OPENSSL -- encrypt injection */
-
-/* ================================================================
  * Coverage: hmac-sha2-256 cleanup with NULL, MAC_final failure
  * ================================================================ */
 
@@ -5946,53 +5743,6 @@ test_register_comp_toomany(void)
 /* ================================================================
  * Blocksize clamping -- direct tx/rx_block_size tests
  * ================================================================ */
-
-static int
-test_blocksize_clamp_direct(void)
-{
-	dssh_test_reset_global_config();
-	ASSERT_EQ(register_all_algorithms(), 0);
-	dssh_transport_set_callbacks(mock_tx_dispatch, mock_rx_dispatch,
-	    mock_rxline_dispatch, mock_extra_line_cb);
-
-	struct mock_io_state io;
-	ASSERT_OK(mock_io_init(&io, 0));
-	dssh_session sess = dssh_session_init(true, 0);
-	ASSERT_NOT_NULL(sess);
-	dssh_session_set_cbdata(sess, &io, &io, &io, &io);
-
-	/* No enc selected -- should return 8 */
-	ASSERT_EQ_U(tx_block_size(sess), 8);
-	ASSERT_EQ_U(rx_block_size(sess), 8);
-
-	/* Set enc with blocksize < 8 */
-	struct dssh_enc_s tiny = { .blocksize = 4 };
-	sess->trans.enc_c2s_selected = &tiny;
-	sess->trans.enc_c2s_ctx = (dssh_enc_ctx *)1;
-	ASSERT_EQ_U(tx_block_size(sess), 8); /* clamped */
-
-	sess->trans.enc_s2c_selected = &tiny;
-	sess->trans.enc_s2c_ctx = (dssh_enc_ctx *)1;
-	ASSERT_EQ_U(rx_block_size(sess), 8); /* clamped */
-
-	/* Set enc with blocksize == 16 */
-	struct dssh_enc_s big = { .blocksize = 16 };
-	sess->trans.enc_c2s_selected = &big;
-	ASSERT_EQ_U(tx_block_size(sess), 16);
-	sess->trans.enc_s2c_selected = &big;
-	ASSERT_EQ_U(rx_block_size(sess), 16);
-
-	/* Restore before cleanup */
-	sess->trans.enc_c2s_selected = NULL;
-	sess->trans.enc_c2s_ctx = NULL;
-	sess->trans.enc_s2c_selected = NULL;
-	sess->trans.enc_s2c_ctx = NULL;
-
-	dssh_session_cleanup(sess);
-	mock_io_free(&io);
-	dssh_test_reset_global_config();
-	return TEST_PASS;
-}
 
 /* ================================================================
  * Cleanup with NULL cleanup function pointers
@@ -6605,52 +6355,6 @@ test_gather_cb(const struct dssh_tx_iov *iov, size_t iovcnt,
 }
 
 static int
-test_tx_gather_set(void)
-{
-	dssh_test_reset_global_config();
-
-	/* Set to NULL (disable) should work */
-	ASSERT_OK(dssh_transport_set_tx_gather(NULL));
-
-	/* Set to non-NULL should work */
-	ASSERT_OK(dssh_transport_set_tx_gather(test_gather_cb));
-
-	/* Set back to NULL */
-	ASSERT_OK(dssh_transport_set_tx_gather(NULL));
-
-	dssh_test_reset_global_config();
-	return TEST_PASS;
-}
-
-static int
-test_tx_gather_toolate(void)
-{
-	dssh_test_reset_global_config();
-
-	if (register_all_algorithms() < 0)
-		return TEST_SKIP;
-	if (test_generate_host_key() < 0)
-		return TEST_SKIP;
-
-	dssh_transport_set_callbacks(mock_tx_dispatch, mock_rx_dispatch,
-	    mock_rxline_dispatch, mock_extra_line_cb);
-
-	/* Before session init -- should succeed */
-	ASSERT_OK(dssh_transport_set_tx_gather(NULL));
-
-	dssh_session sess = dssh_session_init(true, 0);
-	ASSERT_NOT_NULL(sess);
-
-	/* After session init -- should be refused */
-	ASSERT_ERR(dssh_transport_set_tx_gather(NULL),
-	    DSSH_ERROR_TOOLATE);
-
-	dssh_session_cleanup(sess);
-	dssh_test_reset_global_config();
-	return TEST_PASS;
-}
-
-static int
 test_tx_gather_roundtrip(void)
 {
 	ASSERT_TRUE(transport_pair_case(2));
@@ -6705,6 +6409,7 @@ register_fixed_rekey_methods(void)
 #include "transport_transition_cases.h"
 #include "direct_kex_cases.h"
 #include "negotiation_pair_cases.h"
+#include "transport_state_cases.h"
 
 static int
 boundary_tx(uint8_t *buf, size_t bufsz, dssh_session sess, void *cbdata)
@@ -8287,6 +7992,7 @@ test_rekey_global_pipeline(void)
 #include "gather_batch_cases.h"
 
 static struct dssh_test_entry tests[] = {
+	{ "state/context_refusals", test_state_context_refusals },
 	{ "negotiate/offer_replace", test_negotiation_offer_replace },
 	{ "direct_kex/fixture", test_direct_kex_fixture },
 	{ "direct_kex/builder", test_direct_packet_builder },
@@ -8573,7 +8279,7 @@ static struct dssh_test_entry tests[] = {
 
 	/* Formerly-guarded paths */
 	{ "guard/rekey_time_zero",           test_rekey_time_zero },
-	{ "guard/blocksize_lt8",             test_blocksize_lt8 },
+
 	{ "guard/blocksize_clamp_direct",    test_blocksize_clamp_direct },
 	{ "guard/cleanup_null_cleanup_fn",   test_cleanup_null_cleanup_fn },
 	{ "guard/ed25519_sign_basic",        test_ed25519_sign_basic },
@@ -8602,7 +8308,7 @@ static struct dssh_test_entry tests[] = {
 	{ "encode_k/string_encoding",       test_encode_k_string },
 	{ "encode_k/string_empty",          test_encode_k_string_empty },
 #ifdef DSSH_CRYPTO_OPENSSL
-	{ "aes256_ctr/ctx_member_null",     test_aes256_ctr_ctx_member_null },
+
 #endif
 #ifdef DSSH_CRYPTO_OPENSSL
 	{ "aes256_ctr/encrypt_update_fail", test_aes256_ctr_encrypt_update_failure },

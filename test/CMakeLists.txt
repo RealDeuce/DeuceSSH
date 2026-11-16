@@ -1494,6 +1494,17 @@ dssh_add_output_test(dssh_direct_kex_builder dssh_test_transport
 	"1 tests: 1 passed, 0 failed, 0 skipped" --exact direct_kex/builder)
 dssh_add_output_test(dssh_negotiation_pair_offer dssh_test_transport
 	"1 tests: 1 passed, 0 failed, 0 skipped" --exact negotiate/offer_replace)
+set(transport_state_leaves guard/blocksize_clamp_direct state/context_refusals
+	callbacks/set_after_session gather/set gather/toolate getter/names_before_handshake
+	session/set_global_request_cb aes256_ctr/null_ctx)
+if(DEUCESSH_CRYPTO_BACKEND STREQUAL "OpenSSL")
+	list(APPEND transport_state_leaves aes256_ctr/encrypt_update_fail)
+endif()
+foreach(leaf IN LISTS transport_state_leaves)
+	dssh_add_output_test(dssh_state_r102_${leaf} dssh_test_transport
+		"1 tests: 1 passed, 0 failed, 0 skipped" --exact ${leaf})
+	set_tests_properties(dssh_state_r102_${leaf} PROPERTIES TIMEOUT 120)
+endforeach()
 set(direct_kex_leaves
 	release/dhgex_group_validation release/dhgex_peer_validation
 	dhgex/server_null_pubkey_fn dhgex/server_null_sign_fn dhgex/server_recv_fail

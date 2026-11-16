@@ -879,6 +879,17 @@ dssh_add_test(crypto test_crypto.c)
 add_test(NAME dssh_unit_crypto COMMAND dssh_test_crypto)
 dssh_add_test(sntrup test_sntrup.c)
 foreach(mode IN ITEMS native generic)
+	dssh_add_test(sntrup_deterministic_${mode} test_sntrup_arithmetic.c)
+	target_compile_definitions(dssh_test_sntrup_deterministic_${mode} PRIVATE
+		DSSH_SNTRUP_DETERMINISTIC
+		DSSH_SNTRUP_KAT_RESPONSE="${CMAKE_CURRENT_SOURCE_DIR}/vectors/sntrup761.rsp"
+		DSSH_SNTRUP_KAT_INTERMEDIATE="${CMAKE_CURRENT_SOURCE_DIR}/vectors/sntrup761.int")
+	if(mode STREQUAL "generic")
+		target_compile_definitions(dssh_test_sntrup_deterministic_${mode} PRIVATE DSSH_TEST_SNTRUP_GENERIC)
+	endif()
+	dssh_add_output_test(dssh_sntrup_deterministic_${mode} dssh_test_sntrup_deterministic_${mode}
+		"1 tests: 1 passed, 0 failed, 0 skipped" --exact kat/generation)
+	set_tests_properties(dssh_sntrup_deterministic_${mode} PROPERTIES TIMEOUT 120)
 	dssh_add_test(sntrup_arithmetic_${mode} test_sntrup_arithmetic.c)
 	target_compile_definitions(dssh_test_sntrup_arithmetic_${mode} PRIVATE
 		DSSH_SNTRUP_KAT_RESPONSE="${CMAKE_CURRENT_SOURCE_DIR}/vectors/sntrup761.rsp"

@@ -124,14 +124,78 @@ sntrup_kat_decapsulation(const struct sntrup_kat_record *record)
 	    && actual[0] == 0xa5 && actual[sizeof(actual) - 1] == 0xa5;
 }
 
+#ifdef DSSH_SNTRUP_DETERMINISTIC
 static bool
-sntrup_kat_run(bool encoding, unsigned *completed)
+sntrup_kat_generated(const struct sntrup_kat_record *record, struct sntrup_drbg *seeds)
+{
+	uint8_t seed[48];
+	if (!sntrup_drbg_generate(seeds, seed, sizeof(seed))
+	    || memcmp(seed, record->seed, sizeof(seed)) != 0)
+		return false;
+	struct sntrup_drbg state;
+	if (sntrup_active_drbg != NULL || !sntrup_drbg_init(&state, seeds->cipher, seed))
+		return false;
+	uint8_t pk[1160], sk[1765], ct[1041], secret[34], recovered[34];
+	memset(pk, 0xa5, sizeof(pk));
+	memset(sk, 0xa5, sizeof(sk));
+	memset(ct, 0xa5, sizeof(ct));
+	memset(secret, 0xa5, sizeof(secret));
+	memset(recovered, 0xa5, sizeof(recovered));
+	sntrup_active_drbg = &state;
+	bool valid = crypto_kem_sntrup761_keypair(pk + 1, sk + 1) == 0
+	    && state.valid && state.rho && state.words >= 2 && state.calls == state.words + 1
+	    && memcmp(pk + 1, record->pk, sizeof(record->pk)) == 0
+	    && memcmp(sk + 1, record->sk, sizeof(record->sk)) == 0;
+	unsigned calls = state.calls;
+	state.encapsulating = true;
+	if (valid)
+		valid = crypto_kem_sntrup761_enc(ct + 1, secret + 1, pk + 1) == 0
+		    && state.valid && state.calls == calls + 1
+		    && memcmp(ct + 1, record->ct, sizeof(record->ct)) == 0
+		    && memcmp(secret + 1, record->ss, sizeof(record->ss)) == 0;
+	if (valid)
+		valid = crypto_kem_sntrup761_dec(recovered + 1, ct + 1, sk + 1) == 0
+		    && state.calls == calls + 1 && memcmp(recovered + 1, record->ss, sizeof(record->ss)) == 0;
+	sntrup_active_drbg = NULL;
+	valid = pk[0] == 0xa5 && pk[sizeof(pk) - 1] == 0xa5
+	    && sk[0] == 0xa5 && sk[sizeof(sk) - 1] == 0xa5
+	    && ct[0] == 0xa5 && ct[sizeof(ct) - 1] == 0xa5
+	    && secret[0] == 0xa5 && secret[sizeof(secret) - 1] == 0xa5
+	    && recovered[0] == 0xa5 && recovered[sizeof(recovered) - 1] == 0xa5 && valid;
+	dssh_cleanse(&state, sizeof(state));
+	dssh_cleanse(seed, sizeof(seed));
+	dssh_cleanse(pk, sizeof(pk));
+	dssh_cleanse(sk, sizeof(sk));
+	dssh_cleanse(ct, sizeof(ct));
+	dssh_cleanse(secret, sizeof(secret));
+	dssh_cleanse(recovered, sizeof(recovered));
+	return valid;
+}
+#endif
+
+static bool
+sntrup_kat_run(unsigned mode, unsigned *completed)
 {
 	FILE *response = fopen(DSSH_SNTRUP_KAT_RESPONSE, "rb");
 	FILE *intermediate = fopen(DSSH_SNTRUP_KAT_INTERMEDIATE, "rb");
 	bool valid = response != NULL && intermediate != NULL;
 	struct sntrup_kat_record record;
 	char line[64];
+#ifdef DSSH_SNTRUP_DETERMINISTIC
+	struct sntrup_drbg seeds = {0};
+	if (mode == 2) {
+		dssh_test_reset_global_config();
+		valid = dssh_register_aes256_ctr() == 0 && valid;
+		uint8_t entropy[48];
+		for (size_t i = 0; i < sizeof(entropy); i++) {
+			uint8_t octet = (uint8_t)i; /*0..47. */
+			entropy[i] = octet;
+		}
+		if (valid)
+			valid = sntrup_drbg_init(&seeds, gconf.enc_head, entropy);
+		dssh_cleanse(entropy, sizeof(entropy));
+	}
+#endif
 	if (valid)
 		valid = sntrup_kat_line(response, line, sizeof(line)) && strcmp(line, "# kem/sntrup761") == 0
 		    && sntrup_kat_line(response, line, sizeof(line)) && line[0] == 0;
@@ -139,8 +203,14 @@ sntrup_kat_run(bool encoding, unsigned *completed)
 	for (unsigned i = 0; valid && i < 100; i++) {
 		valid = sntrup_kat_read(response, intermediate, i, &record)
 		    && memcmp(record.pk, &record.sk[382], sizeof(record.pk)) == 0;
-		if (valid)
-			valid = encoding ? sntrup_kat_encoding(&record) : sntrup_kat_decapsulation(&record);
+		if (valid) {
+#ifdef DSSH_SNTRUP_DETERMINISTIC
+			if (mode == 2)
+				valid = sntrup_kat_generated(&record, &seeds);
+			else
+#endif
+				valid = mode == 1 ? sntrup_kat_encoding(&record) : sntrup_kat_decapsulation(&record);
+		}
 		if (valid)
 			(*completed)++;
 	}
@@ -152,6 +222,13 @@ sntrup_kat_run(bool encoding, unsigned *completed)
 	if (intermediate != NULL && fclose(intermediate) != 0)
 		valid = false;
 	dssh_cleanse(&record, sizeof(record));
+#ifdef DSSH_SNTRUP_DETERMINISTIC
+	if (mode == 2) {
+		valid = sntrup_active_drbg == NULL && valid;
+		dssh_cleanse(&seeds, sizeof(seeds));
+		dssh_test_reset_global_config();
+	}
+#endif
 	return valid && *completed == 100;
 }
 
@@ -174,5 +251,17 @@ test_sntrup_kat_encoding(void)
 	ASSERT_TRUE(valid && completed == 100 && printed > 0);
 	return TEST_PASS;
 }
+
+#ifdef DSSH_SNTRUP_DETERMINISTIC
+static int
+test_sntrup_kat_generation(void)
+{
+	unsigned completed = 0;
+	bool valid = sntrup_kat_run(2, &completed);
+	int printed = printf("sntrup_kat kind=generation vectors=%u seeds=%u valid=%d\n", completed, completed, valid);
+	ASSERT_TRUE(valid && completed == 100 && printed > 0);
+	return TEST_PASS;
+}
+#endif
 
 #endif

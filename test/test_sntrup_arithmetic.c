@@ -5,9 +5,19 @@
 #include <string.h>
 
 #include "dssh_test.h"
+#include "deucessh-crypto.h"
+
+#ifdef DSSH_SNTRUP_DETERMINISTIC
+ #include "sntrup_drbg.h"
+ #define dssh_random sntrup_deterministic_random
+#endif
 
 /* No DSSH_TESTING: exercise the ordinary primitive/helper implementation. */
 #include "../kex/sntrup761.c"
+
+#ifdef DSSH_SNTRUP_DETERMINISTIC
+ #undef dssh_random
+#endif
 
 #undef p
 #undef q
@@ -349,6 +359,9 @@ test_kem(void)
 #include "sntrup_kat_cases.h"
 
 static struct dssh_test_entry tests[] = {
+#ifdef DSSH_SNTRUP_DETERMINISTIC
+	{"kat/generation", test_sntrup_kat_generation},
+#endif
 	{"kat/decapsulation", test_sntrup_kat_decapsulation},
 	{"kat/encoding", test_sntrup_kat_encoding},
 	{"arithmetic/masks16", test_masks16},

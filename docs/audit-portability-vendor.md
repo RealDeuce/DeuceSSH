@@ -162,3 +162,11 @@ implementations and providers reproduce exact decapsulation and fixed-input
 encoding/cache/ciphertext/session answers. This closes that positive-answer gap;
 deterministic key generation/random sampling, invalid answers and other stated
 upstream/compiler/platform/timing/runtime/release qualifications remain open.
+
+
+R111 subsequently closes native complete positive seeded generation/sampling
+correspondence in [the seeded-generation review](release-1.0-evidence/sntrup-generation-review.md). All100 published seeds, full
+generated keys, sampled ciphertexts and session secrets match in both arithmetic
+modes and providers. The test adapter preserves the original per-word DRBG
+request boundaries; production randomness is unchanged. Independent invalid
+answers and other source/timing/foreign-target/runtime/release gates remain open.

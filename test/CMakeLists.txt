@@ -537,6 +537,17 @@ target_compile_options(dssh_test_vendor_glue PRIVATE ${DEUCESSH_COMPILE_OPTIONS}
 add_test(NAME dssh_unit_vendor_glue COMMAND dssh_test_vendor_glue)
 set_tests_properties(dssh_unit_vendor_glue PROPERTIES TIMEOUT 60)
 
+# Matrix identities against independent coefficient-domain convolution.
+add_executable(dssh_test_mlkem_poly test_mlkem_poly.c)
+set_property(TARGET dssh_test_mlkem_poly PROPERTY C_STANDARD ${DEUCESSH_C_STANDARD})
+set_property(TARGET dssh_test_mlkem_poly PROPERTY C_STANDARD_REQUIRED ON)
+target_include_directories(dssh_test_mlkem_poly PRIVATE ${PROJECT_SOURCE_DIR})
+target_compile_options(dssh_test_mlkem_poly PRIVATE ${DEUCESSH_COMPILE_OPTIONS}
+	$<$<OR:$<C_COMPILER_ID:Clang>,$<C_COMPILER_ID:AppleClang>,$<C_COMPILER_ID:GNU>>:-Wno-unused-function>)
+dssh_add_output_test(dssh_mlkem_polynomial_relations dssh_test_mlkem_poly
+	"ML-KEM polynomial relations: patterns=6 fields=12288 guards=24 inputs=24 valid=1")
+set_tests_properties(dssh_mlkem_polynomial_relations PROPERTIES TIMEOUT 120)
+
 # Original NIST response files for the four bundled ML-KEM hash primitives.
 add_executable(dssh_test_mlkem_hash test_mlkem_hash.c)
 set_property(TARGET dssh_test_mlkem_hash PROPERTY C_STANDARD ${DEUCESSH_C_STANDARD})

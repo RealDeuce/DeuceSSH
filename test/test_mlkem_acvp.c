@@ -65,7 +65,7 @@ static const struct {
 	const char *function;
 	const char *owner;
 	size_t bytes;
-	unsigned counts[3]; /* key generation, encapsulation, decapsulation */
+	unsigned counts[5]; /* keygen, encap, decap, public check, private check */
 } clear_sites[] = {
 	{"libcrux_ml_kem_types_from_17_35", "sk", sizeof(libcrux_ml_kem_types_MlKemPrivateKey_55), {1, 0, 0}},
 	{"libcrux_ml_kem_types_from_05_f2", "copy_of_value", 2400, {1, 0, 0}},
@@ -126,10 +126,22 @@ static const struct {
 	{"libcrux_ml_kem_serialize_compress_then_serialize_message_aa", "coefficient", sizeof(libcrux_ml_kem_vector_portable_vector_type_PortableVector), {0, 0, 1}},
 	{"libcrux_ml_kem_serialize_compress_then_serialize_message_aa", "coefficient_compressed", sizeof(libcrux_ml_kem_vector_portable_vector_type_PortableVector), {0, 0, 1}},
 	{"libcrux_ml_kem_serialize_compress_then_serialize_4_9a", "coefficient", sizeof(libcrux_ml_kem_vector_portable_vector_type_PortableVector), {0, 1, 1}},
+	{"libcrux_ml_kem_matrix_compute_As_plus_e_60", "product", sizeof(libcrux_ml_kem_polynomial_PolynomialRingElement_f0), {1, 0, 0, 0, 0}},
+	{"libcrux_ml_kem_matrix_compute_vector_u_59", "product", sizeof(libcrux_ml_kem_polynomial_PolynomialRingElement_f0), {0, 1, 1, 0, 0}},
+	{"libcrux_ml_kem_matrix_compute_ring_element_v_54", "product", sizeof(libcrux_ml_kem_polynomial_PolynomialRingElement_f0), {0, 1, 1, 0, 0}},
+	{"libcrux_ml_kem_matrix_compute_message_b3", "product", sizeof(libcrux_ml_kem_polynomial_PolynomialRingElement_f0), {0, 0, 1, 0, 0}},
+	{"libcrux_ml_kem_polynomial_add_standard_error_reduce_89_03", "coefficient_normal_form", sizeof(libcrux_ml_kem_vector_portable_vector_type_PortableVector), {3, 0, 0, 0, 0}},
+	{"libcrux_ml_kem_polynomial_add_error_reduce_89_38", "coefficient_normal_form", sizeof(libcrux_ml_kem_vector_portable_vector_type_PortableVector), {0, 3, 3, 0, 0}},
+	{"libcrux_ml_kem_polynomial_add_message_error_reduce_89_ea", "coefficient_normal_form", sizeof(libcrux_ml_kem_vector_portable_vector_type_PortableVector), {0, 1, 1, 0, 0}},
+	{"libcrux_ml_kem_polynomial_add_message_error_reduce_89_ea", "tmp", sizeof(libcrux_ml_kem_vector_portable_vector_type_PortableVector), {0, 1, 1, 0, 0}},
+	{"libcrux_ml_kem_polynomial_subtract_reduce_89_d4", "coefficient_normal_form", sizeof(libcrux_ml_kem_vector_portable_vector_type_PortableVector), {0, 0, 1, 0, 0}},
+	{"libcrux_ml_kem_sampling_sample_from_binomial_distribution_2_85", "sampled_i16s", sizeof(int16_t[256]), {6, 7, 7, 0, 0}},
+	{"libcrux_ml_kem_serialize_compress_then_serialize_10_fc", "coefficient", sizeof(libcrux_ml_kem_vector_portable_vector_type_PortableVector), {0, 3, 3, 0, 0}},
+	{"libcrux_ml_kem_serialize_serialize_uncompressed_ring_element_5b", "coefficient", sizeof(libcrux_ml_kem_vector_portable_vector_type_PortableVector), {6, 3, 0, 3, 0}},
 };
 
 struct clear_observation {
-	unsigned calls[sizeof(clear_sites) / sizeof(clear_sites[0])];
+	uint32_t calls[sizeof(clear_sites) / sizeof(clear_sites[0])];
 	struct dssh_hash_wipes hash;
 	bool valid;
 };
@@ -137,7 +149,7 @@ struct clear_observation {
 /* This runner is single-threaded; publish only during evaluate_primitive. */
 static struct clear_observation *active_observation;
 static size_t observed_cases;
-static size_t observed_clears;
+static uint64_t observed_clears;
 static uint64_t observed_hash_clears;
 static bool observed_hash_valid = true;
 
@@ -154,7 +166,7 @@ observe_clear(const char *function, const char *owner, const void *buffer, size_
 		    || strcmp(owner, clear_sites[i].owner) != 0)
 			continue;
 		if (bytes != clear_sites[i].bytes || buffer == NULL
-		    || observation->calls[i] >= 3) {
+		    || observation->calls[i] == UINT32_MAX) {
 			observation->valid = false;
 			return;
 		}
@@ -180,12 +192,9 @@ check_observer(void)
 		buffer[0] = scenario == 1 ? 1 : 0;
 		const char *function = scenario == 3 ? "unknown" : clear_sites[4].function;
 		size_t bytes = scenario == 2 ? sizeof(buffer) - 1 : sizeof(buffer);
+		if (scenario == 4)
+			observation.calls[4] = UINT32_MAX;
 		observe_clear(function, clear_sites[4].owner, buffer, bytes);
-		if (scenario == 4) {
-			observe_clear(function, clear_sites[4].owner, buffer, bytes);
-			observe_clear(function, clear_sites[4].owner, buffer, bytes);
-			observe_clear(function, clear_sites[4].owner, buffer, bytes);
-		}
 		active_observation = NULL;
 		if (observation.valid != (scenario == 0))
 			valid = false;
@@ -205,13 +214,17 @@ evaluate(const struct dssh_acvp_case *test, const struct dssh_acvp_decoded *byte
 	bool keygen = test->kind == DSSH_ACVP_KEYGEN || test->kind == DSSH_ACVP_DECAP_SEED;
 	bool encap = test->kind == DSSH_ACVP_ENCAP;
 	bool decap = test->kind == DSSH_ACVP_DECAP || test->kind == DSSH_ACVP_DECAP_SEED;
+	bool public_check = test->kind == DSSH_ACVP_PUBLIC_CHECK;
+	bool private_check = test->kind == DSSH_ACVP_PRIVATE_CHECK;
 	for (size_t i = 0; i < sizeof(clear_sites) / sizeof(clear_sites[0]); i++) {
 		unsigned expected = (keygen ? clear_sites[i].counts[0] : 0U)
 		    + (encap ? clear_sites[i].counts[1] : 0U)
-		    + (decap ? clear_sites[i].counts[2] : 0U);
+		    + (decap ? clear_sites[i].counts[2] : 0U)
+		    + (public_check ? clear_sites[i].counts[3] : 0U)
+		    + (private_check ? clear_sites[i].counts[4] : 0U);
 		if (observation.calls[i] != expected)
 			observation.valid = false;
-		/* At most 59 sites x 3 calls x 145 finite cases fit even 16-bit size_t. */
+		/* 71 uint32_t counters across 145 finite cases sum to less than 2^46. */
 		observed_clears += observation.calls[i];
 	}
 	observed_cases++;
@@ -264,7 +277,7 @@ main(int argc, char **argv)
 	if (!check_observer() || !dssh_hash_wipe_controls())
 		return 2;
 	int ret = dssh_acvp_run(argc, argv, "bundled retirement", evaluate);
-	if (printf("ML-KEM retirement: cases=%zu sites=%zu clears=%zu active=%u\n",
+	if (printf("ML-KEM retirement: cases=%zu sites=%zu clears=%" PRIu64 " active=%u\n",
 	    observed_cases, sizeof(clear_sites) / sizeof(clear_sites[0]), observed_clears,
 	    active_observation != NULL ? 1U : 0U) < 0)
 		return 2;

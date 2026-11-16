@@ -60,7 +60,7 @@ evaluate_primitive(const struct dssh_acvp_case *test, const struct dssh_acvp_dec
 
 #ifdef DSSH_TEST_MLKEM_RETIREMENT
 /* Match actual live owner sites, not just buffer sizes. Logical returned
- * values and deeper polynomial/hash owners have separate acceptance work. */
+ * values and deeper polynomial/serialization owners have separate acceptance work. */
 static const struct {
 	const char *function;
 	const char *owner;
@@ -104,6 +104,28 @@ static const struct {
 	{"libcrux_ml_kem_ind_cca_generate_keypair_8c", "uu____2", sizeof(libcrux_ml_kem_types_MlKemPrivateKey_55), {1, 0, 0}},
 	{"libcrux_ml_kem_ind_cca_instantiations_portable_generate_keypair_d5", "copy_of_randomness", 64, {1, 0, 0}},
 	{"libcrux_ml_kem_mlkem768_portable_generate_key_pair", "copy_of_randomness", 64, {1, 0, 0}},
+	{"libcrux_ml_kem_ind_cpa_generate_keypair_fc", "hashed", sizeof(uint8_t[64]), {1, 0, 0}},
+	{"libcrux_ml_kem_ind_cpa_generate_keypair_fc", "prf_input", sizeof(uint8_t[33]), {1, 0, 0}},
+	{"libcrux_ml_kem_ind_cpa_generate_keypair_fc", "secret_sample", sizeof(tuple_b0), {1, 0, 0}},
+	{"libcrux_ml_kem_ind_cpa_generate_keypair_fc", "error_sample", sizeof(tuple_b0), {1, 0, 0}},
+	{"libcrux_ml_kem_ind_cpa_generate_keypair_fc", "t_as_ntt", sizeof(libcrux_ml_kem_polynomial_PolynomialRingElement_f0[3]), {1, 0, 0}},
+	{"libcrux_ml_kem_ind_cpa_sample_vector_cbd_then_ntt_fc", "prf_inputs", sizeof(uint8_t[3][33]), {2, 1, 1}},
+	{"libcrux_ml_kem_ind_cpa_sample_vector_cbd_then_ntt_fc", "prf_outputs", sizeof(uint8_t[3][128]), {2, 1, 1}},
+	{"libcrux_ml_kem_ind_cpa_sample_ring_element_cbd_ac", "prf_inputs", sizeof(uint8_t[3][33]), {0, 1, 1}},
+	{"libcrux_ml_kem_ind_cpa_sample_ring_element_cbd_ac", "prf_outputs", sizeof(uint8_t[3][128]), {0, 1, 1}},
+	{"libcrux_ml_kem_ind_cpa_encrypt_60", "prf_input", sizeof(uint8_t[33]), {0, 1, 1}},
+	{"libcrux_ml_kem_ind_cpa_encrypt_60", "prf_output", sizeof(uint8_t[128]), {0, 1, 1}},
+	{"libcrux_ml_kem_ind_cpa_encrypt_60", "r_sample", sizeof(tuple_b0), {0, 1, 1}},
+	{"libcrux_ml_kem_ind_cpa_encrypt_60", "error_sample", sizeof(tuple_b0), {0, 1, 1}},
+	{"libcrux_ml_kem_ind_cpa_encrypt_60", "error_2", sizeof(libcrux_ml_kem_polynomial_PolynomialRingElement_f0), {0, 1, 1}},
+	{"libcrux_ml_kem_ind_cpa_encrypt_60", "u", sizeof(libcrux_ml_kem_polynomial_PolynomialRingElement_f0[3]), {0, 1, 1}},
+	{"libcrux_ml_kem_ind_cpa_encrypt_60", "message_as_ring_element", sizeof(libcrux_ml_kem_polynomial_PolynomialRingElement_f0), {0, 1, 1}},
+	{"libcrux_ml_kem_ind_cpa_encrypt_60", "v", sizeof(libcrux_ml_kem_polynomial_PolynomialRingElement_f0), {0, 1, 1}},
+	{"libcrux_ml_kem_ind_cpa_decrypt_unpacked_6d", "message", sizeof(libcrux_ml_kem_polynomial_PolynomialRingElement_f0), {0, 0, 1}},
+	{"libcrux_ml_kem_ind_cpa_decrypt_43", "secret_key_unpacked", sizeof(libcrux_ml_kem_ind_cpa_unpacked_IndCpaPrivateKeyUnpacked_f8), {0, 0, 1}},
+	{"libcrux_ml_kem_serialize_compress_then_serialize_message_aa", "coefficient", sizeof(libcrux_ml_kem_vector_portable_vector_type_PortableVector), {0, 0, 1}},
+	{"libcrux_ml_kem_serialize_compress_then_serialize_message_aa", "coefficient_compressed", sizeof(libcrux_ml_kem_vector_portable_vector_type_PortableVector), {0, 0, 1}},
+	{"libcrux_ml_kem_serialize_compress_then_serialize_4_9a", "coefficient", sizeof(libcrux_ml_kem_vector_portable_vector_type_PortableVector), {0, 1, 1}},
 };
 
 struct clear_observation {
@@ -132,7 +154,7 @@ observe_clear(const char *function, const char *owner, const void *buffer, size_
 		    || strcmp(owner, clear_sites[i].owner) != 0)
 			continue;
 		if (bytes != clear_sites[i].bytes || buffer == NULL
-		    || observation->calls[i] >= 2) {
+		    || observation->calls[i] >= 3) {
 			observation->valid = false;
 			return;
 		}
@@ -162,6 +184,7 @@ check_observer(void)
 		if (scenario == 4) {
 			observe_clear(function, clear_sites[4].owner, buffer, bytes);
 			observe_clear(function, clear_sites[4].owner, buffer, bytes);
+			observe_clear(function, clear_sites[4].owner, buffer, bytes);
 		}
 		active_observation = NULL;
 		if (observation.valid != (scenario == 0))
@@ -188,7 +211,7 @@ evaluate(const struct dssh_acvp_case *test, const struct dssh_acvp_decoded *byte
 		    + (decap ? clear_sites[i].counts[2] : 0U);
 		if (observation.calls[i] != expected)
 			observation.valid = false;
-		/* All counts are bounded above by 2, across 145 finite cases. */
+		/* At most 59 sites x 3 calls x 145 finite cases fit even 16-bit size_t. */
 		observed_clears += observation.calls[i];
 	}
 	observed_cases++;

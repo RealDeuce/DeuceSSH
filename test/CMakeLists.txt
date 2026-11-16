@@ -559,6 +559,17 @@ dssh_add_output_test(dssh_mlkem_encodings dssh_test_mlkem_encoding
 	"ML-KEM encodings: widths=4 cases=5578 bytes=127376 fields=89248 guards=22312 inputs=11156 valid=1")
 set_tests_properties(dssh_mlkem_encodings PROPERTIES TIMEOUT 120)
 
+# Vector arithmetic against independent integer formulas and alias checks.
+add_executable(dssh_test_mlkem_vector test_mlkem_vector.c)
+set_property(TARGET dssh_test_mlkem_vector PROPERTY C_STANDARD ${DEUCESSH_C_STANDARD})
+set_property(TARGET dssh_test_mlkem_vector PROPERTY C_STANDARD_REQUIRED ON)
+target_include_directories(dssh_test_mlkem_vector PRIVATE ${PROJECT_SOURCE_DIR})
+target_compile_options(dssh_test_mlkem_vector PRIVATE ${DEUCESSH_COMPILE_OPTIONS}
+	$<$<OR:$<C_COMPILER_ID:Clang>,$<C_COMPILER_ID:AppleClang>,$<C_COMPILER_ID:GNU>>:-Wno-unused-function>)
+dssh_add_output_test(dssh_mlkem_vectors dssh_test_mlkem_vector
+	"ML-KEM vectors: operations=13 cases=1835008 fields=29360128 guards=5505024 inputs=2686976 valid=1")
+set_tests_properties(dssh_mlkem_vectors PROPERTIES TIMEOUT 120)
+
 # Original NIST response files for the four bundled ML-KEM hash primitives.
 add_executable(dssh_test_mlkem_hash test_mlkem_hash.c)
 set_property(TARGET dssh_test_mlkem_hash PROPERTY C_STANDARD ${DEUCESSH_C_STANDARD})

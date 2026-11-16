@@ -198,10 +198,10 @@ test_sign_and_compression(void)
 			int16_t value = (int16_t)(start + offset);
 			vector.elements[lane] = value;
 		}
-		libcrux_ml_kem_vector_portable_vector_type_PortableVector masks =
-			libcrux_ml_kem_vector_portable_arithmetic_shift_right_94(vector);
-		libcrux_ml_kem_vector_portable_vector_type_PortableVector representatives =
-			libcrux_ml_kem_vector_traits_to_unsigned_representative_db(vector);
+		libcrux_ml_kem_vector_portable_vector_type_PortableVector masks;
+		libcrux_ml_kem_vector_portable_arithmetic_shift_right_94(&vector, &masks);
+		libcrux_ml_kem_vector_portable_vector_type_PortableVector representatives;
+		libcrux_ml_kem_vector_traits_to_unsigned_representative_db(&vector, &representatives);
 		for (size_t lane = 0; lane < 16; lane++) {
 			CHECK(masks.elements[lane] == (vector.elements[lane] < 0 ? -1 : 0));
 			int32_t expected = vector.elements[lane];

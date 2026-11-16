@@ -1478,6 +1478,31 @@ foreach(method IN ITEMS group14 group16)
 endforeach()
 dssh_add_output_test(dssh_rekey_fixture_oracle dssh_test_transport
 	"1 tests: 1 passed, 0 failed, 0 skipped" --exact rekey/sequence_oracle)
+dssh_add_output_test(dssh_direct_kex_builder dssh_test_transport
+	"1 tests: 1 passed, 0 failed, 0 skipped" --exact direct_kex/builder)
+set(direct_kex_leaves
+	release/dhgex_group_validation release/dhgex_peer_validation
+	dhgex/server_null_pubkey_fn dhgex/server_null_sign_fn dhgex/server_recv_fail
+	dhgex/server_bad_request_type dhgex/server_short_request dhgex/server_null_provider
+	dhgex/server_provider_error dhgex/server_bad_init_type dhgex/server_e_zero
+	dhgex/server_recv_init_fail dhgex/server_ka_null
+	c25519/server_ka_null c25519/server_null_pubkey_fn c25519/server_null_sign_fn
+	c25519/server_recv_fail c25519/server_bad_init_type c25519/server_bad_qc_len
+	c25519/server_qc_overrun release/c25519_peer_validation release/dhgex_provider_contract)
+foreach(mac IN ITEMS hmac256 hmac512)
+	foreach(kind IN ITEMS gex curve)
+		dssh_add_output_test(dssh_direct_kex_${kind}_${mac} dssh_test_transport
+			"1 tests: 1 passed, 0 failed, 0 skipped" --exact direct_kex/fixture)
+		set_tests_properties(dssh_direct_kex_${kind}_${mac} PROPERTIES
+			ENVIRONMENT "${DSSH_TEST_KEY_ENV};DSSH_TEST_MAC=${mac};DSSH_DIRECT_KEX_KIND=${kind}" TIMEOUT 120)
+	endforeach()
+	foreach(leaf IN LISTS direct_kex_leaves)
+		dssh_add_output_test(dssh_direct_kex_${leaf}_${mac} dssh_test_transport
+			"1 tests: 1 passed, 0 failed, 0 skipped" --exact ${leaf})
+		set_tests_properties(dssh_direct_kex_${leaf}_${mac} PROPERTIES
+			ENVIRONMENT "${DSSH_TEST_KEY_ENV};DSSH_TEST_MAC=${mac}" TIMEOUT 120)
+	endforeach()
+endforeach()
 foreach(suffix IN ITEMS "" _hmac256 _dhgex _rsa _rsa512 _dhgex_rsa _dhgex_rsa512
 	_sntrup _sntrup_rsa _sntrup_rsa512 _mlkem _mlkem_rsa _mlkem_rsa512
 	_rsa_hmac256 _dhgex_hmac256 _sntrup_hmac256)
@@ -2702,6 +2727,15 @@ if(Python3_Interpreter_FOUND AND UNIX AND NOT APPLE)
 			$<TARGET_FILE:dssh_test_transport_rekey_owner> ${mode})
 		set_tests_properties(dssh_rekey_fixture_owner_${mode} PROPERTIES
 			ENVIRONMENT "${DSSH_TEST_KEY_ENV}" TIMEOUT 120)
+	endforeach()
+	foreach(kind IN ITEMS gex curve)
+		foreach(mode IN LISTS owner_modes)
+			add_test(NAME dssh_direct_kex_owner_${kind}_${mode} COMMAND ${Python3_EXECUTABLE}
+				${CMAKE_CURRENT_SOURCE_DIR}/fixture_owner_controls.py
+				$<TARGET_FILE:dssh_test_transport_pair_owner> ${mode})
+			set_tests_properties(dssh_direct_kex_owner_${kind}_${mode} PROPERTIES
+				ENVIRONMENT "${DSSH_TEST_KEY_ENV};DSSH_DIRECT_KEX_KIND=${kind}" TIMEOUT 120)
+		endforeach()
 	endforeach()
 	foreach(kind IN ITEMS cipher fixed)
 		if(kind STREQUAL "fixed")

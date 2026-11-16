@@ -3829,101 +3829,29 @@ ve_ki_thread(void *arg)
 	return 0;
 }
 
-static size_t
-build_plaintext_packet_t(const uint8_t *payload, size_t payload_len,
-    uint8_t *buf, size_t bufsz)
-{
-	size_t bs = 8;
-	size_t min_total = 4 + 1 + payload_len + 4;
-	size_t total = (min_total + bs - 1) / bs * bs;
-	size_t padding_len = total - 4 - 1 - payload_len;
-	if (total > bufsz)
-		return 0;
-	size_t pos = 0;
-	dssh_serialize_uint32((uint32_t)(total - 4), buf, bufsz, &pos);
-	buf[pos++] = (uint8_t)padding_len;
-	memcpy(&buf[pos], payload, payload_len);
-	pos += payload_len;
-	memset(&buf[pos], 0, padding_len);
-	pos += padding_len;
-	return pos;
-}
+#include "direct_kex_fixture.h"
 
 /* DH-GEX server handler infrastructure */
 struct dhgex_server_ctx {
+	struct test_session_pair pair;
 	dssh_session server;
-	struct mock_io_state *io;
 };
 
 static int
 dhgex_server_setup(struct dhgex_server_ctx *ctx)
 {
-	dssh_test_reset_global_config();
-	dssh_test_alloc_reset();
-	dssh_test_ossl_reset();
-
-	if (dssh_register_dh_gex_sha256() < 0)
-		return -1;
-	if (dssh_register_ssh_ed25519() < 0)
-		return -1;
-	if (dssh_register_aes256_ctr() < 0)
-		return -1;
-	if (test_register_mac_algos() < 0)
-		return -1;
-	if (dssh_register_none_comp() < 0)
-		return -1;
-	if (dssh_ed25519_generate_key() < 0)
-		return -1;
-
-	ctx->io = malloc(sizeof(struct mock_io_state));
-	if (mock_io_init(ctx->io, 0) < 0)
-		return -1;
-
-	dssh_transport_set_callbacks(mock_tx_dispatch, mock_rx_dispatch,
-	    mock_rxline_dispatch, mock_extra_line_cb);
-
-	dssh_session client = dssh_session_init(true, 0);
-	if (client == NULL)
-		return -1;
-	dssh_session_set_cbdata(client, ctx->io, ctx->io, ctx->io, ctx->io);
-
-	ctx->server = dssh_session_init(false, 0);
-	if (ctx->server == NULL) {
-		dssh_session_cleanup(client);
-		return -1;
-	}
-	test_dhgex_setup(ctx->server);
-	dssh_session_set_cbdata(ctx->server, ctx->io, ctx->io,
-	    ctx->io, ctx->io);
-
-	/* Two-threaded version_exchange + kexinit */
-	struct ve_ki_ctx ca = { .io = ctx->io, .sess = client };
-	struct ve_ki_ctx sa = { .io = ctx->io, .sess = ctx->server };
-	thrd_t ct, st;
-	if (thrd_create(&ct, ve_ki_thread, &ca) != thrd_success)
-		return -1;
-	if (thrd_create(&st, ve_ki_thread, &sa) != thrd_success)
-		return -1;
-	thrd_join(ct, NULL);
-	thrd_join(st, NULL);
-
-	dssh_session_cleanup(client);
-	mock_io_close_c2s(ctx->io);
-	mock_io_close_s2c(ctx->io);
-	mock_io_free(ctx->io);
-
-	if (ca.result != 0 || sa.result != 0)
-		return -1;
-
-	return 0;
+	ctx->server = NULL;
+	int ret = direct_kex_setup(&ctx->pair, true);
+	if (ret == 0)
+		ctx->server = ctx->pair.server;
+	return ret;
 }
 
 static void
 dhgex_server_teardown(struct dhgex_server_ctx *ctx)
 {
-	dssh_session_cleanup(ctx->server);
-	free(ctx->io);
-	dssh_test_reset_global_config();
+	ctx->server = NULL;
+	direct_kex_dispose(&ctx->pair);
 }
 
 static int group_test_alloc_failure = -1;
@@ -3931,44 +3859,9 @@ static int group_test_alloc_failure = -1;
 /* Run the server handler with specific injected packets */
 static int
 dhgex_server_run(struct dhgex_server_ctx *ctx,
-    const uint8_t *wire, size_t wire_len)
+    const uint8_t *wire, size_t wire_len, int *operation)
 {
-	struct mock_io_state iter_io;
-	if (mock_io_init(&iter_io, 0) < 0)
-		return -999;
-	dssh_session_set_cbdata(ctx->server, &iter_io, &iter_io,
-	    &iter_io, &iter_io);
-
-	if (wire != NULL && wire_len > 0)
-		mock_io_inject(&iter_io.c2s, wire, wire_len);
-
-	/* Close c2s write end so server gets EOF after injected data */
-	if (iter_io.c2s.wfd >= 0) {
-		close(iter_io.c2s.wfd);
-		iter_io.c2s.wfd = -1;
-	}
-
-	/* Ensure ossl injection is disabled */
-	dssh_test_ossl_reset();
-	dssh_test_alloc_reset();
-
-	/* Reset mutable server state */
-	dssh_result_release(&ctx->server->trans.kex_result.lease);
-	ctx->server->trans.kex_result = (struct dssh_kex_result){0};
-	ctx->server->terminate = false;
-
-	if (group_test_alloc_failure >= 0)
-		dssh_test_alloc_fail_after(group_test_alloc_failure);
-	int res = kex(ctx->server);
-	dssh_test_alloc_reset();
-
-	uint8_t drain[16384];
-	mock_io_drain(&iter_io.s2c, drain, sizeof(drain));
-	mock_io_close_c2s(&iter_io);
-	mock_io_close_s2c(&iter_io);
-	mock_io_free(&iter_io);
-
-	return res;
+	return direct_kex_run(&ctx->pair, wire, wire_len, group_test_alloc_failure, operation);
 }
 /* end DH-GEX server handler infra */
 
@@ -4089,11 +3982,12 @@ test_dhgex_group_validation(void)
 	uint8_t request[] = { 34, 0, 0, 8, 0, 0, 0, 8, 0, 0, 0, 8, 0 };
 	uint8_t init[] = { 32, 0, 0, 0, 1, 2 };
 	uint8_t wire[64];
-	size_t len = build_plaintext_packet_t(request, sizeof(request), wire, sizeof(wire));
-	len += build_plaintext_packet_t(init, sizeof(init), wire + len, sizeof(wire) - len);
+	size_t len = 0;
+	ASSERT_EQ(build_plaintext_packet_t(request, sizeof(request), wire, sizeof(wire), &len), 0);
+	ASSERT_EQ(build_plaintext_packet_t(init, sizeof(init), wire, sizeof(wire), &len), 0);
 	int results[10];
 	for (which = 0; which < 10; which++)
-		results[which] = dhgex_server_run(&ctx, wire, len);
+		ASSERT_EQ(dhgex_server_run(&ctx, wire, len, &results[which]), 0);
 	ctx.server->trans.kex_selected->config = original;
 	bool complete = ctx.server->trans.kex_result.shared_secret.len > 0
 	    && ctx.server->trans.kex_result.exchange_hash.len == 32;
@@ -4114,9 +4008,11 @@ test_dhgex_peer_validation(void)
 	uint8_t request[] = { 34, 0, 0, 8, 0, 0, 0, 8, 0, 0, 0, 8, 0 };
 	uint8_t init[] = { 32, 0, 0, 0, 1, 1 };
 	uint8_t wire[64];
-	size_t len = build_plaintext_packet_t(request, sizeof(request), wire, sizeof(wire));
-	len += build_plaintext_packet_t(init, sizeof(init), wire + len, sizeof(wire) - len);
-	int ret = dhgex_server_run(&ctx, wire, len);
+	size_t len = 0;
+	ASSERT_EQ(build_plaintext_packet_t(request, sizeof(request), wire, sizeof(wire), &len), 0);
+	ASSERT_EQ(build_plaintext_packet_t(init, sizeof(init), wire, sizeof(wire), &len), 0);
+	int ret = DSSH_ERROR_INIT;
+	ASSERT_EQ(dhgex_server_run(&ctx, wire, len, &ret), 0);
 	bool absent = ctx.server->trans.kex_result.shared_secret.data == NULL;
 	dhgex_server_teardown(&ctx);
 	ASSERT_TRUE(ret < 0);
@@ -4355,14 +4251,16 @@ test_dhgex_server_null_pubkey_fn(void)
 	/* Set key_algo to a stub with NULL pubkey */
 	struct dssh_key_algo_s dummy = {0};
 	dummy.sign = dummy_sign;
+	dssh_key_algo saved = ctx.server->trans.key_algo_selected;
 	ctx.server->trans.key_algo_selected = &dummy;
 
-	int res = dhgex_server_run(&ctx, NULL, 0);
-	ASSERT_EQ(res, DSSH_ERROR_INIT);
+	int res = DSSH_ERROR_INIT;
+	ASSERT_EQ(dhgex_server_run(&ctx, NULL, 0, &res), 0);
 
 	/* Restore before teardown */
-	ctx.server->trans.key_algo_selected = NULL;
+	ctx.server->trans.key_algo_selected = saved;
 	dhgex_server_teardown(&ctx);
+	ASSERT_EQ(res, DSSH_ERROR_INIT);
 	return TEST_PASS;
 }
 
@@ -4375,13 +4273,15 @@ test_dhgex_server_null_sign_fn(void)
 
 	struct dssh_key_algo_s dummy = {0};
 	dummy.pubkey = dummy_pubkey;
+	dssh_key_algo saved = ctx.server->trans.key_algo_selected;
 	ctx.server->trans.key_algo_selected = &dummy;
 
-	int res = dhgex_server_run(&ctx, NULL, 0);
-	ASSERT_EQ(res, DSSH_ERROR_INIT);
+	int res = DSSH_ERROR_INIT;
+	ASSERT_EQ(dhgex_server_run(&ctx, NULL, 0, &res), 0);
 
-	ctx.server->trans.key_algo_selected = NULL;
+	ctx.server->trans.key_algo_selected = saved;
 	dhgex_server_teardown(&ctx);
+	ASSERT_EQ(res, DSSH_ERROR_INIT);
 	return TEST_PASS;
 }
 
@@ -4393,10 +4293,11 @@ test_dhgex_server_recv_fail(void)
 		return TEST_FAIL;
 
 	/* No packets injected -- recv will fail immediately (pipe closed) */
-	int res = dhgex_server_run(&ctx, NULL, 0);
-	ASSERT_TRUE(res < 0);
+	int res = DSSH_ERROR_INIT;
+	ASSERT_EQ(dhgex_server_run(&ctx, NULL, 0, &res), 0);
 
 	dhgex_server_teardown(&ctx);
+	ASSERT_TRUE(res < 0);
 	return TEST_PASS;
 }
 
@@ -4411,15 +4312,17 @@ test_dhgex_server_bad_request_type(void)
 	uint8_t pkt[16];
 	size_t pp = 0;
 	pkt[pp++] = 32; /* GEX_INIT, not GEX_REQUEST(34) */
-	dssh_serialize_uint32(1, pkt, sizeof(pkt), &pp);
+	ASSERT_EQ(dssh_serialize_uint32(1, pkt, sizeof(pkt), &pp), 0);
 	pkt[pp++] = 0x02;
 	uint8_t wire[64];
-	size_t wlen = build_plaintext_packet_t(pkt, pp, wire, sizeof(wire));
+	size_t wlen = 0;
+	ASSERT_EQ(build_plaintext_packet_t(pkt, pp, wire, sizeof(wire), &wlen), 0);
 
-	int res = dhgex_server_run(&ctx, wire, wlen);
-	ASSERT_EQ(res, DSSH_ERROR_PARSE);
+	int res = DSSH_ERROR_INIT;
+	ASSERT_EQ(dhgex_server_run(&ctx, wire, wlen, &res), 0);
 
 	dhgex_server_teardown(&ctx);
+	ASSERT_EQ(res, DSSH_ERROR_PARSE);
 	return TEST_PASS;
 }
 
@@ -4433,12 +4336,14 @@ test_dhgex_server_short_request(void)
 	/* Inject a GEX_REQUEST with only 5 bytes (need 1+12=13) */
 	uint8_t pkt[5] = { 34, 0, 0, 8, 0 };
 	uint8_t wire[64];
-	size_t wlen = build_plaintext_packet_t(pkt, sizeof(pkt), wire, sizeof(wire));
+	size_t wlen = 0;
+	ASSERT_EQ(build_plaintext_packet_t(pkt, sizeof(pkt), wire, sizeof(wire), &wlen), 0);
 
-	int res = dhgex_server_run(&ctx, wire, wlen);
-	ASSERT_EQ(res, DSSH_ERROR_PARSE);
+	int res = DSSH_ERROR_INIT;
+	ASSERT_EQ(dhgex_server_run(&ctx, wire, wlen, &res), 0);
 
 	dhgex_server_teardown(&ctx);
+	ASSERT_EQ(res, DSSH_ERROR_PARSE);
 	return TEST_PASS;
 }
 
@@ -4453,20 +4358,24 @@ test_dhgex_server_null_provider(void)
 	uint8_t req[16];
 	size_t rp = 0;
 	req[rp++] = 34;
-	dssh_serialize_uint32(2048, req, sizeof(req), &rp);
-	dssh_serialize_uint32(4096, req, sizeof(req), &rp);
-	dssh_serialize_uint32(8192, req, sizeof(req), &rp);
+	ASSERT_EQ(dssh_serialize_uint32(2048, req, sizeof(req), &rp), 0);
+	ASSERT_EQ(dssh_serialize_uint32(4096, req, sizeof(req), &rp), 0);
+	ASSERT_EQ(dssh_serialize_uint32(8192, req, sizeof(req), &rp), 0);
 	uint8_t wire[64];
-	size_t wlen = build_plaintext_packet_t(req, rp, wire, sizeof(wire));
+	size_t wlen = 0;
+	ASSERT_EQ(build_plaintext_packet_t(req, rp, wire, sizeof(wire), &wlen), 0);
 
 	/* Set provider with NULL select_group */
 	struct dssh_dh_gex_provider bad_prov = { .select_group = NULL };
+	void *saved = ctx.server->trans.kex_selected->config;
 	ctx.server->trans.kex_selected->config = &bad_prov;
 
-	int res = dhgex_server_run(&ctx, wire, wlen);
-	ASSERT_EQ(res, DSSH_ERROR_INIT);
+	int res = DSSH_ERROR_INIT;
+	ASSERT_EQ(dhgex_server_run(&ctx, wire, wlen, &res), 0);
 
+	ctx.server->trans.kex_selected->config = saved;
 	dhgex_server_teardown(&ctx);
+	ASSERT_EQ(res, DSSH_ERROR_INIT);
 	return TEST_PASS;
 }
 
@@ -4492,21 +4401,25 @@ test_dhgex_server_provider_error(void)
 	uint8_t req[16];
 	size_t rp = 0;
 	req[rp++] = 34;
-	dssh_serialize_uint32(2048, req, sizeof(req), &rp);
-	dssh_serialize_uint32(4096, req, sizeof(req), &rp);
-	dssh_serialize_uint32(8192, req, sizeof(req), &rp);
+	ASSERT_EQ(dssh_serialize_uint32(2048, req, sizeof(req), &rp), 0);
+	ASSERT_EQ(dssh_serialize_uint32(4096, req, sizeof(req), &rp), 0);
+	ASSERT_EQ(dssh_serialize_uint32(8192, req, sizeof(req), &rp), 0);
 	uint8_t wire[64];
-	size_t wlen = build_plaintext_packet_t(req, rp, wire, sizeof(wire));
+	size_t wlen = 0;
+	ASSERT_EQ(build_plaintext_packet_t(req, rp, wire, sizeof(wire), &wlen), 0);
 
 	struct dssh_dh_gex_provider err_prov = {
 		.select_group = provider_error_cb
 	};
+	void *saved = ctx.server->trans.kex_selected->config;
 	ctx.server->trans.kex_selected->config = &err_prov;
 
-	int res = dhgex_server_run(&ctx, wire, wlen);
-	ASSERT_EQ(res, DSSH_ERROR_INIT);
+	int res = DSSH_ERROR_INIT;
+	ASSERT_EQ(dhgex_server_run(&ctx, wire, wlen, &res), 0);
 
+	ctx.server->trans.kex_selected->config = saved;
 	dhgex_server_teardown(&ctx);
+	ASSERT_EQ(res, DSSH_ERROR_INIT);
 	return TEST_PASS;
 }
 
@@ -4524,23 +4437,24 @@ test_dhgex_server_bad_init_type(void)
 	uint8_t req[16];
 	size_t rp = 0;
 	req[rp++] = 34;
-	dssh_serialize_uint32(2048, req, sizeof(req), &rp);
-	dssh_serialize_uint32(4096, req, sizeof(req), &rp);
-	dssh_serialize_uint32(8192, req, sizeof(req), &rp);
-	wlen += build_plaintext_packet_t(req, rp, &wire[wlen], sizeof(wire) - wlen);
+	ASSERT_EQ(dssh_serialize_uint32(2048, req, sizeof(req), &rp), 0);
+	ASSERT_EQ(dssh_serialize_uint32(4096, req, sizeof(req), &rp), 0);
+	ASSERT_EQ(dssh_serialize_uint32(8192, req, sizeof(req), &rp), 0);
+	ASSERT_EQ(build_plaintext_packet_t(req, rp, wire, sizeof(wire), &wlen), 0);
 
 	/* Wrong type: GEX_REQUEST(34) instead of GEX_INIT(32) */
 	uint8_t bad[16];
 	size_t bp = 0;
 	bad[bp++] = 34; /* wrong: should be 32 */
-	dssh_serialize_uint32(1, bad, sizeof(bad), &bp);
+	ASSERT_EQ(dssh_serialize_uint32(1, bad, sizeof(bad), &bp), 0);
 	bad[bp++] = 0x02;
-	wlen += build_plaintext_packet_t(bad, bp, &wire[wlen], sizeof(wire) - wlen);
+	ASSERT_EQ(build_plaintext_packet_t(bad, bp, wire, sizeof(wire), &wlen), 0);
 
-	int res = dhgex_server_run(&ctx, wire, wlen);
-	ASSERT_TRUE(res < 0);
+	int res = DSSH_ERROR_INIT;
+	ASSERT_EQ(dhgex_server_run(&ctx, wire, wlen, &res), 0);
 
 	dhgex_server_teardown(&ctx);
+	ASSERT_TRUE(res < 0);
 	return TEST_PASS;
 }
 
@@ -4558,22 +4472,23 @@ test_dhgex_server_e_zero(void)
 	uint8_t req[16];
 	size_t rp = 0;
 	req[rp++] = 34;
-	dssh_serialize_uint32(2048, req, sizeof(req), &rp);
-	dssh_serialize_uint32(4096, req, sizeof(req), &rp);
-	dssh_serialize_uint32(8192, req, sizeof(req), &rp);
-	wlen += build_plaintext_packet_t(req, rp, &wire[wlen], sizeof(wire) - wlen);
+	ASSERT_EQ(dssh_serialize_uint32(2048, req, sizeof(req), &rp), 0);
+	ASSERT_EQ(dssh_serialize_uint32(4096, req, sizeof(req), &rp), 0);
+	ASSERT_EQ(dssh_serialize_uint32(8192, req, sizeof(req), &rp), 0);
+	ASSERT_EQ(build_plaintext_packet_t(req, rp, wire, sizeof(wire), &wlen), 0);
 
 	/* GEX_INIT with e=0 (invalid: not in [1, p-1]) */
 	uint8_t init[16];
 	size_t ip = 0;
 	init[ip++] = 32; /* GEX_INIT */
-	dssh_serialize_uint32(0, init, sizeof(init), &ip); /* mpint len=0 -> value 0 */
-	wlen += build_plaintext_packet_t(init, ip, &wire[wlen], sizeof(wire) - wlen);
+	ASSERT_EQ(dssh_serialize_uint32(0, init, sizeof(init), &ip), 0); /* mpint len=0 -> value 0 */
+	ASSERT_EQ(build_plaintext_packet_t(init, ip, wire, sizeof(wire), &wlen), 0);
 
-	int res = dhgex_server_run(&ctx, wire, wlen);
-	ASSERT_TRUE(res < 0);
+	int res = DSSH_ERROR_INIT;
+	ASSERT_EQ(dhgex_server_run(&ctx, wire, wlen, &res), 0);
 
 	dhgex_server_teardown(&ctx);
+	ASSERT_TRUE(res < 0);
 	return TEST_PASS;
 }
 
@@ -4589,16 +4504,18 @@ test_dhgex_server_recv_init_fail(void)
 	uint8_t req[16];
 	size_t rp = 0;
 	req[rp++] = 34;
-	dssh_serialize_uint32(2048, req, sizeof(req), &rp);
-	dssh_serialize_uint32(4096, req, sizeof(req), &rp);
-	dssh_serialize_uint32(8192, req, sizeof(req), &rp);
+	ASSERT_EQ(dssh_serialize_uint32(2048, req, sizeof(req), &rp), 0);
+	ASSERT_EQ(dssh_serialize_uint32(4096, req, sizeof(req), &rp), 0);
+	ASSERT_EQ(dssh_serialize_uint32(8192, req, sizeof(req), &rp), 0);
 	uint8_t wire[64];
-	size_t wlen = build_plaintext_packet_t(req, rp, wire, sizeof(wire));
+	size_t wlen = 0;
+	ASSERT_EQ(build_plaintext_packet_t(req, rp, wire, sizeof(wire), &wlen), 0);
 
-	int res = dhgex_server_run(&ctx, wire, wlen);
-	ASSERT_TRUE(res < 0);
+	int res = DSSH_ERROR_INIT;
+	ASSERT_EQ(dhgex_server_run(&ctx, wire, wlen, &res), 0);
 
 	dhgex_server_teardown(&ctx);
+	ASSERT_TRUE(res < 0);
 	return TEST_PASS;
 }
 
@@ -4613,11 +4530,12 @@ test_dhgex_server_ka_null(void)
 	dssh_key_algo saved = ctx.server->trans.key_algo_selected;
 	ctx.server->trans.key_algo_selected = NULL;
 
-	int res = dhgex_server_run(&ctx, NULL, 0);
-	ASSERT_EQ(res, DSSH_ERROR_INIT);
+	int res = DSSH_ERROR_INIT;
+	ASSERT_EQ(dhgex_server_run(&ctx, NULL, 0, &res), 0);
 
 	ctx.server->trans.key_algo_selected = saved;
 	dhgex_server_teardown(&ctx);
+	ASSERT_EQ(res, DSSH_ERROR_INIT);
 	return TEST_PASS;
 }
 /* end DH-GEX server handler tests */
@@ -4631,118 +4549,32 @@ test_dhgex_server_ka_null(void)
  * ================================================================ */
 
 struct c25519_server_ctx {
+	struct test_session_pair pair;
 	dssh_session server;
-	struct mock_io_state *io;
 };
 
 static int
 c25519_server_setup(struct c25519_server_ctx *ctx)
 {
-	dssh_test_reset_global_config();
-	dssh_test_alloc_reset();
-	dssh_test_ossl_reset();
-
-	if (dssh_register_curve25519_sha256() < 0)
-		return -1;
-	if (dssh_register_ssh_ed25519() < 0)
-		return -1;
-	if (dssh_register_aes256_ctr() < 0)
-		return -1;
-	if (test_register_mac_algos() < 0)
-		return -1;
-	if (dssh_register_none_comp() < 0)
-		return -1;
-	if (dssh_ed25519_generate_key() < 0)
-		return -1;
-
-	ctx->io = malloc(sizeof(struct mock_io_state));
-	if (mock_io_init(ctx->io, 0) < 0)
-		return -1;
-
-	dssh_transport_set_callbacks(mock_tx_dispatch, mock_rx_dispatch,
-	    mock_rxline_dispatch, mock_extra_line_cb);
-
-	dssh_session client = dssh_session_init(true, 0);
-	if (client == NULL)
-		return -1;
-	dssh_session_set_cbdata(client, ctx->io, ctx->io, ctx->io, ctx->io);
-
-	ctx->server = dssh_session_init(false, 0);
-	if (ctx->server == NULL) {
-		dssh_session_cleanup(client);
-		return -1;
-	}
-	dssh_session_set_cbdata(ctx->server, ctx->io, ctx->io,
-	    ctx->io, ctx->io);
-
-	/* Two-threaded version_exchange + kexinit */
-	struct ve_ki_ctx ca = { .io = ctx->io, .sess = client };
-	struct ve_ki_ctx sa = { .io = ctx->io, .sess = ctx->server };
-	thrd_t ct, st;
-	if (thrd_create(&ct, ve_ki_thread, &ca) != thrd_success)
-		return -1;
-	if (thrd_create(&st, ve_ki_thread, &sa) != thrd_success)
-		return -1;
-	thrd_join(ct, NULL);
-	thrd_join(st, NULL);
-
-	dssh_session_cleanup(client);
-	mock_io_close_c2s(ctx->io);
-	mock_io_close_s2c(ctx->io);
-	mock_io_free(ctx->io);
-
-	if (ca.result != 0 || sa.result != 0)
-		return -1;
-
-	return 0;
+	ctx->server = NULL;
+	int ret = direct_kex_setup(&ctx->pair, false);
+	if (ret == 0)
+		ctx->server = ctx->pair.server;
+	return ret;
 }
 
 static void
 c25519_server_teardown(struct c25519_server_ctx *ctx)
 {
-	dssh_session_cleanup(ctx->server);
-	free(ctx->io);
-	dssh_test_reset_global_config();
+	ctx->server = NULL;
+	direct_kex_dispose(&ctx->pair);
 }
 
-/* Run the server handler with specific injected packets */
 static int
 c25519_server_run(struct c25519_server_ctx *ctx,
-    const uint8_t *wire, size_t wire_len)
+    const uint8_t *wire, size_t wire_len, int *operation)
 {
-	struct mock_io_state iter_io;
-	if (mock_io_init(&iter_io, 0) < 0)
-		return -999;
-	dssh_session_set_cbdata(ctx->server, &iter_io, &iter_io,
-	    &iter_io, &iter_io);
-
-	if (wire != NULL && wire_len > 0)
-		mock_io_inject(&iter_io.c2s, wire, wire_len);
-
-	/* Close c2s write end so server gets EOF after injected data */
-	if (iter_io.c2s.wfd >= 0) {
-		close(iter_io.c2s.wfd);
-		iter_io.c2s.wfd = -1;
-	}
-
-	/* Ensure ossl injection is disabled */
-	dssh_test_ossl_reset();
-	dssh_test_alloc_reset();
-
-	/* Reset mutable server state */
-	dssh_result_release(&ctx->server->trans.kex_result.lease);
-	ctx->server->trans.kex_result = (struct dssh_kex_result){0};
-	ctx->server->terminate = false;
-
-	int res = kex(ctx->server);
-
-	uint8_t drain[16384];
-	mock_io_drain(&iter_io.s2c, drain, sizeof(drain));
-	mock_io_close_c2s(&iter_io);
-	mock_io_close_s2c(&iter_io);
-	mock_io_free(&iter_io);
-
-	return res;
+	return direct_kex_run(&ctx->pair, wire, wire_len, -1, operation);
 }
 
 static int
@@ -4756,11 +4588,12 @@ test_c25519_server_ka_null(void)
 	dssh_key_algo saved = ctx.server->trans.key_algo_selected;
 	ctx.server->trans.key_algo_selected = NULL;
 
-	int res = c25519_server_run(&ctx, NULL, 0);
-	ASSERT_EQ(res, DSSH_ERROR_INIT);
+	int res = DSSH_ERROR_INIT;
+	ASSERT_EQ(c25519_server_run(&ctx, NULL, 0, &res), 0);
 
 	ctx.server->trans.key_algo_selected = saved;
 	c25519_server_teardown(&ctx);
+	ASSERT_EQ(res, DSSH_ERROR_INIT);
 	return TEST_PASS;
 }
 
@@ -4774,14 +4607,16 @@ test_c25519_server_null_pubkey_fn(void)
 	/* Set key_algo to a stub with NULL pubkey */
 	struct dssh_key_algo_s dummy = {0};
 	dummy.sign = dummy_sign;
+	dssh_key_algo saved = ctx.server->trans.key_algo_selected;
 	ctx.server->trans.key_algo_selected = &dummy;
 
-	int res = c25519_server_run(&ctx, NULL, 0);
-	ASSERT_EQ(res, DSSH_ERROR_INIT);
+	int res = DSSH_ERROR_INIT;
+	ASSERT_EQ(c25519_server_run(&ctx, NULL, 0, &res), 0);
 
 	/* Restore before teardown */
-	ctx.server->trans.key_algo_selected = NULL;
+	ctx.server->trans.key_algo_selected = saved;
 	c25519_server_teardown(&ctx);
+	ASSERT_EQ(res, DSSH_ERROR_INIT);
 	return TEST_PASS;
 }
 
@@ -4794,13 +4629,15 @@ test_c25519_server_null_sign_fn(void)
 
 	struct dssh_key_algo_s dummy = {0};
 	dummy.pubkey = dummy_pubkey;
+	dssh_key_algo saved = ctx.server->trans.key_algo_selected;
 	ctx.server->trans.key_algo_selected = &dummy;
 
-	int res = c25519_server_run(&ctx, NULL, 0);
-	ASSERT_EQ(res, DSSH_ERROR_INIT);
+	int res = DSSH_ERROR_INIT;
+	ASSERT_EQ(c25519_server_run(&ctx, NULL, 0, &res), 0);
 
-	ctx.server->trans.key_algo_selected = NULL;
+	ctx.server->trans.key_algo_selected = saved;
 	c25519_server_teardown(&ctx);
+	ASSERT_EQ(res, DSSH_ERROR_INIT);
 	return TEST_PASS;
 }
 
@@ -4812,10 +4649,11 @@ test_c25519_server_recv_fail(void)
 		return TEST_FAIL;
 
 	/* No packets injected -- recv will fail immediately (pipe closed) */
-	int res = c25519_server_run(&ctx, NULL, 0);
-	ASSERT_TRUE(res < 0);
+	int res = DSSH_ERROR_INIT;
+	ASSERT_EQ(c25519_server_run(&ctx, NULL, 0, &res), 0);
 
 	c25519_server_teardown(&ctx);
+	ASSERT_TRUE(res < 0);
 	return TEST_PASS;
 }
 
@@ -4830,14 +4668,16 @@ test_c25519_server_bad_init_type(void)
 	uint8_t pkt[8];
 	size_t pp = 0;
 	pkt[pp++] = 31; /* ECDH_REPLY, not ECDH_INIT(30) */
-	dssh_serialize_uint32(32, pkt, sizeof(pkt), &pp);
+	ASSERT_EQ(dssh_serialize_uint32(32, pkt, sizeof(pkt), &pp), 0);
 	uint8_t wire[64];
-	size_t wlen = build_plaintext_packet_t(pkt, pp, wire, sizeof(wire));
+	size_t wlen = 0;
+	ASSERT_EQ(build_plaintext_packet_t(pkt, pp, wire, sizeof(wire), &wlen), 0);
 
-	int res = c25519_server_run(&ctx, wire, wlen);
-	ASSERT_EQ(res, DSSH_ERROR_PARSE);
+	int res = DSSH_ERROR_INIT;
+	ASSERT_EQ(c25519_server_run(&ctx, wire, wlen, &res), 0);
 
 	c25519_server_teardown(&ctx);
+	ASSERT_EQ(res, DSSH_ERROR_PARSE);
 	return TEST_PASS;
 }
 
@@ -4852,16 +4692,18 @@ test_c25519_server_bad_qc_len(void)
 	uint8_t pkt[32];
 	size_t pp = 0;
 	pkt[pp++] = 30; /* SSH_MSG_KEX_ECDH_INIT */
-	dssh_serialize_uint32(16, pkt, sizeof(pkt), &pp);
+	ASSERT_EQ(dssh_serialize_uint32(16, pkt, sizeof(pkt), &pp), 0);
 	memset(&pkt[pp], 0x42, 16);
 	pp += 16;
 	uint8_t wire[64];
-	size_t wlen = build_plaintext_packet_t(pkt, pp, wire, sizeof(wire));
+	size_t wlen = 0;
+	ASSERT_EQ(build_plaintext_packet_t(pkt, pp, wire, sizeof(wire), &wlen), 0);
 
-	int res = c25519_server_run(&ctx, wire, wlen);
-	ASSERT_EQ(res, DSSH_ERROR_PARSE);
+	int res = DSSH_ERROR_INIT;
+	ASSERT_EQ(c25519_server_run(&ctx, wire, wlen, &res), 0);
 
 	c25519_server_teardown(&ctx);
+	ASSERT_EQ(res, DSSH_ERROR_PARSE);
 	return TEST_PASS;
 }
 
@@ -4876,16 +4718,18 @@ test_c25519_server_qc_overrun(void)
 	uint8_t pkt[32];
 	size_t pp = 0;
 	pkt[pp++] = 30; /* SSH_MSG_KEX_ECDH_INIT */
-	dssh_serialize_uint32(32, pkt, sizeof(pkt), &pp); /* claims 32 bytes */
+	ASSERT_EQ(dssh_serialize_uint32(32, pkt, sizeof(pkt), &pp), 0); /* claims 32 bytes */
 	memset(&pkt[pp], 0x42, 10); /* only 10 bytes present */
 	pp += 10;
 	uint8_t wire[64];
-	size_t wlen = build_plaintext_packet_t(pkt, pp, wire, sizeof(wire));
+	size_t wlen = 0;
+	ASSERT_EQ(build_plaintext_packet_t(pkt, pp, wire, sizeof(wire), &wlen), 0);
 
-	int res = c25519_server_run(&ctx, wire, wlen);
-	ASSERT_TRUE(res < 0);
+	int res = DSSH_ERROR_INIT;
+	ASSERT_EQ(c25519_server_run(&ctx, wire, wlen, &res), 0);
 
 	c25519_server_teardown(&ctx);
+	ASSERT_TRUE(res < 0);
 	return TEST_PASS;
 }
 
@@ -4931,8 +4775,10 @@ test_c25519_peer_validation(void)
 		return TEST_FAIL;
 	uint8_t pkt[37] = { SSH_MSG_KEX_ECDH_INIT, 0, 0, 0, 32 };
 	uint8_t wire[64];
-	size_t len = build_plaintext_packet_t(pkt, sizeof(pkt), wire, sizeof(wire));
-	int ret = c25519_server_run(&ctx, wire, len);
+	size_t len = 0;
+	ASSERT_EQ(build_plaintext_packet_t(pkt, sizeof(pkt), wire, sizeof(wire), &len), 0);
+	int ret = DSSH_ERROR_INIT;
+	ASSERT_EQ(c25519_server_run(&ctx, wire, len, &ret), 0);
 	bool output_absent = ctx.server->trans.kex_result.shared_secret.data == NULL;
 	c25519_server_teardown(&ctx);
 	ASSERT_TRUE(ret < 0);
@@ -7153,6 +6999,7 @@ register_fixed_rekey_methods(void)
 }
 
 #include "transport_transition_cases.h"
+#include "direct_kex_cases.h"
 
 static int
 boundary_tx(uint8_t *buf, size_t bufsz, dssh_session sess, void *cbdata)
@@ -8735,12 +8582,14 @@ test_rekey_global_pipeline(void)
 #include "gather_batch_cases.h"
 
 static struct dssh_test_entry tests[] = {
+	{ "direct_kex/fixture", test_direct_kex_fixture },
+	{ "direct_kex/builder", test_direct_packet_builder },
 	{ "rekey/owned_roundtrip", test_rekey_owned_roundtrip },
 	{ "rekey/sequence_oracle", test_rekey_sequence_oracle },
 #if defined(DSSH_TRANSPORT_REKEY_CONTROLS)
 	{ "fixture/ownership", test_transport_all_rekey_ownership },
 #elif defined(DSSH_TRANSPORT_PAIR_CONTROLS)
-	{ "fixture/ownership", test_transport_pair_ownership },
+	{ "fixture/ownership", test_transport_selected_pair_ownership },
 #endif
 	{ "release/test_layout", test_transport_test_layout },
 	{ "gather/batch", test_gather_batch },
@@ -9194,7 +9043,7 @@ main(int argc, char **argv)
 #ifdef DSSH_TRANSPORT_REKEY_CONTROLS
 		return transport_all_rekey_assertion_control(phase);
 #else
-		return transport_pair_assertion_control(phase);
+		return transport_selected_pair_assertion_control(phase);
 #endif
 	}
 #endif

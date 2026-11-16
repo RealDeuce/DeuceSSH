@@ -76,13 +76,15 @@ test_dhgex_provider_contract(void)
 		uint8_t request[] = {34, 0, 0, 8, 0, 0, 0, 16, 0, 0, 0, 32, 0};
 		uint8_t init[] = {32, 0, 0, 0, 1, 2};
 		uint8_t wire[64];
-		size_t length = build_plaintext_packet_t(request, sizeof(request), wire, sizeof(wire));
-		length += build_plaintext_packet_t(init, sizeof(init), wire + length, sizeof(wire) - length);
+		size_t length = 0;
+		ASSERT_EQ(build_plaintext_packet_t(request, sizeof(request), wire, sizeof(wire), &length), 0);
+		ASSERT_EQ(build_plaintext_packet_t(init, sizeof(init), wire, sizeof(wire), &length), 0);
 		unsigned static_before = test_dh_group_static_releases();
 		unsigned rounds = mode == 0 ? 2 : 1;
 		bool valid = true;
 		for (unsigned round = 0; round < rounds; round++) {
-			int ret = dhgex_server_run(&ctx, wire, length);
+			int ret = DSSH_ERROR_INIT;
+			ASSERT_EQ(dhgex_server_run(&ctx, wire, length, &ret), 0);
 			bool owned = mode != 9 && mode != 10 && mode != 14;
 			unsigned releases = owned ? round + 1 : 0;
 			valid = valid && ret == expected[mode] && atomic_load(&state.valid)
@@ -101,7 +103,8 @@ test_dhgex_provider_contract(void)
 			state.prime = rfc3526_grp15_p;
 			state.prime_len = 384;
 			group_test_alloc_failure = 0;
-			int ret = dhgex_server_run(&ctx, wire, length);
+			int ret = DSSH_ERROR_INIT;
+			ASSERT_EQ(dhgex_server_run(&ctx, wire, length, &ret), 0);
 			group_test_alloc_failure = -1;
 			state.prime = rfc3526_grp14_p;
 			state.prime_len = 256;
@@ -110,7 +113,7 @@ test_dhgex_provider_contract(void)
 			    && probe.calls == 3 && probe.valid && dh_group_storage_zero(&state);
 			struct control_tx_failure failure = {.sess = ctx.server};
 			control_tx_failure = &failure;
-			ret = dhgex_server_run(&ctx, wire, length);
+			ASSERT_EQ(dhgex_server_run(&ctx, wire, length, &ret), 0);
 			control_tx_failure = NULL;
 			valid = valid && ret < 0 && failure.calls == 1
 			    && atomic_load(&state.calls) == 4 && atomic_load(&state.releases) == 4

@@ -563,4 +563,223 @@ test_init_large_packet_size(void)
 	return TEST_PASS;
 }
 
+enum state_policy_kind {
+	STATE_POLICY_INITIAL,
+	STATE_POLICY_TX_PACKETS,
+	STATE_POLICY_RX_PACKETS,
+	STATE_POLICY_BYTES,
+	STATE_POLICY_TIME,
+	STATE_POLICY_DISABLED,
+	STATE_POLICY_BELOW,
+	STATE_POLICY_DIRECTIONS,
+	STATE_POLICY_SERVER,
+	STATE_POLICY_ZERO,
+	STATE_POLICY_COUNT
+};
+
+static bool
+state_policy_case(enum state_policy_kind kind)
+{
+	static const struct {
+		enum state_policy_kind kind;
+		uint64_t tx_bytes;
+		uint64_t rx_bytes;
+		uint_fast32_t tx_packets;
+		uint32_t rx_packets;
+		uint32_t seconds;
+		time_t start;
+		time_t now;
+		long nanos;
+		bool expected[2];
+		int clock_calls;
+	} cases[] = {
+		{.kind = STATE_POLICY_INITIAL},
+		{.kind = STATE_POLICY_TX_PACKETS, .tx_packets = DSSH_REKEY_SOFT_LIMIT - 1},
+		{.kind = STATE_POLICY_TX_PACKETS, .tx_packets = DSSH_REKEY_SOFT_LIMIT, .expected = {true, true}},
+		{.kind = STATE_POLICY_TX_PACKETS, .tx_packets = DSSH_REKEY_HARD_LIMIT, .expected = {true, true}},
+		{.kind = STATE_POLICY_TX_PACKETS, .tx_packets = UINT_FAST32_MAX, .expected = {true, true}},
+		{.kind = STATE_POLICY_RX_PACKETS, .rx_packets = DSSH_REKEY_SOFT_LIMIT - 1},
+		{.kind = STATE_POLICY_RX_PACKETS, .rx_packets = DSSH_REKEY_SOFT_LIMIT, .expected = {true, true}},
+		{.kind = STATE_POLICY_RX_PACKETS, .rx_packets = DSSH_REKEY_HARD_LIMIT, .expected = {true, true}},
+		{.kind = STATE_POLICY_RX_PACKETS, .rx_packets = UINT32_MAX, .expected = {true, true}},
+		{.kind = STATE_POLICY_BYTES, .tx_bytes = 1023},
+		{.kind = STATE_POLICY_BYTES, .tx_bytes = 1024, .expected = {true, false}},
+		{.kind = STATE_POLICY_BYTES, .tx_bytes = 8191, .expected = {true, false}},
+		{.kind = STATE_POLICY_BYTES, .tx_bytes = 8192, .expected = {true, true}},
+		{.kind = STATE_POLICY_BYTES, .rx_bytes = 1023},
+		{.kind = STATE_POLICY_BYTES, .rx_bytes = 1024, .expected = {false, true}},
+		{.kind = STATE_POLICY_BYTES, .rx_bytes = 8191, .expected = {false, true}},
+		{.kind = STATE_POLICY_BYTES, .rx_bytes = 8192, .expected = {true, true}},
+		{.kind = STATE_POLICY_TIME, .seconds = 10, .start = 100, .now = 109, .clock_calls = 1},
+		{.kind = STATE_POLICY_TIME, .seconds = 10, .start = 100, .now = 110, .expected = {true, true}, .clock_calls = 1},
+		{.kind = STATE_POLICY_TIME, .seconds = 10, .start = 100, .now = 111, .expected = {true, true}, .clock_calls = 1},
+		{.kind = STATE_POLICY_TIME, .seconds = 10, .start = 100, .now = 90, .clock_calls = 1},
+		{.kind = STATE_POLICY_TIME, .seconds = 10, .start = 100, .now = 109, .nanos = 999999999L, .clock_calls = 1},
+		{.kind = STATE_POLICY_TIME, .seconds = UINT32_MAX, .start = 100, .now = 111, .clock_calls = 1},
+		{.kind = STATE_POLICY_DISABLED, .start = 0, .now = 2000},
+		{.kind = STATE_POLICY_DISABLED, .seconds = 60, .now = 2000, .expected = {true, true}, .clock_calls = 1},
+		{.kind = STATE_POLICY_DISABLED, .seconds = 3600, .start = 100, .now = 110, .clock_calls = 1},
+		{.kind = STATE_POLICY_DISABLED, .tx_bytes = 1024, .expected = {true, false}},
+		{.kind = STATE_POLICY_DISABLED, .rx_bytes = 1024, .expected = {false, true}},
+		{.kind = STATE_POLICY_BELOW, .tx_bytes = 1023, .rx_bytes = 1023,
+		    .tx_packets = DSSH_REKEY_SOFT_LIMIT - 1, .rx_packets = DSSH_REKEY_SOFT_LIMIT - 1},
+		{.kind = STATE_POLICY_BELOW, .tx_bytes = 1023, .rx_bytes = 1023,
+		    .tx_packets = DSSH_REKEY_SOFT_LIMIT - 1, .rx_packets = DSSH_REKEY_SOFT_LIMIT - 1,
+		    .seconds = 10, .start = 100, .now = 109, .clock_calls = 1},
+		/* Both counters stay below their individual limits, even though
+		 * their sum exceeds the smaller directional limit. */
+		{.kind = STATE_POLICY_DIRECTIONS, .tx_bytes = 513, .rx_bytes = 513},
+		{.kind = STATE_POLICY_DIRECTIONS, .tx_bytes = 4097, .rx_bytes = 513, .expected = {true, false}},
+		{.kind = STATE_POLICY_DIRECTIONS, .tx_bytes = 513, .rx_bytes = 4097, .expected = {false, true}},
+		{.kind = STATE_POLICY_DIRECTIONS, .tx_bytes = 8192, .expected = {true, true}},
+		{.kind = STATE_POLICY_DIRECTIONS, .rx_bytes = 8192, .expected = {true, true}},
+		{.kind = STATE_POLICY_SERVER, .tx_bytes = 1024, .expected = {true, false}},
+		{.kind = STATE_POLICY_SERVER, .rx_bytes = 1024, .expected = {false, true}},
+		{.kind = STATE_POLICY_SERVER, .rx_bytes = 8192, .expected = {true, true}},
+		{.kind = STATE_POLICY_ZERO, .seconds = 1, .clock_calls = 1},
+		{.kind = STATE_POLICY_ZERO, .seconds = 1, .now = 1, .expected = {true, true}, .clock_calls = 1},
+		{.kind = STATE_POLICY_ZERO, .seconds = 1, .now = 2, .expected = {true, true}, .clock_calls = 1},
+	};
+	if (kind < STATE_POLICY_INITIAL || kind >= STATE_POLICY_COUNT)
+		return false;
+	struct test_session_pair pair;
+	dssh_enc first = NULL;
+	dssh_enc second = NULL;
+	uint64_t saved_first = 0;
+	uint64_t saved_second = 0;
+	bool changed = false;
+	bool valid = false;
+	unsigned checked = 0;
+	int ret = state_prepare(&pair, true);
+	if (ret != 0)
+		goto done;
+	struct timespec initial = {.tv_sec = kind == STATE_POLICY_ZERO ? 0 : 100};
+	dssh_test_clock_set(initial);
+	ret = state_sessions(&pair, true);
+	first = gconf.enc_head;
+	second = first == NULL ? NULL : first->next;
+	if (ret == 0)
+		ret = state_cipher_contexts(pair.client, first, second);
+	if (ret == 0)
+		ret = state_cipher_contexts(pair.server, first, second);
+	if (ret != 0)
+		goto done;
+	saved_first = first->bytes_per_key;
+	saved_second = second->bytes_per_key;
+	first->bytes_per_key = 1024;
+	second->bytes_per_key = 8192;
+	changed = true;
+	valid = strcmp(first->name, "aes256-ctr") == 0 && strcmp(second->name, "aes128-cbc") == 0;
+	dssh_session sessions[] = {pair.client, pair.server};
+	for (size_t role = 0; role < sizeof(sessions) / sizeof(sessions[0]); role++) {
+		dssh_session sess = sessions[role];
+		valid = sess->trans.rekey_time == initial.tv_sec && atomic_load(&sess->trans.rekey_seconds) == 0
+		    && atomic_load(&sess->trans.tx_since_rekey) == 0 && sess->trans.rx_since_rekey == 0
+		    && atomic_load(&sess->trans.tx_bytes_since_rekey) == 0 && sess->trans.rx_bytes_since_rekey == 0 && valid;
+		for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+			if (cases[i].kind != kind)
+				continue;
+			atomic_store(&sess->trans.tx_since_rekey, cases[i].tx_packets);
+			sess->trans.rx_since_rekey = cases[i].rx_packets;
+			atomic_store(&sess->trans.tx_bytes_since_rekey, cases[i].tx_bytes);
+			sess->trans.rx_bytes_since_rekey = cases[i].rx_bytes;
+			sess->trans.rekey_time = cases[i].start;
+			ret = dssh_session_set_rekey_seconds(sess, cases[i].seconds);
+			valid = ret == 0 && atomic_load(&sess->trans.rekey_seconds) == cases[i].seconds && valid;
+			struct timespec now = {.tv_sec = cases[i].now, .tv_nsec = cases[i].nanos};
+			dssh_test_clock_reset();
+			dssh_test_clock_set(now);
+			dssh_test_clock_fail_after(INT_MAX);
+			bool actual = rekey_needed(sess);
+			int clock_calls = dssh_test_clock_count();
+			dssh_test_clock_reset();
+			valid = actual == cases[i].expected[role] && clock_calls == cases[i].clock_calls
+			    && !dssh_session_is_terminated(sess) && valid;
+			checked++;
+		}
+	}
+	valid = checked > 0 && valid;
+done:
+	if (changed) {
+		first->bytes_per_key = saved_first;
+		second->bytes_per_key = saved_second;
+	}
+	dssh_test_clock_reset();
+	state_finish(&pair);
+	bool retired = state_retired(&pair);
+	int kind_number = (int)kind;
+	int printed = printf("rekey_policy kind=%d roles=2 checked=%u retired=%d valid=%d\n", kind_number, checked, retired, valid);
+	return valid && retired && printed > 0;
+}
+
+static int
+test_rekey_needed_false_initially(void)
+{
+	ASSERT_TRUE(state_policy_case(STATE_POLICY_INITIAL));
+	return TEST_PASS;
+}
+
+static int
+test_rekey_needed_tx_packets(void)
+{
+	ASSERT_TRUE(state_policy_case(STATE_POLICY_TX_PACKETS));
+	return TEST_PASS;
+}
+
+static int
+test_rekey_needed_rx_packets(void)
+{
+	ASSERT_TRUE(state_policy_case(STATE_POLICY_RX_PACKETS));
+	return TEST_PASS;
+}
+
+static int
+test_rekey_needed_bytes(void)
+{
+	ASSERT_TRUE(state_policy_case(STATE_POLICY_BYTES));
+	return TEST_PASS;
+}
+
+static int
+test_rekey_needed_time(void)
+{
+	ASSERT_TRUE(state_policy_case(STATE_POLICY_TIME));
+	return TEST_PASS;
+}
+
+static int
+test_rekey_seconds_disabled(void)
+{
+	ASSERT_TRUE(state_policy_case(STATE_POLICY_DISABLED));
+	return TEST_PASS;
+}
+
+static int
+test_rekey_needed_below_threshold(void)
+{
+	ASSERT_TRUE(state_policy_case(STATE_POLICY_BELOW));
+	return TEST_PASS;
+}
+
+static int
+test_rekey_bytes_per_direction(void)
+{
+	ASSERT_TRUE(state_policy_case(STATE_POLICY_DIRECTIONS));
+	return TEST_PASS;
+}
+
+static int
+test_rekey_server_direction_limits(void)
+{
+	ASSERT_TRUE(state_policy_case(STATE_POLICY_SERVER));
+	return TEST_PASS;
+}
+
+static int
+test_rekey_time_zero(void)
+{
+	ASSERT_TRUE(state_policy_case(STATE_POLICY_ZERO));
+	return TEST_PASS;
+}
+
 #endif

@@ -1510,6 +1510,15 @@ foreach(leaf init/small_packet_size init/large_packet_size)
 		"1 tests: 1 passed, 0 failed, 0 skipped" --exact ${leaf})
 	set_tests_properties(dssh_packet_r103_${leaf} PROPERTIES TIMEOUT 120)
 endforeach()
+set(rekey_policy_leaves rekey/needed_false_initially rekey/needed_tx_packets
+	rekey/needed_rx_packets rekey/needed_bytes rekey/needed_time rekey/seconds_disabled
+	rekey/needed_below_threshold rekey/bytes_per_direction release/server_direction_limits
+	guard/rekey_time_zero)
+foreach(leaf IN LISTS rekey_policy_leaves)
+	dssh_add_output_test(dssh_policy_r104_${leaf} dssh_test_transport
+		"1 tests: 1 passed, 0 failed, 0 skipped" --exact ${leaf})
+	set_tests_properties(dssh_policy_r104_${leaf} PROPERTIES TIMEOUT 120)
+endforeach()
 set(direct_kex_leaves
 	release/dhgex_group_validation release/dhgex_peer_validation
 	dhgex/server_null_pubkey_fn dhgex/server_null_sign_fn dhgex/server_recv_fail

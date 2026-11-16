@@ -825,13 +825,31 @@ done:
 	return ret;
 }
 
+/* Preserve the reference urandom32 little-endian interpretation while keeping
+ * one bulk entropy request and reusing the caller's actual word storage. Each
+ * word's four octets are read before that word is overwritten. */
+static void
+decode_random_words(uint32_t words[p])
+{
+	unsigned char *bytes = (unsigned char *)words;
+	for (size_t i = 0; i < p; i++) {
+		uint32_t low = bytes[4 * i];
+		uint32_t second = bytes[4 * i + 1];
+		uint32_t third = bytes[4 * i + 2];
+		uint32_t high = bytes[4 * i + 3];
+		words[i] = low | (second << 8) | (third << 16) | (high << 24);
+	}
+}
+
 static int
 Short_random(small *out)
 {
 	uint32_t L[p];
 	int ret = randombytes(L, sizeof(L));
-	if (ret == 0)
+	if (ret == 0) {
+		decode_random_words(L);
 		Short_fromlist(out, L);
+	}
 	sntrup_clear(L, sizeof(L));
 	return ret;
 }
@@ -843,6 +861,7 @@ Small_random(small *out)
 	uint32_t L[p];
 	int ret = randombytes(L, sizeof(L));
 	if (ret == 0) {
+		decode_random_words(L);
 		for (i = 0; i < p; ++i) {
 			uint32_t bucket = ((L[i] & UINT32_C(0x3fffffff)) * UINT32_C(3)) >> 30;
 			int32_t coefficient = (int32_t)bucket; /*0..2. */

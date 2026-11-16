@@ -178,3 +178,11 @@ record. Full fallback bytes, input preservation/guards and actual before/after
 positive controls pass on both arithmetic modes/providers. These are independently
 derived specification answers; upstream/timing/foreign-target/runtime/SDK and
 other release qualifications remain open.
+
+
+R113 completes [the bundled/current-upstream correspondence map](release-1.0-evidence/sntrup-correspondence-review.md) and explicitly
+interprets bulk sample words in place. All56 local definitions,93 omitted helpers
+and16 native architecture branches are reconciled. Current primitive/KEX/peer
+acceptance and complete native builds pass, including the corrected standalone
+math dependency. Foreign execution/stack/timing, compiler/provider copies, native
+runtime and other release qualifications remain open.

@@ -1,5 +1,6 @@
 /* Same canonical source, independently compiled native/generic arithmetic. */
 #include <stdint.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
@@ -335,6 +336,51 @@ test_division_encoding(void)
 }
 
 static int
+test_random_words(void)
+{
+	struct {
+		uint32_t before;
+		uint32_t words[761];
+		uint32_t after;
+	} storage;
+	unsigned char *bytes = (unsigned char *)storage.words;
+	uint32_t checked = 0;
+	bool valid = true;
+	for (unsigned pattern = 0; pattern < 256; pattern++) {
+		storage.before = UINT32_C(0x13579bdf);
+		storage.after = UINT32_C(0x2468ace0);
+		for (size_t i = 0; i < 761; i++) {
+			unsigned char first = (unsigned char)pattern; /*0..255. */
+			unsigned char second = (unsigned char)(255 - pattern);
+			unsigned char third = (unsigned char)(i % 256);
+			unsigned char fourth = (unsigned char)((pattern + i / 256) % 256);
+			bytes[4 * i] = first;
+			bytes[4 * i + 1] = second;
+			bytes[4 * i + 2] = third;
+			bytes[4 * i + 3] = fourth;
+		}
+		decode_random_words(storage.words);
+		for (size_t i = 0; i < 761; i++) {
+			/* An independent base256 arithmetic oracle, without shifts or
+			 * inspection of the native word's object representation. */
+			uint64_t expected = pattern + UINT64_C(256) * (255 - pattern)
+			    + UINT64_C(65536) * (i % 256) + UINT64_C(16777216) * ((pattern + i / 256) % 256);
+			if (expected > UINT32_MAX)
+				valid = false;
+			else {
+				uint32_t word = (uint32_t)expected;
+				valid = storage.words[i] == word && valid;
+			}
+			checked++;
+		}
+		valid = storage.before == UINT32_C(0x13579bdf) && storage.after == UINT32_C(0x2468ace0) && valid;
+	}
+	int printed = printf("sntrup_words patterns=256 words=%" PRIu32 " guards=1 valid=%d\n", checked, valid);
+	ASSERT_TRUE(valid && checked == UINT32_C(194816) && printed > 0);
+	return TEST_PASS;
+}
+
+static int
 test_kem(void)
 {
 	uint8_t public_key[crypto_kem_sntrup761_PUBLICKEYBYTES];
@@ -370,6 +416,7 @@ static struct dssh_test_entry tests[] = {
 	{"arithmetic/shifts64", test_shifts64},
 	{"arithmetic/field_reduction", test_field_reduction},
 	{"arithmetic/division_encoding", test_division_encoding},
+	{"arithmetic/random_words", test_random_words},
 	{"arithmetic/kem", test_kem},
 };
 

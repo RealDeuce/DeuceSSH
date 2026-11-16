@@ -2376,137 +2376,6 @@ test_disconnect_long_description(void)
 }
 
 /* ================================================================
- * Packet recv with bad padding (Category 3)
- *
- * After handshake, corrupt a packet so padding_length >= packet_length.
- * ================================================================ */
-
-static int
-test_packet_recv_bad_padding(void)
-{
-	struct handshake_ctx ctx;
-	if (handshake_setup(&ctx) < 0) {
-		handshake_cleanup(&ctx);
-		return TEST_FAIL;
-	}
-
-	/* We need to craft a raw packet with bad padding.
-	 * The simplest approach: send a legitimate packet from client,
-	 * then receive it on server side.  This just confirms the
-	 * normal path works.  For bad padding, we'd need to inject
-	 * raw bytes -- but with encryption active, crafting raw is
-	 * extremely hard.  Instead test pre-handshake. */
-	handshake_cleanup(&ctx);
-
-	/* Test with unencrypted session */
-	dssh_test_reset_global_config();
-	if (register_all_algorithms() < 0)
-		return TEST_FAIL;
-	if (test_generate_host_key() < 0)
-		return TEST_FAIL;
-
-	struct mock_io_state io;
-	if (mock_io_init(&io, 0) < 0) {
-		dssh_test_reset_global_config();
-		return TEST_FAIL;
-	}
-
-	dssh_transport_set_callbacks(mock_tx_dispatch, mock_rx_dispatch,
-	    mock_rxline_dispatch, mock_extra_line_cb);
-
-	/* Create a server session (no handshake -- unencrypted) */
-	dssh_session sess = init_server_session();
-	if (sess == NULL) {
-		mock_io_free(&io);
-		dssh_test_reset_global_config();
-		return TEST_FAIL;
-	}
-	dssh_session_set_cbdata(sess, &io, &io, &io, &io);
-
-	/* Inject a packet where padding_length >= packet_length.
-	 * packet_length=2 (minimum for 1 byte padding + 1 byte payload),
-	 * but set padding_length=255, which is >= packet_length. */
-	uint8_t bad_packet[16];
-	size_t pos = 0;
-	/* packet_length = 2 */
-	dssh_serialize_uint32(2, bad_packet, sizeof(bad_packet), &pos);
-	/* padding_length = 255 (>= packet_length of 2) */
-	bad_packet[pos++] = 255;
-	/* payload byte */
-	bad_packet[pos++] = 0x42;
-	/* Pad to block size (8 bytes minimum) */
-	while (pos < 8)
-		bad_packet[pos++] = 0;
-
-	mock_io_inject(&io.c2s, bad_packet, 8);
-
-	uint8_t msg_type;
-	uint8_t *payload;
-	size_t payload_len;
-	int res = recv_packet(sess, &msg_type,
-	    &payload, &payload_len);
-	ASSERT_EQ(res, DSSH_ERROR_PARSE);
-
-	dssh_session_cleanup(sess);
-	mock_io_free(&io);
-	dssh_test_reset_global_config();
-	return TEST_PASS;
-}
-
-/* ================================================================
- * Packet recv: packet too small (Category 3)
- * ================================================================ */
-
-static int
-test_packet_recv_too_small(void)
-{
-	dssh_test_reset_global_config();
-	if (register_all_algorithms() < 0)
-		return TEST_FAIL;
-	if (test_generate_host_key() < 0)
-		return TEST_FAIL;
-
-	struct mock_io_state io;
-	if (mock_io_init(&io, 0) < 0) {
-		dssh_test_reset_global_config();
-		return TEST_FAIL;
-	}
-
-	dssh_transport_set_callbacks(mock_tx_dispatch, mock_rx_dispatch,
-	    mock_rxline_dispatch, mock_extra_line_cb);
-
-	dssh_session sess = init_server_session();
-	if (sess == NULL) {
-		mock_io_free(&io);
-		dssh_test_reset_global_config();
-		return TEST_FAIL;
-	}
-	dssh_session_set_cbdata(sess, &io, &io, &io, &io);
-
-	/* packet_length = 1, which is < 2 minimum */
-	uint8_t bad_packet[8];
-	size_t pos = 0;
-	dssh_serialize_uint32(1, bad_packet, sizeof(bad_packet), &pos);
-	bad_packet[pos++] = 0;
-	while (pos < 8)
-		bad_packet[pos++] = 0;
-
-	mock_io_inject(&io.c2s, bad_packet, 8);
-
-	uint8_t msg_type;
-	uint8_t *payload;
-	size_t payload_len;
-	int res = recv_packet(sess, &msg_type,
-	    &payload, &payload_len);
-	ASSERT_EQ(res, DSSH_ERROR_PARSE);
-
-	dssh_session_cleanup(sess);
-	mock_io_free(&io);
-	dssh_test_reset_global_config();
-	return TEST_PASS;
-}
-
-/* ================================================================
  * Extra-line callback error (Category 3)
  * ================================================================ */
 
@@ -5835,6 +5704,7 @@ register_fixed_rekey_methods(void)
 #include "negotiation_pair_cases.h"
 #include "transport_state_cases.h"
 #include "transport_clock_cases.h"
+#include "transport_frame_cases.h"
 
 static int
 boundary_tx(uint8_t *buf, size_t bufsz, dssh_session sess, void *cbdata)
@@ -6179,32 +6049,6 @@ test_callback_positive_results(void)
 		dssh_session_cleanup(sess);
 		dssh_test_reset_global_config();
 		ASSERT_EQ(ret, DSSH_ERROR_INVALID);
-		ASSERT_TRUE(terminated);
-	}
-	return TEST_PASS;
-}
-
-static int
-test_packet_framing_boundaries(void)
-{
-	for (uint8_t which = 0; which < 5; which++) {
-		dssh_test_reset_global_config();
-		ASSERT_OK(dssh_transport_set_callbacks(boundary_tx, boundary_rx, boundary_line, NULL));
-		struct boundary_input input = { .limit = 16 };
-		input.packet[3] = which < 4 ? 12 : 11;
-		input.packet[4] = which < 4 ? which : 4;
-		input.packet[5] = SSH_MSG_USERAUTH_SUCCESS;
-		dssh_session sess = dssh_session_init(false, 0);
-		ASSERT_NOT_NULL(sess);
-		ASSERT_OK(dssh_session_set_cbdata(sess, NULL, &input, &input, NULL));
-		uint8_t type;
-		uint8_t *payload;
-		size_t len;
-		int ret = recv_packet(sess, &type, &payload, &len);
-		bool terminated = dssh_session_is_terminated(sess);
-		dssh_session_cleanup(sess);
-		dssh_test_reset_global_config();
-		ASSERT_EQ(ret, DSSH_ERROR_PARSE);
 		ASSERT_TRUE(terminated);
 	}
 	return TEST_PASS;
@@ -7451,6 +7295,7 @@ static struct dssh_test_entry tests[] = {
 	{ "release/version_count_reset", test_version_rx_count_reset },
 	{ "release/callback_results", test_callback_positive_results },
 	{ "release/packet_framing", test_packet_framing_boundaries },
+	{ "packet/framing_constructor_refusals", test_frame_constructor_refusals },
 	{ "release/rekey_changes_algorithms", test_rekey_changes_algorithms },
 	{ "release/fixed_rekey_methods", test_fixed_rekey_methods },
 	{ "release/version_callback_count", test_version_rx_callback_count },

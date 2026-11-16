@@ -1513,6 +1513,12 @@ dssh_add_output_test(dssh_negotiation_pair_offer dssh_test_transport
 dssh_add_output_test(dssh_clock_constructors dssh_test_transport
 	"1 tests: 1 passed, 0 failed, 0 skipped" --exact clock/constructors)
 set_tests_properties(dssh_clock_constructors PROPERTIES TIMEOUT 120)
+foreach(leaf packet/recv_bad_padding packet/recv_too_small release/packet_framing
+	packet/framing_constructor_refusals)
+	dssh_add_output_test(dssh_frame_r107_${leaf} dssh_test_transport
+		"1 tests: 1 passed, 0 failed, 0 skipped" --exact ${leaf})
+	set_tests_properties(dssh_frame_r107_${leaf} PROPERTIES TIMEOUT 120)
+endforeach()
 set(offer_parser_leaves kexinit/parse_valid kexinit/parse_control_char kexinit/parse_name_too_long
 	kexinit/parse_truncated kexinit/parse_too_short kexinit/parse_first_kex_follows
 	kexinit/peer_trunc_namelist release/kexinit_complete_fields kexinit/builder)

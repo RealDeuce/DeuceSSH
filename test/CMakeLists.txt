@@ -1443,6 +1443,10 @@ foreach(suffix IN ITEMS "" _hmac256 _dhgex _rsa _rsa512 _dhgex_rsa _dhgex_rsa512
 	_sntrup _sntrup_rsa _sntrup_rsa512 _mlkem _mlkem_rsa _mlkem_rsa512
 	_rsa_hmac256 _dhgex_hmac256 _sntrup_hmac256)
 	get_test_property(dssh_transport${suffix} ENVIRONMENT transport_pair_environment)
+	dssh_add_output_test(dssh_language_pair${suffix} dssh_test_transport
+		"1 tests: 1 passed, 0 failed, 0 skipped" --exact language/handshake_rekey)
+	set_tests_properties(dssh_language_pair${suffix} PROPERTIES
+		ENVIRONMENT "${transport_pair_environment}" TIMEOUT 120)
 	dssh_add_output_test(dssh_transition_cipher${suffix} dssh_test_transport
 		"1 tests: 1 passed, 0 failed, 0 skipped" --exact release/rekey_changes_algorithms)
 	set_tests_properties(dssh_transition_cipher${suffix} PROPERTIES
@@ -1459,6 +1463,10 @@ foreach(suffix IN ITEMS "" _hmac256 _dhgex _rsa _rsa512 _dhgex_rsa _dhgex_rsa512
 	endforeach()
 endforeach()
 foreach(method IN ITEMS group14 group16)
+	dssh_add_output_test(dssh_language_pair_${method} dssh_test_transport
+		"1 tests: 1 passed, 0 failed, 0 skipped" --exact language/handshake_rekey)
+	set_tests_properties(dssh_language_pair_${method} PROPERTIES
+		ENVIRONMENT "DSSH_TEST_KEX=${method};${DSSH_TEST_KEY_ENV}" TIMEOUT 120)
 	dssh_add_output_test(dssh_transition_cipher_${method} dssh_test_transport
 		"1 tests: 1 passed, 0 failed, 0 skipped" --exact release/rekey_changes_algorithms)
 	set_tests_properties(dssh_transition_cipher_${method} PROPERTIES
@@ -2684,6 +2692,11 @@ if(Python3_Interpreter_FOUND AND UNIX AND NOT APPLE)
 	target_link_options(dssh_test_transport_rekey_owner PRIVATE
 		"-Wl,--wrap=${create_symbol},--wrap=${join_symbol},--wrap=mock_tx_client")
 	foreach(mode IN LISTS owner_modes)
+		add_test(NAME dssh_language_owner_${mode} COMMAND ${Python3_EXECUTABLE}
+			${CMAKE_CURRENT_SOURCE_DIR}/fixture_owner_controls.py
+			$<TARGET_FILE:dssh_test_transport_rekey_owner> ${mode})
+		set_tests_properties(dssh_language_owner_${mode} PROPERTIES
+			ENVIRONMENT "${DSSH_TEST_KEY_ENV};DSSH_LANGUAGE_OWNER=1" TIMEOUT 120)
 		add_test(NAME dssh_rekey_fixture_owner_${mode} COMMAND ${Python3_EXECUTABLE}
 			${CMAKE_CURRENT_SOURCE_DIR}/fixture_owner_controls.py
 			$<TARGET_FILE:dssh_test_transport_rekey_owner> ${mode})

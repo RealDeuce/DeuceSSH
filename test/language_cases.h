@@ -5,9 +5,10 @@ language_value(dssh_session sess, bool peer, enum dssh_direction direction,
 {
 	char guarded[130];
 	memset(guarded, 0x5a, sizeof(guarded));
-	size_t needed = strlen(expected) + 1;
-	if (needed > sizeof(guarded) - 2)
+	size_t length = strlen(expected);
+	if (length >= sizeof(guarded) - 2)
 		return false;
+	size_t needed = length + 1;
 	int64_t required = (int64_t)needed;
 	int64_t got = peer ? dssh_session_get_peer_languages(sess, direction, guarded + 1, needed)
 	    : dssh_session_get_languages(sess, direction, guarded + 1, needed);
@@ -340,52 +341,197 @@ language_configure_pair(dssh_session client, dssh_session server)
 	return ret;
 }
 
+static bool
+language_pair_values(struct test_session_pair *pair, bool local_updated, bool peer_updated)
+{
+	return language_value(pair->client, false, DSSH_CLIENT_TO_SERVER, "en-US,fr")
+	    && language_value(pair->client, false, DSSH_SERVER_TO_CLIENT, local_updated ? "sv-SE" : "x-client")
+	    && language_value(pair->server, false, DSSH_CLIENT_TO_SERVER, local_updated ? "" : "de-DE")
+	    && language_value(pair->server, false, DSSH_SERVER_TO_CLIENT, "ja-JP,x-server")
+	    && language_value(pair->client, true, DSSH_CLIENT_TO_SERVER, peer_updated ? "" : "de-DE")
+	    && language_value(pair->client, true, DSSH_SERVER_TO_CLIENT, "ja-JP,x-server")
+	    && language_value(pair->server, true, DSSH_CLIENT_TO_SERVER, "en-US,fr")
+	    && language_value(pair->server, true, DSSH_SERVER_TO_CLIENT, peer_updated ? "sv-SE" : "x-client");
+}
+
+static int
+language_pair_open(struct test_session_pair *pair)
+{
+	int ret = transport_pair_prepare(pair, 4);
+	if (ret == 0)
+		ret = language_configure_pair(pair->client, pair->server);
+	if (ret == 0)
+		ret = dssh_session_set_rekey_seconds(pair->client, 0);
+	if (ret == 0)
+		ret = dssh_session_set_rekey_seconds(pair->server, 0);
+	if (ret == 0)
+		ret = test_pair_run(pair, dssh_transport_handshake);
+	if (ret != 0)
+		return ret;
+	if (pair->created != 2 || pair->joined != 2 || !transport_pair_versions(pair)
+	    || !transport_pair_algorithms(pair) || !language_pair_values(pair, false, false)
+	    || dssh_test_rekeys_completed(pair->client) != 0 || dssh_test_rekeys_completed(pair->server) != 0)
+		return DSSH_ERROR_INVALID;
+	if (!transport_pair_exchange(pair->client, pair->server, false, SSH_MSG_SERVICE_REQUEST)
+	    || !transport_pair_exchange(pair->server, pair->client, false, SSH_MSG_SERVICE_ACCEPT))
+		return DSSH_ERROR_INVALID;
+	return 0;
+}
+
+static int
+language_pair_assertion_failure(void)
+{
+	ASSERT_TRUE(false);
+	return TEST_PASS;
+}
+
+static struct transport_rekey_result
+language_pair_exercise(int (*ready)(struct test_session_pair *), unsigned assertion_phase)
+{
+	struct transport_rekey_result result = {.ret = DSSH_ERROR_INIT};
+	struct test_session_pair pair;
+	uint8_t *saved = NULL;
+	result.ret = language_pair_open(&pair);
+	if (result.ret != 0)
+		goto done;
+	size_t length = pair.client->trans.session_id_sz;
+	if (length == 0 || pair.server->trans.session_id_sz != length
+	    || pair.client->trans.session_id == NULL || pair.server->trans.session_id == NULL
+	    || memcmp(pair.client->trans.session_id, pair.server->trans.session_id, length) != 0) {
+		result.ret = DSSH_ERROR_INVALID;
+		goto done;
+	}
+	saved = malloc(length);
+	if (saved == NULL) {
+		result.ret = DSSH_ERROR_ALLOC;
+		goto done;
+	}
+	memcpy(saved, pair.client->trans.session_id, length);
+	const char *replacement[] = {"sv-SE"};
+	result.ret = dssh_session_set_languages(pair.client, DSSH_SERVER_TO_CLIENT, replacement, 1);
+	if (result.ret == 0)
+		result.ret = dssh_session_set_languages(pair.server, DSSH_CLIENT_TO_SERVER, NULL, 0);
+	if (result.ret != 0)
+		goto done;
+	if (!language_pair_values(&pair, true, false)) {
+		result.ret = DSSH_ERROR_INVALID;
+		goto done;
+	}
+	uint32_t before[] = {pair.client->trans.tx_seq, pair.client->trans.rx_seq,
+	    pair.server->trans.tx_seq, pair.server->trans.rx_seq};
+	if (ready != NULL) {
+		result.ret = ready(&pair);
+		if (result.ret != 0)
+			goto done;
+	}
+	result.ready = true;
+	if (ready != NULL && assertion_phase < 3) {
+		/* The assertion hook owns the pair; release these bytes first. */
+		free(saved);
+		saved = NULL;
+		pair.operation = transport_rekey_operation;
+		for (unsigned i = 0; result.ret == 0 && i < assertion_phase; i++)
+			result.ret = test_pair_start(&pair, i);
+		if (result.ret != 0)
+			goto done;
+		result.ret = language_pair_assertion_failure();
+		result.valid = result.ret == TEST_FAIL && transport_pair_retired(&pair);
+		goto done;
+	}
+	result.ret = test_pair_run(&pair, transport_rekey_operation);
+	if (result.ret != 0)
+		goto done;
+	uint32_t steps = test_using_dhgex() ? UINT32_C(4) : UINT32_C(3);
+	uint32_t marker_delta = (uint32_t)(steps + 1);
+	result.valid = pair.client_result == 0 && pair.server_result == 0
+	    && transport_rekey_sequence(before[0], pair.client->trans.tx_seq, marker_delta)
+	    && transport_rekey_sequence(before[1], pair.client->trans.rx_seq, steps)
+	    && transport_rekey_sequence(before[2], pair.server->trans.tx_seq, steps)
+	    && transport_rekey_sequence(before[3], pair.server->trans.rx_seq, marker_delta)
+	    && pair.client->trans.tx_since_rekey == 1 && pair.client->trans.rx_since_rekey == 0
+	    && pair.server->trans.tx_since_rekey == 0 && pair.server->trans.rx_since_rekey == 1;
+	if (result.valid)
+		result.valid = transport_pair_exchange(pair.client, pair.server, false, SSH_MSG_SERVICE_REQUEST)
+		    && transport_pair_exchange(pair.server, pair.client, false, SSH_MSG_SERVICE_ACCEPT);
+	uint32_t outbound = (uint32_t)(steps + 2);
+	result.valid = result.valid && pair.created == 4 && pair.joined == 4
+	    && transport_pair_algorithms(&pair) && language_pair_values(&pair, true, true)
+	    && dssh_test_rekeys_completed(pair.client) == 1 && dssh_test_rekeys_completed(pair.server) == 1
+	    && transport_rekey_sequence(before[0], pair.client->trans.tx_seq, outbound)
+	    && transport_rekey_sequence(before[1], pair.client->trans.rx_seq, marker_delta)
+	    && transport_rekey_sequence(before[2], pair.server->trans.tx_seq, marker_delta)
+	    && transport_rekey_sequence(before[3], pair.server->trans.rx_seq, outbound)
+	    && pair.client->trans.tx_since_rekey == 2 && pair.client->trans.rx_since_rekey == 1
+	    && pair.server->trans.tx_since_rekey == 1 && pair.server->trans.rx_since_rekey == 2
+	    && pair.client->trans.session_id_sz == length && pair.server->trans.session_id_sz == length
+	    && pair.client->trans.session_id != NULL && pair.server->trans.session_id != NULL
+	    && memcmp(pair.client->trans.session_id, saved, length) == 0
+	    && memcmp(pair.server->trans.session_id, saved, length) == 0;
+done:
+	free(saved);
+	transport_pair_finish(&pair);
+	result.created = pair.created;
+	result.joined = pair.joined;
+	result.retired = transport_pair_retired(&pair);
+	result.valid = result.valid && result.retired;
+	return result;
+}
+
 static int
 test_language_handshake_rekey(void)
 {
-	struct handshake_ctx ctx;
-	handshake_language_setup = language_configure_pair;
-	int setup = handshake_setup(&ctx);
-	handshake_language_setup = NULL;
-	if (setup != 0) {
-		handshake_cleanup(&ctx);
-		return TEST_FAIL;
-	}
-	bool valid = language_value(ctx.client, true, DSSH_CLIENT_TO_SERVER, "de-DE")
-	    && language_value(ctx.client, true, DSSH_SERVER_TO_CLIENT, "ja-JP,x-server")
-	    && language_value(ctx.server, true, DSSH_CLIENT_TO_SERVER, "en-US,fr")
-	    && language_value(ctx.server, true, DSSH_SERVER_TO_CLIENT, "x-client");
-	const char *replacement[] = {"sv-SE"};
-	valid = valid && dssh_session_set_languages(ctx.client, DSSH_SERVER_TO_CLIENT, replacement, 1) == 0
-	    && dssh_session_set_languages(ctx.server, DSSH_CLIENT_TO_SERVER, NULL, 0) == 0;
-	struct rekey_thread_arg ca = {&ctx, DSSH_ERROR_INIT};
-	struct rekey_thread_arg sa = {&ctx, DSSH_ERROR_INIT};
-	thrd_t client, server;
-	bool client_started = valid && thrd_create(&client, rekey_client_thread, &ca) == thrd_success;
-	bool server_started = client_started && thrd_create(&server, rekey_server_recv_thread, &sa) == thrd_success;
-	if (!server_started) {
-		mock_io_close_c2s(&ctx.io);
-		mock_io_close_s2c(&ctx.io);
-	}
-	if (client_started && thrd_join(client, NULL) != thrd_success)
-		abort();
-	const uint8_t marker[] = {SSH_MSG_SERVICE_REQUEST, 0x42};
-	if (!server_started || ca.result != 0 || send_packet(ctx.client, marker, sizeof(marker), NULL) != 0) {
-		mock_io_close_c2s(&ctx.io);
-		mock_io_close_s2c(&ctx.io);
-		valid = false;
-	}
-	if (server_started && thrd_join(server, NULL) != thrd_success)
-		abort();
-	valid = valid && ca.result == 0 && sa.result == 0
-	    && language_value(ctx.client, true, DSSH_CLIENT_TO_SERVER, "")
-	    && language_value(ctx.client, true, DSSH_SERVER_TO_CLIENT, "ja-JP,x-server")
-	    && language_value(ctx.server, true, DSSH_CLIENT_TO_SERVER, "en-US,fr")
-	    && language_value(ctx.server, true, DSSH_SERVER_TO_CLIENT, "sv-SE");
-	handshake_cleanup(&ctx);
-	ASSERT_TRUE(valid);
+	struct transport_rekey_result result = language_pair_exercise(NULL, 3);
+	int printed = printf("language_pair ready=%d created=%u joined=%u result=%d retired=%d valid=%d\n",
+	    result.ready, result.created, result.joined, result.ret, result.retired, result.valid);
+	ASSERT_TRUE(result.ret == 0 && result.valid && printed > 0);
 	return TEST_PASS;
 }
+
+#ifdef DSSH_TRANSPORT_REKEY_CONTROLS
+static int
+test_transport_all_rekey_ownership(void)
+{
+	const char *selection = getenv("DSSH_LANGUAGE_OWNER");
+	if (selection == NULL)
+		return test_transport_rekey_selected_ownership();
+	if (strcmp(selection, "1") != 0)
+		return TEST_FAIL;
+	struct transport_rekey_result result = language_pair_exercise(transport_rekey_ready, 3);
+	const char *mode = getenv("DSSH_PEER_FAILURE");
+	bool valid = result.ready && result.retired && result.created >= 2 && result.joined >= 2;
+	if (mode != NULL && strcmp(mode, "plain") == 0)
+		valid = valid && result.ret == 0 && result.valid;
+	else if (mode != NULL && strcmp(mode, "tx") == 0)
+		valid = valid && result.ret < 0;
+	else if (mode != NULL && (strcmp(mode, "create-0") == 0 || strcmp(mode, "create-1") == 0))
+		valid = valid && result.ret == DSSH_ERROR_INIT;
+	else
+		valid = false;
+	unsigned created = result.created >= 2 ? result.created - 2 : 0;
+	unsigned joined = result.joined >= 2 ? result.joined - 2 : 0;
+	int printed = printf("fixture_owner=1 created=%u joined=%u valid=%d\n", created, joined, valid);
+	ASSERT_TRUE(valid && printed > 0);
+	return TEST_PASS;
+}
+
+static int
+transport_all_rekey_assertion_control(unsigned phase)
+{
+	const char *selection = getenv("DSSH_LANGUAGE_OWNER");
+	if (selection == NULL)
+		return transport_rekey_selected_assertion_control(phase);
+	if (phase > 2 || strcmp(selection, "1") != 0)
+		return 2;
+	struct transport_rekey_result result = language_pair_exercise(transport_rekey_ready, phase);
+	bool valid = result.ready && result.valid && result.ret == TEST_FAIL
+	    && result.created >= 2 && result.joined >= 2;
+	unsigned created = result.created >= 2 ? result.created - 2 : 0;
+	unsigned joined = result.joined >= 2 ? result.joined - 2 : 0;
+	int printed = printf("fixture_assertion=1 phase=%u created=%u joined=%u valid=%d\n",
+	    phase, created, joined, valid);
+	return valid && printed > 0 ? 1 : 2;
+}
+#endif
 
 struct language_reader {
 	dssh_session sess;

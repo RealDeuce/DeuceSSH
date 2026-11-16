@@ -43,7 +43,6 @@ static bool transport_pair_case(unsigned kind);
 
 static int (*extra_algorithm_registration)(void);
 static const char *handshake_kex_filter;
-static int (*handshake_language_setup)(dssh_session client, dssh_session server);
 static void (*dh_group_tx_observer)(dssh_session sess);
 static _Thread_local dssh_session compression_callback_session;
 static void (*compression_tx_observer)(dssh_session sess);
@@ -315,9 +314,6 @@ handshake_setup_configured(struct handshake_ctx *ctx, bool alternate_cipher, con
 	if (handshake_kex_filter != NULL
 	    && (dssh_session_set_kex_filter(ctx->client, &handshake_kex_filter, 1) < 0
 	        || dssh_session_set_kex_filter(ctx->server, &handshake_kex_filter, 1) < 0))
-		goto setup_fail;
-	if (handshake_language_setup != NULL
-	    && handshake_language_setup(ctx->client, ctx->server) < 0)
 		goto setup_fail;
 	thrd_t ct, st;
 	if (thrd_create(&ct, handshake_client_thread, ctx) != thrd_success)
@@ -2156,37 +2152,6 @@ test_rekey_bytes_per_direction(void)
 	dssh_test_reset_global_config();
 	return TEST_PASS;
 }
-
-struct rekey_thread_arg {
-	struct handshake_ctx *ctx;
-	int result;
-};
-
-static int
-rekey_client_thread(void *arg)
-{
-	struct rekey_thread_arg *a = arg;
-	a->result = rekey(a->ctx->client);
-	return 0;
-}
-
-static int
-rekey_server_recv_thread(void *arg)
-{
-	struct rekey_thread_arg *a = arg;
-	/* Server receives -- recv_packet detects peer KEXINIT and
-	 * handles rekey internally.  We need to send something from
-	 * client after rekey so the server recv returns. */
-	uint8_t msg_type;
-	uint8_t *payload;
-	size_t payload_len;
-	a->result = recv_packet(a->ctx->server,
-	    &msg_type, &payload, &payload_len);
-	return 0;
-}
-
-
-
 
 /* ================================================================
  * Session lifecycle tests
@@ -8773,7 +8738,7 @@ static struct dssh_test_entry tests[] = {
 	{ "rekey/owned_roundtrip", test_rekey_owned_roundtrip },
 	{ "rekey/sequence_oracle", test_rekey_sequence_oracle },
 #if defined(DSSH_TRANSPORT_REKEY_CONTROLS)
-	{ "fixture/ownership", test_transport_rekey_selected_ownership },
+	{ "fixture/ownership", test_transport_all_rekey_ownership },
 #elif defined(DSSH_TRANSPORT_PAIR_CONTROLS)
 	{ "fixture/ownership", test_transport_pair_ownership },
 #endif
@@ -9227,7 +9192,7 @@ main(int argc, char **argv)
 			return 2;
 		unsigned phase = (unsigned)(argv[2][0] - '0');
 #ifdef DSSH_TRANSPORT_REKEY_CONTROLS
-		return transport_rekey_selected_assertion_control(phase);
+		return transport_all_rekey_assertion_control(phase);
 #else
 		return transport_pair_assertion_control(phase);
 #endif

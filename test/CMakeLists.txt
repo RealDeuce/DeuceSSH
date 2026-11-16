@@ -1505,6 +1505,11 @@ foreach(leaf IN LISTS transport_state_leaves)
 		"1 tests: 1 passed, 0 failed, 0 skipped" --exact ${leaf})
 	set_tests_properties(dssh_state_r102_${leaf} PROPERTIES TIMEOUT 120)
 endforeach()
+foreach(leaf init/small_packet_size init/large_packet_size)
+	dssh_add_output_test(dssh_packet_r103_${leaf} dssh_test_transport
+		"1 tests: 1 passed, 0 failed, 0 skipped" --exact ${leaf})
+	set_tests_properties(dssh_packet_r103_${leaf} PROPERTIES TIMEOUT 120)
+endforeach()
 set(direct_kex_leaves
 	release/dhgex_group_validation release/dhgex_peer_validation
 	dhgex/server_null_pubkey_fn dhgex/server_null_sign_fn dhgex/server_recv_fail

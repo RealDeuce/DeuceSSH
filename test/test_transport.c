@@ -3368,48 +3368,6 @@ test_unimplemented_short_payload(void)
  * max_packet_size clamping -- covers ssh-trans.c:1419-1422
  * ================================================================ */
 
-static int
-test_init_small_packet_size(void)
-{
-	/* max_packet_size below minimum gets clamped up */
-	dssh_test_reset_global_config();
-	ASSERT_OK(register_all_algorithms());
-	if (test_generate_host_key() < 0)
-		return TEST_FAIL;
-	dssh_transport_set_callbacks(mock_tx_dispatch, mock_rx_dispatch,
-	    mock_rxline_dispatch, mock_extra_line_cb);
-
-	dssh_session sess = dssh_session_init(true, 100);  /* way too small */
-	ASSERT_NOT_NULL(sess);
-	/* Should be clamped to SSH_BPP_PACKET_SIZE_MIN */
-	ASSERT_TRUE(sess->trans.packet_buf_sz >= 33280);
-
-	dssh_session_cleanup(sess);
-	dssh_test_reset_global_config();
-	return TEST_PASS;
-}
-
-static int
-test_init_large_packet_size(void)
-{
-	/* max_packet_size above maximum gets clamped down */
-	dssh_test_reset_global_config();
-	ASSERT_OK(register_all_algorithms());
-	if (test_generate_host_key() < 0)
-		return TEST_FAIL;
-	dssh_transport_set_callbacks(mock_tx_dispatch, mock_rx_dispatch,
-	    mock_rxline_dispatch, mock_extra_line_cb);
-
-	dssh_session sess = dssh_session_init(true, (size_t)128 * 1024 * 1024);
-	ASSERT_NOT_NULL(sess);
-	/* Should be clamped to SSH_BPP_PACKET_SIZE_MAX (64 MiB) */
-	ASSERT_TRUE(sess->trans.packet_buf_sz <= 64 * 1024 * 1024);
-
-	dssh_session_cleanup(sess);
-	dssh_test_reset_global_config();
-	return TEST_PASS;
-}
-
 /* ================================================================
  * build_namelist overflow -- covers ssh-trans.c:818-823
  * ================================================================ */

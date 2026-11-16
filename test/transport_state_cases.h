@@ -450,4 +450,117 @@ test_aes256_ctr_encrypt_update_failure(void)
 }
 #endif
 
+static struct transport_state_result
+state_packet_case(bool client, size_t requested, size_t expected, int allocation_failure)
+{
+	struct transport_state_result result = {.ret = DSSH_ERROR_INIT};
+	struct test_session_pair pair;
+	result.ret = state_prepare(&pair, false);
+	if (result.ret != 0)
+		goto done;
+	if (expected < 33280 || expected > SIZE_MAX - 4) {
+		result.ret = DSSH_ERROR_INVALID;
+		goto done;
+	}
+	dssh_test_alloc_fail_after(allocation_failure);
+	dssh_session sess = dssh_session_init(client, requested);
+	if (client)
+		pair.client = sess;
+	else
+		pair.server = sess;
+	result.allocations = dssh_test_alloc_count();
+	dssh_test_alloc_reset();
+	if (sess == NULL) {
+		result.ret = DSSH_ERROR_ALLOC;
+		goto done;
+	}
+	result.ret = 0;
+	result.valid = sess->trans.packet_buf_sz == expected && sess->trans.client == client
+	    && sess->trans.tx_packet != NULL && sess->trans.rx_packet != NULL
+	    && sess->trans.tx_packet != sess->trans.rx_packet;
+	if (result.valid) {
+		/* Touch the four-byte prefix and both ends of the exact payload
+		 * extent. ASan checks the actual allocation, not just its size field. */
+		size_t end = 4 + expected - 1;
+		static const size_t starts[] = {0, 3, 4};
+		for (size_t i = 0; i < sizeof(starts) / sizeof(starts[0]); i++) {
+			sess->trans.tx_packet[starts[i]] = 0xb6;
+			sess->trans.rx_packet[starts[i]] = 0x4d;
+		}
+		sess->trans.tx_packet[end] = 0xa7;
+		sess->trans.rx_packet[end] = 0x3e;
+		for (size_t i = 0; i < sizeof(starts) / sizeof(starts[0]); i++)
+			result.valid = sess->trans.tx_packet[starts[i]] == 0xb6
+			    && sess->trans.rx_packet[starts[i]] == 0x4d && result.valid;
+		result.valid = sess->trans.tx_packet[end] == 0xa7 && sess->trans.rx_packet[end] == 0x3e && result.valid;
+	}
+done:
+	state_finish(&pair);
+	result.retired = state_retired(&pair);
+	result.valid = result.valid && result.retired;
+	return result;
+}
+
+static int
+test_init_small_packet_size(void)
+{
+	static const struct {
+		size_t request;
+		size_t expected;
+	} cases[] = {{0, 33280}, {1, 33280}, {100, 33280}, {33279, 33280},
+	    {33280, 33280}, {33281, 33281}};
+	bool valid = true;
+	bool retired = true;
+	int refused = 0;
+	for (unsigned role = 0; role < 2; role++) {
+		for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+			struct transport_state_result result = state_packet_case(role == 0, cases[i].request, cases[i].expected, -1);
+			valid = result.ret == 0 && result.valid && valid;
+			retired = result.retired && retired;
+		}
+		struct transport_state_result baseline = state_packet_case(role == 0, 100, 33280, INT_MAX);
+		valid = baseline.ret == 0 && baseline.valid && baseline.allocations == 3 && valid;
+		retired = baseline.retired && retired;
+		for (int i = 0; valid && i < baseline.allocations; i++) {
+			struct transport_state_result result = state_packet_case(role == 0, 100, 33280, i);
+			valid = result.ret == DSSH_ERROR_ALLOC && result.allocations == i + 1 && result.retired;
+			retired = result.retired && retired;
+			if (valid)
+				refused++;
+		}
+		struct transport_state_result final = state_packet_case(role == 0, 100, 33280, baseline.allocations);
+		valid = final.ret == 0 && final.valid && final.allocations == baseline.allocations && valid;
+		retired = final.retired && retired;
+	}
+	int printed = printf("packet_small roles=2 cases=6 allocations=3 refused=%d retired=%d valid=%d\n", refused, retired, valid);
+	ASSERT_TRUE(valid && refused == 6 && retired && printed > 0);
+	return TEST_PASS;
+}
+
+static int
+test_init_large_packet_size(void)
+{
+	/* All constants and additions are representable even with 16-bit size_t.
+	 * The native representable cap reserves the packet's four-byte prefix. */
+#if SIZE_MAX < UINT32_C(67108864)
+	size_t maximum = SIZE_MAX - 4;
+#else
+	size_t maximum = UINT32_C(67108864);
+#endif
+	size_t requests[] = {maximum - 1, maximum, maximum + 1, SIZE_MAX};
+	bool valid = true;
+	bool retired = true;
+	for (unsigned role = 0; role < 2; role++) {
+		for (size_t i = 0; i < sizeof(requests) / sizeof(requests[0]); i++) {
+			size_t expected = i == 0 ? maximum - 1 : maximum;
+			struct transport_state_result result = state_packet_case(role == 0, requests[i], expected, -1);
+			valid = result.ret == 0 && result.valid && valid;
+			retired = result.retired && retired;
+		}
+	}
+	int printed = printf("packet_large roles=2 cases=4 maximum=%zu retired=%d valid=%d\n", maximum, retired, valid);
+	ASSERT_TRUE(valid && retired && printed > 0);
+	return TEST_PASS;
+}
+
 #endif

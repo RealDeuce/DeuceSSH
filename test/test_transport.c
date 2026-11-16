@@ -6287,45 +6287,7 @@ auth_state_kbi(const uint8_t *user, size_t length, uint32_t count,
 	return probe->kbi_calls == 1 ? DSSH_AUTH_KBI_PROMPT : DSSH_AUTH_SUCCESS;
 }
 
-static int
-queue_auth_service(dssh_session sender, bool accept)
-{
-	uint8_t packet[17];
-	size_t pos = 0;
-	packet[pos++] = accept ? SSH_MSG_SERVICE_ACCEPT : SSH_MSG_SERVICE_REQUEST;
-	DSSH_PUT_U32(12, packet, &pos);
-	memcpy(&packet[pos], "ssh-userauth", 12);
-	pos += 12;
-	return send_packet(sender, packet, pos, NULL);
-}
-
-static int
-queue_auth_state_request(dssh_session sender, const char *username, const char *method)
-{
-	uint8_t packet[128];
-	size_t pos = 0;
-	size_t user_len = strlen(username);
-	size_t method_len = strlen(method);
-	packet[pos++] = SSH_MSG_USERAUTH_REQUEST;
-	DSSH_PUT_U32((uint32_t)user_len, packet, &pos);
-	memcpy(&packet[pos], username, user_len);
-	pos += user_len;
-	DSSH_PUT_U32(14, packet, &pos);
-	memcpy(&packet[pos], "ssh-connection", 14);
-	pos += 14;
-	DSSH_PUT_U32((uint32_t)method_len, packet, &pos);
-	memcpy(&packet[pos], method, method_len);
-	pos += method_len;
-	if (strcmp(method, "keyboard-interactive") == 0) {
-		DSSH_PUT_U32(0, packet, &pos);
-		DSSH_PUT_U32(0, packet, &pos);
-	}
-	else if (strcmp(method, "password") == 0) {
-		packet[pos++] = 0;
-		DSSH_PUT_U32(0, packet, &pos);
-	}
-	return send_packet(sender, packet, pos, NULL);
-}
+#include "auth_state_wire_cases.h"
 
 static int
 test_auth_kbi_request_state(void)
@@ -6940,6 +6902,9 @@ static struct dssh_test_entry tests[] = {
 	{ "release/query_snapshot", test_query_snapshot },
 	{ "release/auth_replayed_message_state", test_auth_replayed_message_state },
 	{ "release/auth_kbi_request_state", test_auth_kbi_request_state },
+	{ "auth_state/wire_builder", test_auth_state_builder },
+	{ "auth_state/queue_wire", test_auth_state_queue_wire },
+	{ "auth_state/queue_constructors", test_auth_state_queue_constructors },
 	{ "release/auth_server_phase_gate", test_auth_server_phase_gate },
 	{ "release/auth_client_unknown_messages", test_auth_client_unknown_messages },
 	{ "release/auth_control_reply_errors", test_auth_control_reply_errors },

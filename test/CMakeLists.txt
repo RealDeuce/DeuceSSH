@@ -1451,6 +1451,12 @@ foreach(suffix IN ITEMS "" _hmac256 _dhgex _rsa _rsa512 _dhgex_rsa _dhgex_rsa512
 		"1 tests: 1 passed, 0 failed, 0 skipped" --exact release/auth_replayed_message_state)
 	set_tests_properties(dssh_offer_auth_replay${suffix} PROPERTIES
 		ENVIRONMENT "${transport_pair_environment}" TIMEOUT 120)
+	foreach(leaf release/auth_kbi_request_state release/auth_server_phase_gate release/auth_client_unknown_messages)
+		dssh_add_output_test(dssh_auth_builder_consumer_r109_${leaf}${suffix} dssh_test_transport
+			"1 tests: 1 passed, 0 failed, 0 skipped" --exact ${leaf})
+		set_tests_properties(dssh_auth_builder_consumer_r109_${leaf}${suffix} PROPERTIES
+			ENVIRONMENT "${transport_pair_environment}" TIMEOUT 120)
+	endforeach()
 	foreach(part IN ITEMS kex comp_s2c)
 		dssh_add_output_test(dssh_negotiation_pair_${part}${suffix} dssh_test_transport
 			"1 tests: 1 passed, 0 failed, 0 skipped" --exact negotiate/no_common_${part})
@@ -1485,6 +1491,12 @@ foreach(method IN ITEMS group14 group16)
 		"1 tests: 1 passed, 0 failed, 0 skipped" --exact release/auth_replayed_message_state)
 	set_tests_properties(dssh_offer_auth_replay_${method} PROPERTIES
 		ENVIRONMENT "DSSH_TEST_KEX=${method};${DSSH_TEST_KEY_ENV}" TIMEOUT 120)
+	foreach(leaf release/auth_kbi_request_state release/auth_server_phase_gate release/auth_client_unknown_messages)
+		dssh_add_output_test(dssh_auth_builder_consumer_r109_${leaf}_${method} dssh_test_transport
+			"1 tests: 1 passed, 0 failed, 0 skipped" --exact ${leaf})
+		set_tests_properties(dssh_auth_builder_consumer_r109_${leaf}_${method} PROPERTIES
+			ENVIRONMENT "DSSH_TEST_KEX=${method};${DSSH_TEST_KEY_ENV}" TIMEOUT 120)
+	endforeach()
 	foreach(part IN ITEMS kex comp_s2c)
 		dssh_add_output_test(dssh_negotiation_pair_${part}_${method} dssh_test_transport
 			"1 tests: 1 passed, 0 failed, 0 skipped" --exact negotiate/no_common_${part})
@@ -1513,6 +1525,11 @@ dssh_add_output_test(dssh_negotiation_pair_offer dssh_test_transport
 dssh_add_output_test(dssh_clock_constructors dssh_test_transport
 	"1 tests: 1 passed, 0 failed, 0 skipped" --exact clock/constructors)
 set_tests_properties(dssh_clock_constructors PROPERTIES TIMEOUT 120)
+foreach(leaf auth_state/wire_builder auth_state/queue_wire auth_state/queue_constructors)
+	dssh_add_output_test(dssh_auth_builder_r109_${leaf} dssh_test_transport
+		"1 tests: 1 passed, 0 failed, 0 skipped" --exact ${leaf})
+	set_tests_properties(dssh_auth_builder_r109_${leaf} PROPERTIES TIMEOUT 120)
+endforeach()
 set(packet_wire_leaves packet/roundtrip packet/alignment packet/min_padding packet/seq_increment
 	packet/server_receives_client packet/too_large packet/bidirectional packet/minimum_payload
 	packet/wire_oracle packet/wire_constructor_refusals)

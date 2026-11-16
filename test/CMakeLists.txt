@@ -1513,6 +1513,14 @@ dssh_add_output_test(dssh_negotiation_pair_offer dssh_test_transport
 dssh_add_output_test(dssh_clock_constructors dssh_test_transport
 	"1 tests: 1 passed, 0 failed, 0 skipped" --exact clock/constructors)
 set_tests_properties(dssh_clock_constructors PROPERTIES TIMEOUT 120)
+set(packet_wire_leaves packet/roundtrip packet/alignment packet/min_padding packet/seq_increment
+	packet/server_receives_client packet/too_large packet/bidirectional packet/minimum_payload
+	packet/wire_oracle packet/wire_constructor_refusals)
+foreach(leaf IN LISTS packet_wire_leaves)
+	dssh_add_output_test(dssh_packet_r108_${leaf} dssh_test_transport
+		"1 tests: 1 passed, 0 failed, 0 skipped" --exact ${leaf})
+	set_tests_properties(dssh_packet_r108_${leaf} PROPERTIES TIMEOUT 120)
+endforeach()
 foreach(leaf packet/recv_bad_padding packet/recv_too_small release/packet_framing
 	packet/framing_constructor_refusals)
 	dssh_add_output_test(dssh_frame_r107_${leaf} dssh_test_transport

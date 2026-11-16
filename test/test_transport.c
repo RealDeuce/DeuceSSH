@@ -3807,28 +3807,6 @@ test_version_tx_toolong_comment(void)
 
 #include "dssh_test_ossl.h"
 
-struct ve_ki_ctx {
-	struct mock_io_state *io;
-	dssh_session sess;
-	int result;
-};
-
-static int
-ve_ki_thread(void *arg)
-{
-	struct ve_ki_ctx *ctx = arg;
-	ctx->result = version_exchange(ctx->sess);
-	if (ctx->result == 0)
-		ctx->result = kexinit(ctx->sess);
-	if (ctx->result < 0) {
-		if (ctx->sess->trans.client)
-			mock_io_close_c2s(ctx->io);
-		else
-			mock_io_close_s2c(ctx->io);
-	}
-	return 0;
-}
-
 #include "direct_kex_fixture.h"
 
 /* DH-GEX server handler infrastructure */
@@ -4858,121 +4836,6 @@ test_c25519_encode_shared_secret_storage(void)
 	    DSSH_ERROR_TOOLONG);
 	return TEST_PASS;
 }
-
-/* ================================================================
- * Negotiation failure -- deterministic test for the || chain at
- * lines 1131-1138.  After a successful two-threaded kexinit, we
- * null out one gconf algo list head so the NEXT kexinit call
- * builds an empty our_list for that category.  peer_kexinit is
- * already populated from the first run, so kexinit skips recv
- * and goes straight to negotiate -- which returns NULL.
- * ================================================================ */
-
-static int
-test_negotiate_no_common_kex(void)
-{
-	dssh_test_reset_global_config();
-	dssh_test_alloc_reset();
-	dssh_test_ossl_reset();
-
-	if (register_all_algorithms() < 0)
-		return TEST_FAIL;
-	if (test_generate_host_key() < 0)
-		return TEST_FAIL;
-
-	struct mock_io_state io;
-	if (mock_io_init(&io, 0) < 0)
-		return TEST_FAIL;
-
-	dssh_transport_set_callbacks(mock_tx_dispatch, mock_rx_dispatch,
-	    mock_rxline_dispatch, mock_extra_line_cb);
-
-	dssh_session client = dssh_session_init(true, 0);
-	if (client == NULL) {
-		mock_io_free(&io);
-		return TEST_FAIL;
-	}
-	dssh_session_set_cbdata(client, &io, &io, &io, &io);
-
-	dssh_session server = init_server_session();
-	if (server == NULL) {
-		dssh_session_cleanup(client);
-		mock_io_free(&io);
-		return TEST_FAIL;
-	}
-	dssh_session_set_cbdata(server, &io, &io, &io, &io);
-
-	/* Successful two-threaded version_exchange + kexinit */
-	{
-		struct ve_ki_ctx ca = { .io = &io, .sess = client };
-		struct ve_ki_ctx sa = { .io = &io, .sess = server };
-		thrd_t ct, st;
-		ASSERT_THRD_CREATE(&ct, ve_ki_thread, &ca);
-		ASSERT_THRD_CREATE(&st, ve_ki_thread, &sa);
-		thrd_join(ct, NULL);
-		thrd_join(st, NULL);
-		if (ca.result != 0 || sa.result != 0) {
-			mock_io_close_c2s(&io);
-			mock_io_close_s2c(&io);
-			dssh_session_cleanup(server);
-			dssh_session_cleanup(client);
-			mock_io_free(&io);
-			dssh_test_reset_global_config();
-			return TEST_FAIL;
-		}
-	}
-
-	/* Verify first kexinit succeeded */
-	ASSERT_NOT_NULL(client->trans.kex_selected);
-	ASSERT_NOT_NULL(client->trans.peer_kexinit);
-
-	/* Close old pipes, open fresh ones for the re-kexinit send */
-	mock_io_close_c2s(&io);
-	mock_io_close_s2c(&io);
-	mock_io_free(&io);
-
-	struct mock_io_state io2;
-	if (mock_io_init(&io2, 0) < 0) {
-		dssh_session_cleanup(server);
-		dssh_session_cleanup(client);
-		dssh_test_reset_global_config();
-		return TEST_FAIL;
-	}
-	dssh_session_set_cbdata(client, &io2, &io2, &io2, &io2);
-
-	/* Keep our complete offer valid, and replace only the peer's
-	 * exchange names with equally sized unsupported names. */
-	uint32_t names_len = DSSH_GET_U32(&client->trans.peer_kexinit[17]);
-	for (size_t i = 0; i < names_len; i++) {
-		if (client->trans.peer_kexinit[21 + i] != ',')
-			client->trans.peer_kexinit[21 + i] = 'x';
-	}
-
-	/* Clear selected fields so the || chain exercises fresh */
-	client->trans.kex_selected = NULL;
-	client->trans.key_algo_selected = NULL;
-	client->trans.enc_c2s_selected = NULL;
-	client->trans.enc_s2c_selected = NULL;
-	client->trans.mac_c2s_selected = NULL;
-	client->trans.mac_s2c_selected = NULL;
-	client->trans.comp_c2s_selected = NULL;
-	client->trans.comp_s2c_selected = NULL;
-
-	/* peer_kexinit is still set from the first run, so
-	 * kexinit will skip recv and go straight to negotiate */
-	int res = kexinit(client);
-	ASSERT_EQ(res, DSSH_ERROR_INVALID);
-
-
-	mock_io_close_c2s(&io2);
-	mock_io_close_s2c(&io2);
-	mock_io_free(&io2);
-	dssh_session_cleanup(server);
-	dssh_session_cleanup(client);
-	dssh_test_reset_global_config();
-	return TEST_PASS;
-}
-
 
 /* ================================================================
  * None algorithm module coverage -- call the no-op functions
@@ -6262,165 +6125,6 @@ test_version_rx_non_ascii(void)
 	return TEST_PASS;
 }
 
-/*
- * Negotiation: comp_s2c NULL (line 1138).
- * Same pattern as test_negotiate_no_common_kex, but we null out
- * only the comp list and craft a peer KEXINIT where comp_c2s
- * matches "none" but comp_s2c is "bogus" -- so comp_c2s_selected
- * succeeds but comp_s2c_selected is NULL.
- *
- * peer_kexinit format: msg_type(1) + cookie(16) + 10 name-lists + bool(1) + reserved(4)
- * For the client, peer = server, so peer_lists[6] = comp_c2s, peer_lists[7] = comp_s2c.
- */
-static size_t
-write_namelist(uint8_t *buf, size_t pos, const char *str)
-{
-	uint32_t len = (uint32_t)strlen(str);
-	buf[pos]     = (uint8_t)((len >> 24) & 0xFF);
-	buf[pos + 1] = (uint8_t)((len >> 16) & 0xFF);
-	buf[pos + 2] = (uint8_t)((len >>  8) & 0xFF);
-	buf[pos + 3] = (uint8_t)(len & 0xFF);
-	memcpy(&buf[pos + 4], str, len);
-	return pos + 4 + len;
-}
-
-static int
-test_negotiate_no_common_comp_s2c(void)
-{
-	dssh_test_reset_global_config();
-	dssh_test_alloc_reset();
-	dssh_test_ossl_reset();
-
-	if (register_all_algorithms() < 0)
-		return TEST_FAIL;
-	if (test_generate_host_key() < 0)
-		return TEST_FAIL;
-
-	struct mock_io_state io;
-	if (mock_io_init(&io, 0) < 0)
-		return TEST_FAIL;
-
-	dssh_transport_set_callbacks(mock_tx_dispatch, mock_rx_dispatch,
-	    mock_rxline_dispatch, mock_extra_line_cb);
-
-	dssh_session client = dssh_session_init(true, 0);
-	if (client == NULL) {
-		mock_io_free(&io);
-		return TEST_FAIL;
-	}
-	dssh_session_set_cbdata(client, &io, &io, &io, &io);
-
-	dssh_session server = init_server_session();
-	if (server == NULL) {
-		dssh_session_cleanup(client);
-		mock_io_free(&io);
-		return TEST_FAIL;
-	}
-	dssh_session_set_cbdata(server, &io, &io, &io, &io);
-
-	/* Successful two-threaded version_exchange + kexinit */
-	{
-		struct ve_ki_ctx ca = { .io = &io, .sess = client };
-		struct ve_ki_ctx sa = { .io = &io, .sess = server };
-		thrd_t ct, st;
-		ASSERT_THRD_CREATE(&ct, ve_ki_thread, &ca);
-		ASSERT_THRD_CREATE(&st, ve_ki_thread, &sa);
-		thrd_join(ct, NULL);
-		thrd_join(st, NULL);
-		if (ca.result != 0 || sa.result != 0) {
-			mock_io_close_c2s(&io);
-			mock_io_close_s2c(&io);
-			dssh_session_cleanup(server);
-			dssh_session_cleanup(client);
-			mock_io_free(&io);
-			dssh_test_reset_global_config();
-			return TEST_FAIL;
-		}
-	}
-
-	ASSERT_NOT_NULL(client->trans.kex_selected);
-	ASSERT_NOT_NULL(client->trans.peer_kexinit);
-
-	/* Close old pipes, open fresh ones for the re-kexinit send */
-	mock_io_close_c2s(&io);
-	mock_io_close_s2c(&io);
-	mock_io_free(&io);
-
-	struct mock_io_state io2;
-	if (mock_io_init(&io2, 0) < 0) {
-		dssh_session_cleanup(server);
-		dssh_session_cleanup(client);
-		dssh_test_reset_global_config();
-		return TEST_FAIL;
-	}
-	dssh_session_set_cbdata(client, &io2, &io2, &io2, &io2);
-
-	/* Build a crafted peer KEXINIT where comp_s2c (peer_lists[7])
-	 * is "bogus" but all other name-lists match our algorithms.
-	 * peer_lists[6] (comp_c2s) is "none" -- matches our comp. */
-	uint8_t crafted[2048];
-	memset(crafted, 0, sizeof(crafted));
-	crafted[0] = 20;  /* SSH_MSG_KEXINIT */
-	/* cookie: bytes 1-16 already zero */
-
-	/* Determine our algorithm names for the matching lists */
-	char kex_name[64], ka_name[64], enc_name[64], mac_name[64];
-	build_namelist(gconf.kex_head,
-	    offsetof(struct dssh_kex_s, name), registry_next_kex, kex_name, sizeof(kex_name), NULL);
-	build_namelist(gconf.key_algo_head,
-	    offsetof(struct dssh_key_algo_s, name), registry_next_key_algo, ka_name, sizeof(ka_name), NULL);
-	build_namelist(gconf.enc_head,
-	    offsetof(struct dssh_enc_s, name), registry_next_enc, enc_name, sizeof(enc_name), NULL);
-	build_namelist(gconf.mac_head,
-	    offsetof(struct dssh_mac_s, name), registry_next_mac, mac_name, sizeof(mac_name), NULL);
-
-	size_t pos = 17;  /* skip msg_type + cookie */
-	pos = write_namelist(crafted, pos, kex_name);     /* [0] kex */
-	pos = write_namelist(crafted, pos, ka_name);      /* [1] host key */
-	pos = write_namelist(crafted, pos, enc_name);     /* [2] enc c2s */
-	pos = write_namelist(crafted, pos, enc_name);     /* [3] enc s2c */
-	pos = write_namelist(crafted, pos, mac_name);     /* [4] mac c2s */
-	pos = write_namelist(crafted, pos, mac_name);     /* [5] mac s2c */
-	pos = write_namelist(crafted, pos, "none");       /* [6] comp c2s -- matches */
-	pos = write_namelist(crafted, pos, "bogus");      /* [7] comp s2c -- NO match */
-	pos = write_namelist(crafted, pos, "");           /* [8] lang c2s */
-	pos = write_namelist(crafted, pos, "");           /* [9] lang s2c */
-	crafted[pos] = 0;  /* first_kex_packet_follows */
-	pos += 5;          /* + 4 bytes reserved (zeros) */
-
-	/* Replace the peer_kexinit */
-	free(client->trans.peer_kexinit);
-	client->trans.peer_kexinit = malloc(pos);
-	memcpy(client->trans.peer_kexinit, crafted, pos);
-	client->trans.peer_kexinit_sz = pos;
-
-	/* Clear selected fields */
-	client->trans.kex_selected = NULL;
-	client->trans.key_algo_selected = NULL;
-	client->trans.enc_c2s_selected = NULL;
-	client->trans.enc_s2c_selected = NULL;
-	client->trans.mac_c2s_selected = NULL;
-	client->trans.mac_s2c_selected = NULL;
-	client->trans.comp_c2s_selected = NULL;
-	client->trans.comp_s2c_selected = NULL;
-
-	/* Re-run kexinit -- should fail because comp_s2c has no match */
-	int res = kexinit(client);
-	ASSERT_EQ(res, DSSH_ERROR_INVALID);
-
-	/* Verify comp_c2s succeeded but comp_s2c is NULL */
-	ASSERT_NOT_NULL(client->trans.comp_c2s_selected);
-	ASSERT_NULL(client->trans.comp_s2c_selected);
-
-	mock_io_close_c2s(&io2);
-	mock_io_close_s2c(&io2);
-	mock_io_free(&io2);
-	dssh_session_cleanup(server);
-	dssh_session_cleanup(client);
-	dssh_test_reset_global_config();
-	return TEST_PASS;
-}
-
 #ifdef DSSH_CRYPTO_OPENSSL /* derive_key + MAC ossl injection tests */
 /*
  * derive_key: fail EVP_DigestUpdate(shared_secret) -- line 1208.
@@ -7000,6 +6704,7 @@ register_fixed_rekey_methods(void)
 
 #include "transport_transition_cases.h"
 #include "direct_kex_cases.h"
+#include "negotiation_pair_cases.h"
 
 static int
 boundary_tx(uint8_t *buf, size_t bufsz, dssh_session sess, void *cbdata)
@@ -8582,6 +8287,7 @@ test_rekey_global_pipeline(void)
 #include "gather_batch_cases.h"
 
 static struct dssh_test_entry tests[] = {
+	{ "negotiate/offer_replace", test_negotiation_offer_replace },
 	{ "direct_kex/fixture", test_direct_kex_fixture },
 	{ "direct_kex/builder", test_direct_packet_builder },
 	{ "rekey/owned_roundtrip", test_rekey_owned_roundtrip },
@@ -8589,7 +8295,7 @@ static struct dssh_test_entry tests[] = {
 #if defined(DSSH_TRANSPORT_REKEY_CONTROLS)
 	{ "fixture/ownership", test_transport_all_rekey_ownership },
 #elif defined(DSSH_TRANSPORT_PAIR_CONTROLS)
-	{ "fixture/ownership", test_transport_selected_pair_ownership },
+	{ "fixture/ownership", test_transport_all_pair_ownership },
 #endif
 	{ "release/test_layout", test_transport_test_layout },
 	{ "gather/batch", test_gather_batch },
@@ -9043,7 +8749,7 @@ main(int argc, char **argv)
 #ifdef DSSH_TRANSPORT_REKEY_CONTROLS
 		return transport_all_rekey_assertion_control(phase);
 #else
-		return transport_selected_pair_assertion_control(phase);
+		return transport_all_pair_assertion_control(phase);
 #endif
 	}
 #endif

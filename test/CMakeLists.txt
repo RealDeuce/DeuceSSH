@@ -1443,6 +1443,12 @@ foreach(suffix IN ITEMS "" _hmac256 _dhgex _rsa _rsa512 _dhgex_rsa _dhgex_rsa512
 	_sntrup _sntrup_rsa _sntrup_rsa512 _mlkem _mlkem_rsa _mlkem_rsa512
 	_rsa_hmac256 _dhgex_hmac256 _sntrup_hmac256)
 	get_test_property(dssh_transport${suffix} ENVIRONMENT transport_pair_environment)
+	foreach(part IN ITEMS kex comp_s2c)
+		dssh_add_output_test(dssh_negotiation_pair_${part}${suffix} dssh_test_transport
+			"1 tests: 1 passed, 0 failed, 0 skipped" --exact negotiate/no_common_${part})
+		set_tests_properties(dssh_negotiation_pair_${part}${suffix} PROPERTIES
+			ENVIRONMENT "${transport_pair_environment}" TIMEOUT 120)
+	endforeach()
 	dssh_add_output_test(dssh_language_pair${suffix} dssh_test_transport
 		"1 tests: 1 passed, 0 failed, 0 skipped" --exact language/handshake_rekey)
 	set_tests_properties(dssh_language_pair${suffix} PROPERTIES
@@ -1463,6 +1469,12 @@ foreach(suffix IN ITEMS "" _hmac256 _dhgex _rsa _rsa512 _dhgex_rsa _dhgex_rsa512
 	endforeach()
 endforeach()
 foreach(method IN ITEMS group14 group16)
+	foreach(part IN ITEMS kex comp_s2c)
+		dssh_add_output_test(dssh_negotiation_pair_${part}_${method} dssh_test_transport
+			"1 tests: 1 passed, 0 failed, 0 skipped" --exact negotiate/no_common_${part})
+		set_tests_properties(dssh_negotiation_pair_${part}_${method} PROPERTIES
+			ENVIRONMENT "DSSH_TEST_KEX=${method};${DSSH_TEST_KEY_ENV}" TIMEOUT 120)
+	endforeach()
 	dssh_add_output_test(dssh_language_pair_${method} dssh_test_transport
 		"1 tests: 1 passed, 0 failed, 0 skipped" --exact language/handshake_rekey)
 	set_tests_properties(dssh_language_pair_${method} PROPERTIES
@@ -1480,6 +1492,8 @@ dssh_add_output_test(dssh_rekey_fixture_oracle dssh_test_transport
 	"1 tests: 1 passed, 0 failed, 0 skipped" --exact rekey/sequence_oracle)
 dssh_add_output_test(dssh_direct_kex_builder dssh_test_transport
 	"1 tests: 1 passed, 0 failed, 0 skipped" --exact direct_kex/builder)
+dssh_add_output_test(dssh_negotiation_pair_offer dssh_test_transport
+	"1 tests: 1 passed, 0 failed, 0 skipped" --exact negotiate/offer_replace)
 set(direct_kex_leaves
 	release/dhgex_group_validation release/dhgex_peer_validation
 	dhgex/server_null_pubkey_fn dhgex/server_null_sign_fn dhgex/server_recv_fail
@@ -2735,6 +2749,15 @@ if(Python3_Interpreter_FOUND AND UNIX AND NOT APPLE)
 				$<TARGET_FILE:dssh_test_transport_pair_owner> ${mode})
 			set_tests_properties(dssh_direct_kex_owner_${kind}_${mode} PROPERTIES
 				ENVIRONMENT "${DSSH_TEST_KEY_ENV};DSSH_DIRECT_KEX_KIND=${kind}" TIMEOUT 120)
+		endforeach()
+	endforeach()
+	foreach(kind IN ITEMS kex comp)
+		foreach(mode IN LISTS owner_modes)
+			add_test(NAME dssh_negotiation_pair_owner_${kind}_${mode} COMMAND ${Python3_EXECUTABLE}
+				${CMAKE_CURRENT_SOURCE_DIR}/fixture_owner_controls.py
+				$<TARGET_FILE:dssh_test_transport_pair_owner> ${mode})
+			set_tests_properties(dssh_negotiation_pair_owner_${kind}_${mode} PROPERTIES
+				ENVIRONMENT "${DSSH_TEST_KEY_ENV};DSSH_NEGOTIATION_KIND=${kind}" TIMEOUT 120)
 		endforeach()
 	endforeach()
 	foreach(kind IN ITEMS cipher fixed)

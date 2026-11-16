@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Verify pinned NIST hash responses, optionally compare a native test driver.
 
-The native driver uses the bundled implementation. This oracle uses Python's
-separate hashlib provider. It neither implements nor replaces production crypto.
+The native driver uses the bundled implementation. Standard answers use
+Python's separate hashlib provider; one private-branch model follows FIPS202. It neither implements nor replaces production crypto.
 """
 import argparse
 import hashlib
@@ -38,6 +38,65 @@ def bit_count(text):
     value = int(text)
     require(value % 8 == 0, 'non-byte input/output')
     return value // 8
+
+
+def rc_bit(index):
+    """FIPS202 Algorithm5, with explicit bit positions rather than a table."""
+    register = [1, 0, 0, 0, 0, 0, 0, 0]
+    for _ in range(index % 255):
+        register = [0] + register
+        for position in (0, 4, 5, 6):
+            register[position] ^= register[8]
+        register = register[:8]
+    return register[0]
+
+
+def raw72_reference(message, length):
+    """Test-only rate72/delimiter06 sponge beyond the fixed SHA3 digest extent.
+
+    FIPS202 §§3.1.2,3.2,3.3,4,5 and AppendixB. This model uses literal
+    coordinate formulas and generated constants, not the bundled C schedule.
+    Its first64 bytes must agree with independent hashlib SHA3-512.
+    """
+    mask = (1 << 64) - 1
+    rotations = {(0, 0): 0}
+    x, y = 1, 0
+    for step in range(24):
+        rotations[x, y] = ((step + 1) * (step + 2) // 2) % 64
+        x, y = y, (2 * x + 3 * y) % 5
+    constants = [sum(rc_bit(j + 7 * rnd) << ((1 << j) - 1) for j in range(7))
+                 for rnd in range(24)]
+
+    def rotate(value, shift):
+        return ((value << shift) | (value >> (64 - shift))) & mask if shift else value
+
+    def permute(state):
+        for constant in constants:
+            columns = [state[x] ^ state[x + 5] ^ state[x + 10] ^ state[x + 15] ^ state[x + 20]
+                       for x in range(5)]
+            theta = [state[x + 5 * y] ^ columns[(x - 1) % 5] ^ rotate(columns[(x + 1) % 5], 1)
+                     for y in range(5) for x in range(5)]
+            rho = [rotate(theta[x + 5 * y], rotations[x, y]) for y in range(5) for x in range(5)]
+            pi = [rho[(x + 3 * y) % 5 + 5 * x] for y in range(5) for x in range(5)]
+            state = [pi[x + 5 * y] ^ ((pi[(x + 1) % 5 + 5 * y] ^ mask) & pi[(x + 2) % 5 + 5 * y])
+                     for y in range(5) for x in range(5)]
+            state[0] ^= constant
+        return state
+
+    padded = bytearray(message) + bytearray(72 - len(message) % 72)
+    padded[len(message)] = 0x06
+    padded[-1] |= 0x80
+    state = [0] * 25
+    for offset in range(0, len(padded), 72):
+        for word in range(9):
+            state[word] ^= int.from_bytes(padded[offset + 8 * word:offset + 8 * (word + 1)], 'little')
+        state = permute(state)
+    output = bytearray()
+    while len(output) < length:
+        output.extend(b''.join(word.to_bytes(8, 'little') for word in state[:9]))
+        if len(output) < length:
+            state = permute(state)
+    return bytes(output[:length])
 
 
 def reference(mode, message, length):
@@ -112,11 +171,18 @@ def boundary_requests():
         message = bytes((29 * i + 17 * seed) % 256 for i in range(102))
         expected = b''.join(hashlib.shake_128(message[34 * i:34 * (i + 1)]).digest(672) for i in range(3))
         requests.append(('matrix128', message, len(expected), expected))
-    require(len(requests) == 1536, 'boundary extent')
+    for size in [0, 1, 71, 72, 73, 143, 144, 145]:
+        for pattern in range(2):
+            message = bytes(size) if pattern == 0 else bytes((197 * i + size + 7) % 256 for i in range(size))
+            stream = raw72_reference(message, 217)
+            require(stream[:64] == hashlib.sha3_512(message).digest(), 'independent raw72 model prefix')
+            for length in [0, 64, 71, 72, 73, 144, 145, 217]:
+                requests.append(('raw72', message, length, stream[:length]))
+    require(len(requests) == 1664, 'boundary extent')
     return requests
 
 
-def compare_program(program):
+def compare_program(program, retirement):
     requests = boundary_requests()
     wire = ''.join(f'{mode} {length} {message.hex() or "-"}\n'
                    for mode, message, length, _ in requests)
@@ -125,8 +191,13 @@ def compare_program(program):
                                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     require(completed.returncode == 0, 'native oracle exit: ' + str(completed.returncode)
             + '\n' + completed.stderr)
-    require(completed.stderr == f'ML-KEM hash oracle: cases={len(requests)} valid=1\n',
-            'native oracle diagnostics: ' + completed.stderr)
+    marker = f'ML-KEM hash oracle: cases={len(requests)} valid=1\n'
+    if retirement:
+        match = re.fullmatch(re.escape(marker) + r'ML-KEM hash retirement: cases=(\d+) sites=14 clears=(\d+) seen=16383 active=0 valid=1\n', completed.stderr)
+        require(match is not None and int(match[1]) == len(requests) and int(match[2]) > 0,
+                'native retirement diagnostics: ' + completed.stderr)
+    else:
+        require(completed.stderr == marker, 'native oracle diagnostics: ' + completed.stderr)
     lines = completed.stdout.splitlines()
     require(len(lines) == len(requests), 'native oracle output count')
     for index, (line, request) in enumerate(zip(lines, requests)):
@@ -136,6 +207,7 @@ def compare_program(program):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--retirement', action='store_true', help='require live hash cleanup observations')
     parser.add_argument('--program', help='built dssh_test_mlkem_hash executable')
     args = parser.parse_args()
     manifest = json.loads(MANIFEST.read_text())
@@ -146,7 +218,7 @@ def main():
     require(total == manifest['total_cases'] == 3592, 'complete corpus count')
     print(f'ML-KEM hash Python: files=10 cases={total} valid=1')
     if args.program:
-        compare_program(args.program)
+        compare_program(args.program, args.retirement)
     return 0
 
 

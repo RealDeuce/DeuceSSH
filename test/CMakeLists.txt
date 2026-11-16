@@ -548,6 +548,17 @@ dssh_add_output_test(dssh_mlkem_hash_cavp dssh_test_mlkem_hash
 	"ML-KEM hash CAVP: 3592 passed, 0 failed; files=10 guards=1"
 	"${CMAKE_CURRENT_SOURCE_DIR}/vectors/sha3-cavp")
 set_tests_properties(dssh_mlkem_hash_cavp PROPERTIES TIMEOUT 120)
+add_executable(dssh_test_mlkem_hash_retirement test_mlkem_hash.c)
+set_property(TARGET dssh_test_mlkem_hash_retirement PROPERTY C_STANDARD ${DEUCESSH_C_STANDARD})
+set_property(TARGET dssh_test_mlkem_hash_retirement PROPERTY C_STANDARD_REQUIRED ON)
+target_include_directories(dssh_test_mlkem_hash_retirement PRIVATE ${PROJECT_SOURCE_DIR})
+target_compile_definitions(dssh_test_mlkem_hash_retirement PRIVATE DSSH_TEST_MLKEM_HASH_RETIREMENT)
+target_compile_options(dssh_test_mlkem_hash_retirement PRIVATE ${DEUCESSH_COMPILE_OPTIONS}
+	$<$<OR:$<C_COMPILER_ID:Clang>,$<C_COMPILER_ID:AppleClang>,$<C_COMPILER_ID:GNU>>:-Wno-unused-function>)
+dssh_add_output_test(dssh_mlkem_hash_retirement dssh_test_mlkem_hash_retirement
+	"ML-KEM hash CAVP: 3592 passed, 0 failed; files=10 guards=1"
+	"${CMAKE_CURRENT_SOURCE_DIR}/vectors/sha3-cavp")
+set_tests_properties(dssh_mlkem_hash_retirement PROPERTIES TIMEOUT 120)
 
 # Pinned official NIST answers, shared by the actual bundled and native roots.
 add_library(dssh_mlkem_acvp_data STATIC mlkem_acvp_data.c)

@@ -5,13 +5,21 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef DSSH_TEST_MLKEM_HASH_RETIREMENT
+#include <inttypes.h>
+static void observe_hash_clear(const char *, const char *, const void *, size_t);
+#define DSSH_MLKEM_CLEAR_OBSERVER observe_hash_clear
+#endif
 #include "kex/libcrux_mlkem768_sha3.h"
+#ifdef DSSH_TEST_MLKEM_HASH_RETIREMENT
+#include "mlkem_hash_retirement.h"
+#endif
 
 #define MAX_INPUT 17068
 #define MAX_OUTPUT 2048
 #define LINE_CAPACITY 35000
 
-enum hash_mode { SHA3_256, SHA3_512, SHAKE128, SHAKE256, MATRIX128 };
+enum hash_mode { SHA3_256, SHA3_512, SHAKE128, SHAKE256, MATRIX128, RAW72 };
 
 static const struct {
 	const char *name;
@@ -125,7 +133,7 @@ hex_bytes(const char *text, uint8_t *out, size_t length)
 }
 
 static bool
-hash_bytes(enum hash_mode mode, uint8_t *input, size_t length, uint8_t *out, size_t outlen)
+hash_bytes_primitive(enum hash_mode mode, uint8_t *input, size_t length, uint8_t *out, size_t outlen)
 {
 	Eurydice_slice data = {input, length};
 	Eurydice_slice digest = {out, outlen};
@@ -141,6 +149,11 @@ hash_bytes(enum hash_mode mode, uint8_t *input, size_t length, uint8_t *out, siz
 	}
 	else if (mode == SHAKE256)
 		libcrux_sha3_portable_shake256(digest, data);
+	else if (mode == RAW72) {
+		Eurydice_slice inputs[1] = {data};
+		Eurydice_slice outputs[1] = {digest};
+		libcrux_sha3_generic_keccak_keccak_e9(inputs, outputs);
+	}
 	else if (mode == MATRIX128) {
 		if (length != 102 || outlen != 2016)
 			return false;
@@ -193,6 +206,80 @@ hash_bytes(enum hash_mode mode, uint8_t *input, size_t length, uint8_t *out, siz
 		return false;
 	return true;
 }
+
+#ifdef DSSH_TEST_MLKEM_HASH_RETIREMENT
+static struct dssh_hash_wipes *active_hash_wipes;
+static uint64_t hash_retired_cases;
+static uint64_t hash_retired_clears;
+static uint32_t hash_seen_sites;
+static bool hash_retirement_valid = true;
+
+static void
+observe_hash_clear(const char *function, const char *owner, const void *buffer, size_t bytes)
+{
+	if (active_hash_wipes != NULL
+	    && !dssh_hash_wipe_record(active_hash_wipes, function, owner, buffer, bytes))
+		active_hash_wipes->valid = false;
+}
+
+static bool
+hash_bytes(enum hash_mode mode, uint8_t *input, size_t length, uint8_t *out, size_t outlen)
+{
+	struct dssh_hash_wipes actual = {.valid = true};
+	struct dssh_hash_wipes expected = {.valid = true};
+	active_hash_wipes = &actual;
+	bool result = hash_bytes_primitive(mode, input, length, out, outlen);
+	active_hash_wipes = NULL;
+	if (!result)
+		return false;
+	if (hash_retired_cases == UINT64_MAX) {
+		hash_retirement_valid = false;
+		return false;
+	}
+	hash_retired_cases++;
+	size_t rate = mode == SHA3_512 || mode == RAW72 ? 72 : mode == SHAKE128 || mode == MATRIX128 ? 168 : 136;
+	/* run_hash bounds input/output at17068/2048. The largest quotient sum
+	 * is below300 on every supported size_t width. */
+	size_t rounds = length / rate + 1;
+	if (outlen != 0)
+		rounds += (outlen - 1) / rate;
+	if (mode == MATRIX128)
+		rounds = 12;
+	uint32_t permutations = (uint32_t)rounds;
+	expected.calls[DSSH_HASH_C] = permutations;
+	expected.calls[DSSH_HASH_T] = permutations;
+	expected.calls[DSSH_HASH_OLD] = permutations;
+	if (mode == SHAKE128 || mode == MATRIX128)
+		expected.calls[DSSH_HASH_FINAL168] = mode == MATRIX128 ? 3 : 1;
+	else {
+		size_t final = mode == SHA3_512 || mode == RAW72 ? DSSH_HASH_FINAL72
+		    : mode == SHA3_256 ? DSSH_HASH_FINAL136_SHA : DSSH_HASH_FINAL136_SHAKE;
+		expected.calls[final] = 1;
+		size_t state = mode == SHA3_512 || mode == RAW72 ? DSSH_HASH_STATE72
+		    : mode == SHA3_256 ? DSSH_HASH_STATE136_SHA : DSSH_HASH_STATE136_SHAKE;
+		expected.calls[state] = 1;
+		if (outlen < rate)
+			expected.calls[rate == 72 ? DSSH_HASH_FIRST_LAST72 : DSSH_HASH_FIRST_LAST136] = 1;
+		else if (outlen % rate != 0)
+			expected.calls[rate == 72 ? DSSH_HASH_LAST72 : DSSH_HASH_LAST136] = 1;
+	}
+	uint64_t clears = dssh_hash_wipe_total(&actual);
+	if (hash_retired_clears > UINT64_MAX - clears) {
+		hash_retirement_valid = false;
+		return false;
+	}
+	hash_retired_clears += clears;
+	for (size_t i = 0; i < DSSH_HASH_WIPE_SLOTS; i++) {
+		if (actual.calls[i] != 0)
+			hash_seen_sites |= UINT32_C(1) << i;
+	}
+	if (!dssh_hash_wipe_match(&actual, &expected))
+		hash_retirement_valid = false;
+	return hash_retirement_valid;
+}
+#else
+#define hash_bytes hash_bytes_primitive
+#endif
 
 static bool
 run_hash(struct hash_work *work, enum hash_mode mode, size_t length, size_t outlen)
@@ -337,7 +424,7 @@ run_file(const char *directory, size_t index, bool negative, struct hash_work *w
 static int
 run_oracle(struct hash_work *work, char *line)
 {
-	static const char *names[] = {"sha3-256", "sha3-512", "shake128", "shake256", "matrix128"};
+	static const char *names[] = {"sha3-256", "sha3-512", "shake128", "shake256", "matrix128", "raw72"};
 	size_t count = 0;
 	int read;
 	while ((read = read_line(stdin, line)) == 1) {
@@ -355,7 +442,7 @@ run_oracle(struct hash_work *work, char *line)
 		}
 		if (mode >= sizeof(names) / sizeof(names[0]))
 			return 2;
-		/* The table index has been checked against five enum values. */
+		/* The table index has been checked against six enum values. */
 		enum hash_mode selected = (enum hash_mode)mode;
 		size_t outlen = (size_t)requested;
 		size_t hexlen = strcmp(input, "-") == 0 ? 0 : strlen(input);
@@ -390,6 +477,10 @@ main(int argc, char **argv)
 	int result = 2;
 	if (work == NULL || line == NULL)
 		goto done;
+#ifdef DSSH_TEST_MLKEM_HASH_RETIREMENT
+	if (!dssh_hash_wipe_controls())
+		goto done;
+#endif
 	if (argc == 2 && strcmp(argv[1], "--oracle") == 0)
 		result = run_oracle(work, line);
 	else if (argc == 2) {
@@ -411,6 +502,12 @@ main(int argc, char **argv)
 		}
 	}
 	done:
+#ifdef DSSH_TEST_MLKEM_HASH_RETIREMENT
+	if (fprintf(stderr, "ML-KEM hash retirement: cases=%" PRIu64 " sites=14 clears=%" PRIu64
+	    " seen=%" PRIu32 " active=%u valid=%u\n", hash_retired_cases, hash_retired_clears,
+	    hash_seen_sites, active_hash_wipes != NULL ? 1U : 0U, hash_retirement_valid ? 1U : 0U) < 0)
+		result = 2;
+#endif
 	if (work != NULL)
 		dssh_secure_zero(work, sizeof(*work));
 	if (line != NULL)

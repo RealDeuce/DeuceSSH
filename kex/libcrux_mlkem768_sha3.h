@@ -6876,82 +6876,73 @@ libcrux_ml_kem_vector_portable_ntt_ntt_step(libcrux_ml_kem_vector_portable_vecto
 	v->elements[i] = v->elements[i] + t;
 }
 
-static KRML_MUSTINLINE libcrux_ml_kem_vector_portable_vector_type_PortableVector
-libcrux_ml_kem_vector_portable_ntt_ntt_layer_1_step(libcrux_ml_kem_vector_portable_vector_type_PortableVector v,
-    int16_t zeta0, int16_t zeta1, int16_t zeta2, int16_t zeta3)
+static KRML_MUSTINLINE void
+libcrux_ml_kem_vector_portable_ntt_ntt_layer_1_step(libcrux_ml_kem_vector_portable_vector_type_PortableVector *v, int16_t zeta0, int16_t zeta1, int16_t zeta2, int16_t zeta3)
 {
-	libcrux_ml_kem_vector_portable_ntt_ntt_step(&v, zeta0, (size_t)0U, (size_t)2U);
-	libcrux_ml_kem_vector_portable_ntt_ntt_step(&v, zeta0, (size_t)1U, (size_t)3U);
-	libcrux_ml_kem_vector_portable_ntt_ntt_step(&v, zeta1, (size_t)4U, (size_t)6U);
-	libcrux_ml_kem_vector_portable_ntt_ntt_step(&v, zeta1, (size_t)5U, (size_t)7U);
-	libcrux_ml_kem_vector_portable_ntt_ntt_step(&v, zeta2, (size_t)8U, (size_t)10U);
-	libcrux_ml_kem_vector_portable_ntt_ntt_step(&v, zeta2, (size_t)9U, (size_t)11U);
-	libcrux_ml_kem_vector_portable_ntt_ntt_step(&v, zeta3, (size_t)12U, (size_t)14U);
-	libcrux_ml_kem_vector_portable_ntt_ntt_step(&v, zeta3, (size_t)13U, (size_t)15U);
-	return v;
+	libcrux_ml_kem_vector_portable_ntt_ntt_step(v, zeta0, (size_t)0U, (size_t)2U);
+	libcrux_ml_kem_vector_portable_ntt_ntt_step(v, zeta0, (size_t)1U, (size_t)3U);
+	libcrux_ml_kem_vector_portable_ntt_ntt_step(v, zeta1, (size_t)4U, (size_t)6U);
+	libcrux_ml_kem_vector_portable_ntt_ntt_step(v, zeta1, (size_t)5U, (size_t)7U);
+	libcrux_ml_kem_vector_portable_ntt_ntt_step(v, zeta2, (size_t)8U, (size_t)10U);
+	libcrux_ml_kem_vector_portable_ntt_ntt_step(v, zeta2, (size_t)9U, (size_t)11U);
+	libcrux_ml_kem_vector_portable_ntt_ntt_step(v, zeta3, (size_t)12U, (size_t)14U);
+	libcrux_ml_kem_vector_portable_ntt_ntt_step(v, zeta3, (size_t)13U, (size_t)15U);
 }
 
 /**
 This function found in impl {(libcrux_ml_kem::vector::traits::Operations for
 libcrux_ml_kem::vector::portable::vector_type::PortableVector)}
 */
-static inline libcrux_ml_kem_vector_portable_vector_type_PortableVector
-libcrux_ml_kem_vector_portable_ntt_layer_1_step_0d(libcrux_ml_kem_vector_portable_vector_type_PortableVector a,
-    int16_t zeta0, int16_t zeta1, int16_t zeta2, int16_t zeta3)
+static inline void
+libcrux_ml_kem_vector_portable_ntt_layer_1_step_0d(libcrux_ml_kem_vector_portable_vector_type_PortableVector *a, int16_t zeta0, int16_t zeta1, int16_t zeta2, int16_t zeta3)
 {
-	return libcrux_ml_kem_vector_portable_ntt_ntt_layer_1_step(a, zeta0, zeta1, zeta2, zeta3);
+	libcrux_ml_kem_vector_portable_ntt_ntt_layer_1_step(a, zeta0, zeta1, zeta2, zeta3);
 }
 
-static KRML_MUSTINLINE libcrux_ml_kem_vector_portable_vector_type_PortableVector
-libcrux_ml_kem_vector_portable_ntt_ntt_layer_2_step(libcrux_ml_kem_vector_portable_vector_type_PortableVector v,
-    int16_t zeta0, int16_t zeta1)
+static KRML_MUSTINLINE void
+libcrux_ml_kem_vector_portable_ntt_ntt_layer_2_step(libcrux_ml_kem_vector_portable_vector_type_PortableVector *v, int16_t zeta0, int16_t zeta1)
 {
-	libcrux_ml_kem_vector_portable_ntt_ntt_step(&v, zeta0, (size_t)0U, (size_t)4U);
-	libcrux_ml_kem_vector_portable_ntt_ntt_step(&v, zeta0, (size_t)1U, (size_t)5U);
-	libcrux_ml_kem_vector_portable_ntt_ntt_step(&v, zeta0, (size_t)2U, (size_t)6U);
-	libcrux_ml_kem_vector_portable_ntt_ntt_step(&v, zeta0, (size_t)3U, (size_t)7U);
-	libcrux_ml_kem_vector_portable_ntt_ntt_step(&v, zeta1, (size_t)8U, (size_t)12U);
-	libcrux_ml_kem_vector_portable_ntt_ntt_step(&v, zeta1, (size_t)9U, (size_t)13U);
-	libcrux_ml_kem_vector_portable_ntt_ntt_step(&v, zeta1, (size_t)10U, (size_t)14U);
-	libcrux_ml_kem_vector_portable_ntt_ntt_step(&v, zeta1, (size_t)11U, (size_t)15U);
-	return v;
+	libcrux_ml_kem_vector_portable_ntt_ntt_step(v, zeta0, (size_t)0U, (size_t)4U);
+	libcrux_ml_kem_vector_portable_ntt_ntt_step(v, zeta0, (size_t)1U, (size_t)5U);
+	libcrux_ml_kem_vector_portable_ntt_ntt_step(v, zeta0, (size_t)2U, (size_t)6U);
+	libcrux_ml_kem_vector_portable_ntt_ntt_step(v, zeta0, (size_t)3U, (size_t)7U);
+	libcrux_ml_kem_vector_portable_ntt_ntt_step(v, zeta1, (size_t)8U, (size_t)12U);
+	libcrux_ml_kem_vector_portable_ntt_ntt_step(v, zeta1, (size_t)9U, (size_t)13U);
+	libcrux_ml_kem_vector_portable_ntt_ntt_step(v, zeta1, (size_t)10U, (size_t)14U);
+	libcrux_ml_kem_vector_portable_ntt_ntt_step(v, zeta1, (size_t)11U, (size_t)15U);
 }
 
 /**
 This function found in impl {(libcrux_ml_kem::vector::traits::Operations for
 libcrux_ml_kem::vector::portable::vector_type::PortableVector)}
 */
-static inline libcrux_ml_kem_vector_portable_vector_type_PortableVector
-libcrux_ml_kem_vector_portable_ntt_layer_2_step_0d(libcrux_ml_kem_vector_portable_vector_type_PortableVector a,
-    int16_t zeta0, int16_t zeta1)
+static inline void
+libcrux_ml_kem_vector_portable_ntt_layer_2_step_0d(libcrux_ml_kem_vector_portable_vector_type_PortableVector *a, int16_t zeta0, int16_t zeta1)
 {
-	return libcrux_ml_kem_vector_portable_ntt_ntt_layer_2_step(a, zeta0, zeta1);
+	libcrux_ml_kem_vector_portable_ntt_ntt_layer_2_step(a, zeta0, zeta1);
 }
 
-static KRML_MUSTINLINE libcrux_ml_kem_vector_portable_vector_type_PortableVector
-libcrux_ml_kem_vector_portable_ntt_ntt_layer_3_step(libcrux_ml_kem_vector_portable_vector_type_PortableVector v,
-    int16_t                                                                                                   zeta)
+static KRML_MUSTINLINE void
+libcrux_ml_kem_vector_portable_ntt_ntt_layer_3_step(libcrux_ml_kem_vector_portable_vector_type_PortableVector *v, int16_t zeta)
 {
-	libcrux_ml_kem_vector_portable_ntt_ntt_step(&v, zeta, (size_t)0U, (size_t)8U);
-	libcrux_ml_kem_vector_portable_ntt_ntt_step(&v, zeta, (size_t)1U, (size_t)9U);
-	libcrux_ml_kem_vector_portable_ntt_ntt_step(&v, zeta, (size_t)2U, (size_t)10U);
-	libcrux_ml_kem_vector_portable_ntt_ntt_step(&v, zeta, (size_t)3U, (size_t)11U);
-	libcrux_ml_kem_vector_portable_ntt_ntt_step(&v, zeta, (size_t)4U, (size_t)12U);
-	libcrux_ml_kem_vector_portable_ntt_ntt_step(&v, zeta, (size_t)5U, (size_t)13U);
-	libcrux_ml_kem_vector_portable_ntt_ntt_step(&v, zeta, (size_t)6U, (size_t)14U);
-	libcrux_ml_kem_vector_portable_ntt_ntt_step(&v, zeta, (size_t)7U, (size_t)15U);
-	return v;
+	libcrux_ml_kem_vector_portable_ntt_ntt_step(v, zeta, (size_t)0U, (size_t)8U);
+	libcrux_ml_kem_vector_portable_ntt_ntt_step(v, zeta, (size_t)1U, (size_t)9U);
+	libcrux_ml_kem_vector_portable_ntt_ntt_step(v, zeta, (size_t)2U, (size_t)10U);
+	libcrux_ml_kem_vector_portable_ntt_ntt_step(v, zeta, (size_t)3U, (size_t)11U);
+	libcrux_ml_kem_vector_portable_ntt_ntt_step(v, zeta, (size_t)4U, (size_t)12U);
+	libcrux_ml_kem_vector_portable_ntt_ntt_step(v, zeta, (size_t)5U, (size_t)13U);
+	libcrux_ml_kem_vector_portable_ntt_ntt_step(v, zeta, (size_t)6U, (size_t)14U);
+	libcrux_ml_kem_vector_portable_ntt_ntt_step(v, zeta, (size_t)7U, (size_t)15U);
 }
 
 /**
 This function found in impl {(libcrux_ml_kem::vector::traits::Operations for
 libcrux_ml_kem::vector::portable::vector_type::PortableVector)}
 */
-static inline libcrux_ml_kem_vector_portable_vector_type_PortableVector
-libcrux_ml_kem_vector_portable_ntt_layer_3_step_0d(libcrux_ml_kem_vector_portable_vector_type_PortableVector a,
-    int16_t                                                                                                  zeta)
+static inline void
+libcrux_ml_kem_vector_portable_ntt_layer_3_step_0d(libcrux_ml_kem_vector_portable_vector_type_PortableVector *a, int16_t zeta)
 {
-	return libcrux_ml_kem_vector_portable_ntt_ntt_layer_3_step(a, zeta);
+	libcrux_ml_kem_vector_portable_ntt_ntt_layer_3_step(a, zeta);
 }
 
 static KRML_MUSTINLINE void
@@ -6964,83 +6955,73 @@ libcrux_ml_kem_vector_portable_ntt_inv_ntt_step(libcrux_ml_kem_vector_portable_v
 	v->elements[j] = libcrux_ml_kem_vector_portable_arithmetic_montgomery_multiply_fe_by_fer(a_minus_b, zeta);
 }
 
-static KRML_MUSTINLINE libcrux_ml_kem_vector_portable_vector_type_PortableVector
-libcrux_ml_kem_vector_portable_ntt_inv_ntt_layer_1_step(
-    libcrux_ml_kem_vector_portable_vector_type_PortableVector v, int16_t zeta0, int16_t zeta1, int16_t zeta2,
-    int16_t zeta3)
+static KRML_MUSTINLINE void
+libcrux_ml_kem_vector_portable_ntt_inv_ntt_layer_1_step(libcrux_ml_kem_vector_portable_vector_type_PortableVector *v, int16_t zeta0, int16_t zeta1, int16_t zeta2, int16_t zeta3)
 {
-	libcrux_ml_kem_vector_portable_ntt_inv_ntt_step(&v, zeta0, (size_t)0U, (size_t)2U);
-	libcrux_ml_kem_vector_portable_ntt_inv_ntt_step(&v, zeta0, (size_t)1U, (size_t)3U);
-	libcrux_ml_kem_vector_portable_ntt_inv_ntt_step(&v, zeta1, (size_t)4U, (size_t)6U);
-	libcrux_ml_kem_vector_portable_ntt_inv_ntt_step(&v, zeta1, (size_t)5U, (size_t)7U);
-	libcrux_ml_kem_vector_portable_ntt_inv_ntt_step(&v, zeta2, (size_t)8U, (size_t)10U);
-	libcrux_ml_kem_vector_portable_ntt_inv_ntt_step(&v, zeta2, (size_t)9U, (size_t)11U);
-	libcrux_ml_kem_vector_portable_ntt_inv_ntt_step(&v, zeta3, (size_t)12U, (size_t)14U);
-	libcrux_ml_kem_vector_portable_ntt_inv_ntt_step(&v, zeta3, (size_t)13U, (size_t)15U);
-	return v;
+	libcrux_ml_kem_vector_portable_ntt_inv_ntt_step(v, zeta0, (size_t)0U, (size_t)2U);
+	libcrux_ml_kem_vector_portable_ntt_inv_ntt_step(v, zeta0, (size_t)1U, (size_t)3U);
+	libcrux_ml_kem_vector_portable_ntt_inv_ntt_step(v, zeta1, (size_t)4U, (size_t)6U);
+	libcrux_ml_kem_vector_portable_ntt_inv_ntt_step(v, zeta1, (size_t)5U, (size_t)7U);
+	libcrux_ml_kem_vector_portable_ntt_inv_ntt_step(v, zeta2, (size_t)8U, (size_t)10U);
+	libcrux_ml_kem_vector_portable_ntt_inv_ntt_step(v, zeta2, (size_t)9U, (size_t)11U);
+	libcrux_ml_kem_vector_portable_ntt_inv_ntt_step(v, zeta3, (size_t)12U, (size_t)14U);
+	libcrux_ml_kem_vector_portable_ntt_inv_ntt_step(v, zeta3, (size_t)13U, (size_t)15U);
 }
 
 /**
 This function found in impl {(libcrux_ml_kem::vector::traits::Operations for
 libcrux_ml_kem::vector::portable::vector_type::PortableVector)}
 */
-static inline libcrux_ml_kem_vector_portable_vector_type_PortableVector
-libcrux_ml_kem_vector_portable_inv_ntt_layer_1_step_0d(libcrux_ml_kem_vector_portable_vector_type_PortableVector a,
-    int16_t zeta0, int16_t zeta1, int16_t zeta2, int16_t zeta3)
+static inline void
+libcrux_ml_kem_vector_portable_inv_ntt_layer_1_step_0d(libcrux_ml_kem_vector_portable_vector_type_PortableVector *a, int16_t zeta0, int16_t zeta1, int16_t zeta2, int16_t zeta3)
 {
-	return libcrux_ml_kem_vector_portable_ntt_inv_ntt_layer_1_step(a, zeta0, zeta1, zeta2, zeta3);
+	libcrux_ml_kem_vector_portable_ntt_inv_ntt_layer_1_step(a, zeta0, zeta1, zeta2, zeta3);
 }
 
-static KRML_MUSTINLINE libcrux_ml_kem_vector_portable_vector_type_PortableVector
-libcrux_ml_kem_vector_portable_ntt_inv_ntt_layer_2_step(
-    libcrux_ml_kem_vector_portable_vector_type_PortableVector v, int16_t zeta0, int16_t zeta1)
+static KRML_MUSTINLINE void
+libcrux_ml_kem_vector_portable_ntt_inv_ntt_layer_2_step(libcrux_ml_kem_vector_portable_vector_type_PortableVector *v, int16_t zeta0, int16_t zeta1)
 {
-	libcrux_ml_kem_vector_portable_ntt_inv_ntt_step(&v, zeta0, (size_t)0U, (size_t)4U);
-	libcrux_ml_kem_vector_portable_ntt_inv_ntt_step(&v, zeta0, (size_t)1U, (size_t)5U);
-	libcrux_ml_kem_vector_portable_ntt_inv_ntt_step(&v, zeta0, (size_t)2U, (size_t)6U);
-	libcrux_ml_kem_vector_portable_ntt_inv_ntt_step(&v, zeta0, (size_t)3U, (size_t)7U);
-	libcrux_ml_kem_vector_portable_ntt_inv_ntt_step(&v, zeta1, (size_t)8U, (size_t)12U);
-	libcrux_ml_kem_vector_portable_ntt_inv_ntt_step(&v, zeta1, (size_t)9U, (size_t)13U);
-	libcrux_ml_kem_vector_portable_ntt_inv_ntt_step(&v, zeta1, (size_t)10U, (size_t)14U);
-	libcrux_ml_kem_vector_portable_ntt_inv_ntt_step(&v, zeta1, (size_t)11U, (size_t)15U);
-	return v;
+	libcrux_ml_kem_vector_portable_ntt_inv_ntt_step(v, zeta0, (size_t)0U, (size_t)4U);
+	libcrux_ml_kem_vector_portable_ntt_inv_ntt_step(v, zeta0, (size_t)1U, (size_t)5U);
+	libcrux_ml_kem_vector_portable_ntt_inv_ntt_step(v, zeta0, (size_t)2U, (size_t)6U);
+	libcrux_ml_kem_vector_portable_ntt_inv_ntt_step(v, zeta0, (size_t)3U, (size_t)7U);
+	libcrux_ml_kem_vector_portable_ntt_inv_ntt_step(v, zeta1, (size_t)8U, (size_t)12U);
+	libcrux_ml_kem_vector_portable_ntt_inv_ntt_step(v, zeta1, (size_t)9U, (size_t)13U);
+	libcrux_ml_kem_vector_portable_ntt_inv_ntt_step(v, zeta1, (size_t)10U, (size_t)14U);
+	libcrux_ml_kem_vector_portable_ntt_inv_ntt_step(v, zeta1, (size_t)11U, (size_t)15U);
 }
 
 /**
 This function found in impl {(libcrux_ml_kem::vector::traits::Operations for
 libcrux_ml_kem::vector::portable::vector_type::PortableVector)}
 */
-static inline libcrux_ml_kem_vector_portable_vector_type_PortableVector
-libcrux_ml_kem_vector_portable_inv_ntt_layer_2_step_0d(libcrux_ml_kem_vector_portable_vector_type_PortableVector a,
-    int16_t zeta0, int16_t zeta1)
+static inline void
+libcrux_ml_kem_vector_portable_inv_ntt_layer_2_step_0d(libcrux_ml_kem_vector_portable_vector_type_PortableVector *a, int16_t zeta0, int16_t zeta1)
 {
-	return libcrux_ml_kem_vector_portable_ntt_inv_ntt_layer_2_step(a, zeta0, zeta1);
+	libcrux_ml_kem_vector_portable_ntt_inv_ntt_layer_2_step(a, zeta0, zeta1);
 }
 
-static KRML_MUSTINLINE libcrux_ml_kem_vector_portable_vector_type_PortableVector
-libcrux_ml_kem_vector_portable_ntt_inv_ntt_layer_3_step(
-    libcrux_ml_kem_vector_portable_vector_type_PortableVector v, int16_t zeta)
+static KRML_MUSTINLINE void
+libcrux_ml_kem_vector_portable_ntt_inv_ntt_layer_3_step(libcrux_ml_kem_vector_portable_vector_type_PortableVector *v, int16_t zeta)
 {
-	libcrux_ml_kem_vector_portable_ntt_inv_ntt_step(&v, zeta, (size_t)0U, (size_t)8U);
-	libcrux_ml_kem_vector_portable_ntt_inv_ntt_step(&v, zeta, (size_t)1U, (size_t)9U);
-	libcrux_ml_kem_vector_portable_ntt_inv_ntt_step(&v, zeta, (size_t)2U, (size_t)10U);
-	libcrux_ml_kem_vector_portable_ntt_inv_ntt_step(&v, zeta, (size_t)3U, (size_t)11U);
-	libcrux_ml_kem_vector_portable_ntt_inv_ntt_step(&v, zeta, (size_t)4U, (size_t)12U);
-	libcrux_ml_kem_vector_portable_ntt_inv_ntt_step(&v, zeta, (size_t)5U, (size_t)13U);
-	libcrux_ml_kem_vector_portable_ntt_inv_ntt_step(&v, zeta, (size_t)6U, (size_t)14U);
-	libcrux_ml_kem_vector_portable_ntt_inv_ntt_step(&v, zeta, (size_t)7U, (size_t)15U);
-	return v;
+	libcrux_ml_kem_vector_portable_ntt_inv_ntt_step(v, zeta, (size_t)0U, (size_t)8U);
+	libcrux_ml_kem_vector_portable_ntt_inv_ntt_step(v, zeta, (size_t)1U, (size_t)9U);
+	libcrux_ml_kem_vector_portable_ntt_inv_ntt_step(v, zeta, (size_t)2U, (size_t)10U);
+	libcrux_ml_kem_vector_portable_ntt_inv_ntt_step(v, zeta, (size_t)3U, (size_t)11U);
+	libcrux_ml_kem_vector_portable_ntt_inv_ntt_step(v, zeta, (size_t)4U, (size_t)12U);
+	libcrux_ml_kem_vector_portable_ntt_inv_ntt_step(v, zeta, (size_t)5U, (size_t)13U);
+	libcrux_ml_kem_vector_portable_ntt_inv_ntt_step(v, zeta, (size_t)6U, (size_t)14U);
+	libcrux_ml_kem_vector_portable_ntt_inv_ntt_step(v, zeta, (size_t)7U, (size_t)15U);
 }
 
 /**
 This function found in impl {(libcrux_ml_kem::vector::traits::Operations for
 libcrux_ml_kem::vector::portable::vector_type::PortableVector)}
 */
-static inline libcrux_ml_kem_vector_portable_vector_type_PortableVector
-libcrux_ml_kem_vector_portable_inv_ntt_layer_3_step_0d(libcrux_ml_kem_vector_portable_vector_type_PortableVector a,
-    int16_t zeta)
+static inline void
+libcrux_ml_kem_vector_portable_inv_ntt_layer_3_step_0d(libcrux_ml_kem_vector_portable_vector_type_PortableVector *a, int16_t zeta)
 {
-	return libcrux_ml_kem_vector_portable_ntt_inv_ntt_layer_3_step(a, zeta);
+	libcrux_ml_kem_vector_portable_ntt_inv_ntt_layer_3_step(a, zeta);
 }
 
 /**
@@ -7082,38 +7063,31 @@ libcrux_ml_kem_vector_portable_ntt_ntt_multiply_binomials(
 	out->elements[j] = o1;
 }
 
-static KRML_MUSTINLINE libcrux_ml_kem_vector_portable_vector_type_PortableVector
-libcrux_ml_kem_vector_portable_ntt_ntt_multiply(libcrux_ml_kem_vector_portable_vector_type_PortableVector *lhs,
-    libcrux_ml_kem_vector_portable_vector_type_PortableVector *rhs, int16_t zeta0, int16_t zeta1, int16_t zeta2,
-    int16_t zeta3)
+static KRML_MUSTINLINE void
+libcrux_ml_kem_vector_portable_ntt_ntt_multiply(libcrux_ml_kem_vector_portable_vector_type_PortableVector *lhs, libcrux_ml_kem_vector_portable_vector_type_PortableVector *rhs, int16_t zeta0, int16_t zeta1, int16_t zeta2, int16_t zeta3, libcrux_ml_kem_vector_portable_vector_type_PortableVector *out)
 {
-	libcrux_ml_kem_vector_portable_vector_type_PortableVector out =
-	    libcrux_ml_kem_vector_portable_vector_type_zero();
 	/* Negation of int16_t promotes to int; cast back so AppleClang
 	 * doesn't flag the int->int16_t arg as a narrowing conversion. */
-	libcrux_ml_kem_vector_portable_ntt_ntt_multiply_binomials(lhs, rhs, zeta0, (size_t)0U, (size_t)1U, &out);
-	libcrux_ml_kem_vector_portable_ntt_ntt_multiply_binomials(lhs, rhs, (int16_t)-zeta0, (size_t)2U, (size_t)3U, &out);
-	libcrux_ml_kem_vector_portable_ntt_ntt_multiply_binomials(lhs, rhs, zeta1, (size_t)4U, (size_t)5U, &out);
-	libcrux_ml_kem_vector_portable_ntt_ntt_multiply_binomials(lhs, rhs, (int16_t)-zeta1, (size_t)6U, (size_t)7U, &out);
-	libcrux_ml_kem_vector_portable_ntt_ntt_multiply_binomials(lhs, rhs, zeta2, (size_t)8U, (size_t)9U, &out);
+	libcrux_ml_kem_vector_portable_ntt_ntt_multiply_binomials(lhs, rhs, zeta0, (size_t)0U, (size_t)1U, out);
+	libcrux_ml_kem_vector_portable_ntt_ntt_multiply_binomials(lhs, rhs, (int16_t)-zeta0, (size_t)2U, (size_t)3U, out);
+	libcrux_ml_kem_vector_portable_ntt_ntt_multiply_binomials(lhs, rhs, zeta1, (size_t)4U, (size_t)5U, out);
+	libcrux_ml_kem_vector_portable_ntt_ntt_multiply_binomials(lhs, rhs, (int16_t)-zeta1, (size_t)6U, (size_t)7U, out);
+	libcrux_ml_kem_vector_portable_ntt_ntt_multiply_binomials(lhs, rhs, zeta2, (size_t)8U, (size_t)9U, out);
 	libcrux_ml_kem_vector_portable_ntt_ntt_multiply_binomials(lhs, rhs, (int16_t)-zeta2, (size_t)10U, (size_t)11U,
-	    &out);
-	libcrux_ml_kem_vector_portable_ntt_ntt_multiply_binomials(lhs, rhs, zeta3, (size_t)12U, (size_t)13U, &out);
+	    out);
+	libcrux_ml_kem_vector_portable_ntt_ntt_multiply_binomials(lhs, rhs, zeta3, (size_t)12U, (size_t)13U, out);
 	libcrux_ml_kem_vector_portable_ntt_ntt_multiply_binomials(lhs, rhs, (int16_t)-zeta3, (size_t)14U, (size_t)15U,
-	    &out);
-	return out;
+	    out);
 }
 
 /**
 This function found in impl {(libcrux_ml_kem::vector::traits::Operations for
 libcrux_ml_kem::vector::portable::vector_type::PortableVector)}
 */
-static inline libcrux_ml_kem_vector_portable_vector_type_PortableVector
-libcrux_ml_kem_vector_portable_ntt_multiply_0d(libcrux_ml_kem_vector_portable_vector_type_PortableVector *lhs,
-    libcrux_ml_kem_vector_portable_vector_type_PortableVector *rhs, int16_t zeta0, int16_t zeta1, int16_t zeta2,
-    int16_t zeta3)
+static inline void
+libcrux_ml_kem_vector_portable_ntt_multiply_0d(libcrux_ml_kem_vector_portable_vector_type_PortableVector *lhs, libcrux_ml_kem_vector_portable_vector_type_PortableVector *rhs, int16_t zeta0, int16_t zeta1, int16_t zeta2, int16_t zeta3, libcrux_ml_kem_vector_portable_vector_type_PortableVector *out)
 {
-	return libcrux_ml_kem_vector_portable_ntt_ntt_multiply(lhs, rhs, zeta0, zeta1, zeta2, zeta3);
+	libcrux_ml_kem_vector_portable_ntt_ntt_multiply(lhs, rhs, zeta0, zeta1, zeta2, zeta3, out);
 }
 
 static KRML_MUSTINLINE void
@@ -8084,15 +8058,12 @@ with types libcrux_ml_kem_vector_portable_vector_type_PortableVector
 with const generics
 
 */
-static KRML_MUSTINLINE libcrux_ml_kem_vector_portable_vector_type_PortableVector_x2
-libcrux_ml_kem_ntt_ntt_layer_int_vec_step_0c(libcrux_ml_kem_vector_portable_vector_type_PortableVector a,
-    libcrux_ml_kem_vector_portable_vector_type_PortableVector b, int16_t zeta_r)
+static KRML_MUSTINLINE void
+libcrux_ml_kem_ntt_ntt_layer_int_vec_step_0c(libcrux_ml_kem_vector_portable_vector_type_PortableVector *a, libcrux_ml_kem_vector_portable_vector_type_PortableVector *b, int16_t zeta_r, libcrux_ml_kem_vector_portable_vector_type_PortableVector *t)
 {
-	libcrux_ml_kem_vector_portable_vector_type_PortableVector t =
-	    libcrux_ml_kem_vector_traits_montgomery_multiply_fe_67(b, zeta_r);
-	b = libcrux_ml_kem_vector_portable_sub_0d(a, &t);
-	a = libcrux_ml_kem_vector_portable_add_0d(a, &t);
-	return (CLITERAL(libcrux_ml_kem_vector_portable_vector_type_PortableVector_x2) {.fst = a, .snd = b});
+	*t = libcrux_ml_kem_vector_traits_montgomery_multiply_fe_67(*b, zeta_r);
+	*b = libcrux_ml_kem_vector_portable_sub_0d(*a, t);
+	*a = libcrux_ml_kem_vector_portable_add_0d(*a, t);
 }
 
 /**
@@ -8105,25 +8076,19 @@ static KRML_MUSTINLINE void
 libcrux_ml_kem_ntt_ntt_at_layer_4_plus_51(size_t *zeta_i, libcrux_ml_kem_polynomial_PolynomialRingElement_f0 *re,
     size_t layer, size_t _initial_coefficient_bound)
 {
+	libcrux_ml_kem_vector_portable_vector_type_PortableVector t;
+	/* All actual calls use layer4..7; one scratch vector is reused. */
 	size_t step = (size_t)1U << (uint32_t)layer;
-	for (size_t i0 = (size_t)0U; i0 < (size_t)128U >> (uint32_t)layer; i0++) {
-		size_t round      = i0;
-		zeta_i[0U]        = zeta_i[0U] + (size_t)1U;
-		size_t offset     = round * step * (size_t)2U;
-		size_t offset_vec = offset / (size_t)16U;
-		size_t step_vec   = step / (size_t)16U;
-		for (size_t i = offset_vec; i < offset_vec + step_vec; i++) {
-			size_t                                                       j = i;
-			libcrux_ml_kem_vector_portable_vector_type_PortableVector_x2 uu____0 =
-			    libcrux_ml_kem_ntt_ntt_layer_int_vec_step_0c(re->coefficients[j],
-				re->coefficients[j + step_vec],
-				libcrux_ml_kem_polynomial_ZETAS_TIMES_MONTGOMERY_R[zeta_i[0U]]);
-			libcrux_ml_kem_vector_portable_vector_type_PortableVector x = uu____0.fst;
-			libcrux_ml_kem_vector_portable_vector_type_PortableVector y = uu____0.snd;
-			re->coefficients[j]                                         = x;
-			re->coefficients[j + step_vec]                              = y;
+	for (size_t round = 0; round < 128 / step; round++) {
+		zeta_i[0] = zeta_i[0] + 1;
+		size_t offset_vec = 2 * round * step / 16;
+		size_t step_vec = step / 16;
+		for (size_t j = offset_vec; j < offset_vec + step_vec; j++) {
+			libcrux_ml_kem_ntt_ntt_layer_int_vec_step_0c(&re->coefficients[j], &re->coefficients[j + step_vec],
+			    libcrux_ml_kem_polynomial_ZETAS_TIMES_MONTGOMERY_R[zeta_i[0]], &t);
 		}
 	}
+	DSSH_MLKEM_CLEAR(t);
 }
 
 /**
@@ -8136,13 +8101,10 @@ static KRML_MUSTINLINE void
 libcrux_ml_kem_ntt_ntt_at_layer_3_fd(size_t *zeta_i, libcrux_ml_kem_polynomial_PolynomialRingElement_f0 *re,
     size_t _layer, size_t _initial_coefficient_bound)
 {
-	for (size_t i = (size_t)0U; i < (size_t)16U; i++) {
-		size_t round = i;
-		zeta_i[0U]   = zeta_i[0U] + (size_t)1U;
-		libcrux_ml_kem_vector_portable_vector_type_PortableVector uu____0 =
-		    libcrux_ml_kem_vector_portable_ntt_layer_3_step_0d(re->coefficients[round],
-			libcrux_ml_kem_polynomial_ZETAS_TIMES_MONTGOMERY_R[zeta_i[0U]]);
-		re->coefficients[round] = uu____0;
+	for (size_t round = 0; round < 16; round++) {
+		zeta_i[0] = zeta_i[0] + 1;
+		libcrux_ml_kem_vector_portable_ntt_layer_3_step_0d(&re->coefficients[round],
+		    libcrux_ml_kem_polynomial_ZETAS_TIMES_MONTGOMERY_R[zeta_i[0]]);
 	}
 }
 
@@ -8156,14 +8118,12 @@ static KRML_MUSTINLINE void
 libcrux_ml_kem_ntt_ntt_at_layer_2_ad(size_t *zeta_i, libcrux_ml_kem_polynomial_PolynomialRingElement_f0 *re,
     size_t _layer, size_t _initial_coefficient_bound)
 {
-	for (size_t i = (size_t)0U; i < (size_t)16U; i++) {
-		size_t round = i;
-		zeta_i[0U]   = zeta_i[0U] + (size_t)1U;
-		re->coefficients[round] =
-		    libcrux_ml_kem_vector_portable_ntt_layer_2_step_0d(re->coefficients[round],
-			libcrux_ml_kem_polynomial_ZETAS_TIMES_MONTGOMERY_R[zeta_i[0U]],
-			libcrux_ml_kem_polynomial_ZETAS_TIMES_MONTGOMERY_R[zeta_i[0U] + (size_t)1U]);
-		zeta_i[0U] = zeta_i[0U] + (size_t)1U;
+	for (size_t round = 0; round < 16; round++) {
+		zeta_i[0] = zeta_i[0] + 1;
+		libcrux_ml_kem_vector_portable_ntt_layer_2_step_0d(&re->coefficients[round],
+		    libcrux_ml_kem_polynomial_ZETAS_TIMES_MONTGOMERY_R[zeta_i[0]],
+		    libcrux_ml_kem_polynomial_ZETAS_TIMES_MONTGOMERY_R[zeta_i[0] + 1]);
+		zeta_i[0] = zeta_i[0] + 1;
 	}
 }
 
@@ -8177,16 +8137,14 @@ static KRML_MUSTINLINE void
 libcrux_ml_kem_ntt_ntt_at_layer_1_a2(size_t *zeta_i, libcrux_ml_kem_polynomial_PolynomialRingElement_f0 *re,
     size_t _layer, size_t _initial_coefficient_bound)
 {
-	for (size_t i = (size_t)0U; i < (size_t)16U; i++) {
-		size_t round = i;
-		zeta_i[0U]   = zeta_i[0U] + (size_t)1U;
-		re->coefficients[round] =
-		    libcrux_ml_kem_vector_portable_ntt_layer_1_step_0d(re->coefficients[round],
-			libcrux_ml_kem_polynomial_ZETAS_TIMES_MONTGOMERY_R[zeta_i[0U]],
-			libcrux_ml_kem_polynomial_ZETAS_TIMES_MONTGOMERY_R[zeta_i[0U] + (size_t)1U],
-			libcrux_ml_kem_polynomial_ZETAS_TIMES_MONTGOMERY_R[zeta_i[0U] + (size_t)2U],
-			libcrux_ml_kem_polynomial_ZETAS_TIMES_MONTGOMERY_R[zeta_i[0U] + (size_t)3U]);
-		zeta_i[0U] = zeta_i[0U] + (size_t)3U;
+	for (size_t round = 0; round < 16; round++) {
+		zeta_i[0] = zeta_i[0] + 1;
+		libcrux_ml_kem_vector_portable_ntt_layer_1_step_0d(&re->coefficients[round],
+		    libcrux_ml_kem_polynomial_ZETAS_TIMES_MONTGOMERY_R[zeta_i[0]],
+		    libcrux_ml_kem_polynomial_ZETAS_TIMES_MONTGOMERY_R[zeta_i[0] + 1],
+		    libcrux_ml_kem_polynomial_ZETAS_TIMES_MONTGOMERY_R[zeta_i[0] + 2],
+		    libcrux_ml_kem_polynomial_ZETAS_TIMES_MONTGOMERY_R[zeta_i[0] + 3]);
+		zeta_i[0] = zeta_i[0] + 3;
 	}
 }
 
@@ -8430,12 +8388,12 @@ libcrux_ml_kem_polynomial_ntt_multiply_89_2a(libcrux_ml_kem_polynomial_Polynomia
 {
 	/* Every coefficient group is assigned; no local polynomial copy. */
 	for (size_t i = 0; i < 16; i++) {
-		ret->coefficients[i] = libcrux_ml_kem_vector_portable_ntt_multiply_0d(
+		libcrux_ml_kem_vector_portable_ntt_multiply_0d(
 		    &self->coefficients[i], &rhs->coefficients[i],
 		    libcrux_ml_kem_polynomial_ZETAS_TIMES_MONTGOMERY_R[64 + 4 * i],
 		    libcrux_ml_kem_polynomial_ZETAS_TIMES_MONTGOMERY_R[64 + 4 * i + 1],
 		    libcrux_ml_kem_polynomial_ZETAS_TIMES_MONTGOMERY_R[64 + 4 * i + 2],
-		    libcrux_ml_kem_polynomial_ZETAS_TIMES_MONTGOMERY_R[64 + 4 * i + 3]);
+		    libcrux_ml_kem_polynomial_ZETAS_TIMES_MONTGOMERY_R[64 + 4 * i + 3], &ret->coefficients[i]);
 	}
 }
 
@@ -8473,16 +8431,14 @@ static KRML_MUSTINLINE void
 libcrux_ml_kem_invert_ntt_invert_ntt_at_layer_1_83(size_t *zeta_i,
     libcrux_ml_kem_polynomial_PolynomialRingElement_f0 *re, size_t _layer)
 {
-	for (size_t i = (size_t)0U; i < (size_t)16U; i++) {
-		size_t round = i;
-		zeta_i[0U]   = zeta_i[0U] - (size_t)1U;
-		re->coefficients[round] =
-		    libcrux_ml_kem_vector_portable_inv_ntt_layer_1_step_0d(re->coefficients[round],
-			libcrux_ml_kem_polynomial_ZETAS_TIMES_MONTGOMERY_R[zeta_i[0U]],
-			libcrux_ml_kem_polynomial_ZETAS_TIMES_MONTGOMERY_R[zeta_i[0U] - (size_t)1U],
-			libcrux_ml_kem_polynomial_ZETAS_TIMES_MONTGOMERY_R[zeta_i[0U] - (size_t)2U],
-			libcrux_ml_kem_polynomial_ZETAS_TIMES_MONTGOMERY_R[zeta_i[0U] - (size_t)3U]);
-		zeta_i[0U] = zeta_i[0U] - (size_t)3U;
+	for (size_t round = 0; round < 16; round++) {
+		zeta_i[0] = zeta_i[0] - 1;
+		libcrux_ml_kem_vector_portable_inv_ntt_layer_1_step_0d(&re->coefficients[round],
+		    libcrux_ml_kem_polynomial_ZETAS_TIMES_MONTGOMERY_R[zeta_i[0]],
+		    libcrux_ml_kem_polynomial_ZETAS_TIMES_MONTGOMERY_R[zeta_i[0] - 1],
+		    libcrux_ml_kem_polynomial_ZETAS_TIMES_MONTGOMERY_R[zeta_i[0] - 2],
+		    libcrux_ml_kem_polynomial_ZETAS_TIMES_MONTGOMERY_R[zeta_i[0] - 3]);
+		zeta_i[0] = zeta_i[0] - 3;
 	}
 }
 
@@ -8496,14 +8452,12 @@ static KRML_MUSTINLINE void
 libcrux_ml_kem_invert_ntt_invert_ntt_at_layer_2_c3(size_t *zeta_i,
     libcrux_ml_kem_polynomial_PolynomialRingElement_f0 *re, size_t _layer)
 {
-	for (size_t i = (size_t)0U; i < (size_t)16U; i++) {
-		size_t round = i;
-		zeta_i[0U]   = zeta_i[0U] - (size_t)1U;
-		re->coefficients[round] =
-		    libcrux_ml_kem_vector_portable_inv_ntt_layer_2_step_0d(re->coefficients[round],
-			libcrux_ml_kem_polynomial_ZETAS_TIMES_MONTGOMERY_R[zeta_i[0U]],
-			libcrux_ml_kem_polynomial_ZETAS_TIMES_MONTGOMERY_R[zeta_i[0U] - (size_t)1U]);
-		zeta_i[0U] = zeta_i[0U] - (size_t)1U;
+	for (size_t round = 0; round < 16; round++) {
+		zeta_i[0] = zeta_i[0] - 1;
+		libcrux_ml_kem_vector_portable_inv_ntt_layer_2_step_0d(&re->coefficients[round],
+		    libcrux_ml_kem_polynomial_ZETAS_TIMES_MONTGOMERY_R[zeta_i[0]],
+		    libcrux_ml_kem_polynomial_ZETAS_TIMES_MONTGOMERY_R[zeta_i[0] - 1]);
+		zeta_i[0] = zeta_i[0] - 1;
 	}
 }
 
@@ -8517,13 +8471,10 @@ static KRML_MUSTINLINE void
 libcrux_ml_kem_invert_ntt_invert_ntt_at_layer_3_68(size_t *zeta_i,
     libcrux_ml_kem_polynomial_PolynomialRingElement_f0 *re, size_t _layer)
 {
-	for (size_t i = (size_t)0U; i < (size_t)16U; i++) {
-		size_t round = i;
-		zeta_i[0U]   = zeta_i[0U] - (size_t)1U;
-		libcrux_ml_kem_vector_portable_vector_type_PortableVector uu____0 =
-		    libcrux_ml_kem_vector_portable_inv_ntt_layer_3_step_0d(re->coefficients[round],
-			libcrux_ml_kem_polynomial_ZETAS_TIMES_MONTGOMERY_R[zeta_i[0U]]);
-		re->coefficients[round] = uu____0;
+	for (size_t round = 0; round < 16; round++) {
+		zeta_i[0] = zeta_i[0] - 1;
+		libcrux_ml_kem_vector_portable_inv_ntt_layer_3_step_0d(&re->coefficients[round],
+		    libcrux_ml_kem_polynomial_ZETAS_TIMES_MONTGOMERY_R[zeta_i[0]]);
 	}
 }
 
@@ -8533,16 +8484,13 @@ libcrux_ml_kem.invert_ntt.inv_ntt_layer_int_vec_step_reduce with types
 libcrux_ml_kem_vector_portable_vector_type_PortableVector with const generics
 
 */
-static KRML_MUSTINLINE libcrux_ml_kem_vector_portable_vector_type_PortableVector_x2
-libcrux_ml_kem_invert_ntt_inv_ntt_layer_int_vec_step_reduce_65(
-    libcrux_ml_kem_vector_portable_vector_type_PortableVector a,
-    libcrux_ml_kem_vector_portable_vector_type_PortableVector b, int16_t zeta_r)
+static KRML_MUSTINLINE void
+libcrux_ml_kem_invert_ntt_inv_ntt_layer_int_vec_step_reduce_65(libcrux_ml_kem_vector_portable_vector_type_PortableVector *a, libcrux_ml_kem_vector_portable_vector_type_PortableVector *b, int16_t zeta_r, libcrux_ml_kem_vector_portable_vector_type_PortableVector *a_minus_b)
 {
-	libcrux_ml_kem_vector_portable_vector_type_PortableVector a_minus_b =
-	    libcrux_ml_kem_vector_portable_sub_0d(b, &a);
-	a = libcrux_ml_kem_vector_portable_barrett_reduce_0d(libcrux_ml_kem_vector_portable_add_0d(a, &b));
-	b = libcrux_ml_kem_vector_traits_montgomery_multiply_fe_67(a_minus_b, zeta_r);
-	return (CLITERAL(libcrux_ml_kem_vector_portable_vector_type_PortableVector_x2) {.fst = a, .snd = b});
+	*a_minus_b = libcrux_ml_kem_vector_portable_sub_0d(*b, a);
+	*a = libcrux_ml_kem_vector_portable_barrett_reduce_0d(
+	    libcrux_ml_kem_vector_portable_add_0d(*a, b));
+	*b = libcrux_ml_kem_vector_traits_montgomery_multiply_fe_67(*a_minus_b, zeta_r);
 }
 
 /**
@@ -8555,25 +8503,19 @@ static KRML_MUSTINLINE void
 libcrux_ml_kem_invert_ntt_invert_ntt_at_layer_4_plus_6e(size_t *zeta_i,
     libcrux_ml_kem_polynomial_PolynomialRingElement_f0 *re, size_t layer)
 {
+	libcrux_ml_kem_vector_portable_vector_type_PortableVector a_minus_b;
+	/* All actual calls use layer4..7; one scratch vector is reused. */
 	size_t step = (size_t)1U << (uint32_t)layer;
-	for (size_t i0 = (size_t)0U; i0 < (size_t)128U >> (uint32_t)layer; i0++) {
-		size_t round      = i0;
-		zeta_i[0U]        = zeta_i[0U] - (size_t)1U;
-		size_t offset     = round * step * (size_t)2U;
-		size_t offset_vec = offset / LIBCRUX_ML_KEM_VECTOR_TRAITS_FIELD_ELEMENTS_IN_VECTOR;
-		size_t step_vec   = step / LIBCRUX_ML_KEM_VECTOR_TRAITS_FIELD_ELEMENTS_IN_VECTOR;
-		for (size_t i = offset_vec; i < offset_vec + step_vec; i++) {
-			size_t                                                       j = i;
-			libcrux_ml_kem_vector_portable_vector_type_PortableVector_x2 uu____0 =
-			    libcrux_ml_kem_invert_ntt_inv_ntt_layer_int_vec_step_reduce_65(re->coefficients[j],
-				re->coefficients[j + step_vec],
-				libcrux_ml_kem_polynomial_ZETAS_TIMES_MONTGOMERY_R[zeta_i[0U]]);
-			libcrux_ml_kem_vector_portable_vector_type_PortableVector x = uu____0.fst;
-			libcrux_ml_kem_vector_portable_vector_type_PortableVector y = uu____0.snd;
-			re->coefficients[j]                                         = x;
-			re->coefficients[j + step_vec]                              = y;
+	for (size_t round = 0; round < 128 / step; round++) {
+		zeta_i[0] = zeta_i[0] - 1;
+		size_t offset_vec = 2 * round * step / 16;
+		size_t step_vec = step / 16;
+		for (size_t j = offset_vec; j < offset_vec + step_vec; j++) {
+			libcrux_ml_kem_invert_ntt_inv_ntt_layer_int_vec_step_reduce_65(&re->coefficients[j], &re->coefficients[j + step_vec],
+			    libcrux_ml_kem_polynomial_ZETAS_TIMES_MONTGOMERY_R[zeta_i[0]], &a_minus_b);
 		}
 	}
+	DSSH_MLKEM_CLEAR(a_minus_b);
 }
 
 /**
@@ -9506,17 +9448,13 @@ with const generics
 static KRML_MUSTINLINE void
 libcrux_ml_kem_ntt_ntt_at_layer_7_f4(libcrux_ml_kem_polynomial_PolynomialRingElement_f0 *re)
 {
-	size_t step = LIBCRUX_ML_KEM_POLYNOMIAL_VECTORS_IN_RING_ELEMENT / (size_t)2U;
-	for (size_t i = (size_t)0U; i < step; i++) {
-		size_t                                                    j = i;
-		libcrux_ml_kem_vector_portable_vector_type_PortableVector t =
-		    libcrux_ml_kem_vector_portable_multiply_by_constant_0d(re->coefficients[j + step],
-			(int16_t)-1600);
-		re->coefficients[j + step] = libcrux_ml_kem_vector_portable_sub_0d(re->coefficients[j], &t);
-		libcrux_ml_kem_vector_portable_vector_type_PortableVector uu____1 =
-		    libcrux_ml_kem_vector_portable_add_0d(re->coefficients[j], &t);
-		re->coefficients[j] = uu____1;
+	libcrux_ml_kem_vector_portable_vector_type_PortableVector t;
+	for (size_t j = 0; j < 8; j++) {
+		t = libcrux_ml_kem_vector_portable_multiply_by_constant_0d(re->coefficients[j + 8], (int16_t)-1600);
+		re->coefficients[j + 8] = libcrux_ml_kem_vector_portable_sub_0d(re->coefficients[j], &t);
+		re->coefficients[j] = libcrux_ml_kem_vector_portable_add_0d(re->coefficients[j], &t);
 	}
+	DSSH_MLKEM_CLEAR(t);
 }
 
 /**

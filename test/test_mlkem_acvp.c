@@ -138,6 +138,9 @@ static const struct {
 	{"libcrux_ml_kem_sampling_sample_from_binomial_distribution_2_85", "sampled_i16s", sizeof(int16_t[256]), {6, 7, 7, 0, 0}},
 	{"libcrux_ml_kem_serialize_compress_then_serialize_10_fc", "coefficient", sizeof(libcrux_ml_kem_vector_portable_vector_type_PortableVector), {0, 3, 3, 0, 0}},
 	{"libcrux_ml_kem_serialize_serialize_uncompressed_ring_element_5b", "coefficient", sizeof(libcrux_ml_kem_vector_portable_vector_type_PortableVector), {6, 3, 0, 3, 0}},
+	{"libcrux_ml_kem_ntt_ntt_at_layer_4_plus_51", "t", sizeof(libcrux_ml_kem_vector_portable_vector_type_PortableVector), {18, 9, 21, 0, 0}},
+	{"libcrux_ml_kem_invert_ntt_invert_ntt_at_layer_4_plus_6e", "a_minus_b", sizeof(libcrux_ml_kem_vector_portable_vector_type_PortableVector), {0, 16, 20, 0, 0}},
+	{"libcrux_ml_kem_ntt_ntt_at_layer_7_f4", "t", sizeof(libcrux_ml_kem_vector_portable_vector_type_PortableVector), {6, 3, 3, 0, 0}},
 };
 
 struct clear_observation {
@@ -224,7 +227,7 @@ evaluate(const struct dssh_acvp_case *test, const struct dssh_acvp_decoded *byte
 		    + (private_check ? clear_sites[i].counts[4] : 0U);
 		if (observation.calls[i] != expected)
 			observation.valid = false;
-		/* 71 uint32_t counters across 145 finite cases sum to less than 2^46. */
+		/* 74 uint32_t counters across 145 finite cases sum to less than 2^46. */
 		observed_clears += observation.calls[i];
 	}
 	observed_cases++;

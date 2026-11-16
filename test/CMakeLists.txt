@@ -1447,6 +1447,10 @@ foreach(suffix IN ITEMS "" _hmac256 _dhgex _rsa _rsa512 _dhgex_rsa _dhgex_rsa512
 		"1 tests: 1 passed, 0 failed, 0 skipped" --exact release/clock_transport)
 	set_tests_properties(dssh_clock_pair${suffix} PROPERTIES
 		ENVIRONMENT "${transport_pair_environment}" TIMEOUT 120)
+	dssh_add_output_test(dssh_offer_auth_replay${suffix} dssh_test_transport
+		"1 tests: 1 passed, 0 failed, 0 skipped" --exact release/auth_replayed_message_state)
+	set_tests_properties(dssh_offer_auth_replay${suffix} PROPERTIES
+		ENVIRONMENT "${transport_pair_environment}" TIMEOUT 120)
 	foreach(part IN ITEMS kex comp_s2c)
 		dssh_add_output_test(dssh_negotiation_pair_${part}${suffix} dssh_test_transport
 			"1 tests: 1 passed, 0 failed, 0 skipped" --exact negotiate/no_common_${part})
@@ -1477,6 +1481,10 @@ foreach(method IN ITEMS group14 group16)
 		"1 tests: 1 passed, 0 failed, 0 skipped" --exact release/clock_transport)
 	set_tests_properties(dssh_clock_pair_${method} PROPERTIES
 		ENVIRONMENT "DSSH_TEST_KEX=${method};${DSSH_TEST_KEY_ENV}" TIMEOUT 120)
+	dssh_add_output_test(dssh_offer_auth_replay_${method} dssh_test_transport
+		"1 tests: 1 passed, 0 failed, 0 skipped" --exact release/auth_replayed_message_state)
+	set_tests_properties(dssh_offer_auth_replay_${method} PROPERTIES
+		ENVIRONMENT "DSSH_TEST_KEX=${method};${DSSH_TEST_KEY_ENV}" TIMEOUT 120)
 	foreach(part IN ITEMS kex comp_s2c)
 		dssh_add_output_test(dssh_negotiation_pair_${part}_${method} dssh_test_transport
 			"1 tests: 1 passed, 0 failed, 0 skipped" --exact negotiate/no_common_${part})
@@ -1505,6 +1513,20 @@ dssh_add_output_test(dssh_negotiation_pair_offer dssh_test_transport
 dssh_add_output_test(dssh_clock_constructors dssh_test_transport
 	"1 tests: 1 passed, 0 failed, 0 skipped" --exact clock/constructors)
 set_tests_properties(dssh_clock_constructors PROPERTIES TIMEOUT 120)
+set(offer_parser_leaves kexinit/parse_valid kexinit/parse_control_char kexinit/parse_name_too_long
+	kexinit/parse_truncated kexinit/parse_too_short kexinit/parse_first_kex_follows
+	kexinit/peer_trunc_namelist release/kexinit_complete_fields kexinit/builder)
+foreach(leaf IN LISTS offer_parser_leaves)
+	dssh_add_output_test(dssh_offer_parser_r106_${leaf} dssh_test_transport
+		"1 tests: 1 passed, 0 failed, 0 skipped" --exact ${leaf})
+	set_tests_properties(dssh_offer_parser_r106_${leaf} PROPERTIES TIMEOUT 120)
+endforeach()
+foreach(leaf release/full_negotiation_offers release/key_capability_selection ext_info/offers)
+	dssh_add_output_test(dssh_offer_consumer_r106_${leaf} dssh_test_transport
+		"1 tests: 1 passed, 0 failed, 0 skipped" --exact ${leaf})
+	set_tests_properties(dssh_offer_consumer_r106_${leaf} PROPERTIES
+		ENVIRONMENT "${DSSH_TEST_KEY_ENV}" TIMEOUT 120)
+endforeach()
 set(transport_state_leaves guard/blocksize_clamp_direct state/context_refusals
 	callbacks/set_after_session gather/set gather/toolate getter/names_before_handshake
 	session/set_global_request_cb aes256_ctr/null_ctx)

@@ -4957,217 +4957,7 @@ test_register_two_comp(void)
  * KEXINIT parsing -- direct unit tests via parse_peer_kexinit
  * ================================================================ */
 
-/*
- * Build a minimal complete KEXINIT with nonempty algorithm lists.
- * Returns total size.  buf must have room for the names and the five-byte trailer.
- */
-static size_t
-build_minimal_kexinit(uint8_t *buf, size_t bufsz)
-{
-	size_t pos = 0;
-
-	buf[pos++] = 20; /* SSH_MSG_KEXINIT */
-	memset(&buf[pos], 0xAA, DSSH_KEXINIT_COOKIE_SIZE);
-	pos += DSSH_KEXINIT_COOKIE_SIZE;
-
-	/* Eight nonempty algorithm lists and two empty language lists. */
-	for (int i = 0; i < 10; i++) {
-		DSSH_PUT_U32(i < 8 ? 1 : 0, buf, &pos);
-		if (i < 8)
-			buf[pos++] = 'a';
-	}
-	buf[pos++] = 0;
-	DSSH_PUT_U32(0, buf, &pos);
-	(void)bufsz;
-	return pos;
-}
-
-static int
-test_kexinit_parse_valid(void)
-{
-	/* Build a KEXINIT with known name-lists */
-	uint8_t buf[512];
-	size_t pos = 0;
-
-	buf[pos++] = 20; /* SSH_MSG_KEXINIT */
-	memset(&buf[pos], 0xAA, DSSH_KEXINIT_COOKIE_SIZE);
-	pos += DSSH_KEXINIT_COOKIE_SIZE;
-
-	/* kex algorithms */
-	const char *names[10] = {
-		"curve25519-sha256", "ssh-ed25519",
-		"aes256-ctr", "aes256-ctr",
-		"hmac-sha2-256", "hmac-sha2-256",
-		"none", "none",
-		"", ""
-	};
-
-	for (int i = 0; i < 10; i++) {
-		uint32_t nlen = (uint32_t)strlen(names[i]);
-
-		DSSH_PUT_U32(nlen, buf, &pos);
-		if (nlen > 0)
-			memcpy(&buf[pos], names[i], nlen);
-		pos += nlen;
-	}
-
-	buf[pos++] = 0; /* first_kex_packet_follows = false */
-	DSSH_PUT_U32(0, buf, &pos);
-
-	struct dssh_name_list peer_lists[10];
-	bool first_kex_follows = true;
-
-	ASSERT_EQ(parse_peer_kexinit(buf, pos, peer_lists,
-	    &first_kex_follows), 0);
-	ASSERT_EQ_U(peer_lists[0].len, strlen("curve25519-sha256"));
-	ASSERT_MEM_EQ(peer_lists[0].data, "curve25519-sha256", peer_lists[0].len);
-	ASSERT_EQ_U(peer_lists[1].len, strlen("ssh-ed25519"));
-	ASSERT_MEM_EQ(peer_lists[1].data, "ssh-ed25519", peer_lists[1].len);
-	ASSERT_EQ_U(peer_lists[2].len, strlen("aes256-ctr"));
-	ASSERT_MEM_EQ(peer_lists[2].data, "aes256-ctr", peer_lists[2].len);
-	ASSERT_EQ_U(peer_lists[6].len, strlen("none"));
-	ASSERT_MEM_EQ(peer_lists[6].data, "none", peer_lists[6].len);
-	ASSERT_EQ_U(peer_lists[8].len, 0);
-	ASSERT_EQ(first_kex_follows, false);
-
-	return TEST_PASS;
-}
-
-static int
-test_kexinit_parse_control_char(void)
-{
-	uint8_t buf[128];
-	size_t pos = build_minimal_kexinit(buf, sizeof(buf));
-
-	/* Overwrite first name-list with a control character */
-	size_t nl_pos = 1 + DSSH_KEXINIT_COOKIE_SIZE;
-
-	DSSH_PUT_U32(3, buf, &nl_pos);
-	buf[nl_pos] = 'a';
-	buf[nl_pos + 1] = '\x01'; /* control char */
-	buf[nl_pos + 2] = 'b';
-
-	struct dssh_name_list peer_lists[10];
-	bool first_kex_follows;
-
-	ASSERT_EQ(parse_peer_kexinit(buf, pos + 3, peer_lists,
-	    &first_kex_follows), DSSH_ERROR_PARSE);
-
-	return TEST_PASS;
-}
-
-static int
-test_kexinit_parse_name_too_long(void)
-{
-	/* Build KEXINIT with a name > 64 bytes in the first list */
-	uint8_t buf[512];
-	size_t pos = 0;
-
-	buf[pos++] = 20;
-	memset(&buf[pos], 0xAA, DSSH_KEXINIT_COOKIE_SIZE);
-	pos += DSSH_KEXINIT_COOKIE_SIZE;
-
-	/* First list: single name of 65 'x' characters */
-	uint32_t nlen = 65;
-
-	DSSH_PUT_U32(nlen, buf, &pos);
-	memset(&buf[pos], 'x', nlen);
-	pos += nlen;
-
-	/* Fill remaining 9 lists as empty */
-	for (int i = 1; i < 10; i++)
-		DSSH_PUT_U32(0, buf, &pos);
-
-	buf[pos++] = 0;
-
-	struct dssh_name_list peer_lists[10];
-	bool first_kex_follows;
-
-	ASSERT_EQ(parse_peer_kexinit(buf, pos, peer_lists,
-	    &first_kex_follows), DSSH_ERROR_PARSE);
-
-	return TEST_PASS;
-}
-
-static int
-test_kexinit_parse_truncated(void)
-{
-	uint8_t buf[128];
-	size_t pos = 0;
-
-	buf[pos++] = 20;
-	memset(&buf[pos], 0xAA, DSSH_KEXINIT_COOKIE_SIZE);
-	pos += DSSH_KEXINIT_COOKIE_SIZE;
-
-	/* First list claims 100 bytes but buffer ends */
-	DSSH_PUT_U32(100, buf, &pos);
-
-	struct dssh_name_list peer_lists[10];
-	bool first_kex_follows;
-
-	ASSERT_EQ(parse_peer_kexinit(buf, pos, peer_lists,
-	    &first_kex_follows), DSSH_ERROR_PARSE);
-
-	return TEST_PASS;
-}
-
-static int
-test_kexinit_parse_too_short(void)
-{
-	/* Buffer shorter than msg_type + cookie */
-	uint8_t buf[10] = {20};
-	struct dssh_name_list peer_lists[10];
-	bool first_kex_follows;
-
-	ASSERT_EQ(parse_peer_kexinit(buf, 5, peer_lists,
-	    &first_kex_follows), DSSH_ERROR_PARSE);
-
-	return TEST_PASS;
-}
-
-static int
-test_kexinit_parse_first_kex_follows(void)
-{
-	uint8_t buf[128];
-	size_t pos = build_minimal_kexinit(buf, sizeof(buf));
-
-	/* Set first_kex_packet_follows to true */
-	buf[pos - 5] = 1;
-
-	struct dssh_name_list peer_lists[10];
-	bool first_kex_follows = false;
-
-	ASSERT_EQ(parse_peer_kexinit(buf, pos, peer_lists,
-	    &first_kex_follows), 0);
-	ASSERT_EQ(first_kex_follows, true);
-
-	return TEST_PASS;
-}
-
-static int
-test_kexinit_peer_parse_truncated_namelist(void)
-{
-	/* Buffer has header + first list length but no data */
-	uint8_t buf[128];
-	size_t pos = 0;
-
-	buf[pos++] = 20;
-	memset(&buf[pos], 0xAA, DSSH_KEXINIT_COOKIE_SIZE);
-	pos += DSSH_KEXINIT_COOKIE_SIZE;
-
-	/* Length field says 10 but only 2 bytes follow */
-	DSSH_PUT_U32(10, buf, &pos);
-	buf[pos++] = 'a';
-	buf[pos++] = 'b';
-
-	struct dssh_name_list peer_lists[10];
-	bool first_kex_follows;
-
-	ASSERT_EQ(parse_peer_kexinit(buf, pos, peer_lists,
-	    &first_kex_follows), DSSH_ERROR_PARSE);
-
-	return TEST_PASS;
-}
+#include "transport_offer_cases.h"
 
 /* ================================================================
  * K wire encoding -- direct unit tests via encode_k_wire
@@ -6087,33 +5877,6 @@ boundary_line(uint8_t *buf, size_t bufsz, size_t *received, dssh_session sess, v
 	return 0;
 }
 
-static size_t
-make_peer_offer(const char *names[10], uint8_t follows, uint8_t *buf, size_t capacity)
-{
-	if (capacity < 17)
-		return 0;
-	buf[0] = SSH_MSG_KEXINIT;
-	memset(buf + 1, 0, 16);
-	size_t pos = 17;
-	for (size_t i = 0; i < 10; i++) {
-		size_t len = strlen(names[i]);
-		if (len > UINT32_MAX)
-			return 0;
-		uint32_t wire_len = (uint32_t)len;
-		if (dssh_serialize_uint32(wire_len, buf, capacity, &pos) < 0
-		    || !dssh_buffer_has(capacity, pos, len))
-			return 0;
-		memcpy(&buf[pos], names[i], len);
-		pos += len;
-	}
-	if (!dssh_buffer_has(capacity, pos, 5))
-		return 0;
-	buf[pos++] = follows;
-	if (dssh_serialize_uint32(0, buf, capacity, &pos) < 0)
-		return 0;
-	return pos;
-}
-
 static int
 negotiation_setup(void)
 {
@@ -6296,33 +6059,6 @@ test_offer_haskey_error(void)
 	dssh_test_reset_global_config();
 	ASSERT_EQ(ret, DSSH_ERROR_INIT);
 	ASSERT_TRUE(unpublished);
-	return TEST_PASS;
-}
-
-static int
-test_kexinit_complete_fields(void)
-{
-	const char *names[10] = { "a", "a", "a", "a", "a", "a", "a", "a", "", "" };
-	uint8_t packet[512];
-	size_t len = make_peer_offer(names, 2, packet, sizeof(packet));
-	ASSERT_TRUE(len > 5);
-	struct dssh_name_list lists[10];
-	bool follows;
-	for (size_t missing = 1; missing <= 5; missing++)
-		ASSERT_EQ(parse_peer_kexinit(packet, len - missing, lists, &follows), DSSH_ERROR_PARSE);
-	packet[len] = 0;
-	ASSERT_EQ(parse_peer_kexinit(packet, len + 1, lists, &follows), DSSH_ERROR_PARSE);
-	packet[len - 1] = 0x42;
-	ASSERT_OK(parse_peer_kexinit(packet, len, lists, &follows));
-	ASSERT_TRUE(follows);
-	packet[0] = SSH_MSG_NEWKEYS;
-	ASSERT_EQ(parse_peer_kexinit(packet, len, lists, &follows), DSSH_ERROR_PARSE);
-	static const char *invalid[] = { "", ",a", "a,", "a,,b", "a b", "a\001b", "a\177b" };
-	for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
-		names[0] = invalid[i];
-		len = make_peer_offer(names, 0, packet, sizeof(packet));
-		ASSERT_EQ(parse_peer_kexinit(packet, len, lists, &follows), DSSH_ERROR_PARSE);
-	}
 	return TEST_PASS;
 }
 
@@ -7700,6 +7436,7 @@ static struct dssh_test_entry tests[] = {
 	{ "release/full_negotiation_offers", test_negotiation_full_offers },
 	{ "release/key_capability_selection", test_negotiation_key_capabilities },
 	{ "release/kexinit_complete_fields", test_kexinit_complete_fields },
+	{ "kexinit/builder", test_peer_offer_builder },
 	{ "release/dhgex_group_selection", test_dhgex_group_selection },
 	{ "release/hybrid_shared_secret_validation", test_hybrid_shared_secret_validation },
 	{ "release/dhgex_group_validation", test_dhgex_group_validation },

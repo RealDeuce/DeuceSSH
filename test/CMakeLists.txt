@@ -537,6 +537,18 @@ target_compile_options(dssh_test_vendor_glue PRIVATE ${DEUCESSH_COMPILE_OPTIONS}
 add_test(NAME dssh_unit_vendor_glue COMMAND dssh_test_vendor_glue)
 set_tests_properties(dssh_unit_vendor_glue PROPERTIES TIMEOUT 60)
 
+# Original NIST response files for the four bundled ML-KEM hash primitives.
+add_executable(dssh_test_mlkem_hash test_mlkem_hash.c)
+set_property(TARGET dssh_test_mlkem_hash PROPERTY C_STANDARD ${DEUCESSH_C_STANDARD})
+set_property(TARGET dssh_test_mlkem_hash PROPERTY C_STANDARD_REQUIRED ON)
+target_include_directories(dssh_test_mlkem_hash PRIVATE ${PROJECT_SOURCE_DIR})
+target_compile_options(dssh_test_mlkem_hash PRIVATE ${DEUCESSH_COMPILE_OPTIONS}
+	$<$<OR:$<C_COMPILER_ID:Clang>,$<C_COMPILER_ID:AppleClang>,$<C_COMPILER_ID:GNU>>:-Wno-unused-function>)
+dssh_add_output_test(dssh_mlkem_hash_cavp dssh_test_mlkem_hash
+	"ML-KEM hash CAVP: 3592 passed, 0 failed; files=10 guards=1"
+	"${CMAKE_CURRENT_SOURCE_DIR}/vectors/sha3-cavp")
+set_tests_properties(dssh_mlkem_hash_cavp PROPERTIES TIMEOUT 120)
+
 # Pinned official NIST answers, shared by the actual bundled and native roots.
 add_library(dssh_mlkem_acvp_data STATIC mlkem_acvp_data.c)
 set_property(TARGET dssh_mlkem_acvp_data PROPERTY C_STANDARD ${DEUCESSH_C_STANDARD})

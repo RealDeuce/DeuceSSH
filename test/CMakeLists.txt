@@ -1443,6 +1443,10 @@ foreach(suffix IN ITEMS "" _hmac256 _dhgex _rsa _rsa512 _dhgex_rsa _dhgex_rsa512
 	_sntrup _sntrup_rsa _sntrup_rsa512 _mlkem _mlkem_rsa _mlkem_rsa512
 	_rsa_hmac256 _dhgex_hmac256 _sntrup_hmac256)
 	get_test_property(dssh_transport${suffix} ENVIRONMENT transport_pair_environment)
+	dssh_add_output_test(dssh_clock_pair${suffix} dssh_test_transport
+		"1 tests: 1 passed, 0 failed, 0 skipped" --exact release/clock_transport)
+	set_tests_properties(dssh_clock_pair${suffix} PROPERTIES
+		ENVIRONMENT "${transport_pair_environment}" TIMEOUT 120)
 	foreach(part IN ITEMS kex comp_s2c)
 		dssh_add_output_test(dssh_negotiation_pair_${part}${suffix} dssh_test_transport
 			"1 tests: 1 passed, 0 failed, 0 skipped" --exact negotiate/no_common_${part})
@@ -1469,6 +1473,10 @@ foreach(suffix IN ITEMS "" _hmac256 _dhgex _rsa _rsa512 _dhgex_rsa _dhgex_rsa512
 	endforeach()
 endforeach()
 foreach(method IN ITEMS group14 group16)
+	dssh_add_output_test(dssh_clock_pair_${method} dssh_test_transport
+		"1 tests: 1 passed, 0 failed, 0 skipped" --exact release/clock_transport)
+	set_tests_properties(dssh_clock_pair_${method} PROPERTIES
+		ENVIRONMENT "DSSH_TEST_KEX=${method};${DSSH_TEST_KEY_ENV}" TIMEOUT 120)
 	foreach(part IN ITEMS kex comp_s2c)
 		dssh_add_output_test(dssh_negotiation_pair_${part}_${method} dssh_test_transport
 			"1 tests: 1 passed, 0 failed, 0 skipped" --exact negotiate/no_common_${part})
@@ -1494,6 +1502,9 @@ dssh_add_output_test(dssh_direct_kex_builder dssh_test_transport
 	"1 tests: 1 passed, 0 failed, 0 skipped" --exact direct_kex/builder)
 dssh_add_output_test(dssh_negotiation_pair_offer dssh_test_transport
 	"1 tests: 1 passed, 0 failed, 0 skipped" --exact negotiate/offer_replace)
+dssh_add_output_test(dssh_clock_constructors dssh_test_transport
+	"1 tests: 1 passed, 0 failed, 0 skipped" --exact clock/constructors)
+set_tests_properties(dssh_clock_constructors PROPERTIES TIMEOUT 120)
 set(transport_state_leaves guard/blocksize_clamp_direct state/context_refusals
 	callbacks/set_after_session gather/set gather/toolate getter/names_before_handshake
 	session/set_global_request_cb aes256_ctr/null_ctx)
@@ -2784,6 +2795,13 @@ if(Python3_Interpreter_FOUND AND UNIX AND NOT APPLE)
 			set_tests_properties(dssh_negotiation_pair_owner_${kind}_${mode} PROPERTIES
 				ENVIRONMENT "${DSSH_TEST_KEY_ENV};DSSH_NEGOTIATION_KIND=${kind}" TIMEOUT 120)
 		endforeach()
+	endforeach()
+	foreach(mode IN LISTS owner_modes)
+		add_test(NAME dssh_clock_pair_owner_${mode} COMMAND ${Python3_EXECUTABLE}
+			${CMAKE_CURRENT_SOURCE_DIR}/fixture_owner_controls.py
+			$<TARGET_FILE:dssh_test_transport_pair_owner> ${mode})
+		set_tests_properties(dssh_clock_pair_owner_${mode} PROPERTIES
+			ENVIRONMENT "${DSSH_TEST_KEY_ENV};DSSH_CLOCK_PAIR_OWNER=1" TIMEOUT 120)
 	endforeach()
 	foreach(kind IN ITEMS cipher fixed)
 		if(kind STREQUAL "fixed")

@@ -4738,62 +4738,6 @@ test_global_request_name_exceeds_payload(void)
  * ================================================================ */
 
 static int
-test_clock_transport(void)
-{
-	dssh_test_reset_global_config();
-	dssh_test_clock_fail_after(0);
-	dssh_session failed = dssh_session_init(true, 0);
-	dssh_test_clock_reset();
-	ASSERT_NULL(failed);
-	struct timespec before_epoch = { .tv_sec = -1, .tv_nsec = 0 };
-	dssh_test_clock_set(before_epoch);
-	dssh_session earlier = dssh_session_init(true, 0);
-	dssh_test_clock_reset();
-	ASSERT_NOT_NULL(earlier);
-	ASSERT_TRUE(earlier->trans.rekey_time == before_epoch.tv_sec);
-	dssh_session_cleanup(earlier);
-
-	struct handshake_ctx ctx;
-	if (handshake_setup(&ctx) < 0) {
-		handshake_cleanup(&ctx);
-		return TEST_FAIL;
-	}
-	dssh_enc_ctx *old_ctx = ctx.client->trans.enc_c2s_ctx;
-	const uint8_t encoded[] = { 0, 0, 0, 1, 1 };
-	dssh_test_clock_fail_after(0);
-	int ret = derive_and_apply_keys(ctx.client, encoded, sizeof(encoded),
-	    ctx.client->trans.enc_c2s_active, ctx.client->trans.enc_s2c_active,
-	    ctx.client->trans.mac_c2s_active, ctx.client->trans.mac_s2c_active);
-	dssh_test_clock_reset();
-	ASSERT_ERR(ret, DSSH_ERROR_INIT);
-	ASSERT_TRUE(ctx.client->trans.enc_c2s_ctx == old_ctx);
-	ASSERT_FALSE(dssh_session_is_terminated(ctx.client));
-
-	ASSERT_OK(dssh_session_set_rekey_seconds(ctx.client, 10));
-	ctx.client->trans.rekey_time = 100;
-	struct timespec now = { .tv_sec = 109 };
-	dssh_test_clock_set(now);
-	bool before = rekey_needed(ctx.client);
-	now.tv_sec = 110;
-	dssh_test_clock_set(now);
-	bool at = rekey_needed(ctx.client);
-	now.tv_sec = 90;
-	dssh_test_clock_set(now);
-	bool backwards = rekey_needed(ctx.client);
-	dssh_test_clock_reset();
-	ASSERT_FALSE(before);
-	ASSERT_TRUE(at);
-	ASSERT_FALSE(backwards);
-	dssh_test_clock_fail_after(0);
-	bool clock_failed = rekey_needed(ctx.client);
-	dssh_test_clock_reset();
-	ASSERT_FALSE(clock_failed);
-	ASSERT_TRUE(dssh_session_is_terminated(ctx.client));
-	handshake_cleanup(&ctx);
-	return TEST_PASS;
-}
-
-static int
 test_ed25519_sign_basic(void)
 {
 	struct test_signature_copies fixture_copies = {0};
@@ -6100,6 +6044,7 @@ register_fixed_rekey_methods(void)
 #include "direct_kex_cases.h"
 #include "negotiation_pair_cases.h"
 #include "transport_state_cases.h"
+#include "transport_clock_cases.h"
 
 static int
 boundary_tx(uint8_t *buf, size_t bufsz, dssh_session sess, void *cbdata)
@@ -7669,7 +7614,7 @@ static struct dssh_test_entry tests[] = {
 #if defined(DSSH_TRANSPORT_REKEY_CONTROLS)
 	{ "fixture/ownership", test_transport_all_rekey_ownership },
 #elif defined(DSSH_TRANSPORT_PAIR_CONTROLS)
-	{ "fixture/ownership", test_transport_all_pair_ownership },
+	{ "fixture/ownership", test_clock_or_all_pair_ownership },
 #endif
 	{ "release/test_layout", test_transport_test_layout },
 	{ "gather/batch", test_gather_batch },
@@ -7749,6 +7694,7 @@ static struct dssh_test_entry tests[] = {
 	{ "release/global_request_validation", test_global_request_validation },
 	{ "release/global_request_results", test_global_request_results },
 	{ "release/clock_transport", test_clock_transport },
+	{ "clock/constructors", test_clock_constructors },
 	{ "release/registration_rejection", test_registration_rejection },
 	{ "release/offer_haskey_error", test_offer_haskey_error },
 	{ "release/full_negotiation_offers", test_negotiation_full_offers },
@@ -8123,7 +8069,7 @@ main(int argc, char **argv)
 #ifdef DSSH_TRANSPORT_REKEY_CONTROLS
 		return transport_all_rekey_assertion_control(phase);
 #else
-		return transport_all_pair_assertion_control(phase);
+		return clock_or_all_pair_assertion_control(phase);
 #endif
 	}
 #endif

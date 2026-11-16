@@ -10,7 +10,8 @@
 typedef libcrux_ml_kem_vector_portable_vector_type_PortableVector vector;
 
 enum operation { OP_ARRAY, OP_ADD, OP_SUB, OP_MUL, OP_AND, OP_COND, OP_BARRETT,
-	OP_MONT, OP_SHIFT, OP_TRAIT_MONT, OP_STANDARD, OP_UNSIGNED, OP_MESSAGE, OP_COUNT };
+	OP_MONT, OP_SHIFT, OP_TRAIT_MONT, OP_STANDARD, OP_UNSIGNED, OP_MESSAGE,
+	OP_COMPRESS_1, OP_COMPRESS_4, OP_COMPRESS_10, OP_DECOMPRESS_4, OP_DECOMPRESS_10, OP_COUNT };
 enum control { CONTROL_NONE, CONTROL_ANSWER, CONTROL_GUARD, CONTROL_INPUT };
 
 struct guarded_vector {
@@ -84,6 +85,16 @@ reference(enum operation op, int32_t left, int32_t right, int16_t constant)
 		return value < 0 ? value + 3329 : value;
 	case OP_MESSAGE:
 		return value * 1665;
+	case OP_COMPRESS_1:
+		return ((value * 2 + 1664) / 3329) % 2;
+	case OP_COMPRESS_4:
+		return ((value * 16 + 1664) / 3329) % 16;
+	case OP_COMPRESS_10:
+		return ((value * 1024 + 1664) / 3329) % 1024;
+	case OP_DECOMPRESS_4:
+		return (value * 3329 + 8) / 16;
+	case OP_DECOMPRESS_10:
+		return (value * 3329 + 512) / 1024;
 	case OP_COUNT:
 		break;
 	}
@@ -134,6 +145,21 @@ evaluate(enum operation op, const vector *left, vector *right, int16_t constant,
 	case OP_MESSAGE:
 		libcrux_ml_kem_vector_traits_decompress_1_63(left, out);
 		break;
+	case OP_COMPRESS_1:
+		libcrux_ml_kem_vector_portable_compress_1_0d(left, out);
+		break;
+	case OP_COMPRESS_4:
+		libcrux_ml_kem_vector_portable_compress_0d_281(left, out);
+		break;
+	case OP_COMPRESS_10:
+		libcrux_ml_kem_vector_portable_compress_0d_28(left, out);
+		break;
+	case OP_DECOMPRESS_4:
+		libcrux_ml_kem_vector_portable_decompress_ciphertext_coefficient_0d_5a1(left, out);
+		break;
+	case OP_DECOMPRESS_10:
+		libcrux_ml_kem_vector_portable_decompress_ciphertext_coefficient_0d_5a(left, out);
+		break;
 	case OP_COUNT:
 		break;
 	}
@@ -174,6 +200,12 @@ run_case(struct workspace *work, enum operation op, unsigned alias, int32_t base
 			left = (left + 32768) % 4096;
 		if (op == OP_MESSAGE)
 			left = (left + 32768) % 2;
+		if (op >= OP_COMPRESS_1 && op <= OP_COMPRESS_10)
+			left = (base + lane) % 3329;
+		if (op == OP_DECOMPRESS_4)
+			left = (base + lane) % 16;
+		if (op == OP_DECOMPRESS_10)
+			left = (base + lane) % 1024;
 		int32_t right = op == OP_ADD ? -(left / 2) : left / 2;
 		/* Generated left/right values and their selected operation outputs
 		 * stay in int16; the reference keeps its result wide regardless. */
@@ -233,8 +265,10 @@ main(int argc, char **argv)
 	bool reported = false;
 	for (enum operation op = OP_ARRAY; op < OP_COUNT && !io_failed; op++) {
 		unsigned aliases = op == OP_ADD || op == OP_SUB ? 3 : 2;
+		int32_t first = op >= OP_COMPRESS_1 ? 0 : -32768;
+		int32_t limit = op <= OP_MESSAGE ? 32768 : op <= OP_COMPRESS_10 ? 3329 : op == OP_DECOMPRESS_4 ? 16 : 1024;
 		for (unsigned alias = 0; alias < aliases && !io_failed; alias++) {
-			for (int32_t value = -32768; value <= 32767; value++) {
+			for (int32_t value = first; value < limit; value++) {
 				if (!run_case(&work, op, alias, value)) {
 					valid = false;
 					if (!reported) {
@@ -249,9 +283,9 @@ main(int argc, char **argv)
 			}
 		}
 	}
-	valid = valid && cases == 1835008 && fields == 29360128 && guards == 5505024 && inputs == 2686976;
+	valid = valid && cases == 1857062 && fields == 29712992 && guards == 5571186 && inputs == 2720057;
 	int result = io_failed ? 2 : valid ? 0 : 1;
-	if (printf("ML-KEM vectors: operations=13 cases=%" PRIu64 " fields=%" PRIu64 " guards=%" PRIu64
+	if (printf("ML-KEM vectors: operations=18 cases=%" PRIu64 " fields=%" PRIu64 " guards=%" PRIu64
 	    " inputs=%" PRIu64 " valid=%u\n", cases, fields, guards, inputs, valid ? 1U : 0U) < 0 || fflush(stdout) != 0)
 		result = 2;
 	dssh_secure_zero(&work, sizeof(work));

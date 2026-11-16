@@ -124,7 +124,6 @@ static const struct {
 	{"libcrux_ml_kem_ind_cpa_decrypt_unpacked_6d", "message", sizeof(libcrux_ml_kem_polynomial_PolynomialRingElement_f0), {0, 0, 1}},
 	{"libcrux_ml_kem_ind_cpa_decrypt_43", "secret_key_unpacked", sizeof(libcrux_ml_kem_ind_cpa_unpacked_IndCpaPrivateKeyUnpacked_f8), {0, 0, 1}},
 	{"libcrux_ml_kem_serialize_compress_then_serialize_message_aa", "coefficient", sizeof(libcrux_ml_kem_vector_portable_vector_type_PortableVector), {0, 0, 1}},
-	{"libcrux_ml_kem_serialize_compress_then_serialize_message_aa", "coefficient_compressed", sizeof(libcrux_ml_kem_vector_portable_vector_type_PortableVector), {0, 0, 1}},
 	{"libcrux_ml_kem_serialize_compress_then_serialize_4_9a", "coefficient", sizeof(libcrux_ml_kem_vector_portable_vector_type_PortableVector), {0, 1, 1}},
 	{"libcrux_ml_kem_matrix_compute_As_plus_e_60", "product", sizeof(libcrux_ml_kem_polynomial_PolynomialRingElement_f0), {1, 0, 0, 0, 0}},
 	{"libcrux_ml_kem_matrix_compute_vector_u_59", "product", sizeof(libcrux_ml_kem_polynomial_PolynomialRingElement_f0), {0, 1, 1, 0, 0}},
@@ -233,7 +232,7 @@ evaluate(const struct dssh_acvp_case *test, const struct dssh_acvp_decoded *byte
 		    + (private_check ? clear_sites[i].counts[4] : 0U);
 		if (observation.calls[i] != expected)
 			observation.valid = false;
-		/* 80 uint32_t counters across 145 finite cases sum to less than 2^46. */
+		/* 79 uint32_t counters across 145 finite cases sum to less than 2^46. */
 		observed_clears += observation.calls[i];
 	}
 	observed_cases++;

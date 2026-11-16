@@ -567,7 +567,7 @@ target_include_directories(dssh_test_mlkem_vector PRIVATE ${PROJECT_SOURCE_DIR})
 target_compile_options(dssh_test_mlkem_vector PRIVATE ${DEUCESSH_COMPILE_OPTIONS}
 	$<$<OR:$<C_COMPILER_ID:Clang>,$<C_COMPILER_ID:AppleClang>,$<C_COMPILER_ID:GNU>>:-Wno-unused-function>)
 dssh_add_output_test(dssh_mlkem_vectors dssh_test_mlkem_vector
-	"ML-KEM vectors: operations=13 cases=1835008 fields=29360128 guards=5505024 inputs=2686976 valid=1")
+	"ML-KEM vectors: operations=18 cases=1857062 fields=29712992 guards=5571186 inputs=2720057 valid=1")
 set_tests_properties(dssh_mlkem_vectors PROPERTIES TIMEOUT 120)
 
 # Original NIST response files for the four bundled ML-KEM hash primitives.

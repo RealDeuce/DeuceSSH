@@ -186,3 +186,10 @@ and16 native architecture branches are reconciled. Current primitive/KEX/peer
 acceptance and complete native builds pass, including the corrected standalone
 math dependency. Foreign execution/stack/timing, compiler/provider copies, native
 runtime and other release qualifications remain open.
+
+
+R114 adds [the complete reachable bundled owner inventory and CCA scratch
+retirement](release-1.0-evidence/mlkem-retirement-review.md).37 actual named sites are qualified by live observations and complete
+official answers across three existing native profiles. Deeper polynomial/hash,
+logical-return/compiler and native Botan owners, wider requirements and runtime/
+platform/release acceptance remain OPEN.

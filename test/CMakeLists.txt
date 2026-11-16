@@ -552,6 +552,17 @@ target_link_libraries(dssh_test_mlkem_acvp PRIVATE dssh_mlkem_acvp_data)
 dssh_add_output_test(dssh_mlkem_acvp_bundled dssh_test_mlkem_acvp
 	"ML-KEM ACVP bundled: 145 passed, 0 failed")
 set_tests_properties(dssh_mlkem_acvp_bundled PROPERTIES TIMEOUT 120)
+add_executable(dssh_test_mlkem_retirement test_mlkem_acvp.c)
+set_property(TARGET dssh_test_mlkem_retirement PROPERTY C_STANDARD ${DEUCESSH_C_STANDARD})
+set_property(TARGET dssh_test_mlkem_retirement PROPERTY C_STANDARD_REQUIRED ON)
+target_include_directories(dssh_test_mlkem_retirement PRIVATE ${PROJECT_SOURCE_DIR})
+target_compile_definitions(dssh_test_mlkem_retirement PRIVATE DSSH_TEST_MLKEM_RETIREMENT)
+target_compile_options(dssh_test_mlkem_retirement PRIVATE ${DEUCESSH_COMPILE_OPTIONS}
+	$<$<OR:$<C_COMPILER_ID:Clang>,$<C_COMPILER_ID:AppleClang>,$<C_COMPILER_ID:GNU>>:-Wno-unused-function>)
+target_link_libraries(dssh_test_mlkem_retirement PRIVATE dssh_mlkem_acvp_data)
+dssh_add_output_test(dssh_mlkem_retirement dssh_test_mlkem_retirement
+	"ML-KEM ACVP bundled retirement: 145 passed, 0 failed")
+set_tests_properties(dssh_mlkem_retirement PROPERTIES TIMEOUT 120)
 if(DEUCESSH_CRYPTO_BACKEND STREQUAL "Botan")
 	add_executable(dssh_test_mlkem_acvp_botan test_mlkem_acvp_botan.cpp)
 	set_property(TARGET dssh_test_mlkem_acvp_botan PROPERTY CXX_STANDARD 20)

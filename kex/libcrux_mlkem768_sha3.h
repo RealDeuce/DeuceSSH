@@ -32,6 +32,25 @@
 #include <stdbool.h>
 #include <stdlib.h>
 
+#include "deucessh-portable.h"
+
+/* Local adaptation: retire owned CCA seed/key/candidate scratch with the
+ * library's standard C17 wipe. The optional observer exists only in a direct
+ * test translation unit and inspects each live owner after its wipe. */
+static inline void
+dssh_mlkem_clear(const char *function, const char *owner, void *buffer, size_t bytes)
+{
+	dssh_secure_zero(buffer, bytes);
+#ifdef DSSH_MLKEM_CLEAR_OBSERVER
+	DSSH_MLKEM_CLEAR_OBSERVER(function, owner, buffer, bytes);
+#else
+	(void)function;
+	(void)owner;
+#endif
+}
+
+#define DSSH_MLKEM_CLEAR(value) dssh_mlkem_clear(__func__, #value, &(value), sizeof(value))
+
 #if !defined(__GNUC__) || (__GNUC__ < 2)
  #define __attribute__(x)
 #endif
@@ -539,7 +558,9 @@ static inline libcrux_ml_kem_mlkem768_MlKem768KeyPair
 libcrux_ml_kem_types_from_17_35(libcrux_ml_kem_types_MlKemPrivateKey_55 sk,
     libcrux_ml_kem_types_MlKemPublicKey_15                              pk)
 {
-	return (CLITERAL(libcrux_ml_kem_mlkem768_MlKem768KeyPair) {.sk = sk, .pk = pk});
+	libcrux_ml_kem_mlkem768_MlKem768KeyPair result = {.sk = sk, .pk = pk};
+	DSSH_MLKEM_CLEAR(sk);
+	return result;
 }
 
 /**
@@ -559,6 +580,7 @@ libcrux_ml_kem_types_from_05_f2(uint8_t value[2400U])
 	memcpy(copy_of_value, value, (size_t)2400U * sizeof(uint8_t));
 	libcrux_ml_kem_types_MlKemPrivateKey_55 lit;
 	memcpy(lit.value, copy_of_value, (size_t)2400U * sizeof(uint8_t));
+	DSSH_MLKEM_CLEAR(copy_of_value);
 	return lit;
 }
 
@@ -716,6 +738,7 @@ libcrux_ml_kem_utils_into_padded_array_ea0(Eurydice_slice slice, uint8_t ret[112
 				uint8_t),
 	    slice, uint8_t);
 	memcpy(ret, out, (size_t)1120U * sizeof(uint8_t));
+	DSSH_MLKEM_CLEAR(out);
 }
 
 /**
@@ -735,6 +758,7 @@ libcrux_ml_kem_utils_into_padded_array_ea(Eurydice_slice slice, uint8_t ret[64U]
 				uint8_t),
 	    slice, uint8_t);
 	memcpy(ret, out, (size_t)64U * sizeof(uint8_t));
+	DSSH_MLKEM_CLEAR(out);
 }
 
 /**
@@ -908,6 +932,7 @@ libcrux_ml_kem_constant_time_ops_select_ct(Eurydice_slice lhs, Eurydice_slice rh
 			      | ((uint32_t)Eurydice_slice_index(rhs, i0, uint8_t, uint8_t *) & (uint32_t)~mask));
 	}
 	memcpy(ret, out, (size_t)32U * sizeof(uint8_t));
+	DSSH_MLKEM_CLEAR(out);
 }
 
 static KRML_NOINLINE void
@@ -925,6 +950,7 @@ libcrux_ml_kem_constant_time_ops_compare_ciphertexts_select_shared_secret_in_con
 	uint8_t ret0[32U];
 	libcrux_ml_kem_constant_time_ops_select_shared_secret_in_constant_time(lhs_s, rhs_s, selector, ret0);
 	memcpy(ret, ret0, (size_t)32U * sizeof(uint8_t));
+	DSSH_MLKEM_CLEAR(ret0);
 }
 
  #if defined(__cplusplus)
@@ -10373,6 +10399,7 @@ libcrux_ml_kem_variant_kdf_d8_41(Eurydice_slice shared_secret, libcrux_ml_kem_ml
 	uint8_t out[32U] = {0U};
 	Eurydice_slice_copy(Eurydice_array_to_slice((size_t)32U, out, uint8_t), shared_secret, uint8_t);
 	memcpy(ret, out, (size_t)32U * sizeof(uint8_t));
+	DSSH_MLKEM_CLEAR(out);
 }
 
 /**
@@ -10457,6 +10484,16 @@ libcrux_ml_kem_ind_cca_decapsulate_70(libcrux_ml_kem_types_MlKemPrivateKey_55 *p
 	    Eurydice_array_to_slice((size_t)32U, shared_secret, uint8_t),
 	    Eurydice_array_to_slice((size_t)32U, implicit_rejection_shared_secret, uint8_t), ret0);
 	memcpy(ret, ret0, (size_t)32U * sizeof(uint8_t));
+	DSSH_MLKEM_CLEAR(decrypted);
+	DSSH_MLKEM_CLEAR(to_hash0);
+	DSSH_MLKEM_CLEAR(hashed);
+	DSSH_MLKEM_CLEAR(to_hash);
+	DSSH_MLKEM_CLEAR(implicit_rejection_shared_secret0);
+	DSSH_MLKEM_CLEAR(copy_of_decrypted);
+	DSSH_MLKEM_CLEAR(expected_ciphertext);
+	DSSH_MLKEM_CLEAR(implicit_rejection_shared_secret);
+	DSSH_MLKEM_CLEAR(shared_secret);
+	DSSH_MLKEM_CLEAR(ret0);
 }
 
 /**
@@ -10519,6 +10556,7 @@ libcrux_ml_kem_variant_entropy_preprocess_d8_63(Eurydice_slice randomness, uint8
 	uint8_t out[32U] = {0U};
 	Eurydice_slice_copy(Eurydice_array_to_slice((size_t)32U, out, uint8_t), randomness, uint8_t);
 	memcpy(ret, out, (size_t)32U * sizeof(uint8_t));
+	DSSH_MLKEM_CLEAR(out);
 }
 
 /**
@@ -10599,6 +10637,12 @@ libcrux_ml_kem_ind_cca_encapsulate_cd(libcrux_ml_kem_types_MlKemPublicKey_15 *pu
 	tuple_3c lit;
 	lit.fst = uu____5;
 	memcpy(lit.snd, copy_of_shared_secret_array, (size_t)32U * sizeof(uint8_t));
+	DSSH_MLKEM_CLEAR(randomness0);
+	DSSH_MLKEM_CLEAR(to_hash);
+	DSSH_MLKEM_CLEAR(hashed);
+	DSSH_MLKEM_CLEAR(copy_of_randomness);
+	DSSH_MLKEM_CLEAR(shared_secret_array);
+	DSSH_MLKEM_CLEAR(copy_of_shared_secret_array);
 	return lit;
 }
 
@@ -10627,7 +10671,9 @@ libcrux_ml_kem_ind_cca_instantiations_portable_encapsulate_c6(libcrux_ml_kem_typ
 	/* Passing arrays by value in Rust generates a copy in C */
 	uint8_t copy_of_randomness[32U];
 	memcpy(copy_of_randomness, randomness, (size_t)32U * sizeof(uint8_t));
-	return libcrux_ml_kem_ind_cca_encapsulate_cd(uu____0, copy_of_randomness);
+	tuple_3c result = libcrux_ml_kem_ind_cca_encapsulate_cd(uu____0, copy_of_randomness);
+	DSSH_MLKEM_CLEAR(copy_of_randomness);
+	return result;
 }
 
 /**
@@ -10645,7 +10691,9 @@ libcrux_ml_kem_mlkem768_portable_encapsulate(libcrux_ml_kem_types_MlKemPublicKey
 	/* Passing arrays by value in Rust generates a copy in C */
 	uint8_t copy_of_randomness[32U];
 	memcpy(copy_of_randomness, randomness, (size_t)32U * sizeof(uint8_t));
-	return libcrux_ml_kem_ind_cca_instantiations_portable_encapsulate_c6(uu____0, copy_of_randomness);
+	tuple_3c result = libcrux_ml_kem_ind_cca_instantiations_portable_encapsulate_c6(uu____0, copy_of_randomness);
+	DSSH_MLKEM_CLEAR(copy_of_randomness);
+	return result;
 }
 
 /**
@@ -10669,6 +10717,8 @@ libcrux_ml_kem_variant_cpa_keygen_seed_d8_0e(Eurydice_slice key_generation_seed,
 	uint8_t ret0[64U];
 	libcrux_ml_kem_hash_functions_portable_G_f1_e4(Eurydice_array_to_slice((size_t)33U, seed, uint8_t), ret0);
 	memcpy(ret, ret0, (size_t)64U * sizeof(uint8_t));
+	DSSH_MLKEM_CLEAR(seed);
+	DSSH_MLKEM_CLEAR(ret0);
 }
 
 /**
@@ -10954,6 +11004,7 @@ libcrux_ml_kem_ind_cca_serialize_kem_secret_key_48(Eurydice_slice private_key, E
 				uu____9 + Eurydice_slice_len(implicit_rejection_value, uint8_t), uint8_t),
 	    implicit_rejection_value, uint8_t);
 	memcpy(ret, out, (size_t)2400U * sizeof(uint8_t));
+	DSSH_MLKEM_CLEAR(out);
 }
 
 /**
@@ -11004,7 +11055,15 @@ libcrux_ml_kem_ind_cca_generate_keypair_8c(uint8_t randomness[64U])
 	/* Passing arrays by value in Rust generates a copy in C */
 	uint8_t copy_of_public_key[1184U];
 	memcpy(copy_of_public_key, public_key, (size_t)1184U * sizeof(uint8_t));
-	return libcrux_ml_kem_types_from_17_35(uu____2, libcrux_ml_kem_types_from_b6_da(copy_of_public_key));
+	libcrux_ml_kem_mlkem768_MlKem768KeyPair result =
+	    libcrux_ml_kem_types_from_17_35(uu____2, libcrux_ml_kem_types_from_b6_da(copy_of_public_key));
+	DSSH_MLKEM_CLEAR(uu____0);
+	DSSH_MLKEM_CLEAR(ind_cpa_private_key);
+	DSSH_MLKEM_CLEAR(secret_key_serialized);
+	DSSH_MLKEM_CLEAR(copy_of_secret_key_serialized);
+	DSSH_MLKEM_CLEAR(private_key);
+	DSSH_MLKEM_CLEAR(uu____2);
+	return result;
 }
 
 /**
@@ -11028,7 +11087,9 @@ libcrux_ml_kem_ind_cca_instantiations_portable_generate_keypair_d5(uint8_t rando
 	/* Passing arrays by value in Rust generates a copy in C */
 	uint8_t copy_of_randomness[64U];
 	memcpy(copy_of_randomness, randomness, (size_t)64U * sizeof(uint8_t));
-	return libcrux_ml_kem_ind_cca_generate_keypair_8c(copy_of_randomness);
+	libcrux_ml_kem_mlkem768_MlKem768KeyPair result = libcrux_ml_kem_ind_cca_generate_keypair_8c(copy_of_randomness);
+	DSSH_MLKEM_CLEAR(copy_of_randomness);
+	return result;
 }
 
 /**
@@ -11040,7 +11101,9 @@ libcrux_ml_kem_mlkem768_portable_generate_key_pair(uint8_t randomness[64U])
 	/* Passing arrays by value in Rust generates a copy in C */
 	uint8_t copy_of_randomness[64U];
 	memcpy(copy_of_randomness, randomness, (size_t)64U * sizeof(uint8_t));
-	return libcrux_ml_kem_ind_cca_instantiations_portable_generate_keypair_d5(copy_of_randomness);
+	libcrux_ml_kem_mlkem768_MlKem768KeyPair result = libcrux_ml_kem_ind_cca_instantiations_portable_generate_keypair_d5(copy_of_randomness);
+	DSSH_MLKEM_CLEAR(copy_of_randomness);
+	return result;
 }
 
 /**
@@ -11705,5 +11768,7 @@ typedef int16_t libcrux_ml_kem_vector_portable_arithmetic_FieldElementTimesMontg
 /* defines for PRNG inputs */
 #define LIBCRUX_ML_KEM_KEY_PAIR_PRNG_LEN 64
 #define LIBCRUX_ML_KEM_ENC_PRNG_LEN      32
+
+#undef DSSH_MLKEM_CLEAR
 
 #endif /* LIBCRUX_MLKEM768_SHA3_H */

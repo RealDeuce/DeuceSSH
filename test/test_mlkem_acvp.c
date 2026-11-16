@@ -141,6 +141,12 @@ static const struct {
 	{"libcrux_ml_kem_ntt_ntt_at_layer_4_plus_51", "t", sizeof(libcrux_ml_kem_vector_portable_vector_type_PortableVector), {18, 9, 21, 0, 0}},
 	{"libcrux_ml_kem_invert_ntt_invert_ntt_at_layer_4_plus_6e", "a_minus_b", sizeof(libcrux_ml_kem_vector_portable_vector_type_PortableVector), {0, 16, 20, 0, 0}},
 	{"libcrux_ml_kem_ntt_ntt_at_layer_7_f4", "t", sizeof(libcrux_ml_kem_vector_portable_vector_type_PortableVector), {6, 3, 3, 0, 0}},
+	{"libcrux_ml_kem_vector_portable_serialize_serialize_4", "encoded", sizeof(uint8_t_x4), {0, 16, 16, 0, 0}},
+	{"libcrux_ml_kem_vector_portable_serialize_serialize_10", "encoded", sizeof(uint8_t_x5), {0, 48, 48, 0, 0}},
+	{"libcrux_ml_kem_vector_portable_serialize_serialize_12", "encoded", sizeof(uint8_t_x3), {96, 48, 0, 48, 0}},
+	{"libcrux_ml_kem_vector_portable_serialize_deserialize_4", "decoded", sizeof(int16_t_x8), {0, 0, 16, 0, 0}},
+	{"libcrux_ml_kem_vector_portable_serialize_deserialize_10", "decoded", sizeof(int16_t_x8), {0, 0, 48, 0, 0}},
+	{"libcrux_ml_kem_vector_portable_serialize_deserialize_12", "decoded", sizeof(int16_t_x2), {0, 96, 96, 48, 0}},
 };
 
 struct clear_observation {
@@ -227,7 +233,7 @@ evaluate(const struct dssh_acvp_case *test, const struct dssh_acvp_decoded *byte
 		    + (private_check ? clear_sites[i].counts[4] : 0U);
 		if (observation.calls[i] != expected)
 			observation.valid = false;
-		/* 74 uint32_t counters across 145 finite cases sum to less than 2^46. */
+		/* 80 uint32_t counters across 145 finite cases sum to less than 2^46. */
 		observed_clears += observation.calls[i];
 	}
 	observed_cases++;

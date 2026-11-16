@@ -174,13 +174,93 @@ sntrup_kat_generated(const struct sntrup_kat_record *record, struct sntrup_drbg 
 #endif
 
 static bool
+sntrup_kat_rejection(const struct sntrup_kat_record *record, unsigned index,
+    FILE *answers, unsigned *cases, unsigned *controls)
+{
+	if (!sntrup_kat_decapsulation(record))
+		return false;
+	(*controls)++;
+	uint8_t key[1765], ciphertext[1041], actual[34], expected[32];
+	unsigned limit = index == 0 ? 1266U : 3U;
+	for (unsigned which = 0; which < limit; which++) {
+		const char *kind;
+		unsigned slot = 0;
+		size_t position;
+		uint8_t mask;
+		if (which == 0) {
+			kind = "first";
+			position = 0;
+			mask = 1;
+		}
+		else if (which == 1) {
+			kind = "last";
+			position = 1038;
+			mask = 128;
+		}
+		else if (which == 2) {
+			kind = "zero";
+			position = 0;
+			mask = 0;
+		}
+		else {
+			bool confirm = which >= 1010;
+			kind = confirm ? "confirm" : "body";
+			slot = which - (confirm ? 1010U : 3U);
+			position = confirm ? 1007 + slot / 8 : slot;
+			uint8_t bit = (uint8_t)(1U << (slot % 8)); /*1..128. */
+			mask = bit;
+		}
+		char line[64], label[64];
+		int printed = snprintf(label, sizeof(label), "case = %u:%s:%u", index, kind, slot);
+		if (printed <= 0)
+			return false;
+		size_t extent = (size_t)printed;
+		if (extent >= sizeof(label) || !sntrup_kat_line(answers, line, sizeof(line))
+		    || strcmp(line, label) != 0 || !sntrup_kat_hex(answers, "fallback = ", expected, sizeof(expected)))
+			return false;
+		memset(key, 0xa5, sizeof(key));
+		memset(ciphertext, 0xa5, sizeof(ciphertext));
+		memset(actual, 0xa5, sizeof(actual));
+		memcpy(key + 1, record->sk, sizeof(record->sk));
+		if (which == 2)
+			memset(ciphertext + 1, 0, sizeof(record->ct));
+		else {
+			memcpy(ciphertext + 1, record->ct, sizeof(record->ct));
+			ciphertext[1 + position] ^= mask;
+		}
+		bool valid = crypto_kem_sntrup761_dec(actual + 1, ciphertext + 1, key + 1) == 0
+		    && memcmp(actual + 1, expected, sizeof(expected)) == 0
+		    && memcmp(actual + 1, record->ss, sizeof(record->ss)) != 0
+		    && memcmp(key + 1, record->sk, sizeof(record->sk)) == 0
+		    && key[0] == 0xa5 && key[sizeof(key) - 1] == 0xa5
+		    && ciphertext[0] == 0xa5 && ciphertext[sizeof(ciphertext) - 1] == 0xa5
+		    && actual[0] == 0xa5 && actual[sizeof(actual) - 1] == 0xa5;
+		for (size_t i = 0; i < sizeof(record->ct); i++) {
+			uint8_t wanted = which == 2 ? 0 : record->ct[i];
+			if (i == position)
+				wanted ^= mask;
+			valid = ciphertext[i + 1] == wanted && valid;
+		}
+		if (!valid)
+			return false;
+		(*cases)++;
+	}
+	if (!sntrup_kat_decapsulation(record))
+		return false;
+	(*controls)++;
+	return true;
+}
+
+static bool
 sntrup_kat_run(unsigned mode, unsigned *completed)
 {
 	FILE *response = fopen(DSSH_SNTRUP_KAT_RESPONSE, "rb");
 	FILE *intermediate = fopen(DSSH_SNTRUP_KAT_INTERMEDIATE, "rb");
-	bool valid = response != NULL && intermediate != NULL;
+	FILE *answers = mode == 3 ? fopen(DSSH_SNTRUP_REJECTION_ANSWERS, "rb") : NULL;
+	bool valid = response != NULL && intermediate != NULL && (mode != 3 || answers != NULL);
 	struct sntrup_kat_record record;
 	char line[64];
+	unsigned rejected = 0, controls = 0;
 #ifdef DSSH_SNTRUP_DETERMINISTIC
 	struct sntrup_drbg seeds = {0};
 	if (mode == 2) {
@@ -199,6 +279,10 @@ sntrup_kat_run(unsigned mode, unsigned *completed)
 	if (valid)
 		valid = sntrup_kat_line(response, line, sizeof(line)) && strcmp(line, "# kem/sntrup761") == 0
 		    && sntrup_kat_line(response, line, sizeof(line)) && line[0] == 0;
+	if (valid && mode == 3)
+		valid = sntrup_kat_line(answers, line, sizeof(line))
+		    && strcmp(line, "# DeuceSSH sntrup761 rejection answers v1") == 0
+		    && sntrup_kat_line(answers, line, sizeof(line)) && line[0] == 0;
 	*completed = 0;
 	for (unsigned i = 0; valid && i < 100; i++) {
 		valid = sntrup_kat_read(response, intermediate, i, &record)
@@ -209,7 +293,8 @@ sntrup_kat_run(unsigned mode, unsigned *completed)
 				valid = sntrup_kat_generated(&record, &seeds);
 			else
 #endif
-				valid = mode == 1 ? sntrup_kat_encoding(&record) : sntrup_kat_decapsulation(&record);
+				valid = mode == 3 ? sntrup_kat_rejection(&record, i, answers, &rejected, &controls)
+				    : mode == 1 ? sntrup_kat_encoding(&record) : sntrup_kat_decapsulation(&record);
 		}
 		if (valid)
 			(*completed)++;
@@ -217,9 +302,13 @@ sntrup_kat_run(unsigned mode, unsigned *completed)
 	if (valid)
 		valid = fgetc(response) == EOF && !ferror(response)
 		    && fgetc(intermediate) == EOF && !ferror(intermediate);
+	if (valid && mode == 3)
+		valid = fgetc(answers) == EOF && !ferror(answers);
 	if (response != NULL && fclose(response) != 0)
 		valid = false;
 	if (intermediate != NULL && fclose(intermediate) != 0)
+		valid = false;
+	if (answers != NULL && fclose(answers) != 0)
 		valid = false;
 	dssh_cleanse(&record, sizeof(record));
 #ifdef DSSH_SNTRUP_DETERMINISTIC
@@ -229,7 +318,22 @@ sntrup_kat_run(unsigned mode, unsigned *completed)
 		dssh_test_reset_global_config();
 	}
 #endif
+	if (mode == 3) {
+		valid = valid && rejected == 1563 && controls == 200;
+		int printed = printf("sntrup_rejection records=%u cases=%u controls=%u valid=%d\n",
+		    *completed, rejected, controls, valid);
+		valid = printed > 0 && valid;
+	}
 	return valid && *completed == 100;
+}
+
+static int
+test_sntrup_kat_rejection(void)
+{
+	unsigned completed = 0;
+	bool valid = sntrup_kat_run(3, &completed);
+	ASSERT_TRUE(valid && completed == 100);
+	return TEST_PASS;
 }
 
 static int

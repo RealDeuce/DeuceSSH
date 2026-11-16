@@ -364,6 +364,7 @@ static struct dssh_test_entry tests[] = {
 #endif
 	{"kat/decapsulation", test_sntrup_kat_decapsulation},
 	{"kat/encoding", test_sntrup_kat_encoding},
+	{"kat/rejection", test_sntrup_kat_rejection},
 	{"arithmetic/masks16", test_masks16},
 	{"arithmetic/minmax_sort", test_minmax_sort},
 	{"arithmetic/shifts64", test_shifts64},

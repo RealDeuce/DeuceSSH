@@ -170,3 +170,11 @@ generated keys, sampled ciphertexts and session secrets match in both arithmetic
 modes and providers. The test adapter preserves the original per-word DRBG
 request boundaries; production randomness is unchanged. Independent invalid
 answers and other source/timing/foreign-target/runtime/release gates remain open.
+
+
+R112 adds [independent rejection answers](release-1.0-evidence/sntrup-rejection-review.md) for all confirmation bits and
+body-byte positions of one record, plus three selected cases on every published
+record. Full fallback bytes, input preservation/guards and actual before/after
+positive controls pass on both arithmetic modes/providers. These are independently
+derived specification answers; upstream/timing/foreign-target/runtime/SDK and
+other release qualifications remain open.

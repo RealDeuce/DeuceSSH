@@ -154,3 +154,11 @@ whole vendor implementation's timing. The
 binds sources, native executables, commands, model, compiler AST and assembly.
 Whole secret/provider/platform/upstream/peer/SDK and release gates remain open;
 the independent native TLS qualification retains its separate recorded scope.
+
+
+R110 subsequently adds the complete official100-record valid-response and
+sampled-input corpus in [the known-answer review](release-1.0-evidence/sntrup-kat-review.md). Both native/generic
+implementations and providers reproduce exact decapsulation and fixed-input
+encoding/cache/ciphertext/session answers. This closes that positive-answer gap;
+deterministic key generation/random sampling, invalid answers and other stated
+upstream/compiler/platform/timing/runtime/release qualifications remain open.

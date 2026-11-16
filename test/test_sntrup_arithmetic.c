@@ -346,7 +346,11 @@ test_kem(void)
 	return TEST_PASS;
 }
 
+#include "sntrup_kat_cases.h"
+
 static struct dssh_test_entry tests[] = {
+	{"kat/decapsulation", test_sntrup_kat_decapsulation},
+	{"kat/encoding", test_sntrup_kat_encoding},
 	{"arithmetic/masks16", test_masks16},
 	{"arithmetic/minmax_sort", test_minmax_sort},
 	{"arithmetic/shifts64", test_shifts64},

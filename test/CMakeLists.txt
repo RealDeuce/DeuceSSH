@@ -880,6 +880,14 @@ add_test(NAME dssh_unit_crypto COMMAND dssh_test_crypto)
 dssh_add_test(sntrup test_sntrup.c)
 foreach(mode IN ITEMS native generic)
 	dssh_add_test(sntrup_arithmetic_${mode} test_sntrup_arithmetic.c)
+	target_compile_definitions(dssh_test_sntrup_arithmetic_${mode} PRIVATE
+		DSSH_SNTRUP_KAT_RESPONSE="${CMAKE_CURRENT_SOURCE_DIR}/vectors/sntrup761.rsp"
+		DSSH_SNTRUP_KAT_INTERMEDIATE="${CMAKE_CURRENT_SOURCE_DIR}/vectors/sntrup761.int")
+	foreach(part IN ITEMS decapsulation encoding)
+		dssh_add_output_test(dssh_sntrup_kat_${mode}_${part} dssh_test_sntrup_arithmetic_${mode}
+			"1 tests: 1 passed, 0 failed, 0 skipped" --exact kat/${part})
+		set_tests_properties(dssh_sntrup_kat_${mode}_${part} PROPERTIES TIMEOUT 120)
+	endforeach()
 	if(mode STREQUAL "generic")
 		target_compile_definitions(dssh_test_sntrup_arithmetic_${mode} PRIVATE DSSH_TEST_SNTRUP_GENERIC)
 	endif()

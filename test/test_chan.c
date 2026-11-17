@@ -758,10 +758,19 @@ static int test_acceptqueue_many_entries(void)
 	struct dssh_accept_queue q;
 	acceptqueue_init(&q);
 
-	/* Ring buffer capacity is DSSH_ACCEPT_QUEUE_CAP (8).
-	 * Push/pop in batches to exercise wrap-around. */
+	/* Fill and drain from every head position. A refused ninth entry must
+	 * leave the complete FIFO intact, including when its storage wraps. */
 	uint32_t seq = 0;
-	for (int batch = 0; batch < 4; batch++) {
+	for (size_t batch = 0; batch < DSSH_ACCEPT_QUEUE_CAP; batch++) {
+		const uint8_t advance[] = "advance";
+		ASSERT_EQ(acceptqueue_push(&q, UINT32_MAX, 0, 0,
+		    advance, sizeof(advance) - 1), 0);
+		struct dssh_incoming_open skipped;
+		ASSERT_EQ(acceptqueue_pop(&q, &skipped), 0);
+		ASSERT_EQ_U(skipped.peer_channel, UINT32_MAX);
+		ASSERT_EQ_U(q.head, (batch + 1) % DSSH_ACCEPT_QUEUE_CAP);
+		ASSERT_EQ_U(q.count, 0);
+
 		/* Fill to capacity */
 		for (uint32_t i = 0; i < DSSH_ACCEPT_QUEUE_CAP; i++) {
 			char type[16];
@@ -773,6 +782,11 @@ static int test_acceptqueue_many_entries(void)
 			    (seq + i) * 100, (seq + i) * 50,
 			    (const uint8_t *)type, strlen(type)));
 		}
+		ASSERT_EQ_U(q.count, DSSH_ACCEPT_QUEUE_CAP);
+		const uint8_t refused[] = "refused";
+		ASSERT_ERR(acceptqueue_push(&q, UINT32_MAX, 1, 1,
+		    refused, sizeof(refused) - 1), DSSH_ERROR_TOOMANY);
+		ASSERT_EQ_U(q.count, DSSH_ACCEPT_QUEUE_CAP);
 
 		/* Drain all */
 		for (uint32_t i = 0; i < DSSH_ACCEPT_QUEUE_CAP; i++) {
@@ -782,6 +796,7 @@ static int test_acceptqueue_many_entries(void)
 			ASSERT_EQ(e.peer_channel, seq + i);
 			ASSERT_EQ(e.peer_window, (seq + i) * 100);
 			ASSERT_EQ(e.peer_max_packet, (seq + i) * 50);
+			ASSERT_NULL(e.protocol_id);
 
 			char expected[16];
 			int formatted = snprintf(expected, sizeof(expected), "ch%" PRIu32,
@@ -871,7 +886,7 @@ static int test_acceptqueue_type_nul_terminated(void)
 	struct dssh_accept_queue q;
 	acceptqueue_init(&q);
 
-	/* Push binary data as type -- should be NUL-terminated */
+	/* Preserve embedded zeros and append a terminator after all ten bytes. */
 	uint8_t binary[10] = {65, 66, 67, 0, 68, 69, 70, 0, 71, 72};
 	ASSERT_OK(acceptqueue_push(&q, 0, 0, 0, binary, 10));
 
@@ -879,10 +894,8 @@ static int test_acceptqueue_type_nul_terminated(void)
 	int pop_ret = acceptqueue_pop(&q, &e);
 	ASSERT_EQ(pop_ret, 0);
 	ASSERT_EQ_U(e.channel_type_len, 10);
-	/* NUL terminator at position 63 max, but data has embedded NULs */
-	ASSERT_EQ(e.channel_type[0], 'A');
-	ASSERT_EQ(e.channel_type[1], 'B');
-	ASSERT_EQ(e.channel_type[2], 'C');
+	ASSERT_MEM_EQ(e.channel_type, binary, sizeof(binary));
+	ASSERT_EQ(e.channel_type[sizeof(binary)], '\0');
 
 	acceptqueue_free(&q);
 	return chan_unit_finish(&fixture, TEST_PASS, false);

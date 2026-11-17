@@ -19,7 +19,7 @@ A from-scratch SSH library in standard C17 implementing the core SSH protocol:
 - [RFC 9941](standards/rfc9941.txt) — sntrup761x25519-sha512 Key Exchange
 - [RFC 10042](standards/rfc10042.txt) — mlkem768x25519-sha256 Hybrid Key Exchange
 
-No proprietary extensions (no `@` algorithm names).
+Built-in algorithms use standardized names; no proprietary extensions are implemented.
 
 ## Dependencies
 
@@ -30,6 +30,13 @@ No proprietary extensions (no `@` algorithm names).
 Botan-backed binary packages require the Botan version used to compile them.
 The installed CMake and pkg-config metadata record that version. Rebuild
 DeuceSSH when changing Botan versions; the source-build minimum remains 3.13.0.
+
+The version floors above specify source/API compatibility, not a security patch
+level. Deploy a currently supported, security-patched provider (including a
+vendor-maintained build where applicable). Upstream OpenSSL 3.0 no longer has
+community support; see the [OpenSSL support policy](https://openssl-library.org/policies/releasestrat/),
+[OpenSSL advisories](https://openssl-library.org/news/vulnerabilities/) and
+[Botan advisories](https://botan.randombit.net/security.html).
 
 Both backends use the bundled C17 ML-KEM-768 implementation. The selected
 backend supplies randomness, X25519 and the SSH transcript hash.
@@ -713,6 +720,12 @@ are validated before method handling. Inputs are borrowed only during the hook.
 The successful username output is capped at 255 bytes and the caller's capacity;
 callbacks and identity comparisons always use the complete username bytes.
 
+Applications prepare textual usernames, passwords and messages in the wire
+encoding required by their SSH fields (normally UTF-8), converting from local
+encodings as needed. The library preserves callback byte spans without Unicode
+normalization; account mapping, local password conversion and display validation
+belong to the application. Channel stream bytes have no imposed text encoding.
+
 ### Callback Return Values
 
 These values apply to credential callbacks, not the request hook.
@@ -1364,6 +1377,11 @@ session with `dssh_kex_set_ctx()`; session state is separate. See
 DH-GEX works out of the box — the built-in default selects from
 RFC 3526 groups 14–18 (2048–8192-bit) based on the client's requested
 min/preferred/max range.
+The built-in client requests 2048/4096/8192 bits. Fixed group14 uses 2048 bits
+and group16 uses 4096 bits; DH strength depends on the modulus as well as the
+hash. Registration order expresses application preference, rather than a
+universal strength ranking.
+
 
 To override with custom groups (e.g. from a moduli file), use the provider and
 result types in the installed `deucessh-kex.h`. Configure a registered DH-GEX

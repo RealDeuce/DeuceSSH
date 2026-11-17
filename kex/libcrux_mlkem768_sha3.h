@@ -6748,25 +6748,25 @@ libcrux_ml_kem_vector_portable_montgomery_multiply_by_constant_0d(const libcrux_
 
 /**
  The `compress_*` functions implement the `Compress` function specified in the
- NIST FIPS 203 standard (Page 18, Expression 4.5), which is defined as:
+ final NIST FIPS 203 standard (Section 4.2.1, Equation 4.7), which is defined as:
 
  ```plaintext
  Compress_d: Zq -> Z_{2^d}
- Compress_d(x) = round((2^d/q)*x)
+ Compress_d(x) = round((2^d/q)*x) mod 2^d
  ```
 
  Since `round(x) = floor(x + 1/2)` we have:
 
  ```plaintext
- Compress_d(x) = floor((2^d/q)*x + 1/2)
-               = floor((2^{d+1}*x + q) / 2q)
+ Compress_d(x) = floor((2^d/q)*x + 1/2) mod 2^d
+               = floor((2^{d+1}*x + q) / 2q) mod 2^d
  ```
 
- For further information about the function implementations, consult the
- `implementation_notes.pdf` document in this directory.
+ See docs/audit-portability-vendor.md and test/test_mlkem_vector.c for
+ the retained implementation review and independent integer-domain checks.
 
  The NIST FIPS 203 standard can be found at
- <https://csrc.nist.gov/pubs/fips/203/ipd>.
+ <https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.203.pdf>.
 */
 static inline uint8_t
 libcrux_ml_kem_vector_portable_compress_compress_message_coefficient(uint16_t fe)
@@ -6980,10 +6980,10 @@ libcrux_ml_kem_vector_portable_inv_ntt_layer_3_step_0d(libcrux_ml_kem_vector_por
 }
 
 /**
- Compute the product of two Kyber binomials with respect to the
- modulus `X^2 - zeta`.
+ Compute the product of two degree-one polynomials modulo `X^2 - gamma`.
+ The implementation parameter zeta represents gamma*R modulo q.
 
- This function almost implements <strong>Algorithm 11</strong> of the
+ This function almost implements <strong>Algorithm 12</strong> of the
  NIST FIPS 203 standard, which is reproduced below:
 
  ```plaintext
@@ -6995,11 +6995,11 @@ libcrux_ml_kem_vector_portable_inv_ntt_layer_3_step_0d(libcrux_ml_kem_vector_por
  c_1 <- a_0*b_1 + a_1*b_0
  return c_0, c_1
  ```
- We say "almost" because the coefficients output by this function are in
- the Montgomery domain (unlike in the specification).
+ With unscaled inputs and zeta = gamma*R mod q, the result carries R^-1
+ relative to the specified product (R = 2^16); callers correct that scale.
 
  The NIST FIPS 203 standard can be found at
- <https://csrc.nist.gov/pubs/fips/203/ipd>.
+ <https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.203.pdf>.
 */
 static KRML_MUSTINLINE void
 libcrux_ml_kem_vector_portable_ntt_ntt_multiply_binomials(
@@ -8162,30 +8162,30 @@ libcrux_ml_kem_serialize_deserialize_then_decompress_ring_element_v_56(Eurydice_
 
 /**
  Given two `KyberPolynomialRingElement`s in their NTT representations,
- compute their product. Given two polynomials in the NTT domain `f^` and `j^`,
- the `ith` coefficient of the product `k^` is determined by the calculation:
+ compute their product. Given two polynomials in the NTT domain `f^` and `g^`,
+ the `ith` coordinate of the product `h^` is determined by the calculation:
 
  ```plaintext
  h^[2*i] + h^[2*i + 1]X = (f^[2*i] + f^[2*i + 1]X)*(g^[2*i] + g^[2*i + 1]X) mod (X^2
  - zeta^(2*BitRev_7(i) + 1))
  ```
 
- This function almost implements <strong>Algorithm 10</strong> of the
+ This function almost implements <strong>Algorithm 11</strong> of the
  NIST FIPS 203 standard, which is reproduced below:
 
  ```plaintext
- Input: Two arrays f^  in  Z_2_5_6 and g^  in  Z_2_5_6.
- Output: An array h^  in  Zq.
+ Input: Two arrays f^ and g^ in (Zq)^256.
+ Output: An array h^ in (Zq)^256.
 
  for(i <- 0; i < 128; i++)
      (h^[2i], h^[2i+1]) <- BaseCaseMultiply(f^[2i], f^[2i+1], g^[2i], g^[2i+1],
  zeta^(2*BitRev_7(i) + 1)) end for return h^
  ```
- We say "almost" because the coefficients of the ring element output by
- this function are in the Montgomery domain.
+ For unscaled NTT inputs, the implementation result carries R^-1
+ relative to the specified product; callers apply the matching conversion.
 
  The NIST FIPS 203 standard can be found at
- <https://csrc.nist.gov/pubs/fips/203/ipd>.
+ <https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.203.pdf>.
 */
 /**
 This function found in impl
@@ -8470,10 +8470,10 @@ libcrux_ml_kem_serialize_compress_then_serialize_message_aa(const libcrux_ml_kem
 }
 
 /**
- This function implements <strong>Algorithm 14</strong> of the
- NIST FIPS 203 specification; this is the Kyber CPA-PKE decryption algorithm.
+ This helper and its caller implement <strong>Algorithm 15</strong> of the
+ final NIST FIPS 203 specification: the K-PKE.Decrypt component algorithm.
 
- Algorithm 14 is reproduced below:
+ Algorithm 15 is outlined below; this helper receives the decoded s^:
 
  ```plaintext
  Input: decryption key dkpke  in  B^{384k}.
@@ -8484,14 +8484,14 @@ libcrux_ml_kem_serialize_compress_then_serialize_message_aa(const libcrux_ml_kem
  c_2 <- c[32d_uk : 32(d_uk + d_v)]
  u <- Decompress_{d_u}(ByteDecode_{d_u}(c_1))
  v <- Decompress_{d_v}(ByteDecode_{d_v}(c_2))
- s^ <- ByteDecode_1_2(dkpke)
- w <- v - NTT-^1(s^^T * NTT(u))
+ s^ <- ByteDecode_12(dkpke)  (performed by the caller)
+ w <- v - NTT^{-1}(s_hat^T * NTT(u))
  m <- ByteEncode_1(Compress_1(w))
  return m
  ```
 
  The NIST FIPS 203 standard can be found at
- <https://csrc.nist.gov/pubs/fips/203/ipd>.
+ <https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.203.pdf>.
 */
 /**
 A monomorphic instance of libcrux_ml_kem.ind_cpa.decrypt_unpacked
@@ -8743,24 +8743,24 @@ libcrux_ml_kem_hash_functions_portable_shake128_squeeze_three_blocks_f1_69(
 }
 
 /**
- If `bytes` contains a set of uniformly random bytes, this function
- uniformly samples a ring element `a^` that is treated as being the NTT
- representation of the corresponding polynomial `a`.
+ Consume one finite block from each of three continuing SHAKE128 streams.
+ Accepted coefficients are appended to the existing per-lane outputs;
+ the caller owns the XOF state and preserves it between calls.
 
- Since rejection sampling is used, it is possible the supplied bytes are
- not enough to sample the element, in which case an `Err` is returned and the
- caller must try again with a fresh set of bytes.
+ Return true only when every lane has reached 256 coefficients, or false
+ when more bytes are needed. Counts reaching 256 are clamped to 256;
+ the caller squeezes the next block from the same stream when necessary.
 
- This function <strong>partially</strong> implements <strong>Algorithm
- 6</strong> of the NIST FIPS 203 standard, We say "partially" because this
- implementation only accepts a finite set of bytes as input and returns an error
- if the set is not enough; Algorithm 6 of the FIPS 203 standard on the other
- hand samples from an infinite stream of bytes until the ring element is filled.
- Algorithm 6 is reproduced below:
+ This is the block-at-a-time rejection loop of final FIPS 203
+ Algorithm 7 (SampleNTT), rather than a separate seed-to-polynomial API.
+ The initial block is 504 bytes per lane; continuation blocks are 168.
+ Batch writes use the caller's 272-coefficient scratch rows; only the
+ first 256 coefficients of each completed row form the logical output.
+ The underlying SampleNTT rejection loop is outlined below:
 
  ```plaintext
- Input: byte stream B  in  B*.
- Output: array a^  in  Z_2_5_6.
+ Input below: continuing SHAKE128 output after absorbing seed and indices.
+ Output: array a^ in (Zq)^256.
 
  i <- 0
  j <- 0
@@ -8781,7 +8781,7 @@ libcrux_ml_kem_hash_functions_portable_shake128_squeeze_three_blocks_f1_69(
  ```
 
  The NIST FIPS 203 standard can be found at
- <https://csrc.nist.gov/pubs/fips/203/ipd>.
+ <https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.203.pdf>.
 */
 /**
 A monomorphic instance of
@@ -8856,24 +8856,24 @@ libcrux_ml_kem_hash_functions_portable_shake128_squeeze_block_f1_60(
 }
 
 /**
- If `bytes` contains a set of uniformly random bytes, this function
- uniformly samples a ring element `a^` that is treated as being the NTT
- representation of the corresponding polynomial `a`.
+ Consume one finite block from each of three continuing SHAKE128 streams.
+ Accepted coefficients are appended to the existing per-lane outputs;
+ the caller owns the XOF state and preserves it between calls.
 
- Since rejection sampling is used, it is possible the supplied bytes are
- not enough to sample the element, in which case an `Err` is returned and the
- caller must try again with a fresh set of bytes.
+ Return true only when every lane has reached 256 coefficients, or false
+ when more bytes are needed. Counts reaching 256 are clamped to 256;
+ the caller squeezes the next block from the same stream when necessary.
 
- This function <strong>partially</strong> implements <strong>Algorithm
- 6</strong> of the NIST FIPS 203 standard, We say "partially" because this
- implementation only accepts a finite set of bytes as input and returns an error
- if the set is not enough; Algorithm 6 of the FIPS 203 standard on the other
- hand samples from an infinite stream of bytes until the ring element is filled.
- Algorithm 6 is reproduced below:
+ This is the block-at-a-time rejection loop of final FIPS 203
+ Algorithm 7 (SampleNTT), rather than a separate seed-to-polynomial API.
+ The initial block is 504 bytes per lane; continuation blocks are 168.
+ Batch writes use the caller's 272-coefficient scratch rows; only the
+ first 256 coefficients of each completed row form the logical output.
+ The underlying SampleNTT rejection loop is outlined below:
 
  ```plaintext
- Input: byte stream B  in  B*.
- Output: array a^  in  Z_2_5_6.
+ Input below: continuing SHAKE128 output after absorbing seed and indices.
+ Output: array a^ in (Zq)^256.
 
  i <- 0
  j <- 0
@@ -8894,7 +8894,7 @@ libcrux_ml_kem_hash_functions_portable_shake128_squeeze_block_f1_60(
  ```
 
  The NIST FIPS 203 standard can be found at
- <https://csrc.nist.gov/pubs/fips/203/ipd>.
+ <https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.203.pdf>.
 */
 /**
 A monomorphic instance of
@@ -9102,7 +9102,7 @@ libcrux_ml_kem_hash_functions_portable_PRFxN_f1_93(uint8_t (*input)[33U], uint8_
  - If v >= 0, Pr[v] = BINOMIAL_COEFFICIENT(2 * ETA; ETA - v) / 2 ^ (2 * ETA)
  ```
 
- The values `v < 0` are mapped to the appropriate `KyberFieldElement`.
+ This implementation keeps signed representatives in [-ETA, ETA], modulo q.
 
  The expected value is:
 
@@ -9120,12 +9120,12 @@ libcrux_ml_kem_hash_functions_portable_PRFxN_f1_93(uint8_t (*input)[33U], uint8_
  2^(2 * ETA)) = ETA / 2
  ```
 
- This function implements <strong>Algorithm 7</strong> of the NIST FIPS 203
+ This function implements <strong>Algorithm 8</strong> of the NIST FIPS 203
  standard, which is reproduced below:
 
  ```plaintext
  Input: byte array B  in  B^{64eta}.
- Output: array f  in  Z_2_5_6.
+ Output: array f in (Zq)^256.
 
  b <- BytesToBits(B)
  for (i <- 0; i < 256; i++)
@@ -9137,7 +9137,7 @@ libcrux_ml_kem_hash_functions_portable_PRFxN_f1_93(uint8_t (*input)[33U], uint8_
  ```
 
  The NIST FIPS 203 standard can be found at
- <https://csrc.nist.gov/pubs/fips/203/ipd>.
+ <https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.203.pdf>.
 */
 /**
 A monomorphic instance of

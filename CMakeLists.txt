@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(deucessh VERSION 0.1 LANGUAGES C)
+project(deucessh VERSION 1.0.0 LANGUAGES C)
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/DeuceSSHCStandard.cmake")
 
 # Default to Release for single-config generators when the user hasn't
@@ -458,6 +458,9 @@ install(TARGETS ${DEUCESSH_INSTALL_TARGETS}
 
 install(FILES ${DEUCESSH_PUBLIC_HEADERS}
 	DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/deucessh)
+
+install(FILES LICENSE.md
+	DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/deucessh)
 
 install(EXPORT deucesshTargets
 	FILE deucesshTargets.cmake

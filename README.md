@@ -56,6 +56,15 @@ cmake --build build -j8
 ```
 
 Produces `libdeucessh.a` (static) and `libdeucessh.so` (shared).
+The v1.0 package version is 1.0.0 and the shared-library ABI major is 1.
+`cmake --install build --prefix <prefix>` installs headers, libraries, CMake/
+pkg-config metadata and the project/bundled-code notices in
+`share/licenses/deucessh/LICENSE.md` (using the configured install data directory).
+
+ELF shared builds apply `-z nodlopen` when the linker supports it. Link the
+library as a program dependency; late loading with `dlopen` is unsupported in
+that configuration. macOS and Windows do not use this ELF flag.
+
 
 Use `-S . -B build` to prevent cmake from discovering the parent
 `src/CMakeLists.txt`.
@@ -81,215 +90,75 @@ it.
 
 ## Quick Start — Client
 
+[examples/client.c](examples/client.c) is the complete POSIX client example.
+It requires the trusted host fingerprint and a dedicated password descriptor;
+stdin remains available for channel data. See the invocation under
+[Host Key Verification](#host-key-verification-client-only).
+
+For an application integration, configure algorithms and I/O before creating
+sessions, check `dssh_session_init()` for NULL, and install the session's
+termination and host-key verification callbacks before handshaking. The
+[registration example](#algorithm-registration) includes both fixed SHA-2 DH
+groups alongside the hybrid and Curve25519 methods. Select an encrypted cipher
+and an integrity MAC for credential authentication.
+
 ```c
 #include "deucessh.h"
 #include "deucessh-auth.h"
 #include "deucessh-conn.h"
-#include "deucessh-algorithms.h"
 
-/* 1. Implement I/O callbacks */
-static int my_tx(uint8_t *buf, size_t bufsz,
-    dssh_session sess, void *cbdata)
+/* sess has application I/O, termination and host-trust callbacks configured. */
+int start_client(dssh_session sess, const char *username, const char *password)
 {
-    /* Send exactly bufsz bytes over your transport (socket, etc.).
-     * Block until complete or dssh_session_is_terminated(sess).
-     * Return 0 on success, negative on error. */
-}
-
-static int my_rx(uint8_t *buf, size_t bufsz,
-    dssh_session sess, void *cbdata)
-{
-    /* Receive exactly bufsz bytes.  Same contract as tx. */
-}
-
-int main(void)
-{
-    /* 2. Register algorithms (order = preference) */
-    dssh_transport_set_callbacks(my_tx, my_rx, NULL, NULL);
-    if (dssh_register_curve25519_sha256() != 0
-        || dssh_register_dh_group16_sha512() != 0
-        || dssh_register_dh_group14_sha256() != 0)
-        return 1;
-    dssh_register_ssh_ed25519();
-    dssh_register_aes256_ctr();
-    dssh_register_none_enc();
-    dssh_register_hmac_sha2_256();
-    dssh_register_none_mac();
-    dssh_register_none_comp();
-
-    /* 3. Create session (opaque handle) */
-    dssh_session sess = dssh_session_init(true, 0);
-    dssh_session_set_terminate_cb(sess, on_terminate, NULL);
-    dssh_session_set_hostkey_verify_cb(sess, my_hostkey_verify, NULL);
-
-    /* 4. Handshake */
-    dssh_transport_handshake(sess);
-
-    /* 5. Try the application's chosen method directly. */
-    int r = dssh_auth_password(sess, "user", "pass", NULL, NULL);
-    if (r != DSSH_AUTH_SUCCESS) {
-        dssh_session_cleanup(sess);
-        return 1;
-    }
-
-    /* 6. Start the demux thread */
-    dssh_session_start(sess);
-
-    /* 7. Open channel via params builder */
-    struct dssh_chan_params cp;
-    dssh_chan_params_init(&cp, DSSH_CHAN_EXEC);
-    dssh_chan_params_set_command(&cp, "echo hello");
-    dssh_chan_params_set_pty(&cp, false);
-
-    dssh_channel ch = dssh_chan_open(sess, &cp);
-    dssh_chan_params_free(&cp);
-
-    /* 8. Read output using poll/read */
-    uint8_t buf[4096];
-    int ev;
-    while ((ev = dssh_chan_poll(ch,
-            DSSH_POLL_READ | DSSH_POLL_EVENT, -1)) > 0) {
-        if (ev & DSSH_POLL_EVENT) {
-            struct dssh_chan_event event;
-            dssh_chan_read_event(ch, &event);
-            continue;
-        }
-        if (ev & DSSH_POLL_READ) {
-            int64_t n = dssh_chan_read(ch, 0, buf, sizeof(buf));
-            if (n <= 0)
-                break;
-            write(STDOUT_FILENO, buf, n);
-        }
-    }
-
-    /* 9. Clean up; an ordinary close consumes ch even on error. */
-    int closed = dssh_chan_close(ch, -1);
-    ch = NULL;
-    dssh_session_cleanup(sess);
-    return closed == 0 ? 0 : 1;
+    int ret = dssh_transport_handshake(sess);
+    if (ret != 0)
+        return ret;
+    ret = dssh_auth_password(sess, username, password, NULL, NULL);
+    if (ret != DSSH_AUTH_SUCCESS)
+        return ret;
+    return dssh_session_start(sess);
 }
 ```
 
-For an interactive shell instead of exec:
-
-```c
-struct dssh_chan_params cp;
-dssh_chan_params_init(&cp, DSSH_CHAN_SHELL);
-dssh_chan_params_set_term(&cp, "xterm-256color");
-dssh_chan_params_set_size(&cp, 80, 24, 0, 0);
-/* PTY is enabled by default for DSSH_CHAN_SHELL */
-
-dssh_channel ch = dssh_chan_open(sess, &cp);
-dssh_chan_params_free(&cp);
-```
+A PARTIAL or CONTINUE result leaves authentication incomplete; inspect the
+current methods and choose another action before starting the connection layer.
+After successful start, open channels with `dssh_chan_open()` or
+`dssh_chan_zc_open()`. The application owns session cleanup on every outcome.
 
 ## Quick Start — Server
 
+[examples/server.c](examples/server.c) and
+[examples/kbi-game-server.c](examples/kbi-game-server.c) provide complete POSIX
+I/O, key provisioning, authentication, channel setup and cleanup examples.
+Build them with `cmake --build build --target server kbi-game-server`.
+
+Register algorithms and load/generate host keys before the first session-init
+attempt. Check every registration, key and callback setter result. Authentication
+callbacks authorize credentials against the application's account policy;
+channel callbacks separately authorize the requested shell/exec/subsystem.
+
 ```c
 #include "deucessh.h"
 #include "deucessh-auth.h"
 #include "deucessh-conn.h"
-#include "deucessh-algorithms.h"
 
-/* Server-side auth: accept any password */
-static int my_password_cb(const uint8_t *username, size_t username_len,
-    const uint8_t *password, size_t password_len,
-    struct dssh_bytes_result *change_prompt, void *cbdata)
+/* sess has application I/O and termination callbacks configured.
+ * cbs contains the application's credential-checking callbacks. */
+int start_server(dssh_session sess, const struct dssh_auth_server_cbs *cbs)
 {
-    return DSSH_AUTH_SUCCESS;
-}
-
-/* Channel accept callbacks */
-static int my_shell_cb(dssh_channel ch,
-    const struct dssh_chan_params *params,
-    struct dssh_chan_accept_result *result, void *cbdata)
-{
-    return 0;  /* accept */
-}
-
-static int my_exec_cb(dssh_channel ch,
-    const struct dssh_chan_params *params,
-    struct dssh_chan_accept_result *result, void *cbdata)
-{
-    return 0;  /* accept */
-}
-
-int main(void)
-{
-    /* 1. Register algorithms and I/O callbacks (same as client) */
-    dssh_transport_set_callbacks(my_tx, my_rx, NULL, NULL);
-    if (dssh_register_curve25519_sha256() != 0
-        || dssh_register_dh_group16_sha512() != 0
-        || dssh_register_dh_group14_sha256() != 0)
-        return 1;
-    dssh_register_ssh_ed25519();
-    dssh_register_rsa_sha2_256();
-    dssh_register_aes256_ctr();
-    dssh_register_hmac_sha2_256();
-    dssh_register_none_comp();
-
-    /* 2. Load host keys (stored on algorithm entry, not session) */
-    dssh_ed25519_load_key_file("/path/to/host_ed25519.pem", NULL, NULL);
-    dssh_rsa_sha2_256_load_key_file("/path/to/host_rsa.pem", NULL, NULL);
-
-    /* 3. Create session */
-    dssh_session sess = dssh_session_init(false, 0);
-    dssh_session_set_terminate_cb(sess, on_terminate, NULL);
-
-    /* 4. Handshake */
-    dssh_transport_handshake(sess);
-
-    /* 5. Authenticate */
-    struct dssh_auth_server_cbs auth_cbs = {
-        .methods_str = "publickey,password",
-        .password_cb = my_password_cb,
-    };
-    uint8_t username[256];
-    size_t username_len = sizeof(username);
-    dssh_auth_set_banner(sess, "Welcome!\r\n", NULL);
-    dssh_auth_server(sess, &auth_cbs, username, &username_len);
-
-    /* 6. Start demux thread */
-    dssh_session_start(sess);
-
-    /* 7. Accept incoming channels */
-    struct dssh_chan_accept_cbs accept_cbs = {
-        .shell = my_shell_cb,
-        .exec = my_exec_cb,
-    };
-
-    dssh_channel ch = dssh_chan_accept(sess, &accept_cbs, -1);
-    if (ch == NULL)
-        return 1;
-
-    enum dssh_chan_type ctype = dssh_chan_get_type(ch);
-
-    if (ctype == DSSH_CHAN_EXEC) {
-        const char *cmd = dssh_chan_get_command(ch);
-        /* ... handle exec ... */
-        dssh_chan_write(ch, 0,
-            (const uint8_t *)"done\n", 5);
-    } else {
-        /* Shell — echo loop */
-        uint8_t buf[4096];
-        for (;;) {
-            int ev = dssh_chan_poll(ch, DSSH_POLL_READ, -1);
-            if (ev <= 0)
-                break;
-            int64_t n = dssh_chan_read(ch, 0, buf, sizeof(buf));
-            if (n <= 0)
-                break;
-            dssh_chan_write(ch, 0, buf, n);
-        }
-    }
-
-    /* 8. Clean up; this server selects exit status zero. */
-    int closed = dssh_chan_close(ch, 0);
-    ch = NULL;
-    dssh_session_cleanup(sess);
-    return closed == 0 ? 0 : 1;
+    int ret = dssh_transport_handshake(sess);
+    if (ret != 0)
+        return ret;
+    ret = dssh_auth_server(sess, cbs, NULL, NULL);
+    if (ret != 0)
+        return ret;
+    return dssh_session_start(sess);
 }
 ```
+
+After successful start, `dssh_chan_accept()` performs callback-driven channel
+setup. Dispose each owned channel with `dssh_chan_close()` and clean up the
+session after application workers have stopped using it.
 
 ## I/O Callbacks
 
@@ -2274,10 +2143,11 @@ and never returned to the caller.
 | `DSSH_ERROR_ALLOC` | -3 | Memory allocation failure |
 | `DSSH_ERROR_INIT` | -4 | Initialization or crypto failure |
 | `DSSH_ERROR_TERMINATED` | -5 | Session terminated |
-| `DSSH_ERROR_TOOLATE` | -6 | Operation not allowed after session started |
-| `DSSH_ERROR_TOOMANY` | -7 | Too many registered algorithms |
+| `DSSH_ERROR_TOOLATE` | -6 | Operation no longer allowed in this state |
+| `DSSH_ERROR_TOOMANY` | -7 | Configured capacity or registry limit exceeded |
 | `DSSH_ERROR_TOOLONG` | -8 | Data exceeds buffer or protocol limit |
-| `DSSH_ERROR_NOMORE` | -10 | No more items in name-list |
+| `DSSH_ERROR_MUST_BE_NULL` | -9 | Registration link was not NULL |
+| `DSSH_ERROR_NOMORE` | -10 | No queued item is available |
 | `DSSH_ERROR_REKEY_NEEDED` | -11 | Must rekey before sending more packets |
 | `DSSH_ERROR_REJECTED` | -13 | Channel open or request rejected |
 | `DSSH_ERROR_TIMEOUT` | -14 | Operation timed out |
@@ -2292,12 +2162,12 @@ Pass a larger value to support bigger payloads.
 
 ## Limits
 
-| Constant | Value | Source | Description |
-|----------|-------|--------|-------------|
-| `DSSH_VERSION_STRING_MAX` | 255 | RFC 4253 s4.2 | Maximum SSH identification string length. |
-| `DSSH_ALGO_NAME_MAX` | 64 | RFC 4251 s6 | Maximum algorithm name length. |
-| `DSSH_NAMELIST_BUF_SIZE` | 1024 | Practical | Maximum total algorithm name-list length. |
-| `DSSH_DISCONNECT_DESC_MAX` | 230 | Practical | Maximum disconnect description (clamped, not rejected). |
+| Limit | Value | Source | Description |
+|-------|-------|--------|-------------|
+| Identification line | 255 bytes | RFC 4253 s4.2 | Includes prefix and CRLF. |
+| Algorithm name | 64 bytes | RFC 4251 s6 | Each individual name. |
+| Complete negotiation lists | Session packet bound | Transport framing | No separate fixed 1024-byte list limit. |
+| Locally sent disconnect description | 230 bytes | Implementation bound | Clamped to fit its control slot. |
 
 ## Testing
 
@@ -2312,8 +2182,7 @@ ctest -R dssh_self           # integration selftests
 ```
 
 CTest prepares the shared Ed25519/RSA key cache before parallel consumers
-start, including filtered runs. Assertion cleanup runs before returning from
-the failed test so stack-owned sessions and worker arguments remain valid.
+start, including filtered runs.
 
 Optional independent OpenSSH tests require POSIX process/I/O support, Python
 3.9+, `ssh`, `sshd`, and `ssh-keygen`. Enable them with
@@ -2327,20 +2196,16 @@ the current local account is permitted to authenticate using its isolated test
 configuration. Complete diagnostics and actual process exits remain in the
 build tree's `test/openssh-evidence/` directory; private keys are removed.
 
-The [extension validation record](docs/release-1.0-evidence/validation-2026-11-05-ext-info.txt)
-records the exact native backend/algorithm selections, historical failures and
-subsequent harness corrections. Two fully instrumented OpenSSL group-exchange
-client cases remain under runtime qualification. Optional RFC 8308 delayed
-compression, flow-control and elevation extensions are not advertised.
-Provider update/backport and call-path reconciliation remains a separate
-[release gate](docs/release-1.0-evidence/provider-freshness-ledger.md).
+Optional RFC 8308 delayed compression, flow-control and elevation extensions
+are not advertised. Current release requirements, validation scopes and residual
+limitations are in the [release checklist](docs/release-1.0-checklist.md).
 
 ## Debugging
 
 Build with `-DDSSH_TRACE_WIRE` (e.g.
-`-DCMAKE_C_FLAGS=-DDSSH_TRACE_WIRE`) to emit one stderr line per
-SSH packet sent and received.  Each line is prefixed `[dssh-wire]`
-and reports `tx msg_type=N len=M` or `rx msg_type=N len=M`, where
+`-DCMAKE_C_FLAGS=-DDSSH_TRACE_WIRE`) to deliver packet metadata through the
+session's diagnostic callback at `DSSH_LOG_DEBUG`. Configure that callback and
+debug level before traffic. Records are local, prefixed `[dssh-wire]`, and report `tx msg_type=N len=M` or `rx msg_type=N len=M`, where
 N is the SSH message type number (RFC 4253 / 4254, e.g. 20
 KEXINIT, 21 NEWKEYS, 91 CHANNEL_OPEN_CONFIRMATION, 93
 CHANNEL_WINDOW_ADJUST, 94 CHANNEL_DATA, 95 CHANNEL_EXTENDED_DATA,
@@ -2355,6 +2220,9 @@ deucessh.h               Core: errors, session lifecycle, transport queries
 deucessh-auth.h          Authentication (client + server)
 deucessh-conn.h          Connection: channels, params, poll/read/write, accept
 deucessh-algorithms.h    Algorithm registration + key management
+deucessh-crypto.h        Backend-neutral crypto utilities
+deucessh-lang.h          Directional language preferences and peer lists
+deucessh-result.h        Byte spans and producer-owned release leases
 deucessh-portable.h      Visibility macros (included automatically)
 ```
 
@@ -2375,14 +2243,17 @@ ssh-auth.c          RFC 4252 authentication
 ssh-conn.c          RFC 4254 connection + channel I/O
 ssh.c               Session lifecycle + wire format
 
+crypto/             Backend-neutral primitive implementations
 kex/                Key exchange modules
 key_algo/           Host key algorithm modules
 enc/                Encryption modules
 mac/                MAC modules
 comp/               Compression modules
 
-client.c            Example client
-server.c            Example server
+examples/client.c          POSIX client
+examples/server.c          POSIX server
+examples/kbi-game-server.c POSIX keyboard-interactive server
+posix/, win32/             Private C11 thread compatibility shims
 
 test/               Test suite (built with -DDEUCESSH_BUILD_TESTS=ON)
   dssh_test.h       Test framework (assert macros, runner)

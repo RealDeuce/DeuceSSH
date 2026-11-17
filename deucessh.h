@@ -18,11 +18,11 @@ extern "C" {
 #define DSSH_ERROR_ALLOC         -3  /* Memory allocation failure */
 #define DSSH_ERROR_INIT          -4  /* Initialization or crypto failure */
 #define DSSH_ERROR_TERMINATED    -5  /* Session terminated (peer disconnected) */
-#define DSSH_ERROR_TOOLATE       -6  /* Operation not allowed after session started */
-#define DSSH_ERROR_TOOMANY       -7  /* Too many registered algorithms */
+#define DSSH_ERROR_TOOLATE       -6  /* Operation no longer allowed in this state */
+#define DSSH_ERROR_TOOMANY       -7  /* Configured capacity or registry limit exceeded */
 #define DSSH_ERROR_TOOLONG       -8  /* Data exceeds buffer or protocol limit */
 #define DSSH_ERROR_MUST_BE_NULL  -9  /* Linked list next pointer was not NULL */
-#define DSSH_ERROR_NOMORE        -10 /* No more items in name-list */
+#define DSSH_ERROR_NOMORE        -10 /* No queued item is available */
 #define DSSH_ERROR_REKEY_NEEDED  -11 /* Must rekey before sending more packets */
 #define DSSH_ERROR_REJECTED      -13 /* Channel open or request rejected by peer */
 #define DSSH_ERROR_TIMEOUT       -14 /* Operation timed out waiting for peer */

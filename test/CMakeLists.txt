@@ -1447,7 +1447,6 @@ add_test(NAME dssh_targeted_mlkem768_null_ka
 # Botan-specific C++ unit tests
 if(DEUCESSH_CRYPTO_BACKEND STREQUAL "Botan")
 	dssh_add_test(mlkem_parity test_mlkem_parity.cpp)
-	target_sources(dssh_test_mlkem_parity PRIVATE ${PROJECT_SOURCE_DIR}/kex/mlkem768.c)
 	set_property(TARGET dssh_test_mlkem_parity PROPERTY CXX_STANDARD 20)
 	set_property(TARGET dssh_test_mlkem_parity PROPERTY CXX_STANDARD_REQUIRED ON)
 	add_test(NAME dssh_unit_mlkem_parity COMMAND dssh_test_mlkem_parity)

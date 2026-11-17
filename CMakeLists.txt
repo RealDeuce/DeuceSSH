@@ -277,8 +277,6 @@ if(DEUCESSH_CRYPTO_BACKEND STREQUAL "OpenSSL")
 		kex/curve25519-sha256-openssl.c
 		kex/dh-gex-sha256-openssl.c
 		kex/sntrup761x25519-sha512-openssl.c
-		kex/mlkem768x25519-sha256-openssl.c
-		kex/mlkem768.c
 		key_algo/ssh-ed25519-openssl.c
 		key_algo/rsa-sha2-256-openssl.c
 		key_algo/rsa-sha2-512-openssl.c
@@ -295,8 +293,6 @@ elseif(DEUCESSH_CRYPTO_BACKEND STREQUAL "Botan")
 		kex/dh-gex-sha256-botan.cpp
 		kex/sntrup761x25519-sha512-botan.c
 		kex/sntrup761x25519-sha512-botan.cpp
-		kex/mlkem768x25519-sha256-botan.c
-		kex/mlkem768x25519-sha256-botan.cpp
 		key_algo/ssh-ed25519-botan.c
 		key_algo/ssh-ed25519-botan.cpp
 		key_algo/rsa-sha2-256-botan.c
@@ -324,6 +320,8 @@ set(DEUCESSH_SOURCES
 	kex/workspace.c
 	kex/curve25519-sha256.c
 	kex/hybrid-pq-kex.c
+	kex/mlkem768x25519-sha256.c
+	kex/mlkem768.c
 	kex/dh-gex-sha256.c
 	kex/dh-fixed.c
 	kex/dh-gex-groups.c

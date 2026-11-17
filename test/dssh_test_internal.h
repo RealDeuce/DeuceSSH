@@ -229,7 +229,6 @@ int dhgex_handler(const struct dssh_kex_context *kctx, struct dssh_kex_result *o
 int dhgex_validate_group(const BIGNUM *p, const BIGNUM *g, BN_CTX *bnctx,
     const uint8_t *p_raw, size_t p_len, const uint8_t *g_raw, size_t g_len);
 int sntrup761x25519_handler(const struct dssh_kex_context *kctx, struct dssh_kex_result *out);
-int mlkem768x25519_handler(const struct dssh_kex_context *kctx, struct dssh_kex_result *out);
 #elif defined(DSSH_CRYPTO_BOTAN)
 /*
  * Botan backend: extern "C" wrappers in the .cpp files.
@@ -237,14 +236,13 @@ int mlkem768x25519_handler(const struct dssh_kex_context *kctx, struct dssh_kex_
 int dssh_botan_curve25519_handler(const struct dssh_kex_context *kctx, struct dssh_kex_result *out);
 int dssh_botan_dhgex_handler(const struct dssh_kex_context *kctx, struct dssh_kex_result *out);
 int dssh_botan_sntrup761x25519_handler(const struct dssh_kex_context *kctx, struct dssh_kex_result *out);
-int dssh_botan_mlkem768x25519_handler(const struct dssh_kex_context *kctx, struct dssh_kex_result *out);
 #define curve25519_handler       dssh_botan_curve25519_handler
 #define dhgex_handler            dssh_botan_dhgex_handler
 #define sntrup761x25519_handler  dssh_botan_sntrup761x25519_handler
-#define mlkem768x25519_handler   dssh_botan_mlkem768x25519_handler
 #endif
 
-/* Backend-matched ML-KEM fixture generation for packet-replay tests. */
+/* Common ML-KEM handler and fixture generation for packet-replay tests. */
+int mlkem768x25519_handler(const struct dssh_kex_context *kctx, struct dssh_kex_result *out);
 int dssh_test_mlkem768_public_key(uint8_t *pk_out, size_t pk_len);
 
 /*

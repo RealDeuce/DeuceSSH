@@ -31,6 +31,9 @@ Botan-backed binary packages require the Botan version used to compile them.
 The installed CMake and pkg-config metadata record that version. Rebuild
 DeuceSSH when changing Botan versions; the source-build minimum remains 3.13.0.
 
+Both backends use the bundled C17 ML-KEM-768 implementation. The selected
+backend supplies randomness, X25519 and the SSH transcript hash.
+
 ## Building
 
 CMake selects C17 when supported. On macOS x86 only, a compiler without

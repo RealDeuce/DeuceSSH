@@ -1,6 +1,6 @@
-// RFC 10042: mlkem768x25519-sha256 (OpenSSL backend)
+// RFC 10042: mlkem768x25519-sha256 (backend-neutral ML-KEM adapter)
 //
-// Provides X25519 and ML-KEM-768 crypto operations for the shared
+// Combines the selected backend's X25519 with the bundled ML-KEM-768 for the shared
 // protocol handler in hybrid-pq-kex.c.
 
 #include <stdlib.h>
@@ -36,7 +36,7 @@ static const struct hybrid_pq_params mlkem_params = {
     .q_s_len      = MLKEM_CT_LEN + DSSH_X25519_LEN,
 };
 
-/* --- PQ operations (vendor mlkem768 lib) --- */
+/* --- PQ operations (bundled C17 ML-KEM) --- */
 
 static int
 mlkem_keygen(uint8_t *pk_out, uint8_t *storage, size_t capacity, void **sk_ctx)
@@ -95,7 +95,7 @@ dssh_test_mlkem768_public_key(uint8_t *pk_out, size_t pk_len)
 }
 #endif
 
-static const struct hybrid_pq_ops ossl_mlkem_ops = {
+static const struct hybrid_pq_ops mlkem_ops = {
 	.x25519          = &dssh_x25519_backend,
     .pq_keygen        = mlkem_keygen,
     .pq_encaps        = mlkem_encaps,
@@ -106,13 +106,13 @@ static const struct hybrid_pq_ops ossl_mlkem_ops = {
 DSSH_PRIVATE int
 mlkem768x25519_init(bool client, void *config, void **state)
 {
-	return hybrid_pq_init_impl(client, config, state, &mlkem_params, &ossl_mlkem_ops);
+	return hybrid_pq_init_impl(client, config, state, &mlkem_params, &mlkem_ops);
 }
 
 DSSH_TESTABLE int
 mlkem768x25519_handler(const struct dssh_kex_context *kctx, struct dssh_kex_result *out)
 {
-	return hybrid_pq_handler_impl(kctx, out, &mlkem_params, &ossl_mlkem_ops);
+	return hybrid_pq_handler_impl(kctx, out, &mlkem_params, &mlkem_ops);
 }
 
 DSSH_PUBLIC int

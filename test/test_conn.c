@@ -1142,334 +1142,54 @@ test_open_subsystem(void)
  * Session I/O (~8 tests)
  * ================================================================ */
 
+#include "conn_stream_fixture.h"
+
 static int
 test_session_write_read(void)
 {
-	struct conn_ctx ctx;
-	if (conn_setup(&ctx) < 0)
-		return TEST_FAIL;
-
-	struct open_exec_ctx oc = {
-		.client = ctx.client,
-		.server = ctx.server,
-		.command = "cmd",
-		.cbs = &accept_cbs_all,
-		.accept_timeout = 30000,
-	};
-	if (open_exec_channel(&ctx, &oc) < 0) {
-		conn_cleanup(&ctx);
-		return TEST_SKIP;
-	}
-
-	const uint8_t msg[] = "Hello, server!";
-	int64_t written = dssh_chan_write(oc.client_ch, 0,
-	    msg, sizeof(msg) - 1);
-	ASSERT_TRUE(written > 0);
-
-	int ev = dssh_chan_poll(oc.server_ch, DSSH_POLL_READ, 5000);
-	ASSERT_TRUE(ev & DSSH_POLL_READ);
-
-	uint8_t buf[256];
-	int64_t nread = dssh_chan_read(oc.server_ch, 0,
-	    buf, sizeof(buf));
-	ASSERT_TRUE(nread > 0);
-	ASSERT_EQ(nread, (int64_t)(sizeof(msg) - 1));
-	ASSERT_MEM_EQ(buf, msg, sizeof(msg) - 1);
-
-	dssh_chan_close(oc.client_ch, 0);
-	dssh_chan_close(oc.server_ch, 0);
-	conn_cleanup(&ctx);
-	return TEST_PASS;
+	return stream_body_run(STREAM_FORWARD);
 }
 
 static int
 test_session_read_write_reverse(void)
 {
-	struct conn_ctx ctx;
-	if (conn_setup(&ctx) < 0)
-		return TEST_FAIL;
-
-	struct open_exec_ctx oc = {
-		.client = ctx.client,
-		.server = ctx.server,
-		.command = "cmd",
-		.cbs = &accept_cbs_all,
-		.accept_timeout = 30000,
-	};
-	if (open_exec_channel(&ctx, &oc) < 0) {
-		conn_cleanup(&ctx);
-		return TEST_SKIP;
-	}
-
-	const uint8_t msg[] = "Hello, client!";
-	int64_t written = dssh_chan_write(oc.server_ch, 0,
-	    msg, sizeof(msg) - 1);
-	ASSERT_TRUE(written > 0);
-
-	int ev = dssh_chan_poll(oc.client_ch, DSSH_POLL_READ, 5000);
-	ASSERT_TRUE(ev & DSSH_POLL_READ);
-
-	uint8_t buf[256];
-	int64_t nread = dssh_chan_read(oc.client_ch, 0,
-	    buf, sizeof(buf));
-	ASSERT_TRUE(nread > 0);
-	ASSERT_EQ(nread, (int64_t)(sizeof(msg) - 1));
-	ASSERT_MEM_EQ(buf, msg, sizeof(msg) - 1);
-
-	dssh_chan_close(oc.client_ch, 0);
-	dssh_chan_close(oc.server_ch, 0);
-	conn_cleanup(&ctx);
-	return TEST_PASS;
+	return stream_body_run(STREAM_REVERSE);
 }
 
 static int
 test_session_write_ext(void)
 {
-	struct conn_ctx ctx;
-	if (conn_setup(&ctx) < 0)
-		return TEST_FAIL;
-
-	struct open_exec_ctx oc = {
-		.client = ctx.client,
-		.server = ctx.server,
-		.command = "cmd",
-		.cbs = &accept_cbs_all,
-		.accept_timeout = 30000,
-	};
-	if (open_exec_channel(&ctx, &oc) < 0) {
-		conn_cleanup(&ctx);
-		return TEST_SKIP;
-	}
-
-	const uint8_t stderr_msg[] = "error output";
-	int64_t written = dssh_chan_write(oc.server_ch, 1,
-	    stderr_msg, sizeof(stderr_msg) - 1);
-	ASSERT_TRUE(written > 0);
-
-	int ev = dssh_chan_poll(oc.client_ch, DSSH_POLL_READEXT, 5000);
-	ASSERT_TRUE(ev & DSSH_POLL_READEXT);
-
-	uint8_t buf[256];
-	int64_t nread = dssh_chan_read(oc.client_ch, 1,
-	    buf, sizeof(buf));
-	ASSERT_TRUE(nread > 0);
-	ASSERT_EQ(nread, (int64_t)(sizeof(stderr_msg) - 1));
-	ASSERT_MEM_EQ(buf, stderr_msg, sizeof(stderr_msg) - 1);
-
-	dssh_chan_close(oc.client_ch, 0);
-	dssh_chan_close(oc.server_ch, 0);
-	conn_cleanup(&ctx);
-	return TEST_PASS;
+	return stream_body_run(STREAM_STDERR_REVERSE);
 }
 
 static int
 test_session_read_ext(void)
 {
-	struct conn_ctx ctx;
-	if (conn_setup(&ctx) < 0)
-		return TEST_FAIL;
-
-	struct open_exec_ctx oc = {
-		.client = ctx.client,
-		.server = ctx.server,
-		.command = "cmd",
-		.cbs = &accept_cbs_all,
-		.accept_timeout = 30000,
-	};
-	if (open_exec_channel(&ctx, &oc) < 0) {
-		conn_cleanup(&ctx);
-		return TEST_SKIP;
-	}
-
-	const uint8_t stderr_msg[] = "client stderr";
-	int64_t written = dssh_chan_write(oc.client_ch, 1,
-	    stderr_msg, sizeof(stderr_msg) - 1);
-	ASSERT_TRUE(written > 0);
-
-	int ev = dssh_chan_poll(oc.server_ch, DSSH_POLL_READEXT, 5000);
-	ASSERT_TRUE(ev & DSSH_POLL_READEXT);
-
-	uint8_t buf[256];
-	int64_t nread = dssh_chan_read(oc.server_ch, 1,
-	    buf, sizeof(buf));
-	ASSERT_TRUE(nread > 0);
-	ASSERT_MEM_EQ(buf, stderr_msg, sizeof(stderr_msg) - 1);
-
-	dssh_chan_close(oc.client_ch, 0);
-	dssh_chan_close(oc.server_ch, 0);
-	conn_cleanup(&ctx);
-	return TEST_PASS;
+	return stream_body_run(STREAM_STDERR_FORWARD);
 }
 
 static int
 test_session_poll_read(void)
 {
-	struct conn_ctx ctx;
-	if (conn_setup(&ctx) < 0)
-		return TEST_FAIL;
-
-	struct open_exec_ctx oc = {
-		.client = ctx.client,
-		.server = ctx.server,
-		.command = "cmd",
-		.cbs = &accept_cbs_all,
-		.accept_timeout = 30000,
-	};
-	if (open_exec_channel(&ctx, &oc) < 0) {
-		conn_cleanup(&ctx);
-		return TEST_SKIP;
-	}
-
-	const uint8_t msg[] = "data";
-	dssh_chan_write(oc.client_ch, 0, msg, sizeof(msg) - 1);
-
-	int ev = dssh_chan_poll(oc.server_ch, DSSH_POLL_READ, 5000);
-	ASSERT_TRUE(ev & DSSH_POLL_READ);
-
-	dssh_chan_close(oc.client_ch, 0);
-	dssh_chan_close(oc.server_ch, 0);
-	conn_cleanup(&ctx);
-	return TEST_PASS;
+	return stream_body_run(STREAM_POLL_READ);
 }
 
 static int
 test_session_poll_timeout(void)
 {
-	struct conn_ctx ctx;
-	if (conn_setup(&ctx) < 0)
-		return TEST_FAIL;
-
-	struct open_exec_ctx oc = {
-		.client = ctx.client,
-		.server = ctx.server,
-		.command = "cmd",
-		.cbs = &accept_cbs_all,
-		.accept_timeout = 30000,
-	};
-	if (open_exec_channel(&ctx, &oc) < 0) {
-		conn_cleanup(&ctx);
-		return TEST_SKIP;
-	}
-
-	int ev = dssh_chan_poll(oc.server_ch, DSSH_POLL_READ, 100);
-	ASSERT_EQ(ev, 0);
-
-	dssh_chan_close(oc.client_ch, 0);
-	dssh_chan_close(oc.server_ch, 0);
-	conn_cleanup(&ctx);
-	return TEST_PASS;
+	return stream_body_run(STREAM_POLL_TIMEOUT);
 }
 
 static int
 test_session_large_write(void)
 {
-	struct conn_ctx ctx;
-	if (conn_setup(&ctx) < 0)
-		return TEST_FAIL;
-
-	struct open_exec_ctx oc = {
-		.client = ctx.client,
-		.server = ctx.server,
-		.command = "cmd",
-		.cbs = &accept_cbs_all,
-		.accept_timeout = 30000,
-	};
-	if (open_exec_channel(&ctx, &oc) < 0) {
-		conn_cleanup(&ctx);
-		return TEST_SKIP;
-	}
-
-	size_t total = 32768;
-	uint8_t *data = malloc(total);
-	if (data == NULL) {
-		dssh_chan_close(oc.client_ch, 0);
-		dssh_chan_close(oc.server_ch, 0);
-		conn_cleanup(&ctx);
-		return TEST_SKIP;
-	}
-	for (size_t i = 0; i < total; i++)
-		data[i] = (uint8_t)(i & 0xFF);
-
-	int64_t written = dssh_chan_write(oc.client_ch, 0, data, total);
-	ASSERT_TRUE(written > 0);
-
-	uint8_t *readbuf = malloc(total);
-	if (readbuf == NULL) {
-		free(data);
-		dssh_chan_close(oc.client_ch, 0);
-		dssh_chan_close(oc.server_ch, 0);
-		conn_cleanup(&ctx);
-		return TEST_SKIP;
-	}
-
-	size_t got = 0;
-	while (got < (size_t)written) {
-		int ev = dssh_chan_poll(oc.server_ch, DSSH_POLL_READ, 5000);
-		if (ev <= 0)
-			break;
-		int64_t n = dssh_chan_read(oc.server_ch, 0,
-		    &readbuf[got], total - got);
-		if (n <= 0)
-			break;
-		got += (size_t)n;
-	}
-
-	ASSERT_EQ_U(got, (size_t)written);
-	ASSERT_MEM_EQ(readbuf, data, got);
-
-	free(data);
-	free(readbuf);
-	dssh_chan_close(oc.client_ch, 0);
-	dssh_chan_close(oc.server_ch, 0);
-	conn_cleanup(&ctx);
-	return TEST_PASS;
+	return stream_body_run(STREAM_LARGE);
 }
 
 static int
 test_session_multiple_writes(void)
 {
-	struct conn_ctx ctx;
-	if (conn_setup(&ctx) < 0)
-		return TEST_FAIL;
-
-	struct open_exec_ctx oc = {
-		.client = ctx.client,
-		.server = ctx.server,
-		.command = "cmd",
-		.cbs = &accept_cbs_all,
-		.accept_timeout = 30000,
-	};
-	if (open_exec_channel(&ctx, &oc) < 0) {
-		conn_cleanup(&ctx);
-		return TEST_SKIP;
-	}
-
-	const uint8_t m1[] = "AAA";
-	const uint8_t m2[] = "BBB";
-	const uint8_t m3[] = "CCC";
-	dssh_chan_write(oc.client_ch, 0, m1, 3);
-	dssh_chan_write(oc.client_ch, 0, m2, 3);
-	dssh_chan_write(oc.client_ch, 0, m3, 3);
-
-	uint8_t buf[256];
-	size_t got = 0;
-	while (got < 9) {
-		int ev = dssh_chan_poll(oc.server_ch, DSSH_POLL_READ, 5000);
-		if (ev <= 0)
-			break;
-		int64_t n = dssh_chan_read(oc.server_ch, 0,
-		    &buf[got], sizeof(buf) - got);
-		if (n <= 0)
-			break;
-		got += (size_t)n;
-	}
-	ASSERT_EQ_U(got, 9);
-	ASSERT_MEM_EQ(buf, "AAABBBCCC", 9);
-
-	dssh_chan_close(oc.client_ch, 0);
-	dssh_chan_close(oc.server_ch, 0);
-	conn_cleanup(&ctx);
-	return TEST_PASS;
+	return stream_body_run(STREAM_MULTIPLE);
 }
 
 /* ================================================================
@@ -1905,163 +1625,25 @@ test_channel_close_subsys(void)
 static int
 test_eof_detection(void)
 {
-	struct conn_ctx ctx;
-	if (conn_setup(&ctx) < 0)
-		return TEST_FAIL;
-
-	struct open_exec_ctx oc = {
-		.client = ctx.client,
-		.server = ctx.server,
-		.command = "cmd",
-		.cbs = &accept_cbs_all,
-		.accept_timeout = 30000,
-	};
-	if (open_exec_channel(&ctx, &oc) < 0) {
-		conn_cleanup(&ctx);
-		return TEST_SKIP;
-	}
-
-	/* Server writes data, then closes (sends exit-status + EOF + CLOSE) */
-	const uint8_t msg[] = "final output";
-	dssh_chan_write(oc.server_ch, 0, msg, sizeof(msg) - 1);
-	dssh_chan_close(oc.server_ch, 0);
-
-	/* Client reads data */
-	uint8_t buf[256];
-	size_t got = 0;
-	for (;;) {
-		int ev = dssh_chan_poll(oc.client_ch,
-		    DSSH_POLL_READ, 5000);
-		if (ev <= 0)
-			break;
-		int64_t n = dssh_chan_read(oc.client_ch, 0,
-		    buf + got, sizeof(buf) - got);
-		if (n <= 0)
-			break;
-		got += (size_t)n;
-	}
-	ASSERT_TRUE(got >= sizeof(msg) - 1);
-	ASSERT_MEM_EQ(buf, msg, sizeof(msg) - 1);
-
-	dssh_chan_close(oc.client_ch, 0);
-	conn_cleanup(&ctx);
-	return TEST_PASS;
+	return stream_body_run(STREAM_CLOSE);
 }
 
 static int
 test_eof_half_close(void)
 {
-	struct conn_ctx ctx;
-	if (conn_setup(&ctx) < 0)
-		return TEST_FAIL;
-
-	struct open_exec_ctx oc = {
-		.client = ctx.client,
-		.server = ctx.server,
-		.command = "cmd",
-		.cbs = &accept_cbs_all,
-		.accept_timeout = 30000,
-	};
-	if (open_exec_channel(&ctx, &oc) < 0) {
-		conn_cleanup(&ctx);
-		return TEST_SKIP;
-	}
-
-	/* Server sends data */
-	const uint8_t msg[] = "server data after client eof";
-	dssh_chan_write(oc.server_ch, 0, msg, sizeof(msg) - 1);
-
-	/* Client should be able to read */
-	uint8_t buf[256];
-	size_t got = 0;
-	while (got < sizeof(msg) - 1) {
-		int ev = dssh_chan_poll(oc.client_ch,
-		    DSSH_POLL_READ, 1000);
-		if (ev <= 0)
-			break;
-		int64_t n = dssh_chan_read(oc.client_ch, 0,
-		    &buf[got], sizeof(buf) - got);
-		if (n <= 0)
-			break;
-		got += (size_t)n;
-	}
-	ASSERT_EQ_U(got, sizeof(msg) - 1);
-	ASSERT_MEM_EQ(buf, msg, sizeof(msg) - 1);
-
-	dssh_chan_close(oc.client_ch, 0);
-	dssh_chan_close(oc.server_ch, 0);
-	conn_cleanup(&ctx);
-	return TEST_PASS;
+	return stream_body_run(STREAM_HALF_CLOSE);
 }
 
 /*
  * Stream I/O follows non-blocking POSIX semantics:
  *   read returns 0 only on real EOF; NOMORE for empty-no-EOF.
  *   write returns 0 only when bufsz == 0; NOMORE for window-full.
- *   Peek (buf == NULL) keeps the legacy "0 = no bytes available".
+ *   Peek (buf == NULL) returns the buffered count, including zero.
  */
 static int
 test_read_nomore_vs_eof(void)
 {
-	struct conn_ctx ctx;
-	if (conn_setup(&ctx) < 0)
-		return TEST_FAIL;
-
-	struct open_exec_ctx oc = {
-		.client = ctx.client,
-		.server = ctx.server,
-		.command = "cmd",
-		.cbs = &accept_cbs_all,
-		.accept_timeout = 30000,
-	};
-	if (open_exec_channel(&ctx, &oc) < 0) {
-		conn_cleanup(&ctx);
-		return TEST_SKIP;
-	}
-
-	uint8_t buf[64];
-
-	/* Empty buffer, no EOF: NOMORE. */
-	int64_t n = dssh_chan_read(oc.client_ch, 0, buf, sizeof(buf));
-	ASSERT_EQ(n, DSSH_ERROR_NOMORE);
-
-	/* Peek never returns NOMORE -- always non-negative count. */
-	int64_t avail = dssh_chan_read(oc.client_ch, 0, NULL, 0);
-	ASSERT_EQ(avail, 0);
-
-	/* After data arrives, real bytes come back. */
-	const uint8_t payload[] = "ping";
-	dssh_chan_write(oc.server_ch, 0, payload, sizeof(payload) - 1);
-	int ev = dssh_chan_poll(oc.client_ch, DSSH_POLL_READ, 5000);
-	ASSERT_TRUE(ev & DSSH_POLL_READ);
-	n = dssh_chan_read(oc.client_ch, 0, buf, sizeof(buf));
-	ASSERT_EQ(n, (int64_t)(sizeof(payload) - 1));
-
-	/* Drained again with no EOF yet: NOMORE, not 0. */
-	n = dssh_chan_read(oc.client_ch, 0, buf, sizeof(buf));
-	ASSERT_EQ(n, DSSH_ERROR_NOMORE);
-
-	/* Write side: 0-byte write returns 0; window-full returns
-	 * NOMORE; normal write returns the byte count. */
-	n = dssh_chan_write(oc.client_ch, 0, payload, 0);
-	ASSERT_EQ(n, 0);
-
-	uint32_t saved_window      = oc.client_ch->remote_window;
-	oc.client_ch->remote_window = 0;
-	n = dssh_chan_write(oc.client_ch, 0, payload, sizeof(payload) - 1);
-	ASSERT_EQ(n, DSSH_ERROR_NOMORE);
-	oc.client_ch->remote_window = saved_window;
-
-	/* Server closes -> EOF arrives.  Poll wakes; read returns 0. */
-	dssh_chan_close(oc.server_ch, 0);
-	ev = dssh_chan_poll(oc.client_ch, DSSH_POLL_READ, 5000);
-	ASSERT_TRUE(ev & DSSH_POLL_READ);
-	n = dssh_chan_read(oc.client_ch, 0, buf, sizeof(buf));
-	ASSERT_EQ(n, 0);
-
-	dssh_chan_close(oc.client_ch, 0);
-	conn_cleanup(&ctx);
-	return TEST_PASS;
+	return stream_body_run(STREAM_NOMORE);
 }
 
 static int
@@ -2527,34 +2109,7 @@ test_accept_timeout_short(void)
 static int
 test_session_poll_timeout_zero(void)
 {
-	struct conn_ctx ctx;
-	if (conn_setup(&ctx) < 0)
-		return TEST_FAIL;
-
-	struct open_exec_ctx oc = {
-		.client = ctx.client,
-		.server = ctx.server,
-		.command = "echo polltest",
-		.cbs = &accept_cbs_all,
-		.accept_timeout = 30000,
-	};
-	if (open_exec_channel(&ctx, &oc) < 0) {
-		conn_cleanup(&ctx);
-		return TEST_FAIL;
-	}
-	if (oc.client_ch == NULL || oc.server_ch == NULL) {
-		conn_cleanup(&ctx);
-		return TEST_FAIL;
-	}
-
-	/* Poll with timeout=0 on client -- no data pending */
-	int events = dssh_chan_poll(oc.client_ch,
-	    DSSH_POLL_READ | DSSH_POLL_WRITE, 0);
-	/* Should return 0 (no events) or just DSSH_POLL_WRITE */
-	ASSERT_TRUE(events >= 0);
-
-	conn_cleanup(&ctx);
-	return TEST_PASS;
+	return stream_body_run(STREAM_NOWAIT);
 }
 
 /* ================================================================
@@ -8020,9 +7575,11 @@ test_compression_window_rekey(void)
 #include "conn_consume_cases.h"
 #include "conn_eof_cases.h"
 #include "read_result_cases.h"
+#include "stream_body_cases.h"
 #include "gather_full_cases.h"
 
 static struct dssh_test_entry tests[] = {
+	{ "stream_body/controls", test_stream_body_controls },
 	{ "read_result/deferred", test_read_result_deferred },
 	{ "read_result/failures", test_read_result_failures },
 	{ "read_result/retry", test_read_result_retry },

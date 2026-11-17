@@ -375,6 +375,11 @@ foreach(kind IN ITEMS static shared)
 	endif()
 endforeach()
 
+if(WIN32)
+	include("${CMAKE_CURRENT_SOURCE_DIR}/windows.cmake")
+	return()
+endif()
+
 # Prepend project root to source paths (they're relative to ssh/, not test/)
 set(DSSH_TEST_LIB_SOURCES "")
 foreach(src ${DEUCESSH_SOURCES})

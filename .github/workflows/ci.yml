@@ -3,6 +3,7 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -134,7 +135,7 @@ jobs:
             --output-on-failure --no-tests=error
 
   windows:
-    name: Windows build (OpenSSL)
+    name: Windows tests (OpenSSL)
     runs-on: windows-2022
     timeout-minutes: 30
 
@@ -158,7 +159,11 @@ jobs:
       - name: Install OpenSSL
         env:
           VCPKG_BINARY_SOURCES: 'clear;files,${{ runner.temp }}\vcpkg-cache,readwrite'
-        run: vcpkg install openssl:x64-windows
+        run: |
+          vcpkg install openssl:x64-windows
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows/bin" |
+            Out-File -FilePath $env:GITHUB_PATH -Append
 
       - name: Save vcpkg binary cache
         if: steps.cache-vcpkg.outputs.cache-hit != 'true'
@@ -170,9 +175,25 @@ jobs:
       - name: Configure
         run: >-
           cmake -S . -B build -A x64
-          -DDEUCESSH_BUILD_TESTS=OFF
+          -DDEUCESSH_BUILD_TESTS=ON
           -DDEUCESSH_CRYPTO_BACKEND=OpenSSL
           -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
 
       - name: Build
         run: cmake --build build --config Release --parallel
+
+      - name: Test
+        run: >-
+          ctest --test-dir build --build-config Release --parallel 1
+          --timeout 120 --output-on-failure --no-tests=error
+          --output-junit "${{ runner.temp }}/windows-tests.xml"
+
+      - name: Preserve Windows test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-test-results
+          path: |
+            ${{ runner.temp }}/windows-tests.xml
+            build/Testing/Temporary/LastTest.log
+          if-no-files-found: ignore

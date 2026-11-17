@@ -1,11 +1,11 @@
 /*
- * mock_io.c -- Bidirectional mock I/O using socketpair().
+ * mock_io.c -- Bidirectional mock I/O using native connected sockets.
  *
- * Each direction (c2s, s2c) is a Unix socketpair.  Blocking
+ * Each direction (c2s, s2c) is a Unix socketpair or a Windows loopback pair.  Blocking
  * read/write with natural close-unblocks-peer behavior -- no
  * condvars or timed waits needed.
  *
- * Fd fields are _Atomic int.  The close helpers use shutdown() to unblock
+ * Socket handle fields are atomic.  The close helpers use shutdown() to unblock
  * concurrent I/O without racing descriptor lifetime; pipe_free() performs
  * the actual atomic-exchange + close after worker threads have joined.
  */
@@ -13,11 +13,41 @@
 #include <errno.h>
 #include <limits.h>
 #include <stdlib.h>
+#include "mock_io.h"
+
+#ifdef _WIN32
+#include "mock_io_win32.h"
+#else
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
+#endif
 
-#include "mock_io.h"
+#ifndef _WIN32
+static intmax_t
+mock_native_send(mock_io_handle fd, const uint8_t *data, size_t count)
+{
+	return send(fd, data, count, MSG_NOSIGNAL);
+}
+
+static intmax_t
+mock_native_read(mock_io_handle fd, uint8_t *data, size_t count)
+{
+	return read(fd, data, count);
+}
+
+static intmax_t
+mock_native_drain(mock_io_handle fd, uint8_t *data, size_t count)
+{
+	return recv(fd, data, count, MSG_DONTWAIT);
+}
+
+static int
+mock_native_shutdown(mock_io_handle fd)
+{
+	return shutdown(fd, SHUT_RDWR);
+}
+#endif
 
 static _Thread_local void (*read_retry_hook)(void *);
 static _Thread_local void *read_retry_data;
@@ -52,7 +82,11 @@ read_retry(void)
 static size_t
 pipe_request(size_t length)
 {
+#ifdef _WIN32
+	uintmax_t maximum = INT_MAX;
+#else
 	uintmax_t maximum = (uintmax_t)SSIZE_MAX;
+#endif
 	if (length > maximum) {
 		/* maximum < length <= SIZE_MAX proves this conversion fits. */
 		size_t bounded = (size_t)maximum;
@@ -62,7 +96,7 @@ pipe_request(size_t length)
 }
 
 static bool
-pipe_count(ssize_t returned, size_t requested, size_t *count)
+pipe_count(intmax_t returned, size_t requested, size_t *count)
 {
 	if (returned <= 0)
 		return false;
@@ -84,16 +118,25 @@ pipe_line_next(size_t have, size_t *next)
 }
 
 static void
-close_owned(int fd)
+close_owned(mock_io_handle fd)
 {
 	/* Do not retry a release whose native outcome is unknown. */
+#ifdef _WIN32
+	if (closesocket(fd) != 0)
+#else
 	if (close(fd) < 0)
+#endif
 		abort();
 }
 
 static int
 pipe_init(struct mock_io_pipe *p)
 {
+#ifdef _WIN32
+	mock_io_handle fds[2];
+	if (mock_win_pair(fds) != 0)
+		return -1;
+#else
 	int fds[2];
 	if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) < 0)
 		return -1;
@@ -109,6 +152,7 @@ pipe_init(struct mock_io_pipe *p)
 		close_owned(fds[1]);
 		return -1;
 	}
+#endif
 	atomic_store(&p->wfd, fds[0]);
 	atomic_store(&p->rfd, fds[1]);
 	atomic_store(&p->read_closed, false);
@@ -121,11 +165,11 @@ pipe_free(struct mock_io_pipe *p)
 {
 	atomic_store(&p->read_closed, true);
 	atomic_store(&p->write_closed, true);
-	int fd = atomic_exchange(&p->rfd, -1);
-	if (fd >= 0)
+	mock_io_handle fd = atomic_exchange(&p->rfd, MOCK_IO_INVALID);
+	if (fd != MOCK_IO_INVALID)
 		close_owned(fd);
-	fd = atomic_exchange(&p->wfd, -1);
-	if (fd >= 0)
+	fd = atomic_exchange(&p->wfd, MOCK_IO_INVALID);
+	if (fd != MOCK_IO_INVALID)
 		close_owned(fd);
 }
 
@@ -134,8 +178,8 @@ pipe_close_write(struct mock_io_pipe *p)
 {
 	if (atomic_exchange(&p->write_closed, true))
 		return;
-	int fd = atomic_load(&p->wfd);
-	if (fd >= 0 && shutdown(fd, SHUT_RDWR) < 0 && errno != ENOTCONN)
+	mock_io_handle fd = atomic_load(&p->wfd);
+	if (fd != MOCK_IO_INVALID && mock_native_shutdown(fd) < 0 && errno != ENOTCONN)
 		abort();
 }
 
@@ -144,8 +188,8 @@ pipe_close_read(struct mock_io_pipe *p)
 {
 	if (atomic_exchange(&p->read_closed, true))
 		return;
-	int fd = atomic_load(&p->rfd);
-	if (fd >= 0 && shutdown(fd, SHUT_RDWR) < 0 && errno != ENOTCONN)
+	mock_io_handle fd = atomic_load(&p->rfd);
+	if (fd != MOCK_IO_INVALID && mock_native_shutdown(fd) < 0 && errno != ENOTCONN)
 		abort();
 }
 
@@ -157,14 +201,14 @@ pipe_write(struct mock_io_pipe *p, const uint8_t *data, size_t len)
 {
 	if (len > 0 && data == NULL)
 		return -1;
-	int fd = atomic_load(&p->wfd);
-	if (fd < 0 || atomic_load(&p->write_closed)
+	mock_io_handle fd = atomic_load(&p->wfd);
+	if (fd == MOCK_IO_INVALID || atomic_load(&p->write_closed)
 	    || atomic_load(&p->read_closed))
 		return -1;
 	size_t written = 0;
 	while (written < len) {
 		size_t requested = pipe_request(len - written);
-		ssize_t n = send(fd, data + written, requested, MSG_NOSIGNAL);
+		intmax_t n = mock_native_send(fd, data + written, requested);
 		if (n < 0 && errno == EINTR)
 			continue;
 		if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
@@ -189,8 +233,8 @@ pipe_read(struct mock_io_pipe *p, uint8_t *buf, size_t len)
 {
 	if (len > 0 && buf == NULL)
 		return -1;
-	int fd = atomic_load(&p->rfd);
-	if (fd < 0 || atomic_load(&p->read_closed))
+	mock_io_handle fd = atomic_load(&p->rfd);
+	if (fd == MOCK_IO_INVALID || atomic_load(&p->read_closed))
 		return -1;
 	size_t have = 0;
 	while (have < len) {
@@ -198,7 +242,7 @@ pipe_read(struct mock_io_pipe *p, uint8_t *buf, size_t len)
 		 * Only an already-closed writer makes this read's empty result final. */
 		bool writer_closed = atomic_load(&p->write_closed);
 		size_t requested = pipe_request(len - have);
-		ssize_t n = read(fd, buf + have, requested);
+		intmax_t n = mock_native_read(fd, buf + have, requested);
 		if (n < 0 && errno == EINTR)
 			continue;
 		if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
@@ -228,14 +272,14 @@ pipe_readline(struct mock_io_pipe *p, uint8_t *buf, size_t bufsz,
 	*bytes_received = 0;
 	if (bufsz > 0 && buf == NULL)
 		return -1;
-	int fd = atomic_load(&p->rfd);
-	if (fd < 0 || atomic_load(&p->read_closed))
+	mock_io_handle fd = atomic_load(&p->rfd);
+	if (fd == MOCK_IO_INVALID || atomic_load(&p->read_closed))
 		return -1;
 	size_t have = 0;
 	for (;;) {
 		uint8_t ch;
 		bool writer_closed = atomic_load(&p->write_closed);
-		ssize_t n = read(fd, &ch, 1);
+		intmax_t n = mock_native_read(fd, &ch, 1);
 		if (n < 0 && errno == EINTR)
 			continue;
 		if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
@@ -268,17 +312,31 @@ mock_io_init(struct mock_io_state *io, size_t capacity)
 	(void)capacity;
 	if (io == NULL)
 		return -1;
+#ifdef _WIN32
+	WSADATA data;
+	if (WSAStartup(MAKEWORD(2, 2), &data) != 0)
+		return -1;
+#endif
 	struct mock_io_pipe *pipes[] = {&io->c2s, &io->s2c};
 	for (size_t i = 0; i < sizeof(pipes) / sizeof(pipes[0]); i++) {
-		atomic_init(&pipes[i]->rfd, -1);
-		atomic_init(&pipes[i]->wfd, -1);
+		atomic_init(&pipes[i]->rfd, MOCK_IO_INVALID);
+		atomic_init(&pipes[i]->wfd, MOCK_IO_INVALID);
 		atomic_init(&pipes[i]->read_closed, true);
 		atomic_init(&pipes[i]->write_closed, true);
 	}
-	if (pipe_init(&io->c2s) < 0)
+	if (pipe_init(&io->c2s) < 0) {
+#ifdef _WIN32
+		if (WSACleanup() != 0)
+			abort();
+#endif
 		return -1;
+	}
 	if (pipe_init(&io->s2c) < 0) {
 		pipe_free(&io->c2s);
+#ifdef _WIN32
+		if (WSACleanup() != 0)
+			abort();
+#endif
 		return -1;
 	}
 	return 0;
@@ -289,6 +347,10 @@ mock_io_free(struct mock_io_state *io)
 {
 	pipe_free(&io->c2s);
 	pipe_free(&io->s2c);
+#ifdef _WIN32
+	if (WSACleanup() != 0)
+		abort();
+#endif
 }
 
 void
@@ -396,11 +458,11 @@ mock_io_inject(struct mock_io_pipe *p, const uint8_t *data, size_t len)
 {
 	if (len > 0 && data == NULL)
 		return 0;
-	int fd = atomic_load(&p->wfd);
-	if (fd < 0)
+	mock_io_handle fd = atomic_load(&p->wfd);
+	if (fd == MOCK_IO_INVALID)
 		return 0;
 	size_t requested = pipe_request(len);
-	ssize_t n = send(fd, data, requested, MSG_NOSIGNAL);
+	intmax_t n = mock_native_send(fd, data, requested);
 	size_t count;
 	return pipe_count(n, requested, &count) ? count : 0;
 }
@@ -410,11 +472,11 @@ mock_io_drain(struct mock_io_pipe *p, uint8_t *buf, size_t bufsz)
 {
 	if (bufsz > 0 && buf == NULL)
 		return 0;
-	int fd = atomic_load(&p->rfd);
-	if (fd < 0)
+	mock_io_handle fd = atomic_load(&p->rfd);
+	if (fd == MOCK_IO_INVALID)
 		return 0;
 	size_t requested = pipe_request(bufsz);
-	ssize_t n = recv(fd, buf, requested, MSG_DONTWAIT);
+	intmax_t n = mock_native_drain(fd, buf, requested);
 	size_t count;
 	return pipe_count(n, requested, &count) ? count : 0;
 }

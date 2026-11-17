@@ -1,7 +1,7 @@
 /*
  * mock_io.h -- Bidirectional mock I/O for DeuceSSH layer tests.
  *
- * Uses socketpair() for natural blocking/unblocking behavior.
+ * Uses native connected sockets for blocking/unblocking behavior.
  * When one side closes, the other gets an error immediately --
  * no timed waits or condvar signaling needed.
  */
@@ -16,9 +16,17 @@
 
 #include "deucessh.h"
 
+#ifdef _WIN32
+typedef uintptr_t mock_io_handle;
+#define MOCK_IO_INVALID UINTPTR_MAX
+#else
+typedef int mock_io_handle;
+#define MOCK_IO_INVALID (-1)
+#endif
+
 struct mock_io_pipe {
-	_Atomic int rfd;    /* read end */
-	_Atomic int wfd;    /* write end */
+	_Atomic mock_io_handle rfd;    /* read end */
+	_Atomic mock_io_handle wfd;    /* write end */
 	atomic_bool read_closed;
 	atomic_bool write_closed;
 };
@@ -29,8 +37,8 @@ struct mock_io_state {
 };
 
 /*
- * Initialize mock I/O state.  Creates two socketpairs.
- * The capacity parameter is ignored; socketpairs supply their own buffering.
+ * Initialize mock I/O state.  Creates two connected socket pairs.
+ * The capacity parameter is ignored; native sockets supply their own buffering.
  * Returns 0 on success.
  */
 int mock_io_init(struct mock_io_state *io, size_t capacity);

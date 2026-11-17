@@ -6226,6 +6226,7 @@ test_auth_control_reply_errors(void)
 }
 
 struct auth_state_probe {
+	unsigned requests;
 	unsigned none_calls;
 	unsigned password_calls;
 	unsigned kbi_calls;
@@ -6234,6 +6235,19 @@ struct auth_state_probe {
 	bool complete_kbi;
 	bool valid_identity;
 };
+
+static int
+auth_state_request(const uint8_t *user, size_t length, const uint8_t *method,
+    size_t method_length, bool new_identity, void *cbdata)
+{
+	struct auth_state_probe *probe = cbdata;
+	const char *expected = probe->requests == 0 ? "first" : "second";
+	probe->valid_identity &= new_identity && length == strlen(expected)
+	    && memcmp(user, expected, length) == 0 && method != NULL && method_length != 0;
+	/* This fixture has no completed factors; allow its identity replacement. */
+	probe->requests++;
+	return 0;
+}
 
 static void
 auth_state_unimplemented(uint32_t rejected, void *cbdata)
@@ -6302,6 +6316,7 @@ test_auth_kbi_request_state(void)
 		struct auth_state_probe probe = { .complete_kbi = mode == 3, .valid_identity = true };
 		struct dssh_auth_server_cbs cbs = {
 			.methods_str = "password,keyboard-interactive", .none_cb = auth_state_none,
+			.request_cb = auth_state_request,
 			.password_cb = auth_state_password, .keyboard_interactive_cb = auth_state_kbi,
 			.cbdata = &probe,
 		};
@@ -6336,6 +6351,7 @@ test_auth_kbi_request_state(void)
 		ASSERT_FALSE(ctx.server->server_auth_active);
 		ASSERT_FALSE(dssh_session_is_terminated(ctx.server));
 		ASSERT_TRUE(probe.valid_identity);
+		ASSERT_EQ_U(probe.requests, mode == 3 ? 1 : 2);
 		ASSERT_EQ_U(probe.none_calls, mode == 0 || mode > 3 ? 1 : 0);
 		ASSERT_EQ_U(probe.password_calls, mode == 1 ? 1 : 0);
 		ASSERT_EQ_U(probe.kbi_calls, mode == 2 || mode == 3 ? 2 : 1);

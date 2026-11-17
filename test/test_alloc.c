@@ -687,11 +687,13 @@ allocation_password_control(void)
 	if (ret == 0)
 		ret = allocation_pair_run(&owner, allocation_handshake_operation, -1, false, false);
 	if (ret == 0)
-		ret = allocation_pair_run(&owner, allocation_auth_operation, 0, false, false);
+		/* The first server identity needs one retained allocation. Refuse
+		 * any additional allocation during this plain password exchange. */
+		ret = allocation_pair_run(&owner, allocation_auth_operation, 1, false, false);
 	int calls = dssh_test_alloc_count();
 	bool completed = ret == 0 && owner.pair.client_result == 0 && owner.pair.server_result == 0;
 	allocation_cleanup(&owner);
-	bool valid = completed && calls == 0 && allocation_pair_retired(&owner);
+	bool valid = completed && calls == 1 && allocation_pair_retired(&owner);
 	if (printf("allocation_password completed=%d calls=%d retired=%d valid=%d\n",
 	        completed, calls, allocation_pair_retired(&owner), valid) < 0)
 		return TEST_FAIL;

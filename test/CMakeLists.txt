@@ -2447,6 +2447,22 @@ dssh_add_output_test(dssh_conn_consume_capture_bounds dssh_test_conn
 set_tests_properties(dssh_conn_consume_capture_bounds PROPERTIES TIMEOUT 120
 	ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys)
 
+foreach(part IN ITEMS deferred failures retry terminal provider)
+	foreach(profile IN ITEMS ordinary growth)
+		if(part STREQUAL "provider" AND profile STREQUAL "ordinary" AND DEUCESSH_CRYPTO_BACKEND STREQUAL "Botan")
+			continue()
+		endif()
+		set(extra "")
+		if(profile STREQUAL "growth")
+			set(extra "DSSH_TEST_COMPRESSION=test-growth")
+		endif()
+		dssh_add_output_test(dssh_conn_read_result_${part}_${profile} dssh_test_conn
+			"1 tests: 1 passed, 0 failed, 0 skipped" --exact read_result/${part})
+		set_tests_properties(dssh_conn_read_result_${part}_${profile} PROPERTIES TIMEOUT 120
+			ENVIRONMENT "${DSSH_TEST_KEY_ENV};${extra}" FIXTURES_REQUIRED dssh_cached_keys)
+	endforeach()
+endforeach()
+
 foreach(part IN ITEMS probe wire)
 	dssh_add_output_test(dssh_conn_native_eof_${part} dssh_test_conn
 		"1 tests: 1 passed, 0 failed, 0 skipped" --exact release/native_eof_${part})

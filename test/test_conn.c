@@ -8019,9 +8019,15 @@ test_compression_window_rekey(void)
 #include "conn_storage_cases.h"
 #include "conn_consume_cases.h"
 #include "conn_eof_cases.h"
+#include "read_result_cases.h"
 #include "gather_full_cases.h"
 
 static struct dssh_test_entry tests[] = {
+	{ "read_result/deferred", test_read_result_deferred },
+	{ "read_result/failures", test_read_result_failures },
+	{ "read_result/retry", test_read_result_retry },
+	{ "read_result/terminal", test_read_result_terminal },
+	{ "read_result/provider", test_read_result_provider },
 	{ "gather/full_batch_sha512", test_gather_full_batch },
 	{ "release/native_eof_probe", test_native_eof_probe },
 	{ "release/native_eof_wire", test_native_eof_wire },

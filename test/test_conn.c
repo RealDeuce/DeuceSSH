@@ -898,11 +898,7 @@ test_session_stop(void)
 	dssh_session_stop(ctx.server);
 	ASSERT_FALSE(ctx.server->demux_running);
 
-	g_active_ctx = NULL;
-	dssh_session_cleanup(ctx.server);
-	dssh_session_cleanup(ctx.client);
-	mock_io_free(&ctx.io);
-	dssh_test_reset_global_config();
+	conn_cleanup(&ctx);
 	return TEST_PASS;
 }
 
@@ -924,11 +920,7 @@ test_session_start_stop(void)
 	ASSERT_FALSE(ctx.client->demux_running);
 	ASSERT_FALSE(ctx.server->demux_running);
 
-	g_active_ctx = NULL;
-	dssh_session_cleanup(ctx.server);
-	dssh_session_cleanup(ctx.client);
-	mock_io_free(&ctx.io);
-	dssh_test_reset_global_config();
+	conn_cleanup(&ctx);
 	return TEST_PASS;
 }
 
@@ -943,15 +935,15 @@ test_session_stop_open_channel(void)
 		.command = "stop-with-owned-parameters", .cbs = &accept_cbs_all,
 		.accept_timeout = 30000,
 	};
-	ASSERT_OK(open_exec_channel(&ctx, &oc));
+	ASSERT_EQ(open_exec_channel(&ctx, &oc), 0);
 	ASSERT_NOT_NULL(oc.client_ch);
 	ASSERT_NOT_NULL(oc.server_ch);
 	ASSERT_STR_EQ(oc.client_ch->params.command, oc.command);
 	ASSERT_STR_EQ(oc.server_ch->params.command, oc.command);
 	ASSERT_NOT_NULL(oc.client_ch->events.entries);
 	ASSERT_NOT_NULL(oc.server_ch->events.entries);
-	/* Leave both handles registered. Stop must release the same owned
-	 * queues and strings as chan_close(), also under LeakSanitizer. */
+	/* Leave both handles registered. Stop releases their owned queues,
+	 * buffers and parameter snapshots before session cleanup. */
 	mock_io_close_c2s(&ctx.io);
 	mock_io_close_s2c(&ctx.io);
 	dssh_session_stop(ctx.client);
@@ -991,8 +983,8 @@ test_open_exec(void)
 	ASSERT_NOT_NULL(oc.client_ch);
 	ASSERT_NOT_NULL(oc.server_ch);
 
-	dssh_chan_close(oc.client_ch, 0);
-	dssh_chan_close(oc.server_ch, 0);
+	ASSERT_EQ(dssh_chan_close(oc.client_ch, 0), 0);
+	ASSERT_EQ(dssh_chan_close(oc.server_ch, 0), 0);
 	conn_cleanup(&ctx);
 	return TEST_PASS;
 }
@@ -1017,13 +1009,15 @@ test_open_exec_command(void)
 		return TEST_FAIL;
 	}
 
-	/* Verify the command arrived on the server side */
+	/* Both owned snapshots survive the worker's builder release. */
+	ASSERT_EQ(dssh_chan_get_type(oc.client_ch), DSSH_CHAN_EXEC);
+	ASSERT_STR_EQ(dssh_chan_get_command(oc.client_ch), "ls -la /tmp");
 	ASSERT_EQ(dssh_chan_get_type(oc.server_ch), DSSH_CHAN_EXEC);
 	ASSERT_NOT_NULL(dssh_chan_get_command(oc.server_ch));
 	ASSERT_STR_EQ(dssh_chan_get_command(oc.server_ch), "ls -la /tmp");
 
-	dssh_chan_close(oc.client_ch, 0);
-	dssh_chan_close(oc.server_ch, 0);
+	ASSERT_EQ(dssh_chan_close(oc.client_ch, 0), 0);
+	ASSERT_EQ(dssh_chan_close(oc.server_ch, 0), 0);
 	conn_cleanup(&ctx);
 	return TEST_PASS;
 }
@@ -1106,8 +1100,8 @@ test_open_shell(void)
 	ASSERT_EQ_U(pty_cols, 80);
 	ASSERT_EQ_U(pty_rows, 24);
 
-	dssh_chan_close(oc.client_ch, 0);
-	dssh_chan_close(oc.server_ch, 0);
+	ASSERT_EQ(dssh_chan_close(oc.client_ch, 0), 0);
+	ASSERT_EQ(dssh_chan_close(oc.server_ch, 0), 0);
 	conn_cleanup(&ctx);
 	return TEST_PASS;
 }
@@ -1699,7 +1693,9 @@ test_session_start_twice(void)
 
 	/* Already started in conn_setup. Start again should fail. */
 	int res = dssh_session_start(ctx.client);
-	ASSERT_TRUE(res < 0);
+	ASSERT_EQ(res, DSSH_ERROR_INIT);
+	ASSERT_TRUE(ctx.client->demux_running);
+	ASSERT_TRUE(ctx.server->demux_running);
 
 	conn_cleanup(&ctx);
 	return TEST_PASS;
@@ -5934,14 +5930,8 @@ test_chan_get_pty(void)
 	    &oc.client_ch, server_accept_shell_thread, &oc,
 	    &oc.server_ch), 0);
 
-	if (oc.client_ch == NULL || oc.server_ch == NULL) {
-		if (oc.client_ch != NULL)
-			dssh_chan_close(oc.client_ch, -1);
-		if (oc.server_ch != NULL)
-			dssh_chan_close(oc.server_ch, -1);
-		conn_cleanup(&ctx);
-		return TEST_FAIL;
-	}
+	ASSERT_NOT_NULL(oc.client_ch);
+	ASSERT_NOT_NULL(oc.server_ch);
 
 	/* Server channel should have PTY info */
 	ASSERT_TRUE(dssh_chan_has_pty(oc.server_ch));
@@ -5957,6 +5947,13 @@ test_chan_get_pty(void)
 	ASSERT_TRUE(dssh_chan_has_pty(oc.client_ch));
 	const struct dssh_chan_params *cpty = dssh_chan_get_pty(oc.client_ch);
 	ASSERT_NOT_NULL(cpty);
+	ASSERT_STR_EQ(cpty->term, "vt100");
+	ASSERT_EQ_U(cpty->cols, UINT32_C(0x01020304));
+	ASSERT_EQ_U(cpty->rows, 43);
+	ASSERT_EQ_U(cpty->wpx, 800);
+	ASSERT_EQ_U(cpty->hpx, 600);
+	ASSERT_NULL(dssh_chan_get_command(oc.client_ch));
+	ASSERT_NULL(dssh_chan_get_subsystem(oc.client_ch));
 
 	/* Subsystem channel without PTY should return NULL */
 	struct open_subsys_ctx sc = {
@@ -5968,13 +5965,18 @@ test_chan_get_pty(void)
 	    &sc.client_ch, server_accept_subsys_thread, &sc,
 	    &sc.server_ch), 0);
 
+	ASSERT_FALSE(dssh_chan_has_pty(sc.client_ch));
+	ASSERT_NULL(dssh_chan_get_pty(sc.client_ch));
+	ASSERT_EQ(dssh_chan_get_type(sc.server_ch), DSSH_CHAN_SUBSYSTEM);
+	ASSERT_STR_EQ(dssh_chan_get_subsystem(sc.server_ch), "test-no-pty");
+	ASSERT_NULL(dssh_chan_get_command(sc.server_ch));
 	ASSERT_FALSE(dssh_chan_has_pty(sc.server_ch));
 	ASSERT_NULL(dssh_chan_get_pty(sc.server_ch));
-	dssh_chan_close(sc.client_ch, -1);
-	dssh_chan_close(sc.server_ch, -1);
+	ASSERT_EQ(dssh_chan_close(sc.client_ch, -1), 0);
+	ASSERT_EQ(dssh_chan_close(sc.server_ch, -1), 0);
 
-	dssh_chan_close(oc.client_ch, 0);
-	dssh_chan_close(oc.server_ch, 0);
+	ASSERT_EQ(dssh_chan_close(oc.client_ch, 0), 0);
+	ASSERT_EQ(dssh_chan_close(oc.server_ch, 0), 0);
 	conn_cleanup(&ctx);
 	return TEST_PASS;
 }
@@ -6052,24 +6054,27 @@ test_env_roundtrip(void)
 	    &oc.client_ch, server_accept_exec_thread, &oc,
 	    &oc.server_ch), 0);
 
-	if (oc.client_ch == NULL || oc.server_ch == NULL) {
-		if (oc.client_ch != NULL)
-			dssh_chan_close(oc.client_ch, -1);
-		if (oc.server_ch != NULL)
-			dssh_chan_close(oc.server_ch, -1);
-		conn_cleanup(&ctx);
-		return TEST_FAIL;
-	}
+	ASSERT_NOT_NULL(oc.client_ch);
+	ASSERT_NOT_NULL(oc.server_ch);
 
 	/* Server channel should have received the env vars */
+	/* The client snapshot retains both requested entries independently of
+	 * the server's callback selection. The builder is already released. */
+	ASSERT_EQ_U(oc.client_ch->params.env_count, 2);
+	ASSERT_NOT_NULL(oc.client_ch->params.env);
+	ASSERT_STR_EQ(oc.client_ch->params.env[0].name, "LANG");
+	ASSERT_STR_EQ(oc.client_ch->params.env[0].value, "en_US.UTF-8");
+	ASSERT_STR_EQ(oc.client_ch->params.env[1].name, "TERM");
+	ASSERT_STR_EQ(oc.client_ch->params.env[1].value, "xterm");
+	ASSERT_NOT_NULL(oc.server_ch->params.env);
 	ASSERT_EQ_U(oc.server_ch->params.env_count, 2);
 	ASSERT_STR_EQ(oc.server_ch->params.env[0].name, "LANG");
 	ASSERT_STR_EQ(oc.server_ch->params.env[0].value, "en_US.UTF-8");
 	ASSERT_STR_EQ(oc.server_ch->params.env[1].name, "TERM");
 	ASSERT_STR_EQ(oc.server_ch->params.env[1].value, "xterm");
 
-	dssh_chan_close(oc.client_ch, 0);
-	dssh_chan_close(oc.server_ch, 0);
+	ASSERT_EQ(dssh_chan_close(oc.client_ch, 0), 0);
+	ASSERT_EQ(dssh_chan_close(oc.server_ch, 0), 0);
 	conn_cleanup(&ctx);
 	return TEST_PASS;
 }
@@ -6106,11 +6111,20 @@ test_env_callback_rejection(void)
 	    &oc.server_ch), 0);
 	ASSERT_NOT_NULL(oc.client_ch);
 	ASSERT_NOT_NULL(oc.server_ch);
+	/* The client snapshot retains both requested entries independently of
+	 * the server's callback selection. The builder is already released. */
+	ASSERT_EQ_U(oc.client_ch->params.env_count, 2);
+	ASSERT_NOT_NULL(oc.client_ch->params.env);
+	ASSERT_STR_EQ(oc.client_ch->params.env[0].name, "LANG");
+	ASSERT_STR_EQ(oc.client_ch->params.env[0].value, "en_US.UTF-8");
+	ASSERT_STR_EQ(oc.client_ch->params.env[1].name, "TERM");
+	ASSERT_STR_EQ(oc.client_ch->params.env[1].value, "xterm");
+	ASSERT_NOT_NULL(oc.server_ch->params.env);
 	ASSERT_EQ_U(oc.server_ch->params.env_count, 1);
 	ASSERT_STR_EQ(oc.server_ch->params.env[0].name, "TERM");
 	ASSERT_STR_EQ(oc.server_ch->params.env[0].value, "xterm");
-	dssh_chan_close(oc.client_ch, 0);
-	dssh_chan_close(oc.server_ch, 0);
+	ASSERT_EQ(dssh_chan_close(oc.client_ch, 0), 0);
+	ASSERT_EQ(dssh_chan_close(oc.server_ch, 0), 0);
 	conn_cleanup(&ctx);
 	return TEST_PASS;
 }

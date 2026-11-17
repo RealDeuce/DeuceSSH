@@ -2,7 +2,20 @@
 #include <string.h>
 
 #include "mlkem_acvp.h"
+#ifndef DSSH_ACVP_CASES
 #include "mlkem_acvp_vectors.h"
+#define DSSH_ACVP_CASES acvp_cases
+#endif
+
+#ifndef DSSH_ACVP_PRINTF
+#define DSSH_ACVP_PRINTF printf
+#endif
+#ifndef DSSH_ACVP_FPRINTF
+#define DSSH_ACVP_FPRINTF fprintf
+#endif
+#ifndef DSSH_ACVP_FFLUSH
+#define DSSH_ACVP_FFLUSH fflush
+#endif
 
 static int
 hex_digit(char byte)
@@ -116,15 +129,17 @@ dssh_acvp_run(int argc, char **argv, const char *provider, dssh_acvp_evaluate ev
 	size_t counts[DSSH_ACVP_KIND_COUNT] = {0};
 	size_t implicit = 0;
 	size_t failed = 0;
-	size_t total = sizeof(acvp_cases) / sizeof(acvp_cases[0]);
+	size_t total = sizeof(DSSH_ACVP_CASES) / sizeof(DSSH_ACVP_CASES[0]);
 	if (total != 145 || evaluate == NULL)
 		return 2;
 	struct dssh_acvp_decoded bytes;
 	for (size_t i = 0; i < total; i++) {
-		const struct dssh_acvp_case *test = acvp_cases[i];
+		const struct dssh_acvp_case *test = DSSH_ACVP_CASES[i];
 		memset(&bytes, 0, sizeof(bytes));
 		if (!decode_case(test, &bytes)) {
-			fprintf(stderr, "Invalid ACVP fixture at index %zu\n", i);
+			if (DSSH_ACVP_FPRINTF(stderr, "Invalid ACVP fixture at index %zu\n", i) < 0
+			    || DSSH_ACVP_FFLUSH(stderr) != 0)
+				return 2;
 			return 2;
 		}
 		if (negative != NULL && (test->kind != negative->kind
@@ -153,8 +168,9 @@ dssh_acvp_run(int argc, char **argv, const char *provider, dssh_acvp_evaluate ev
 			}
 		}
 		bool matched = evaluate(&control, &bytes);
-		if (!matched)
-			fprintf(stderr, "ACVP mismatch: %s group %u case %u\n", test->profile, test->group, test->id);
+		if (!matched && (DSSH_ACVP_FPRINTF(stderr, "ACVP mismatch: %s group %u case %u\n",
+		    test->profile, test->group, test->id) < 0 || DSSH_ACVP_FFLUSH(stderr) != 0))
+			return 2;
 		if (negative != NULL)
 			return matched ? 0 : 1;
 		counts[test->kind]++;
@@ -170,7 +186,8 @@ dssh_acvp_run(int argc, char **argv, const char *provider, dssh_acvp_evaluate ev
 	}
 	if (implicit != 15)
 		return 2;
-	printf("ML-KEM ACVP %s: %zu passed, %zu failed; keygen=25 encap=50 decap=30 public=20 private=20 implicit=15\n",
-	    provider, total - failed, failed);
+	if (DSSH_ACVP_PRINTF("ML-KEM ACVP %s: %zu passed, %zu failed; keygen=25 encap=50 decap=30 public=20 private=20 implicit=15\n",
+	    provider, total - failed, failed) < 0 || DSSH_ACVP_FFLUSH(stdout) != 0)
+		return 2;
 	return failed == 0 ? 0 : 1;
 }

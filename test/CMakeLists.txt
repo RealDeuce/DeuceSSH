@@ -528,6 +528,14 @@ endif()
 
 # This exercises the bundled C glue directly without a provider, registry or
 # library test hooks. The runner uses only standard C library facilities.
+add_executable(dssh_test_acvp_io test_acvp_io.c)
+set_property(TARGET dssh_test_acvp_io PROPERTY C_STANDARD ${DEUCESSH_C_STANDARD})
+set_property(TARGET dssh_test_acvp_io PROPERTY C_STANDARD_REQUIRED ON)
+target_compile_options(dssh_test_acvp_io PRIVATE ${DEUCESSH_COMPILE_OPTIONS})
+dssh_add_output_test(dssh_acvp_reporting dssh_test_acvp_io
+	"ACVP reporting: controls=12 valid=1")
+set_tests_properties(dssh_acvp_reporting PROPERTIES TIMEOUT 30)
+
 add_executable(dssh_test_vendor_glue test_vendor_glue.c)
 set_property(TARGET dssh_test_vendor_glue PROPERTY C_STANDARD ${DEUCESSH_C_STANDARD})
 set_property(TARGET dssh_test_vendor_glue PROPERTY C_STANDARD_REQUIRED ON)

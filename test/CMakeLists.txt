@@ -567,6 +567,17 @@ dssh_add_output_test(dssh_mlkem_encodings dssh_test_mlkem_encoding
 	"ML-KEM encodings: widths=4 cases=5578 bytes=127376 fields=89248 guards=22312 inputs=11156 valid=1")
 set_tests_properties(dssh_mlkem_encodings PROPERTIES TIMEOUT 120)
 
+# Exact comparison/selection domains and output aliases, without test hooks.
+add_executable(dssh_test_mlkem_selection test_mlkem_selection.c)
+set_property(TARGET dssh_test_mlkem_selection PROPERTY C_STANDARD ${DEUCESSH_C_STANDARD})
+set_property(TARGET dssh_test_mlkem_selection PROPERTY C_STANDARD_REQUIRED ON)
+target_include_directories(dssh_test_mlkem_selection PRIVATE ${PROJECT_SOURCE_DIR})
+target_compile_options(dssh_test_mlkem_selection PRIVATE ${DEUCESSH_COMPILE_OPTIONS}
+	$<$<OR:$<C_COMPILER_ID:Clang>,$<C_COMPILER_ID:AppleClang>,$<C_COMPILER_ID:GNU>>:-Wno-unused-function>)
+dssh_add_output_test(dssh_mlkem_selection dssh_test_mlkem_selection
+	"ML-KEM selection: nonzero=256 selections=3072 comparisons=8705 valid=1")
+set_tests_properties(dssh_mlkem_selection PROPERTIES TIMEOUT 30)
+
 # Vector arithmetic against independent integer formulas and alias checks.
 add_executable(dssh_test_mlkem_vector test_mlkem_vector.c)
 set_property(TARGET dssh_test_mlkem_vector PROPERTY C_STANDARD ${DEUCESSH_C_STANDARD})

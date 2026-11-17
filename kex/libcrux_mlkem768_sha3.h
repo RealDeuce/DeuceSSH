@@ -921,7 +921,9 @@ static inline void
 libcrux_ml_kem_constant_time_ops_select_ct(Eurydice_slice lhs, Eurydice_slice rhs, uint8_t selector,
     uint8_t ret[32U])
 {
-	uint8_t mask = core_num__u8_6__wrapping_sub(libcrux_ml_kem_constant_time_ops_is_non_zero(selector), 1U);
+	/* Retain the bytewise selection through optimizing compilation. */
+	volatile uint8_t mask =
+	    core_num__u8_6__wrapping_sub(libcrux_ml_kem_constant_time_ops_is_non_zero(selector), 1U);
 	uint8_t out[32U] = {0U};
 	for (size_t i = (size_t)0U; i < LIBCRUX_ML_KEM_CONSTANTS_SHARED_SECRET_SIZE; i++) {
 		size_t i0 = i;
@@ -931,6 +933,7 @@ libcrux_ml_kem_constant_time_ops_select_ct(Eurydice_slice lhs, Eurydice_slice rh
 	}
 	memcpy(ret, out, (size_t)32U * sizeof(uint8_t));
 	DSSH_MLKEM_CLEAR(out);
+	mask = 0;
 }
 
 static KRML_NOINLINE void

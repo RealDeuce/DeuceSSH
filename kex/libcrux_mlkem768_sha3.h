@@ -7095,8 +7095,8 @@ typedef struct uint8_t_x4_s {
 	uint8_t f3;
 } uint8_t_x4;
 
-static KRML_MUSTINLINE uint8_t_x4
-libcrux_ml_kem_vector_portable_serialize_serialize_4_int(const int16_t *v)
+static KRML_MUSTINLINE void
+libcrux_ml_kem_vector_portable_serialize_serialize_4_int(const int16_t *v, uint8_t_x4 *out)
 {
 	uint8_t result0 =
 	    (uint8_t)((uint32_t)(uint8_t)v[1] << 4U
@@ -7110,7 +7110,10 @@ libcrux_ml_kem_vector_portable_serialize_serialize_4_int(const int16_t *v)
 	uint8_t result3 =
 	    (uint8_t)((uint32_t)(uint8_t)v[7] << 4U
 		      | (uint32_t)(uint8_t)v[6]);
-	return (CLITERAL(uint8_t_x4) {.fst = result0, .snd = result1, .thd = result2, .f3 = result3});
+	out->fst = result0;
+	out->snd = result1;
+	out->thd = result2;
+	out->f3 = result3;
 }
 
 static KRML_MUSTINLINE void
@@ -7118,7 +7121,7 @@ libcrux_ml_kem_vector_portable_serialize_serialize_4(const libcrux_ml_kem_vector
 {
 	uint8_t_x4 encoded;
 	for (size_t group = 0; group < 2; group++) {
-		encoded = libcrux_ml_kem_vector_portable_serialize_serialize_4_int(v->elements + 8 * group);
+		libcrux_ml_kem_vector_portable_serialize_serialize_4_int(v->elements + 8 * group, &encoded);
 		ret[4 * group + 0] = encoded.fst;
 		ret[4 * group + 1] = encoded.snd;
 		ret[4 * group + 2] = encoded.thd;
@@ -7137,8 +7140,8 @@ libcrux_ml_kem_vector_portable_serialize_4_0d(const libcrux_ml_kem_vector_portab
 	libcrux_ml_kem_vector_portable_serialize_serialize_4(a, ret);
 }
 
-static KRML_MUSTINLINE int16_t_x8
-libcrux_ml_kem_vector_portable_serialize_deserialize_4_int(Eurydice_slice bytes)
+static KRML_MUSTINLINE void
+libcrux_ml_kem_vector_portable_serialize_deserialize_4_int(Eurydice_slice bytes, int16_t_x8 *out)
 {
 	int16_t v0 = (int16_t)((uint32_t)Eurydice_slice_index(bytes, (size_t)0U, uint8_t, uint8_t *) & 15U);
 	int16_t v1 = (int16_t)((uint32_t)Eurydice_slice_index(bytes, (size_t)0U, uint8_t, uint8_t *) >> 4U & 15U);
@@ -7148,8 +7151,14 @@ libcrux_ml_kem_vector_portable_serialize_deserialize_4_int(Eurydice_slice bytes)
 	int16_t v5 = (int16_t)((uint32_t)Eurydice_slice_index(bytes, (size_t)2U, uint8_t, uint8_t *) >> 4U & 15U);
 	int16_t v6 = (int16_t)((uint32_t)Eurydice_slice_index(bytes, (size_t)3U, uint8_t, uint8_t *) & 15U);
 	int16_t v7 = (int16_t)((uint32_t)Eurydice_slice_index(bytes, (size_t)3U, uint8_t, uint8_t *) >> 4U & 15U);
-	return (CLITERAL(
-	    int16_t_x8) {.fst = v0, .snd = v1, .thd = v2, .f3 = v3, .f4 = v4, .f5 = v5, .f6 = v6, .f7 = v7});
+	out->fst = v0;
+	out->snd = v1;
+	out->thd = v2;
+	out->f3 = v3;
+	out->f4 = v4;
+	out->f5 = v5;
+	out->f6 = v6;
+	out->f7 = v7;
 }
 
 static KRML_MUSTINLINE void
@@ -7157,8 +7166,8 @@ libcrux_ml_kem_vector_portable_serialize_deserialize_4(Eurydice_slice bytes, lib
 {
 	int16_t_x8 decoded;
 	for (size_t group = 0; group < 2; group++) {
-		decoded = libcrux_ml_kem_vector_portable_serialize_deserialize_4_int(
-		    Eurydice_slice_subslice2(bytes, 4 * group, 4 * (group + 1), uint8_t));
+		libcrux_ml_kem_vector_portable_serialize_deserialize_4_int(
+		    Eurydice_slice_subslice2(bytes, 4 * group, 4 * (group + 1), uint8_t), &decoded);
 		ret->elements[8 * group + 0] = decoded.fst;
 		ret->elements[8 * group + 1] = decoded.snd;
 		ret->elements[8 * group + 2] = decoded.thd;
@@ -7297,8 +7306,8 @@ libcrux_ml_kem_vector_portable_deserialize_5_0d(Eurydice_slice a)
 	return libcrux_ml_kem_vector_portable_serialize_deserialize_5(a);
 }
 
-static KRML_MUSTINLINE uint8_t_x5
-libcrux_ml_kem_vector_portable_serialize_serialize_10_int(const int16_t *v)
+static KRML_MUSTINLINE void
+libcrux_ml_kem_vector_portable_serialize_serialize_10_int(const int16_t *v, uint8_t_x5 *out)
 {
 	uint8_t r0 = (uint8_t)(v[0] & (int16_t)255);
 	uint8_t r1 =
@@ -7317,7 +7326,11 @@ libcrux_ml_kem_vector_portable_serialize_serialize_10_int(const int16_t *v)
 		      | (uint32_t)(uint8_t)(v[2] >> 4U
 					    & (int16_t)63));
 	uint8_t r4 = (uint8_t)(v[3] >> 2U & (int16_t)255);
-	return (CLITERAL(uint8_t_x5) {.fst = r0, .snd = r1, .thd = r2, .f3 = r3, .f4 = r4});
+	out->fst = r0;
+	out->snd = r1;
+	out->thd = r2;
+	out->f3 = r3;
+	out->f4 = r4;
 }
 
 static KRML_MUSTINLINE void
@@ -7325,7 +7338,7 @@ libcrux_ml_kem_vector_portable_serialize_serialize_10(const libcrux_ml_kem_vecto
 {
 	uint8_t_x5 encoded;
 	for (size_t group = 0; group < 4; group++) {
-		encoded = libcrux_ml_kem_vector_portable_serialize_serialize_10_int(v->elements + 4 * group);
+		libcrux_ml_kem_vector_portable_serialize_serialize_10_int(v->elements + 4 * group, &encoded);
 		ret[5 * group + 0] = encoded.fst;
 		ret[5 * group + 1] = encoded.snd;
 		ret[5 * group + 2] = encoded.thd;
@@ -7345,8 +7358,8 @@ libcrux_ml_kem_vector_portable_serialize_10_0d(const libcrux_ml_kem_vector_porta
 	libcrux_ml_kem_vector_portable_serialize_serialize_10(a, ret);
 }
 
-static KRML_MUSTINLINE int16_t_x8
-libcrux_ml_kem_vector_portable_serialize_deserialize_10_int(Eurydice_slice bytes)
+static KRML_MUSTINLINE void
+libcrux_ml_kem_vector_portable_serialize_deserialize_10_int(Eurydice_slice bytes, int16_t_x8 *out)
 {
 	int16_t r0 =
 	    (int16_t)(((int16_t)Eurydice_slice_index(bytes, (size_t)1U, uint8_t, uint8_t *) & (int16_t)3) << 8U
@@ -7370,8 +7383,14 @@ libcrux_ml_kem_vector_portable_serialize_deserialize_10_int(Eurydice_slice bytes
 		      | (int16_t)Eurydice_slice_index(bytes, (size_t)7U, uint8_t, uint8_t *) >> 4U);
 	int16_t r7 = (int16_t)((int16_t)Eurydice_slice_index(bytes, (size_t)9U, uint8_t, uint8_t *) << 2U
 			       | (int16_t)Eurydice_slice_index(bytes, (size_t)8U, uint8_t, uint8_t *) >> 6U);
-	return (CLITERAL(
-	    int16_t_x8) {.fst = r0, .snd = r1, .thd = r2, .f3 = r3, .f4 = r4, .f5 = r5, .f6 = r6, .f7 = r7});
+	out->fst = r0;
+	out->snd = r1;
+	out->thd = r2;
+	out->f3 = r3;
+	out->f4 = r4;
+	out->f5 = r5;
+	out->f6 = r6;
+	out->f7 = r7;
 }
 
 static KRML_MUSTINLINE void
@@ -7379,8 +7398,8 @@ libcrux_ml_kem_vector_portable_serialize_deserialize_10(Eurydice_slice bytes, li
 {
 	int16_t_x8 decoded;
 	for (size_t group = 0; group < 2; group++) {
-		decoded = libcrux_ml_kem_vector_portable_serialize_deserialize_10_int(
-		    Eurydice_slice_subslice2(bytes, 10 * group, 10 * (group + 1), uint8_t));
+		libcrux_ml_kem_vector_portable_serialize_deserialize_10_int(
+		    Eurydice_slice_subslice2(bytes, 10 * group, 10 * (group + 1), uint8_t), &decoded);
 		ret->elements[8 * group + 0] = decoded.fst;
 		ret->elements[8 * group + 1] = decoded.snd;
 		ret->elements[8 * group + 2] = decoded.thd;
@@ -7409,14 +7428,16 @@ typedef struct uint8_t_x3_s {
 	uint8_t thd;
 } uint8_t_x3;
 
-static KRML_MUSTINLINE uint8_t_x3
-libcrux_ml_kem_vector_portable_serialize_serialize_12_int(const int16_t *v)
+static KRML_MUSTINLINE void
+libcrux_ml_kem_vector_portable_serialize_serialize_12_int(const int16_t *v, uint8_t_x3 *out)
 {
 	uint8_t r0 = (uint8_t)(v[0] & (int16_t)255);
 	uint8_t r1 = (uint8_t)(v[0] >> 8U
 			       | (v[1] & (int16_t)15) << 4U);
 	uint8_t r2 = (uint8_t)(v[1] >> 4U & (int16_t)255);
-	return (CLITERAL(uint8_t_x3) {.fst = r0, .snd = r1, .thd = r2});
+	out->fst = r0;
+	out->snd = r1;
+	out->thd = r2;
 }
 
 static KRML_MUSTINLINE void
@@ -7424,7 +7445,7 @@ libcrux_ml_kem_vector_portable_serialize_serialize_12(const libcrux_ml_kem_vecto
 {
 	uint8_t_x3 encoded;
 	for (size_t group = 0; group < 8; group++) {
-		encoded = libcrux_ml_kem_vector_portable_serialize_serialize_12_int(v->elements + 2 * group);
+		libcrux_ml_kem_vector_portable_serialize_serialize_12_int(v->elements + 2 * group, &encoded);
 		ret[3 * group + 0] = encoded.fst;
 		ret[3 * group + 1] = encoded.snd;
 		ret[3 * group + 2] = encoded.thd;
@@ -7447,15 +7468,16 @@ typedef struct int16_t_x2_s {
 	int16_t snd;
 } int16_t_x2;
 
-static KRML_MUSTINLINE int16_t_x2
-libcrux_ml_kem_vector_portable_serialize_deserialize_12_int(Eurydice_slice bytes)
+static KRML_MUSTINLINE void
+libcrux_ml_kem_vector_portable_serialize_deserialize_12_int(Eurydice_slice bytes, int16_t_x2 *out)
 {
 	int16_t byte0 = (int16_t)Eurydice_slice_index(bytes, (size_t)0U, uint8_t, uint8_t *);
 	int16_t byte1 = (int16_t)Eurydice_slice_index(bytes, (size_t)1U, uint8_t, uint8_t *);
 	int16_t byte2 = (int16_t)Eurydice_slice_index(bytes, (size_t)2U, uint8_t, uint8_t *);
 	int16_t r0    = (int16_t)((byte1 & (int16_t)15) << 8U | (byte0 & (int16_t)255));
 	int16_t r1    = (int16_t)(byte2 << 4U | (byte1 >> 4U & (int16_t)15));
-	return (CLITERAL(int16_t_x2) {.fst = r0, .snd = r1});
+	out->fst = r0;
+	out->snd = r1;
 }
 
 static KRML_MUSTINLINE void
@@ -7463,8 +7485,8 @@ libcrux_ml_kem_vector_portable_serialize_deserialize_12(Eurydice_slice bytes, li
 {
 	int16_t_x2 decoded;
 	for (size_t group = 0; group < 8; group++) {
-		decoded = libcrux_ml_kem_vector_portable_serialize_deserialize_12_int(
-		    Eurydice_slice_subslice2(bytes, 3 * group, 3 * (group + 1), uint8_t));
+		libcrux_ml_kem_vector_portable_serialize_deserialize_12_int(
+		    Eurydice_slice_subslice2(bytes, 3 * group, 3 * (group + 1), uint8_t), &decoded);
 		ret->elements[2 * group + 0] = decoded.fst;
 		ret->elements[2 * group + 1] = decoded.snd;
 	}

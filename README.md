@@ -1562,23 +1562,31 @@ still 0).
 
 Setting `DSSH_PARAM_ACCEPT_EARLY_DATA` on the channel params asks the
 library to deliver pre-setup data anyway, bypassing the rx-window
-clip until the terminal request response arrives.  The flag only
-applies in stream-shaped channels, so it is **rejected with
-`DSSH_ERROR_INVALID` (NULL channel) on `DSSH_CHAN_SUBSYSTEM`** —
-subsystem channels use a message queue with no coherent destination
-for pre-setup bytes.
+clip until local channel setup completes. The workaround is limited to
+`DSSH_CHAN_SHELL` and `DSSH_CHAN_EXEC`, in either stream or zero-copy mode.
+It is **rejected with `DSSH_ERROR_INVALID` (NULL channel) on
+`DSSH_CHAN_SUBSYSTEM`**. Subsystem channels retain normal zero-window setup;
+their receive storage follows the selected stream or zero-copy API.
 
 ```c
-struct dssh_chan_params cp;
-dssh_chan_params_init(&cp, DSSH_CHAN_SHELL);
-dssh_chan_params_set_accept_early_data(&cp, true);
-dssh_channel ch = dssh_chan_open(sess, &cp);
-dssh_chan_params_free(&cp);
+dssh_channel example_open_early_shell(dssh_session sess)
+{
+	struct dssh_chan_params cp;
+	int ret = dssh_chan_params_init(&cp, DSSH_CHAN_SHELL);
+	if (ret != 0)
+		return NULL;
+	ret = dssh_chan_params_set_accept_early_data(&cp, true);
+	dssh_channel ch = NULL;
+	if (ret == 0)
+		ch = dssh_chan_open(sess, &cp);
+	dssh_chan_params_free(&cp);
+	return ch;
+}
 ```
 
 Bytes accepted via the bypass are NOT credited back to the peer (no
 WINDOW_ADJUST is sent for them) — the over-budget bytes were free,
-not advertised.  Once the terminal request response arrives normal
+not advertised. Once local channel setup completes, normal
 window enforcement resumes for the rest of the channel's life.
 
 These same servers further gate *post-setup* output on receiving any
@@ -1625,9 +1633,9 @@ Return values follow non-blocking POSIX semantics:
 - `DSSH_ERROR_NOMORE`: would block (analogous to POSIX
   `-1/EAGAIN`).  Read returns this when the bytebuf is empty but
   no EOF has arrived; write returns it when the remote send
-  window is full.  Poll-then-read / poll-then-write callers
-  never see this because `dssh_chan_poll` only flags `READ` /
-  `READEXT` / `WRITE` ready when actual progress is possible.
+  window is full. Readiness is a snapshot: another caller can consume data
+  or send-window credit after poll returns, so the next operation must
+  still handle `DSSH_ERROR_NOMORE`.
 - `< 0` (other): `DSSH_ERROR_*`
 
 The peek form (`buf == NULL, bufsz == 0`) always returns the

@@ -103,6 +103,22 @@ is successful only for an empty input. Check negative errors before converting
 an I/O result to `size_t`. Peeking with `dssh_chan_read(ch, stream, NULL, 0)`
 reports buffered bytes without consuming them.
 
+Shell, exec and subsystem channels support either stream or zero-copy I/O;
+the open function or terminal accept result selects the I/O model. The
+early-data workaround is limited to shell/exec channels in either model.
+Subsystem channels retain ordinary zero-window setup.
+
+Once a read delivers bytes, it returns their count. The channel retains the
+first later receive-credit error. The next non-NULL positive-capacity read on
+either stream reports it once without copying or consuming bytes. Peeks and
+zero-capacity calls preserve that error. Requested read directions poll ready
+while it remains pending, including when their buffers are empty. A subsequent
+read can retry queued credit without another application data send. After
+termination, reads report a retained error and drain buffered data before EOF.
+
+Poll readiness is a snapshot. Another reader or writer may consume data or
+send-window credit before the next operation, which must still handle NOMORE.
+
 `DSSH_POLL_EVENT` exposes ordered events through `dssh_chan_read_event()`. Event
 text uses complete borrowed byte views, including exact lengths and peer
 language. It has no promised NUL terminator. Views remain valid until the next

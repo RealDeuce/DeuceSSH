@@ -4394,10 +4394,10 @@ dssh_chan_open(struct dssh_session_s *sess, const struct dssh_chan_params *param
 	if (params_validate(params) < 0)
 		return NULL;
 
-	/* DSSH_PARAM_ACCEPT_EARLY_DATA only makes sense for stream-shaped
-	 * channels: subsystem channels use a message queue and have no
-	 * coherent destination for bytes that arrive before the
-	 * subsystem-req response. */
+	/* Early-data delivery is a shell/exec workaround. Subsystem channels
+	 * keep ordinary zero-window setup in both I/O models. This is a
+	 * channel-type policy; this stream open still uses ring buffers
+	 * for all supported terminal request types. */
 	if ((params->flags & DSSH_PARAM_ACCEPT_EARLY_DATA)
 	    && params->type != DSSH_CHAN_SHELL && params->type != DSSH_CHAN_EXEC)
 		return NULL;
@@ -4672,11 +4672,11 @@ dssh_chan_poll(struct dssh_channel_s *ch, int events, int timeout_ms)
 		return DSSH_ERROR_TERMINATED;
 	}
 	for (;;) {
-		/* Session terminate behaves like POSIX POLLHUP: surface
-		 * every requested data flag so the caller wakes and the
-		 * subsequent dssh_chan_read returns 0 (EOF) or
-		 * dssh_chan_write returns a negative error.  Mirrors how
-		 * close_received already forces READ/READEXT ready. */
+		/* Termination makes every requested data direction ready.
+		 * Reads first report retained errors and drain buffered bytes,
+		 * then return EOF. Writes return a negative error. This mirrors
+		 * how close_received forces read readiness, and uses the same
+		 * ordinary poll predicates below. */
 		bool terminated = sess->terminate;
 		bool read_failed = atomic_load(&ch->read_error) < 0;
 		int ready = 0;
@@ -5012,8 +5012,8 @@ dssh_chan_zc_open(struct dssh_session_s *sess, const struct dssh_chan_params *pa
 	if (params_validate(params) < 0)
 		return NULL;
 
-	/* See dssh_chan_open: SUBSYSTEM channels have no coherent
-	 * destination for pre-setup data. */
+	/* See dssh_chan_open: the shell/exec early-data workaround excludes
+	 * subsystem channels in both stream and zero-copy mode. */
 	if ((params->flags & DSSH_PARAM_ACCEPT_EARLY_DATA)
 	    && params->type != DSSH_CHAN_SHELL && params->type != DSSH_CHAN_EXEC)
 		return NULL;

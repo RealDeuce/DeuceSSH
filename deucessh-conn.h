@@ -23,10 +23,10 @@ extern "C" {
 typedef struct dssh_channel_s *dssh_channel;
 
 /* Poll event flags */
-#define DSSH_POLL_READ    0x01 /* stdout data (or EOF) */
-#define DSSH_POLL_READEXT 0x02 /* stderr data (or EOF) */
+#define DSSH_POLL_READ    0x01 /* stdout data, EOF, or retained read error */
+#define DSSH_POLL_READEXT 0x02 /* stderr data, EOF, or retained read error */
 #define DSSH_POLL_WRITE   0x04 /* send window has space */
-/* 0x08 reserved (was DSSH_POLL_SIGNAL) */
+/* 0x08 reserved */
 
 /*
  * Start the demux thread.  Call after handshake and auth are complete.
@@ -46,8 +46,8 @@ DSSH_PUBLIC int dssh_session_start(dssh_session sess);
 DSSH_PUBLIC void dssh_session_stop(dssh_session sess);
 
 /* ================================================================
- * New channel API (dssh_chan_*) — types and builder functions.
- * See design-channel-io-api.md for the full design.
+ * Channel types and builder functions.
+ * See README.md for complete usage.
  * ================================================================ */
 
 /* Channel type: one terminal request per channel (RFC 4254 s6.5) */
@@ -236,7 +236,7 @@ struct dssh_chan_accept_result {
 	uint32_t max_window; /* 0 = default */
 };
 
-/* ---- New dssh_chan_* API ---- */
+/* ---- Channel I/O API ---- */
 
 /* Open a stream-mode channel.  Performs the full setup sequence:
  * CHANNEL_OPEN, env, pty-req, shell/exec/subsystem, WINDOW_ADJUST.
@@ -265,9 +265,9 @@ DSSH_PUBLIC dssh_channel dssh_chan_open(dssh_session sess, const struct dssh_cha
  *   DSSH_ERROR_NOMORE when the remote window is full (would-block
  *   analog of -1/EAGAIN), and other negative DSSH_ERROR_* on error.
  *
- * Poll-then-read / poll-then-write callers never see NOMORE because
- * dssh_chan_poll only flags READ/READEXT/WRITE ready when actual
- * progress is possible.
+ * Readiness is a snapshot. Another caller may consume buffered data
+ * or send-window credit after poll returns, so the next read/write
+ * must still handle DSSH_ERROR_NOMORE.
  *
  * Peek: dssh_chan_read(ch, stream, NULL, 0) returns available bytes
  * (always >= 0; never NOMORE). */
@@ -283,8 +283,9 @@ DSSH_PUBLIC int64_t dssh_chan_write(dssh_channel ch, int stream, const uint8_t *
  * Session termination behaves like POSIX POLLHUP: every requested
  * data flag (DSSH_POLL_READ, DSSH_POLL_READEXT, DSSH_POLL_WRITE) is
  * surfaced as ready, regardless of buffer state.  The caller's next
- * dssh_chan_read returns 0 (EOF) once the bytebuf is drained;
- * dssh_chan_write returns a negative error.  This means a poll loop
+ * dssh_chan_read reports any retained read error, then drains buffered
+ * bytes before returning 0 (EOF); dssh_chan_write returns a negative
+ * error. This means a poll loop
  * naturally exits via subsequent read/write rather than spinning on
  * a 0 return.  DSSH_POLL_EVENT is not affected by termination --
  * use the data flags or the terminate callback to detect it.

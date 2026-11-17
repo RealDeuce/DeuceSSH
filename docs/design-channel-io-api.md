@@ -1,7 +1,7 @@
-> Current BREAK contract: the approved synchronous action handler replaces
-> BREAK events. See [the current API guide](api-design-4254.md#break-actions)
-> and [README](../README.md#receiving-break-requests). This document retains
-> earlier design discussion; the installed public headers govern declarations.
+> Historical pre-release design discussion. Current channel contracts and
+> examples are in [the API guide](api-design-4254.md), [README](../README.md),
+> and [the public header](../deucessh-conn.h). Those sources include the approved
+> event byte views, BREAK handler, read completion and channel-close contracts.
 
 # Channel I/O API Redesign
 

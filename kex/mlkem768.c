@@ -23,7 +23,8 @@ crypto_kem_mlkem768_keypair(unsigned char *pk, unsigned char *sk)
 		return -1;
 	}
 
-	libcrux_ml_kem_mlkem768_MlKem768KeyPair kp = libcrux_ml_kem_mlkem768_portable_generate_key_pair(rnd);
+	libcrux_ml_kem_mlkem768_MlKem768KeyPair kp;
+	libcrux_ml_kem_mlkem768_portable_generate_key_pair(rnd, &kp);
 
 	memcpy(pk, kp.pk.value, crypto_kem_mlkem768_PUBLICKEYBYTES);
 	memcpy(sk, kp.sk.value, crypto_kem_mlkem768_SECRETKEYBYTES);
@@ -50,7 +51,8 @@ crypto_kem_mlkem768_enc(unsigned char *ct, unsigned char *ss, const unsigned cha
 		return -1;
 	}
 
-	tuple_3c enc = libcrux_ml_kem_mlkem768_portable_encapsulate(&mlkem_pk, rnd);
+	tuple_3c enc;
+	libcrux_ml_kem_mlkem768_portable_encapsulate(&mlkem_pk, rnd, &enc);
 
 	memcpy(ct, enc.fst.value, crypto_kem_mlkem768_CIPHERTEXTBYTES);
 	memcpy(ss, enc.snd, crypto_kem_mlkem768_BYTES);

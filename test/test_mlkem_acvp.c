@@ -1,17 +1,45 @@
 /* Deterministic official answers for the actual selected bundled ML-KEM roots. */
 #include <string.h>
+#include <inttypes.h>
+#include <stdio.h>
 
 #include "mlkem_acvp.h"
 #ifdef DSSH_TEST_MLKEM_RETIREMENT
-#include <stdio.h>
 static void observe_clear(const char *, const char *, const void *, size_t);
 #define DSSH_MLKEM_CLEAR_OBSERVER observe_clear
 #endif
 #include "kex/libcrux_mlkem768_sha3.h"
 #ifdef DSSH_TEST_MLKEM_RETIREMENT
-#include <inttypes.h>
 #include "mlkem_hash_retirement.h"
 #endif
+
+enum output_control {
+	OUTPUT_CONTROL_NONE,
+	OUTPUT_CONTROL_KEYGEN_GUARD,
+	OUTPUT_CONTROL_ENCAP_GUARD,
+	OUTPUT_CONTROL_KEYGEN_INPUT,
+	OUTPUT_CONTROL_ENCAP_INPUT,
+	OUTPUT_CONTROL_PUBLIC_INPUT
+};
+
+static enum output_control output_control;
+static uint64_t output_keygens;
+static uint64_t output_encapsulations;
+static uint64_t output_guards;
+static uint64_t output_inputs;
+static bool output_valid = true;
+
+static bool
+check_output_guards(const uint8_t before[16], const uint8_t after[16])
+{
+	bool valid = true;
+	for (size_t i = 0; i < 16; i++) {
+		if (before[i] != 0xa5 || after[i] != 0x5a)
+			valid = false;
+	}
+	output_guards += 2;
+	return valid;
+}
 
 static bool
 evaluate_primitive(const struct dssh_acvp_case *test, const struct dssh_acvp_decoded *bytes)
@@ -20,15 +48,34 @@ evaluate_primitive(const struct dssh_acvp_case *test, const struct dssh_acvp_dec
 	memcpy(seed, bytes->d, 32);
 	memcpy(seed + 32, bytes->z, 32);
 	if (test->kind == DSSH_ACVP_KEYGEN || test->kind == DSSH_ACVP_DECAP_SEED) {
-		libcrux_ml_kem_mlkem768_MlKem768KeyPair key = libcrux_ml_kem_mlkem768_portable_generate_key_pair(seed);
-		bool equal = memcmp(key.pk.value, bytes->ek, sizeof(bytes->ek)) == 0
-		    && memcmp(key.sk.value, bytes->dk, sizeof(bytes->dk)) == 0;
+		struct {
+			uint8_t before[16];
+			libcrux_ml_kem_mlkem768_MlKem768KeyPair value;
+			uint8_t after[16];
+		} key;
+		memset(&key, 0xa5, sizeof(key));
+		memset(key.after, 0x5a, sizeof(key.after));
+		libcrux_ml_kem_mlkem768_portable_generate_key_pair(seed, &key.value);
+		if (output_control == OUTPUT_CONTROL_KEYGEN_GUARD)
+			key.after[0] = 0;
+		if (output_control == OUTPUT_CONTROL_KEYGEN_INPUT)
+			seed[0] ^= 1;
+		bool guarded = check_output_guards(key.before, key.after);
+		bool first_preserved = memcmp(seed, bytes->d, 32) == 0;
+		bool last_preserved = memcmp(seed + 32, bytes->z, 32) == 0;
+		bool preserved = first_preserved && last_preserved;
+		output_keygens++;
+		output_inputs++;
+		output_valid = guarded && preserved && output_valid;
+		bool equal = memcmp(key.value.pk.value, bytes->ek, sizeof(bytes->ek)) == 0
+		    && memcmp(key.value.sk.value, bytes->dk, sizeof(bytes->dk)) == 0
+		    && guarded && preserved;
 		if (test->kind == DSSH_ACVP_KEYGEN)
 			return equal;
 		libcrux_ml_kem_mlkem768_MlKem768Ciphertext ciphertext;
 		memcpy(ciphertext.value, bytes->c, sizeof(bytes->c));
 		uint8_t secret[32];
-		libcrux_ml_kem_mlkem768_portable_decapsulate(&key.sk, &ciphertext, secret);
+		libcrux_ml_kem_mlkem768_portable_decapsulate(&key.value.sk, &ciphertext, secret);
 		return equal && memcmp(secret, bytes->k, sizeof(secret)) == 0;
 	}
 	if (test->kind == DSSH_ACVP_ENCAP || test->kind == DSSH_ACVP_PUBLIC_CHECK) {
@@ -41,9 +88,30 @@ evaluate_primitive(const struct dssh_acvp_case *test, const struct dssh_acvp_dec
 			return false;
 		uint8_t randomness[32];
 		memcpy(randomness, bytes->m, sizeof(randomness));
-		tuple_3c result = libcrux_ml_kem_mlkem768_portable_encapsulate(&key, randomness);
-		return memcmp(result.fst.value, bytes->c, sizeof(bytes->c)) == 0
-		    && memcmp(result.snd, bytes->k, sizeof(bytes->k)) == 0;
+		struct {
+			uint8_t before[16];
+			tuple_3c value;
+			uint8_t after[16];
+		} result;
+		memset(&result, 0xa5, sizeof(result));
+		memset(result.after, 0x5a, sizeof(result.after));
+		libcrux_ml_kem_mlkem768_portable_encapsulate(&key, randomness, &result.value);
+		if (output_control == OUTPUT_CONTROL_ENCAP_GUARD)
+			result.after[0] = 0;
+		if (output_control == OUTPUT_CONTROL_ENCAP_INPUT)
+			randomness[0] ^= 1;
+		if (output_control == OUTPUT_CONTROL_PUBLIC_INPUT)
+			key.value[0] ^= 1;
+		bool guarded = check_output_guards(result.before, result.after);
+		bool randomness_preserved = memcmp(randomness, bytes->m, sizeof(randomness)) == 0;
+		bool key_preserved = memcmp(key.value, bytes->ek, sizeof(key.value)) == 0;
+		bool preserved = randomness_preserved && key_preserved;
+		output_encapsulations++;
+		output_inputs += 2;
+		output_valid = guarded && preserved && output_valid;
+		return memcmp(result.value.fst.value, bytes->c, sizeof(bytes->c)) == 0
+		    && memcmp(result.value.snd, bytes->k, sizeof(bytes->k)) == 0
+		    && guarded && preserved;
 	}
 	libcrux_ml_kem_types_MlKemPrivateKey_55 key;
 	libcrux_ml_kem_mlkem768_MlKem768Ciphertext ciphertext = {0};
@@ -67,10 +135,8 @@ static const struct {
 	size_t bytes;
 	unsigned counts[5]; /* keygen, encap, decap, public check, private check */
 } clear_sites[] = {
-	{"libcrux_ml_kem_types_from_17_35", "sk", sizeof(libcrux_ml_kem_types_MlKemPrivateKey_55), {1, 0, 0}},
-	{"libcrux_ml_kem_types_from_05_f2", "copy_of_value", 2400, {1, 0, 0}},
 	{"libcrux_ml_kem_utils_into_padded_array_ea0", "out", 1120, {0, 0, 1}},
-	{"libcrux_ml_kem_utils_into_padded_array_ea", "out", 64, {0, 1, 1}},
+	{"libcrux_ml_kem_utils_into_padded_array_ea", "out", 64, {0, 0, 1}},
 	{"libcrux_ml_kem_constant_time_ops_select_ct", "out", 32, {0, 0, 1}},
 	{"libcrux_ml_kem_constant_time_ops_compare_ciphertexts_select_shared_secret_in_constant_time", "ret0", 32, {0, 0, 1}},
 	{"libcrux_ml_kem_variant_kdf_d8_41", "out", 32, {0, 1, 2}},
@@ -85,25 +151,12 @@ static const struct {
 	{"libcrux_ml_kem_ind_cca_decapsulate_70", "shared_secret", 32, {0, 0, 1}},
 	{"libcrux_ml_kem_ind_cca_decapsulate_70", "ret0", 32, {0, 0, 1}},
 	{"libcrux_ml_kem_variant_entropy_preprocess_d8_63", "out", 32, {0, 1, 0}},
-	{"libcrux_ml_kem_ind_cca_encapsulate_cd", "randomness0", 32, {0, 1, 0}},
 	{"libcrux_ml_kem_ind_cca_encapsulate_cd", "to_hash", 64, {0, 1, 0}},
 	{"libcrux_ml_kem_ind_cca_encapsulate_cd", "hashed", 64, {0, 1, 0}},
-	{"libcrux_ml_kem_ind_cca_encapsulate_cd", "copy_of_randomness", 32, {0, 1, 0}},
-	{"libcrux_ml_kem_ind_cca_encapsulate_cd", "shared_secret_array", 32, {0, 1, 0}},
-	{"libcrux_ml_kem_ind_cca_encapsulate_cd", "copy_of_shared_secret_array", 32, {0, 1, 0}},
-	{"libcrux_ml_kem_ind_cca_instantiations_portable_encapsulate_c6", "copy_of_randomness", 32, {0, 1, 0}},
-	{"libcrux_ml_kem_mlkem768_portable_encapsulate", "copy_of_randomness", 32, {0, 1, 0}},
 	{"libcrux_ml_kem_variant_cpa_keygen_seed_d8_0e", "seed", 33, {1, 0, 0}},
 	{"libcrux_ml_kem_variant_cpa_keygen_seed_d8_0e", "ret0", 64, {1, 0, 0}},
 	{"libcrux_ml_kem_ind_cca_serialize_kem_secret_key_48", "out", 2400, {1, 0, 0}},
 	{"libcrux_ml_kem_ind_cca_generate_keypair_8c", "uu____0", sizeof(libcrux_ml_kem_utils_extraction_helper_Keypair768), {1, 0, 0}},
-	{"libcrux_ml_kem_ind_cca_generate_keypair_8c", "ind_cpa_private_key", 1152, {1, 0, 0}},
-	{"libcrux_ml_kem_ind_cca_generate_keypair_8c", "secret_key_serialized", 2400, {1, 0, 0}},
-	{"libcrux_ml_kem_ind_cca_generate_keypair_8c", "copy_of_secret_key_serialized", 2400, {1, 0, 0}},
-	{"libcrux_ml_kem_ind_cca_generate_keypair_8c", "private_key", sizeof(libcrux_ml_kem_types_MlKemPrivateKey_55), {1, 0, 0}},
-	{"libcrux_ml_kem_ind_cca_generate_keypair_8c", "uu____2", sizeof(libcrux_ml_kem_types_MlKemPrivateKey_55), {1, 0, 0}},
-	{"libcrux_ml_kem_ind_cca_instantiations_portable_generate_keypair_d5", "copy_of_randomness", 64, {1, 0, 0}},
-	{"libcrux_ml_kem_mlkem768_portable_generate_key_pair", "copy_of_randomness", 64, {1, 0, 0}},
 	{"libcrux_ml_kem_ind_cpa_generate_keypair_fc", "hashed", sizeof(uint8_t[64]), {1, 0, 0}},
 	{"libcrux_ml_kem_ind_cpa_generate_keypair_fc", "prf_input", sizeof(uint8_t[33]), {1, 0, 0}},
 	{"libcrux_ml_kem_ind_cpa_generate_keypair_fc", "secret_sample", sizeof(tuple_b0), {1, 0, 0}},
@@ -232,7 +285,7 @@ evaluate(const struct dssh_acvp_case *test, const struct dssh_acvp_decoded *byte
 		    + (private_check ? clear_sites[i].counts[4] : 0U);
 		if (observation.calls[i] != expected)
 			observation.valid = false;
-		/* 79 uint32_t counters across 145 finite cases sum to less than 2^46. */
+		/* 64 uint32_t counters across 145 finite cases sum to less than 2^46. */
 		observed_clears += observation.calls[i];
 	}
 	observed_cases++;
@@ -281,10 +334,25 @@ evaluate(const struct dssh_acvp_case *test, const struct dssh_acvp_decoded *byte
 int
 main(int argc, char **argv)
 {
+	if (argc == 2) {
+		if (strcmp(argv[1], "--negative-output-keygen") == 0)
+			output_control = OUTPUT_CONTROL_KEYGEN_GUARD;
+		else if (strcmp(argv[1], "--negative-output-encap") == 0)
+			output_control = OUTPUT_CONTROL_ENCAP_GUARD;
+		else if (strcmp(argv[1], "--negative-input-keygen") == 0)
+			output_control = OUTPUT_CONTROL_KEYGEN_INPUT;
+		else if (strcmp(argv[1], "--negative-input-encap") == 0)
+			output_control = OUTPUT_CONTROL_ENCAP_INPUT;
+		else if (strcmp(argv[1], "--negative-input-public") == 0)
+			output_control = OUTPUT_CONTROL_PUBLIC_INPUT;
+		if (output_control != OUTPUT_CONTROL_NONE)
+			argc = 1;
+	}
+	int ret;
 	#ifdef DSSH_TEST_MLKEM_RETIREMENT
 	if (!check_observer() || !dssh_hash_wipe_controls())
 		return 2;
-	int ret = dssh_acvp_run(argc, argv, "bundled retirement", evaluate);
+	ret = dssh_acvp_run(argc, argv, "bundled retirement", evaluate);
 	if (printf("ML-KEM retirement: cases=%zu sites=%zu clears=%" PRIu64 " active=%u\n",
 	    observed_cases, sizeof(clear_sites) / sizeof(clear_sites[0]), observed_clears,
 	    active_observation != NULL ? 1U : 0U) < 0)
@@ -293,8 +361,13 @@ main(int argc, char **argv)
 	    " active=%u valid=%u\n", observed_cases, observed_hash_clears,
 	    active_observation != NULL ? 1U : 0U, observed_hash_valid ? 1U : 0U) < 0)
 		return 2;
-	return ret;
 #else
-	return dssh_acvp_run(argc, argv, "bundled", evaluate);
+	ret = dssh_acvp_run(argc, argv, "bundled", evaluate);
 #endif
+	if (printf("ML-KEM caller outputs: keygen=%" PRIu64 " encap=%" PRIu64
+	    " guards=%" PRIu64 " inputs=%" PRIu64 " valid=%u\n", output_keygens,
+	    output_encapsulations, output_guards, output_inputs, output_valid ? 1U : 0U) < 0
+	    || fflush(stdout) != 0)
+		return 2;
+	return ret;
 }

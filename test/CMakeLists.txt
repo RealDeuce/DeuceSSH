@@ -662,6 +662,14 @@ function(dssh_add_test test_name source_file)
 	endif()
 endfunction()
 
+# Compile the actual private ML-KEM wrapper with test-only endpoint names.
+dssh_add_test(mlkem_wrapper test_mlkem_wrapper.c)
+target_compile_options(dssh_test_mlkem_wrapper PRIVATE
+	$<$<OR:$<C_COMPILER_ID:Clang>,$<C_COMPILER_ID:AppleClang>,$<C_COMPILER_ID:GNU>>:-Wno-unused-function>)
+dssh_add_output_test(dssh_mlkem_wrapper_owners dssh_test_mlkem_wrapper
+	"ML-KEM wrappers: cases=223 failed=0 excluded=20 random=193 wipes=318 bytes=[0-9]+ zero_failures=0 guards=599 inputs=163 answers=200 owners=100,35,93,60,30 valid=1")
+set_tests_properties(dssh_mlkem_wrapper_owners PROPERTIES TIMEOUT 120)
+
 # Exercise the exact production ring arithmetic under unsigned size models.
 foreach(model IN ITEMS native u8 u16 u32 u64)
 	add_executable(dssh_test_ring_sizes_${model} test_ring_sizes.c)

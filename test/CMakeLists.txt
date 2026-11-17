@@ -3520,3 +3520,14 @@ foreach(profile IN ITEMS ordinary growth)
 			ENVIRONMENT "DSSH_TEST_COMPRESSION=test-growth")
 	endif()
 endforeach()
+
+foreach(profile IN ITEMS ordinary growth)
+	dssh_add_output_test(dssh_conn_event_body_${profile} dssh_test_conn
+		"1 tests: 1 passed, 0 failed, 0 skipped" --exact event_body/controls)
+	set_tests_properties(dssh_conn_event_body_${profile} PROPERTIES TIMEOUT 120
+		ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys)
+	if(profile STREQUAL "growth")
+		set_property(TEST dssh_conn_event_body_${profile} APPEND PROPERTY
+			ENVIRONMENT "DSSH_TEST_COMPRESSION=test-growth")
+	endif()
+endforeach()

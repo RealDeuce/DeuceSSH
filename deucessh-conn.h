@@ -252,6 +252,14 @@ DSSH_PUBLIC dssh_channel dssh_chan_open(dssh_session sess, const struct dssh_cha
  *   drained), DSSH_ERROR_NOMORE when the bytebuf is empty but no
  *   EOF has arrived (would-block analog of -1/EAGAIN), and other
  *   negative DSSH_ERROR_* on error.
+ *   Once bytes have been delivered, read returns their count. A later
+ *   receive-credit error is retained for the next non-NULL read with
+ *   nonzero capacity on either stream; that call reports the error once
+ *   without copying or consuming data. Availability peeks do not consume
+ *   a retained error. Requested read directions poll ready until it is read.
+ *   A subsequent positive-capacity read retries retained receive credit,
+ *   including when the stream buffer is empty. Release another session's
+ *   same-thread TX reservation before reading data; peeks remain available.
  *
  *   write returns bytes sent (>0), 0 only when bufsz == 0,
  *   DSSH_ERROR_NOMORE when the remote window is full (would-block

@@ -1547,8 +1547,10 @@ DSSH_TESTABLE int
 drain_one_wa_slot(struct dssh_session_s *sess, struct dssh_channel_s *ch, bool *progress, bool discard)
 {
 	int lr = mtx_lock(&ch->buf_mtx);
-	if (lr != thrd_success)
+	if (lr != thrd_success) {
+		channel_defer_read_error(sess, ch, DSSH_ERROR_TERMINATED);
 		return DSSH_ERROR_TERMINATED;
+	}
 	if (!atomic_load(&ch->wa_slot.ready)) {
 		dssh_mtx_unlock(&ch->buf_mtx);
 		return 0;
@@ -1572,12 +1574,15 @@ drain_one_wa_slot(struct dssh_session_s *sess, struct dssh_channel_s *ch, bool *
 	DSSH_PUT_U32(bytes, buf, &wp);
 	ch->wa_slot.payload_len = 9;
 	int ret = tx_finalize(sess, buf, 9);
+	int read_error = ret;
 	bool refused = tx_drain_refused(sess, ret);
 	bool fatal = ret < 0 && !refused;
 
 	lr = mtx_lock(&ch->buf_mtx);
-	if (lr != thrd_success)
+	if (lr != thrd_success) {
+		channel_defer_read_error(sess, ch, read_error < 0 ? read_error : DSSH_ERROR_TERMINATED);
 		return DSSH_ERROR_TERMINATED;
+	}
 	if (ret == 0)
 		ch->local_window = window_add(ch->local_window, bytes);
 	if (!fatal) {
@@ -1592,10 +1597,12 @@ drain_one_wa_slot(struct dssh_session_s *sess, struct dssh_channel_s *ch, bool *
 		int br = cnd_broadcast(&ch->poll_cnd);
 		dssh_mtx_unlock(&ch->buf_mtx);
 		if (br != thrd_success)
-			return DSSH_ERROR_TERMINATED;
+			ret = DSSH_ERROR_TERMINATED;
 	}
 	else
 		dssh_mtx_unlock(&ch->buf_mtx);
+	if (ret < 0)
+		channel_defer_read_error(sess, ch, read_error < 0 ? read_error : ret);
 	if (!refused)
 		*progress = true;
 	return sess->terminate ? DSSH_ERROR_TERMINATED : ret;
@@ -1762,7 +1769,7 @@ tx_acquire(struct dssh_session_s *sess, uint8_t msg_type)
 	return 0;
 }
 
-static bool
+DSSH_PRIVATE bool
 tx_slot_context_allowed(struct dssh_session_s *sess)
 {
 	return (tx_owned_session == NULL || tx_owned_session == sess)

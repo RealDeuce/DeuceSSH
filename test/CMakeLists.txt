@@ -2447,7 +2447,7 @@ dssh_add_output_test(dssh_conn_consume_capture_bounds dssh_test_conn
 set_tests_properties(dssh_conn_consume_capture_bounds PROPERTIES TIMEOUT 120
 	ENVIRONMENT "${DSSH_TEST_KEY_ENV}" FIXTURES_REQUIRED dssh_cached_keys)
 
-foreach(part IN ITEMS deferred failures retry terminal provider)
+foreach(part IN ITEMS deferred failures retry terminal provider reservations poll concurrent)
 	foreach(profile IN ITEMS ordinary growth)
 		if(part STREQUAL "provider" AND profile STREQUAL "ordinary" AND DEUCESSH_CRYPTO_BACKEND STREQUAL "Botan")
 			continue()

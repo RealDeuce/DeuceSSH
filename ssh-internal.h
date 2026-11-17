@@ -362,6 +362,14 @@ struct dssh_channel_s {
 	 * channel. ACTIVE keeps the channel alive while that dispatch drops
 	 * buf_mtx for callbacks or I/O. */
 	atomic_int dispatch_state;
+	/* First receive-credit failure, shared by both stream read directions.
+	 * Atomic publication also works after an acquisition failure; ordinary
+	 * publication pairs with buf_mtx/poll_cnd to avoid a lost wakeup. */
+	atomic_int read_error;
+	/* A terminal failure can propagate through several scheduler frames.
+	 * Publish it only once, even if another reader acknowledges it before
+	 * the original read finishes releasing packet-engine ownership. */
+	atomic_bool read_error_terminal;
 
 			     /* 4-byte */
 	uint32_t              local_id;
@@ -424,6 +432,9 @@ struct dssh_channel_s {
 		struct dssh_bytebuf stderr_buf;
 	} buf;
 };
+
+DSSH_PRIVATE void channel_defer_read_error(struct dssh_session_s *sess,
+	struct dssh_channel_s *ch, int error);
 
 /* Private protocol ownership outlives an application channel when a peer
  * response is still outstanding. The local number is immutable once

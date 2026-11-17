@@ -1633,12 +1633,22 @@ Return values follow non-blocking POSIX semantics:
 The peek form (`buf == NULL, bufsz == 0`) always returns the
 non-negative byte count; it never returns `NOMORE`.
 
+Once a read delivers bytes, it returns their count. If returning receive credit
+then fails, the channel retains the first error. The next non-NULL read with
+nonzero capacity on either stream reports that error once, without copying or
+consuming data. Peeks preserve it. A subsequent positive-capacity read retries
+queued credit, even when its stream buffer is empty, so recovery needs no new
+application data send. A same-thread zero-copy reservation for another session
+must be finished or canceled before reading data; availability peeks remain
+available. A reservation on the same session is preserved, with credit queued
+until its owner finishes or cancels it.
+
 ### Poll events
 
 | Flag | Meaning |
 |------|---------|
-| `DSSH_POLL_READ` | stdout data or EOF available |
-| `DSSH_POLL_READEXT` | stderr data or EOF available |
+| `DSSH_POLL_READ` | stdout data, EOF, or a retained read error available |
+| `DSSH_POLL_READEXT` | stderr data, EOF, or a retained read error available |
 | `DSSH_POLL_WRITE` | send window has space |
 | `DSSH_POLL_EVENT` | event ready (signal, window-change, etc.) |
 
@@ -1647,6 +1657,7 @@ non-negative byte count; it never returns `NOMORE`.
 (`dssh_session_is_terminated()` is true), every requested data flag
 is surfaced as ready — POSIX `POLLHUP` semantics — so the caller's
 next `dssh_chan_read` returns 0 (EOF) once the bytebuf is drained
+and any retained read error has been reported,
 and `dssh_chan_write` returns a negative error.  A poll loop
 therefore exits naturally through the subsequent read/write rather
 than spinning on a 0 return.  `DSSH_POLL_EVENT` is unaffected by

@@ -306,6 +306,7 @@ DSSH_PRIVATE int      send_channel_reply(struct dssh_session_s *sess, struct dss
 DSSH_PRIVATE int      schedule_wa_slot(struct dssh_session_s *sess);
 DSSH_PRIVATE int      tx_acquire(struct dssh_session_s *sess, uint8_t msg_type);
 DSSH_PRIVATE bool     tx_owner_is_current(struct dssh_session_s *sess);
+DSSH_PRIVATE bool     tx_slot_context_allowed(struct dssh_session_s *sess);
 DSSH_PRIVATE void     tx_unlock_with_slots(struct dssh_session_s *sess);
 DSSH_PRIVATE int      tx_unlock_with_result(struct dssh_session_s *sess, int result);
 DSSH_PRIVATE size_t   tx_slot_buf_size(size_t max_payload, size_t block_size, uint16_t mac_digest);

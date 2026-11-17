@@ -2099,6 +2099,8 @@ new_channel(struct dssh_session_s *sess, struct dssh_channel_id *id)
 	atomic_init(&ch->terminate_woken, false);
 	atomic_init(&ch->tx_refs, 0);
 	atomic_init(&ch->dispatch_state, DSSH_CHANNEL_DISPATCH_IDLE);
+	atomic_init(&ch->read_error, 0);
+	atomic_init(&ch->read_error_terminal, false);
 	atomic_init(&ch->remote_window, 0);
 	atomic_init(&ch->setup_complete, false);
 	atomic_init(&ch->wa_slot.ready, false);
@@ -2207,7 +2209,7 @@ maybe_replenish_window(struct dssh_session_s *sess, struct dssh_channel_s *ch)
 	}
 
 	/* No point replenishing if peer is done sending */
-	if (ch->eof_received || ch->close_received) {
+	if (ch->eof_received || ch->close_received || sess->terminate) {
 		return channel_unlock_lifecycle(sess, ch);
 	}
 
@@ -4513,6 +4515,33 @@ fail_sync:
 	return NULL;
 }
 
+/* Store before attempting notification: a failed acquisition must not replace
+ * the first error or the count of bytes already delivered. No mutex is held
+ * on entry. The TX caller retains its channel reference through this call. */
+DSSH_PRIVATE void
+channel_defer_read_error(struct dssh_session_s *sess, struct dssh_channel_s *ch, int error)
+{
+	if (ch->io_model != DSSH_IO_STREAM || error >= 0)
+		return;
+	if ((error == DSSH_ERROR_TERMINATED || sess->terminate)
+	    && atomic_exchange(&ch->read_error_terminal, true))
+		return;
+	int expected = 0;
+	(void)atomic_compare_exchange_strong(&ch->read_error, &expected, error);
+	/* Termination already makes every requested read direction ready. */
+	if (sess->terminate)
+		return;
+	int ret = mtx_lock(&ch->buf_mtx);
+	if (ret != thrd_success) {
+		dssh_thrd_check(sess, ret);
+		return;
+	}
+	ret = cnd_broadcast(&ch->poll_cnd);
+	dssh_mtx_unlock(&ch->buf_mtx);
+	if (ret != thrd_success)
+		dssh_thrd_check(sess, ret);
+}
+
 DSSH_PUBLIC int64_t
 dssh_chan_read(struct dssh_channel_s *ch, int stream, uint8_t *buf, size_t bufsz)
 {
@@ -4525,6 +4554,8 @@ dssh_chan_read(struct dssh_channel_s *ch, int stream, uint8_t *buf, size_t bufsz
 	if (buf == NULL && bufsz != 0)
 		return DSSH_ERROR_INVALID;
 	struct dssh_session_s *sess = ch->sess;
+	if (buf != NULL && bufsz != 0 && !tx_slot_context_allowed(sess))
+		return DSSH_ERROR_INVALID;
 	bool                   ext  = (stream != 0);
 	int lock_ret = mtx_lock(&ch->buf_mtx);
 	if (lock_ret != thrd_success) {
@@ -4537,6 +4568,37 @@ dssh_chan_read(struct dssh_channel_s *ch, int stream, uint8_t *buf, size_t bufsz
 		if (channel_unlock_lifecycle(sess, ch) < 0)
 			return DSSH_ERROR_TERMINATED;
 		return (int64_t)avail;
+	}
+	if (bufsz != 0) {
+		int error = atomic_exchange(&ch->read_error, 0);
+		if (error < 0) {
+			if (channel_unlock_lifecycle(sess, ch) < 0)
+				return DSSH_ERROR_TERMINATED;
+			return error;
+		}
+		/* Retry already queued credit even if this stream is empty. A
+		 * resolved pre-wire refusal must not need another application send.
+		 * Reacquire and recheck before consuming any bytes or new error. */
+		bool retry = !sess->terminate && !ch->eof_received && !ch->close_received
+		    && ch->window_adjust_pending > 0 && atomic_load(&ch->wa_slot.ready);
+		if (retry) {
+			if (channel_unlock_lifecycle(sess, ch) < 0)
+				return DSSH_ERROR_TERMINATED;
+			int ret = schedule_wa_slot(sess);
+			if (ret < 0)
+				channel_defer_read_error(sess, ch, ret);
+			lock_ret = mtx_lock(&ch->buf_mtx);
+			if (lock_ret != thrd_success) {
+				dssh_thrd_check(sess, lock_ret);
+				return DSSH_ERROR_TERMINATED;
+			}
+			error = atomic_exchange(&ch->read_error, 0);
+			if (error < 0) {
+				if (channel_unlock_lifecycle(sess, ch) < 0)
+					return DSSH_ERROR_TERMINATED;
+				return error;
+			}
+		}
 	}
 	size_t n              = bytebuf_read(bb, buf, bufsz, 0);
 	/* Disambiguate empty-buffer from EOF: return 0 only when EOF
@@ -4552,7 +4614,7 @@ dssh_chan_read(struct dssh_channel_s *ch, int stream, uint8_t *buf, size_t bufsz
 	if (n > 0) {
 		int wret = maybe_replenish_window(sess, ch);
 		if (wret < 0)
-			return wret;
+			channel_defer_read_error(sess, ch, wret);
 	}
 	return (int64_t)n;
 }
@@ -4616,14 +4678,15 @@ dssh_chan_poll(struct dssh_channel_s *ch, int events, int timeout_ms)
 		 * dssh_chan_write returns a negative error.  Mirrors how
 		 * close_received already forces READ/READEXT ready. */
 		bool terminated = sess->terminate;
+		bool read_failed = atomic_load(&ch->read_error) < 0;
 		int ready = 0;
 		if ((events & DSSH_POLL_READ)
 		    && ((bytebuf_available(&ch->buf.stdout_buf) > 0) || ch->eof_received || ch->close_received
-		        || terminated))
+		        || terminated || read_failed))
 			ready |= DSSH_POLL_READ;
 		if ((events & DSSH_POLL_READEXT)
 		    && ((bytebuf_available(&ch->buf.stderr_buf) > 0) || ch->eof_received || ch->close_received
-		        || terminated))
+		        || terminated || read_failed))
 			ready |= DSSH_POLL_READEXT;
 		if ((events & DSSH_POLL_WRITE)
 		    && (terminated

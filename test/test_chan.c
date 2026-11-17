@@ -1583,6 +1583,20 @@ test_accept_env_validation(void)
 	memcpy(packet, valid, sizeof(valid));
 	packet[9] = 0;
 	ASSERT_EQ(accept_env_request(NULL, packet, sizeof(valid), &p, &cbs, &cancelled), DSSH_ERROR_PARSE);
+	static const uint32_t large_lengths[] = {UINT32_C(65536), UINT32_C(65537), UINT32_MAX};
+	for (size_t field = 0; field < 2; field++) {
+		for (size_t i = 0; i < sizeof(large_lengths) / sizeof(large_lengths[0]); i++) {
+			memcpy(packet, valid, sizeof(valid));
+			size_t offset = field == 0 ? 0 : 5;
+			DSSH_PUT_U32(large_lengths[i], packet, &offset);
+			dssh_test_alloc_fail_after(0);
+			int result = accept_env_request(NULL, packet, sizeof(valid), &p, &cbs, &cancelled);
+			int allocations = dssh_test_alloc_count();
+			dssh_test_alloc_reset();
+			ASSERT_EQ(result, DSSH_ERROR_PARSE);
+			ASSERT_EQ(allocations, 0);
+		}
+	}
 	ASSERT_EQ_U(decision.calls, 0);
 	ASSERT_EQ_U(p.env_count, 0);
 

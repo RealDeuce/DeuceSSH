@@ -1047,11 +1047,16 @@ parse_env_data(const uint8_t *data, size_t data_len, const uint8_t **name, size_
 		return DSSH_ERROR_PARSE;
 	nlen = DSSH_GET_U32(&data[pos]);
 	pos += 4;
-	if (!dssh_buffer_has(data_len, pos, nlen))
+#if SIZE_MAX < UINT32_MAX
+	if (nlen > SIZE_MAX)
+		return DSSH_ERROR_PARSE;
+#endif
+	size_t name_size = (size_t)nlen;
+	if (!dssh_buffer_has(data_len, pos, name_size))
 		return DSSH_ERROR_PARSE;
 	*name     = &data[pos];
-	*name_len = nlen;
-	pos += nlen;
+	*name_len = name_size;
+	pos += name_size;
 
 	uint32_t vlen;
 
@@ -1059,10 +1064,15 @@ parse_env_data(const uint8_t *data, size_t data_len, const uint8_t **name, size_
 		return DSSH_ERROR_PARSE;
 	vlen = DSSH_GET_U32(&data[pos]);
 	pos += 4;
-	if (!dssh_buffer_has(data_len, pos, vlen) || vlen != data_len - pos)
+#if SIZE_MAX < UINT32_MAX
+	if (vlen > SIZE_MAX)
+		return DSSH_ERROR_PARSE;
+#endif
+	size_t value_size = (size_t)vlen;
+	if (!dssh_buffer_has(data_len, pos, value_size) || value_size != data_len - pos)
 		return DSSH_ERROR_PARSE;
 	*value     = &data[pos];
-	*value_len = vlen;
+	*value_len = value_size;
 	return 0;
 }
 

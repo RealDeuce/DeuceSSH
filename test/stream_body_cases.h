@@ -10,15 +10,24 @@ test_stream_body_controls(void)
 		test_session_write_ext, test_session_read_ext, test_session_poll_read,
 		test_session_poll_timeout, test_session_large_write, test_session_multiple_writes,
 		test_eof_detection, test_eof_half_close, test_read_nomore_vs_eof,
-		test_session_poll_timeout_zero
+		test_session_poll_timeout_zero,
+		test_open_subsystem, test_subsys_write_read, test_subsys_multiple_writes,
+		test_subsys_poll, test_subsys_large_write, test_channel_close_subsys,
+		test_subsys_write_after_close, test_subsys_poll_write, test_subsys_poll_timeout_zero,
+		test_subsystem_roundtrip, test_subsys_write_zero
 	};
 	unsigned cases = 0;
 	for (size_t host = 0; host < sizeof(hosts) / sizeof(hosts[0]); host++) {
-		bool polling_only = host == STREAM_POLL_TIMEOUT || host == STREAM_NOWAIT;
+		bool polling_only = host == STREAM_POLL_TIMEOUT || host == STREAM_NOWAIT
+		    || host == STREAM_SUBSYS_POLL_WRITE || host == STREAM_SUBSYS_POLL_EMPTY;
 		for (unsigned fault = STREAM_NO_FAULT; fault <= STREAM_ALLOC_SECOND; fault++) {
-			if ((polling_only && (fault == STREAM_BAD_WRITE || fault == STREAM_LONG_WRITE
+			if ((host == STREAM_SUBSYS_OPEN && fault != STREAM_NO_FAULT && fault != STREAM_AFTER_OPEN)
+			    || (host == STREAM_SUBSYS_CLOSE && (fault == STREAM_BAD_WRITE
+			        || fault == STREAM_LONG_WRITE || fault == STREAM_SHORT_IO))
+			    || (host == STREAM_SUBSYS_ZERO && fault == STREAM_SHORT_IO)
+			    || (polling_only && (fault == STREAM_BAD_WRITE || fault == STREAM_LONG_WRITE
 			    || fault == STREAM_BAD_READ || fault == STREAM_LONG_READ || fault == STREAM_SHORT_IO))
-			    || (host != STREAM_LARGE && (fault == STREAM_ALLOC_FIRST || fault == STREAM_ALLOC_SECOND)))
+			    || (host != STREAM_LARGE && host != STREAM_SUBSYS_LARGE && (fault == STREAM_ALLOC_FIRST || fault == STREAM_ALLOC_SECOND)))
 				continue;
 			enum stream_body_fault selected = (enum stream_body_fault)fault;
 			stream_body_fault = selected;

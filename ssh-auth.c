@@ -464,6 +464,7 @@ send_info_request(struct dssh_session_s *sess, struct dssh_auth_challenge *resul
  * Parse the common prefix of a USERAUTH_REQUEST:
  *   string user, string service, string method
  * Returns the offset past the method string, or negative on error.
+ * REJECTED distinguishes a complete prefix for an unavailable service.
  */
 DSSH_TESTABLE int64_t
 parse_userauth_prefix(const uint8_t *payload, size_t payload_len, const uint8_t **username, size_t *username_len,
@@ -474,11 +475,14 @@ parse_userauth_prefix(const uint8_t *payload, size_t payload_len, const uint8_t 
 	size_t service_len;
 	if (!auth_read_string(payload, payload_len, &pos, username, username_len)
 	    || !auth_read_string(payload, payload_len, &pos, &service, &service_len)
-	    || service_len != DSSH_STRLEN(service_connection)
-	    || memcmp(service, service_connection, service_len) != 0
 	    || !auth_read_string(payload, payload_len, &pos, method, method_len)
 	    || !auth_name_valid(*method, *method_len))
 		return DSSH_ERROR_PARSE;
+	/* Distinguish an unavailable service from malformed framing. The server
+	 * cannot carry authentication factors into a different service. */
+	if (service_len != DSSH_STRLEN(service_connection)
+	    || memcmp(service, service_connection, service_len) != 0)
+		return DSSH_ERROR_REJECTED;
 #if SIZE_MAX > INT64_MAX
 	if (pos > INT64_MAX)
 		return DSSH_ERROR_INVALID;
@@ -819,7 +823,7 @@ handle_auth_kbi_run(struct dssh_session_s *sess, const struct dssh_auth_server_c
 }
 
 static int
-handle_auth_kbi_impl(struct dssh_session_s *sess, const struct dssh_auth_server_cbs *cbs,
+handle_auth_kbi(struct dssh_session_s *sess, const struct dssh_auth_server_cbs *cbs,
     const uint8_t *user, size_t user_len, const uint8_t *payload, size_t payload_len, size_t rpos,
     uint8_t **next_payload, size_t *next_payload_len)
 {
@@ -827,26 +831,6 @@ handle_auth_kbi_impl(struct dssh_session_s *sess, const struct dssh_auth_server_
 	int ret = handle_auth_kbi_run(sess, cbs, user, user_len, payload, payload_len, rpos,
 	    next_payload, next_payload_len, &views);
 	auth_kbi_views_free(&views);
-	return ret;
-}
-
-static int
-handle_auth_kbi(struct dssh_session_s *sess, const struct dssh_auth_server_cbs *cbs, const uint8_t *user,
-    size_t user_len, const uint8_t *payload, size_t payload_len, size_t rpos,
-    uint8_t **next_payload, size_t *next_payload_len)
-{
-	/* The receive buffer is reused for every INFO_RESPONSE. Preserve the
-	 * request identity for the entire callback exchange. */
-	uint8_t *saved_user = malloc(user_len > 0 ? user_len : 1);
-
-	if (saved_user == NULL)
-		return DSSH_ERROR_ALLOC;
-	if (user_len > 0)
-		memcpy(saved_user, user, user_len);
-	int ret = handle_auth_kbi_impl(sess, cbs, saved_user, user_len, payload, payload_len, rpos,
-	    next_payload, next_payload_len);
-
-	free(saved_user);
 	return ret;
 }
 
@@ -968,8 +952,7 @@ handle_auth_publickey(struct dssh_session_s *sess, const struct dssh_auth_server
  * Server-side authentication loop
  * ================================================================ */
 static int
-auth_server_run(struct dssh_session_s *sess, const struct dssh_auth_server_cbs *cbs, uint8_t *username_out,
-    size_t *username_out_len)
+auth_server_accept_service(struct dssh_session_s *sess)
 {
 	uint8_t  msg_type;
 	uint8_t *payload;
@@ -1021,9 +1004,77 @@ auth_server_run(struct dssh_session_s *sess, const struct dssh_auth_server_cbs *
 			return res;
 	}
 
-	/* Saved username for output */
-	uint8_t saved_user[256];
-	size_t  saved_user_len = 0;
+	sess->server_auth_service_accepted = true;
+	return 0;
+}
+
+/* Identity storage is session-owned, bounded by the receive packet capacity,
+ * and retained across method attempts and recoverable operation returns. */
+static int
+auth_server_request_begin(struct dssh_session_s *sess, const struct dssh_auth_server_cbs *cbs,
+    const uint8_t *user, size_t user_len, const uint8_t *method, size_t method_len)
+{
+	bool new_identity = !sess->server_auth_user_bound || user_len != sess->server_auth_user_len;
+	if (!new_identity && user_len > 0)
+		new_identity = memcmp(user, sess->server_auth_user, user_len) != 0;
+	if (sess->server_auth_user_bound && new_identity && cbs->request_cb == NULL)
+		return transport_disconnect_result(sess, SSH_DISCONNECT_BY_APPLICATION,
+		    "authentication identity changed", DSSH_ERROR_TERMINATED);
+	if (user_len > sess->trans.packet_buf_sz) {
+		session_set_terminate(sess);
+		return DSSH_ERROR_TERMINATED;
+	}
+	size_t needed = user_len > 0 ? user_len : 1;
+	if (needed > sess->server_auth_user_capacity) {
+		uint8_t *storage = realloc(sess->server_auth_user, needed);
+		if (storage == NULL) {
+			session_set_terminate(sess);
+			return DSSH_ERROR_TERMINATED;
+		}
+		sess->server_auth_user = storage;
+		sess->server_auth_user_capacity = needed;
+	}
+	if (new_identity) {
+		dssh_cleanse(sess->server_auth_user, sess->server_auth_user_capacity);
+		if (user_len > 0)
+			memcpy(sess->server_auth_user, user, user_len);
+		sess->server_auth_user_len = user_len;
+		sess->server_auth_user_bound = true;
+	}
+	if (cbs->request_cb != NULL) {
+		int ret = cbs->request_cb(sess->server_auth_user, user_len, method, method_len,
+		    new_identity, cbs->cbdata);
+		if (sess->terminate)
+			return DSSH_ERROR_TERMINATED;
+		if (ret != 0)
+			return transport_disconnect_result(sess, SSH_DISCONNECT_BY_APPLICATION,
+			    "authentication request rejected", DSSH_ERROR_TERMINATED);
+	}
+	if (cbs->methods_str == NULL) {
+		session_set_terminate(sess);
+		return DSSH_ERROR_TERMINATED;
+	}
+	const uint8_t *methods = (const uint8_t *)cbs->methods_str;
+	if (!auth_methods_valid(methods, strlen(cbs->methods_str))) {
+		session_set_terminate(sess);
+		return DSSH_ERROR_TERMINATED;
+	}
+	return 0;
+}
+
+static int
+auth_server_run(struct dssh_session_s *sess, const struct dssh_auth_server_cbs *cbs, uint8_t *username_out,
+    size_t *username_out_len)
+{
+	uint8_t msg_type;
+	uint8_t *payload;
+	size_t payload_len;
+	int res;
+	if (!sess->server_auth_service_accepted) {
+		res = auth_server_accept_service(sess);
+		if (res < 0)
+			return res;
+	}
 	bool have_request = false;
 
 	/* Auth loop */
@@ -1051,6 +1102,9 @@ auth_server_run(struct dssh_session_s *sess, const struct dssh_auth_server_cbs *
 		int64_t        rpos_raw =
 		    parse_userauth_prefix(payload, payload_len, &user, &user_len, &method, &method_len);
 
+		if (rpos_raw == DSSH_ERROR_REJECTED)
+			return transport_disconnect_result(sess, SSH_DISCONNECT_SERVICE_NOT_AVAILABLE,
+			    "service unavailable", DSSH_ERROR_TERMINATED);
 		if (rpos_raw < 0)
 			return (int)rpos_raw;
 #if SIZE_MAX < INT64_MAX
@@ -1059,9 +1113,11 @@ auth_server_run(struct dssh_session_s *sess, const struct dssh_auth_server_cbs *
 #endif
 		size_t rpos = (size_t)rpos_raw;
 
-		/* Save username */
-		saved_user_len = user_len < sizeof(saved_user) ? user_len : sizeof(saved_user) - 1;
-		memcpy(saved_user, user, saved_user_len);
+		res = auth_server_request_begin(sess, cbs, user, user_len, method, method_len);
+		if (res < 0)
+			return res;
+		/* INFO_RESPONSE reuses the receive packet; the identity stays live. */
+		user = sess->server_auth_user;
 
 		/* Dispatch by method */
 		int r;
@@ -1106,9 +1162,11 @@ auth_server_run(struct dssh_session_s *sess, const struct dssh_auth_server_cbs *
 
 done:
 	if ((username_out != NULL) && (username_out_len != NULL)) {
+		size_t saved_user_len = sess->server_auth_user_len < 255 ? sess->server_auth_user_len : 255;
 		size_t copy_len = saved_user_len < *username_out_len ? saved_user_len : *username_out_len;
 
-		memcpy(username_out, saved_user, copy_len);
+		if (copy_len > 0)
+			memcpy(username_out, sess->server_auth_user, copy_len);
 		*username_out_len = copy_len;
 	}
 	return 0;

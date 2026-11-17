@@ -4613,6 +4613,8 @@ dssh_session_cleanup(struct dssh_session_s *sess)
 	free(sess->pending_banner);
 	free(sess->pending_banner_lang);
 	free(sess->auth_methods);
+	dssh_cleanse(sess->server_auth_user, sess->server_auth_user_capacity);
+	free(sess->server_auth_user);
 	free(sess->kex_filter);
 	free(sess->key_algo_filter);
 	free(sess->enc_filter);

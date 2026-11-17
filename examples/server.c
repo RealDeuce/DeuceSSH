@@ -342,6 +342,23 @@ looking_at(const char *cmd, const char *obj)
 	return false;
 }
 
+/* These examples serve one connection per process. The request hook marks
+ * a new attempt; a zero-response continuation does not restart the game. */
+static bool kbi_initial_request;
+
+static int
+auth_request(const uint8_t *username, size_t username_len, const uint8_t *method,
+    size_t method_len, bool new_identity, void *cbdata)
+{
+	(void)username;
+	(void)username_len;
+	(void)new_identity;
+	(void)cbdata;
+	kbi_initial_request = method_len == sizeof("keyboard-interactive") - 1
+	    && memcmp(method, "keyboard-interactive", method_len) == 0;
+	return 0;
+}
+
 static int
 auth_kbi(const uint8_t *username, size_t username_len, uint32_t num_responses, const uint8_t **responses,
     const size_t *response_lens, struct dssh_auth_challenge *out, void *cbdata)
@@ -354,7 +371,8 @@ auth_kbi(const uint8_t *username, size_t username_len, uint32_t num_responses, c
 		return DSSH_AUTH_DISCONNECT;
 
 	/* First call -- initialize game */
-	if (num_responses == 0 && responses == NULL) {
+	if (kbi_initial_request) {
+		kbi_initial_request = false;
 		memset(&gs, 0, sizeof(gs));
 		gs.room     = ROOM_GATE;
 		if (example_display_text(gs.username, sizeof(gs.username), username, username_len) < 0)
@@ -817,6 +835,7 @@ prompt:
 }
 
 static struct dssh_auth_server_cbs auth_cbs = {
+    .request_cb              = auth_request,
     .methods_str             = "publickey,password,keyboard-interactive",
     .none_cb                 = auth_none,
     .password_cb             = auth_password,

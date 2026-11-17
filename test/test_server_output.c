@@ -124,6 +124,8 @@ one_output_case(unsigned which)
 	struct dssh_bytes_result prompt = {0};
 	int result = 0;
 	if (valid && which < 2) {
+		static const uint8_t method[] = "keyboard-interactive";
+		valid = auth_request(username, sizeof(username), method, sizeof(method) - 1, true, NULL) == 0;
 		result = auth_kbi(username, sizeof(username), 0, NULL, NULL, &challenge, NULL);
 		valid &= result == (which == 1 ? DSSH_AUTH_DISCONNECT : DSSH_AUTH_KBI_PROMPT);
 		if (which == 0)

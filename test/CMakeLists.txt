@@ -1910,6 +1910,7 @@ set(AUTH_TESTS
 	auth/roundtrip/kbi auth/roundtrip/multiple_attempts
 	auth/banner_delivered auth/banner_no_lang
 	auth/server/password_change auth/server/publickey_probe
+	auth/server/request_boundaries auth/server/request_identity auth/server/request_results
 	auth/server/unknown_method auth/server/unexpected_message
 	auth/kbi/zero_prompts auth/kbi/failure_response
 	auth/kbi/callback_abort auth/kbi/empty_response

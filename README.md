@@ -681,6 +681,7 @@ responses.
 ```c
 struct dssh_auth_server_cbs cbs = {
     .methods_str = "publickey,password,keyboard-interactive",
+    .request_cb = my_request_cb,             /* optional; see below */
     .password_cb = my_password_cb,
     .passwd_change_cb = my_passwd_change_cb,  /* optional */
     .publickey_cb = my_pubkey_cb,             /* optional */
@@ -697,7 +698,24 @@ dssh_auth_set_banner(sess, "Welcome to my server!\r\n", NULL);
 int r = dssh_auth_server(sess, &cbs, username, &username_len);
 ```
 
+Without `request_cb`, the first request binds the complete username for the
+login exchange; a later change disconnects. A missing `none_cb` automatically
+rejects the normal discovery probe. Simple password/public-key servers need
+neither callback.
+
+The optional request hook runs once per USERAUTH_REQUEST, including unknown
+methods and replacement interactive attempts. It runs before method handling,
+but never for an INFO_RESPONSE round. Reset accumulated factors when
+`new_identity` is true, and reset attempt-local dialogue on every invocation.
+The hook returns zero to continue; this grants no authentication. A negative
+error or invalid positive result ends the session. Updated `methods_str` values
+are validated before method handling. Inputs are borrowed only during the hook.
+The successful username output is capped at 255 bytes and the caller's capacity;
+callbacks and identity comparisons always use the complete username bytes.
+
 ### Callback Return Values
+
+These values apply to credential callbacks, not the request hook.
 
 | Value | Meaning |
 |-------|---------|
@@ -791,6 +809,22 @@ struct kbi_server_state {
     bool prompted;
 };
 
+/* Install this as request_cb with the same cbdata as my_kbi_cb.
+ * This single-factor example has no completed factors to reset. */
+static int
+my_request_cb(const uint8_t *username, size_t username_len,
+    const uint8_t *method, size_t method_len, bool new_identity, void *cbdata)
+{
+    (void)username;
+    (void)username_len;
+    (void)method;
+    (void)method_len;
+    (void)new_identity;
+    struct kbi_server_state *state = cbdata;
+    state->prompted = false;
+    return 0;
+}
+
 static void
 release_static_challenge(void *owner)
 {
@@ -832,7 +866,8 @@ The library releases a present lease after its final read on every outcome.
 It never clears or frees producer storage. Text spans do not require NUL
 terminators. Name and instruction may be empty; prompt text must be nonempty.
 A zero-prompt challenge still requires a response, so track rounds in application
-state rather than treating every zero-response callback as the first call.
+state and reset it in `request_cb`, rather than treating every zero-response
+callback as the first call.
 
 ## Algorithm Registration
 

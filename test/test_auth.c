@@ -12637,6 +12637,9 @@ test_auth_request_capacity(void)
 #include "auth_request_boundary_cases.h"
 
 static struct dssh_test_entry tests[] = {
+	{ "auth/server/request_boundaries", test_auth_request_boundaries },
+	{ "auth/server/request_identity", test_auth_request_identity },
+	{ "auth/server/request_results", test_auth_request_results },
 	{ "auth/post_success/direct", test_auth_post_success_direct },
 	{ "auth/post_success/wire", test_auth_post_success_wire },
 	{ "auth/continuation/snapshots", test_auth_continuation_snapshots },
@@ -12926,14 +12929,4 @@ static struct dssh_test_entry tests[] = {
 };
 
 DSSH_TEST_NO_CLEANUP
-#define main dssh_test_auth_main
 DSSH_TEST_MAIN(tests)
-#undef main
-
-int
-main(int argc, char *argv[])
-{
-	if (argc == 2 && strcmp(argv[1], "--audit-auth-boundaries") == 0)
-		return auth_boundary_probe();
-	return dssh_test_auth_main(argc, argv);
-}

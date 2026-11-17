@@ -562,6 +562,12 @@ struct dssh_session_s {
 	bool        auth_methods_available;
 	/* Owned by the synchronous server authentication receive operation. */
 	bool        server_auth_active;
+	/* Retained across server-operation errors; pre-start calls are serialized. */
+	uint8_t    *server_auth_user;
+	size_t      server_auth_user_len;
+	size_t      server_auth_user_capacity;
+	bool        server_auth_user_bound;
+	bool        server_auth_service_accepted;
 };
 
 /* A failed release of a valid owned mutex leaves no recoverable ownership or

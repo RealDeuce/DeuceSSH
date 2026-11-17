@@ -222,9 +222,32 @@ typedef int (*dssh_auth_server_publickey_cb)(const uint8_t *username, size_t use
 typedef int (*dssh_auth_server_none_cb)(const uint8_t *username, size_t username_len, void *cbdata);
 
 /*
+ * Called once for each USERAUTH_REQUEST after the username/service/method
+ * prefix is validated, before method-specific handling. This includes none,
+ * unsupported methods and a request replacing an interactive attempt.
+ * All byte spans are borrowed only for this callback.
+ *
+ * new_identity is true for the first request and whenever the complete
+ * username differs from the preceding request. On true, clear accumulated
+ * authentication factors for the old identity. On every invocation, retire
+ * the previous attempt's dialogue state and prepare the current attempt.
+ * Persistent account/password changes are not rolled back.
+ *
+ * Return 0 to continue method processing; this does not authenticate the
+ * user. A negative DSSH_ERROR_* ends the SSH session, and dssh_auth_server
+ * returns DSSH_ERROR_TERMINATED. A positive result is invalid and also ends
+ * the session. Session termination requested by the callback prevents method
+ * dispatch. The normal authentication-callback restrictions apply.
+ */
+typedef int (*dssh_auth_server_request_cb)(const uint8_t *username, size_t username_len,
+    const uint8_t *method, size_t method_len, bool new_identity, void *cbdata);
+
+/*
  * Server-side keyboard-interactive callback (RFC 4256).
  *
- * Called in a loop.  On the first call, num_responses is 0 and
+ * Called in a loop. Use request_cb to reset attempt-local state on each new
+ * request when initial and zero-response rounds must be distinguished.
+ * On the first call, num_responses is 0 and
  * responses is NULL -- the callback should provide initial prompts.
  * On subsequent calls, responses contains the client's answers to
  * the previous prompts.
@@ -265,6 +288,7 @@ typedef int (*dssh_auth_server_kbi_cb)(const uint8_t *username, size_t username_
  */
 struct dssh_auth_server_cbs {
 	const char                       *methods_str;
+	dssh_auth_server_request_cb       request_cb;
 	dssh_auth_server_none_cb          none_cb;
 	dssh_auth_server_password_cb      password_cb;
 	dssh_auth_server_passwd_change_cb passwd_change_cb;
@@ -275,15 +299,24 @@ struct dssh_auth_server_cbs {
 
 /*
  * Run the server-side authentication loop (RFC 4252).
- * Receives SSH_MSG_SERVICE_REQUEST, sends SERVICE_ACCEPT,
+ * Receives SSH_MSG_SERVICE_REQUEST, sends SERVICE_ACCEPT once per session,
  * then loops receiving USERAUTH_REQUEST and dispatching to the
  * appropriate callback.  Sends SUCCESS, FAILURE, PK_OK, or
  * PASSWD_CHANGEREQ as appropriate.
  *
+ * A NULL request_cb binds authentication to the first request's complete
+ * username. A later change disconnects and returns DSSH_ERROR_TERMINATED.
+ * An installed request_cb permits a change only after it reports a complete
+ * reset. A missing none_cb still produces the ordinary automatic failure;
+ * neither a request callback nor a none callback is required for that probe.
+ * methods_str updates made by request_cb are validated before method handling.
+ * Only ssh-connection is supported; requesting another service disconnects.
+ *
  * username_out_len is in/out: on input *username_out_len is the
  * buffer capacity; on output it is the number of bytes written.
- * Usernames longer than the buffer are truncated.  The library
- * internally caps usernames at 255 bytes.
+ * The output copy is limited to 255 bytes and the supplied capacity.
+ * Method callbacks receive the full request username; identity comparisons
+ * likewise use its full length, independently of this output copy.
  * Pass NULL for both username_out and username_out_len to skip
  * username output.
  *

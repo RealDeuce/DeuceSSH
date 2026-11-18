@@ -109,19 +109,39 @@ Status: **proposed for review; not implemented**. This section specifies the
 policy to implement. It does not authorize changing exports or public contracts
 before review.
 
+### Required effect on every shared-library platform
+
+1. A previously linked application or consumer DSO keeps the interface version
+   it selected, including its signature, data representation and documented
+   behavior, when using an upgraded DeuceSSH library.
+2. Newly compiled and linked code selects the interface described by its current
+   headers. A provider missing that interface must fail to satisfy the required
+   import; it must not silently bind the caller to an older ABI.
+3. Multiple interface versions share one coordinated implementation/state where
+   appropriate. Library filename changes are a fallback for an ABI that cannot
+   be retained, rather than the only strategy on a non-ELF platform.
+
+These effects are the requirement. Native ELF version nodes, Mach-O symbol
+aliases and PE export names are different ways to encode the binding. A version
+resource or library-wide compatibility number alone does not pin an individual
+call to an older function ABI. Normal load-time imports must resolve before
+execution; explicitly delayed or runtime lookups enforce the requirement when
+the requested entry is resolved.
+
 ### Initial v1.0 assignment
 
-- Give every public, externally linked DeuceSSH function the ELF symbol version
-  `DEUCESSH_1.0`. This includes the consumer APIs, crypto/result utilities,
+- Assign every public, externally linked DeuceSSH function the logical interface
+  version 1.0. This includes the consumer APIs, crypto/result utilities,
   algorithm registration/key helpers and exported module-support APIs from all
   installed public headers.
-- Keep the C names unchanged. A default ELF export will appear as, for example,
-  `dssh_session_init@@DEUCESSH_1.0`; ordinary C callers continue to call
-  `dssh_session_init()`.
-- Use one checked-in linker version map with explicit symbol names. Do not use
-  a broad `dssh_*` export wildcard, which would silently assign future additions
-  to the original version. Keep every other definition local with `local: *;`,
-  including private functions, bundled primitives and embedded-provider symbols.
+- Keep application-written C calls unchanged. Headers and link artifacts bind
+  those names to the selected platform representation described below.
+- Keep one explicit public-symbol/interface assignment list, used to produce
+  the native export maps and bindings. On ELF, use `DEUCESSH_1.0` and explicit
+  global names, with `local: *;` for the rest. Do not use a broad `dssh_*`
+  wildcard that silently assigns future additions to the original interface.
+  Keep private functions, bundled primitives and embedded-provider symbols out
+  of the public export set on every platform.
 - Keep imported dependency symbols under their providers' versioning. Public
   macros, constants, inline functions, typedefs and struct layouts have no dynamic
   symbol entry; their compatibility is part of the overall public ABI contract.
@@ -133,9 +153,9 @@ before review.
 | Change | Required treatment |
 | --- | --- |
 | Implementation fix preserving documented behavior for valid uses | Keep existing symbol assignments. Undocumented behavior does not define the supported ABI. |
-| New public function | Add its explicit name to a node for the release introducing it, such as `DEUCESSH_1.1`. Retain existing nodes and definitions. |
-| Backward-compatible extension of an existing function | When callers need to distinguish the extended interface from an older library, provide a new default symbol version and retain the old version. Both versions may use the same implementation if it satisfies both contracts. |
-| Incompatible function signature or documented behavior | Require API review. Where both ABIs can be implemented safely, retain the old versioned entry and provide the new ABI as the default version, using coordinated implementations or wrappers as needed. |
+| New public function | Assign it the interface version of the release introducing it, such as 1.1. Add the corresponding native binding and retain existing assignments and definitions. |
+| Backward-compatible extension of an existing function | When callers need to distinguish the extended interface from an older library, select a new interface version for new links and retain the old binding. Both versions may use the same implementation if it satisfies both contracts. |
+| Incompatible function signature or documented behavior | Require API review. Where both ABIs can be implemented safely, retain the old entry and select the new ABI for new links, using coordinated implementations or wrappers as needed. |
 | Change whose required old ABI cannot be retained | Require API review and a new library ABI identity/SONAME. Public struct layouts, callbacks, ownership and state shared between entry points must be considered together. |
 
 Retain ELF SONAME `libdeucessh.so.1` while the library continues to provide its
@@ -151,10 +171,10 @@ versioning requires the actual old definition to remain available: declaring
 node inheritance alone does not supply it. Keep predecessor relationships in
 the map for clarity, and never remove a published node while retaining that ABI.
 
-Version nodes record interface availability, including extensions to existing
+Interface assignments record availability, including extensions to existing
 functions. They are not mechanically added for every release or automatically
 excluded from patch releases. An implementation-only patch keeps its existing
-assignments. Symbol versions also do not describe SSH wire protocol or algorithm
+assignments. These versions also do not describe SSH wire protocol or algorithm
 negotiation versions.
 
 An exposed struct change cannot be handled merely by attaching a new label to
@@ -166,13 +186,30 @@ representation before claiming that old and new ABIs can coexist.
 | Build | Mechanism |
 | --- | --- |
 | ELF shared libraries, including Linux and FreeBSD | Apply the explicit version map through the actual linker driver. Versioning is required for these shared builds; an unsupported linker must produce a clear configuration failure rather than silently omit it. |
-| macOS shared libraries | Use the dylib identity, compatibility/current versions and controlled exports. Mach-O exports do not carry GNU ELF version nodes; an incompatible replacement needs a distinct native ABI identity unless compatibility is retained another way. |
-| Windows DLLs | Keep the public C export names and explicit export annotations. PE exports do not carry GNU ELF version nodes; an incompatible replacement needs a distinct DLL/import-library identity unless compatibility is retained another way. |
-| Static libraries | Keep ordinary C symbol names. There is no dynamic-loader version table; applications and external modules must use compatible headers, library and provider ABIs. |
+| macOS shared libraries | Use ABI-qualified Mach-O symbol names and declaration aliases, following Apple's symbol-versioning approach. For example, the C spelling `dssh_example()` can bind to `_dssh_example$DSSH_1_0`. A later declaration selects a new qualified name while the dylib retains the old definition. Keep controlled exports and appropriate dylib identity/version metadata as well. |
+| Windows DLLs | Use ABI-qualified PE export names, for example `dssh_example_v1_0`, with public-header aliases selecting the current declaration and its matching import-library symbol. A later header selects the new export while the same DLL retains the old export/adapter. A `.def` file controls export names and mappings; the import library records the selected name. UCRT compatibility and DLL version resources do not provide this binding themselves. |
+| Static libraries | There is no dynamic-loader version table. Any header-selected external name must match an archive definition; applications and external modules must use compatible headers, library and provider ABIs. |
 
-This proposal does not add version suffixes to public C identifiers. The native
-mechanism differs by object format; ELF symbol versioning is not presented as
-available on every platform.
+The proposed macOS/Windows bindings preserve source-level function spelling;
+binary export names are platform-specific. Compiler declaration aliases and
+ordinary C header aliases belong behind the public portability layer. They
+must not expose provider types or alter public C types. For static Windows
+builds, any such header alias must match the archive's definitions as well.
+
+Apple's `__DARWIN_ALIAS` family deliberately selects alternate symbols while
+preserving source-level names, including suffixes such as `$UNIX2003` and
+`$INODE64`. This supplies the relevant macOS precedent; restricting the plan to
+dylib-wide version numbers would miss the required effect. See
+[Apple's declarations and explanation](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/cdefs.h#L788).
+Windows named-export and import-library mapping is documented in Microsoft's
+[EXPORTS reference](https://learn.microsoft.com/en-us/cpp/build/reference/exports)
+and [import-library reference](https://learn.microsoft.com/en-us/cpp/build/reference/building-an-import-library-and-export-file).
+
+Runtime symbol lookups must request an ABI-qualified entry, or explicitly use
+a documented current-default lookup with the matching declaration. On ELF a
+version-aware lookup can select a node; on macOS/Windows the qualified export
+name selects it. Do not silently fall back to an older definition when a
+requested version is unavailable.
 
 ### Consumer link contract
 
@@ -186,24 +223,26 @@ not a substitute for rebuilding against matching headers and libraries.
 
 ### Implementation and acceptance
 
-1. Reconcile the explicit map with the public header declarations and actual
-   shared-library definitions. Make the map a linker dependency so an edit
-   triggers relinking. Preserve existing visibility and dependency isolation.
-2. Check the built ELF library: every expected public definition has the
-   `DEUCESSH_1.0` default version, none is missing or unversioned, and no private
-   definition is exported. Exclude undefined dependency imports from that check.
-3. Build and run a normal installed C17 consumer against the versioned shared
-   library. Inspect its recorded DeuceSSH version requirements. Retain the
-   existing static-consumer and applicable native export checks.
+1. Reconcile the public-symbol assignment list with header declarations and
+   actual shared-library definitions. Make generated export/binding artifacts
+   proper build dependencies. Preserve visibility and dependency isolation.
+2. Check every platform's actual exports and consumer imports. ELF definitions
+   must have the expected node; Mach-O and PE names must encode the selected
+   interface. No public definition may be missing or accidentally unqualified,
+   and no private definition may be exported. Exclude undefined provider imports.
+3. Build and run normal installed C17 consumers against each native shared
+   library. Inspect their recorded bindings. Retain static-consumer checks,
+   including consistency of any header aliases with archive definitions.
 4. Check that a consumer DSO also records its DeuceSSH dependency and versioned
    references. When first introducing a second version of an interface, verify
    that an already-linked consumer keeps its original binding and a newly
    compiled/linked consumer selects the new default. Versioned extensions must
    also reject a provider that lacks the required interface version.
-5. Run the affected existing consumer tests on both crypto backends and the
-   applicable Linux/FreeBSD builds. Keep native macOS/Windows export acceptance
-   distinct from ELF version-table checks. Add later-node acceptance when a
-   release first introduces such a node.
+5. Apply the same old-consumer/new-consumer/provider-missing-interface cases on
+   Linux/FreeBSD, macOS and Windows using their native mechanisms. Run affected
+   existing consumer tests on both crypto backends. Cross-generated object/import
+   tables establish binding syntax only; native CI must establish execution.
+   Introduce later-interface acceptance when the first such change is proposed.
 
 The primary design reference is Drepper's paper, sections 3.1–3.8 (pages 34–39),
 especially the compatible-extension and incompatible-interface examples in

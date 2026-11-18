@@ -100,15 +100,14 @@ lifetime. Cipher and MAC callback signatures have not changed.
 
 ## Build, optional algorithms and examples
 
-Installed Botan-backed package metadata currently requires the exact Botan
-version used to compile DeuceSSH. Upgrading Botan can therefore make a new
-CMake/pkg-config consumer configuration fail until DeuceSSH is rebuilt. This
-branch added that exact-version packaging policy; the source-build minimum
-remains Botan 3.13.0. There is no matching DeuceSSH runtime version check.
-Existing dynamically linked binaries remain subject to their normal shared
-library and ABI dependencies. Botan's [ABI policy](https://botan.randombit.net/handbook/abi.html)
-describes SONAME revisions for ABI changes; full release-version equality is a
-separate constraint imposed by the current DeuceSSH package metadata.
+Botan-backed binaries require an ABI-compatible Botan library, with no exact
+release-version pin in the installed CMake or pkg-config metadata. Compatible
+updates do not require a rebuild just because the release version differs.
+Rebuild DeuceSSH when Botan's ABI changes; the source/API minimum remains
+Botan 3.13.0. Existing dynamically linked binaries retain their normal shared
+library dependencies. Botan's [ABI policy](https://botan.randombit.net/handbook/abi.html)
+describes SONAME revisions for ABI changes. Static-library consumers must also
+link against an ABI-compatible Botan or rebuild DeuceSSH for the new ABI.
 
 The additional optional KEX registrations are
 `dssh_register_dh_group14_sha256()` and

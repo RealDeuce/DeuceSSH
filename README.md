@@ -27,9 +27,9 @@ Built-in algorithms use standardized names; no proprietary extensions are implem
   (libcrypto only — no libssl)
 - **C11 threads** (`<threads.h>`, `<stdatomic.h>`) — used internally only, not exposed in public headers
 
-Botan-backed binary packages require the Botan version used to compile them.
-The installed CMake and pkg-config metadata record that version. Rebuild
-DeuceSSH when changing Botan versions; the source-build minimum remains 3.13.0.
+Botan-backed binaries require an ABI-compatible Botan library. Compatible
+updates do not require an exact release-version match. Rebuild DeuceSSH when
+Botan's ABI changes; the source/API minimum remains 3.13.0.
 
 The version floors above specify source/API compatibility, not a security patch
 level. Deploy a currently supported, security-patched provider (including a

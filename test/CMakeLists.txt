@@ -722,11 +722,6 @@ foreach(model IN ITEMS native u16 u32 u64)
 		"packet_sizes model=${model} width=[0-9]+ checks=[1-9][0-9]* failed=0")
 endforeach()
 
-add_test(NAME dssh_botan_package_metadata COMMAND ${CMAKE_COMMAND}
-	"-DDSSH_SOURCE=${PROJECT_SOURCE_DIR}"
-	"-DDSSH_WORK=${CMAKE_CURRENT_BINARY_DIR}/botan-package-control"
-	-P "${CMAKE_CURRENT_SOURCE_DIR}/test_botan_package.cmake")
-
 # Exercise the exact production time arithmetic under different C type models.
 foreach(model IN ITEMS i16 u16 i32 u32 i64 u64 f32 f64 fwide)
 	if(model STREQUAL "i16")

@@ -1,7 +1,9 @@
 # DeuceSSH — Drepper DSO Best Practices Audit
 
-Audit of the shared library build against Ulrich Drepper's "How To
-Write Shared Libraries" (2002), updated for modern toolchains.
+Audit of the shared library build against Ulrich Drepper's
+[How To Write Shared Libraries](https://www.akkadia.org/drepper/dsohowto.pdf).
+The symbol-versioning draft below was revised after reading the complete
+47-page version 4.1.2, dated December 10, 2011.
 
 The audit below is a historical build snapshot. The
 [symbol-versioning plan](#symbol-versioning-plan) records the proposed v1.0
@@ -130,30 +132,57 @@ before review.
 
 | Change | Required treatment |
 | --- | --- |
-| Implementation fix preserving the public ABI | Keep the existing symbol version and library ABI major. |
-| New public function in a minor release | Add its explicit name to a node such as `DEUCESSH_1.1`, inheriting from the preceding node. Existing symbols keep their original assignments. |
-| Later patch release | Keep symbol assignments unchanged; version nodes do not follow patch numbers. |
-| Incompatible signature, calling convention, exposed struct layout or public contract | Require API review and a new library ABI major. The next major starts its own baseline, such as `DEUCESSH_2.0`; symbol versioning alone does not make an incompatible public struct usable. |
+| Implementation fix preserving documented behavior for valid uses | Keep existing symbol assignments. Undocumented behavior does not define the supported ABI. |
+| New public function | Add its explicit name to a node for the release introducing it, such as `DEUCESSH_1.1`. Retain existing nodes and definitions. |
+| Backward-compatible extension of an existing function | When callers need to distinguish the extended interface from an older library, provide a new default symbol version and retain the old version. Both versions may use the same implementation if it satisfies both contracts. |
+| Incompatible function signature or documented behavior | Require API review. Where both ABIs can be implemented safely, retain the old versioned entry and provide the new ABI as the default version, using coordinated implementations or wrappers as needed. |
+| Change whose required old ABI cannot be retained | Require API review and a new library ABI identity/SONAME. Public struct layouts, callbacks, ownership and state shared between entry points must be considered together. |
 
-For ABI major 1, retain ELF SONAME `libdeucessh.so.1` across compatible minor and
-patch releases while the full library filename follows the release version.
-Adding a minor version node lets the linker record which new interface a
-consumer actually uses. Do not reassign old functions merely because their
-implementation changed. A symbol-version node does not describe SSH wire
-protocol or negotiated algorithm versions.
+Retain ELF SONAME `libdeucessh.so.1` while the library continues to provide its
+published ABIs. A release/API version increase does not itself require a SONAME
+change. The current CMake coupling of SOVERSION to PROJECT_VERSION_MAJOR must
+therefore be separated when implementing this policy. The full library filename
+can continue to follow the package release version.
+
+For an existing function with two ABIs, the old entry has a nondefault version
+such as `function@DEUCESSH_1.0`; new links select the single default, such as
+`function@@DEUCESSH_1.1`. Existing binaries retain their old binding. GNU-style
+versioning requires the actual old definition to remain available: declaring
+node inheritance alone does not supply it. Keep predecessor relationships in
+the map for clarity, and never remove a published node while retaining that ABI.
+
+Version nodes record interface availability, including extensions to existing
+functions. They are not mechanically added for every release or automatically
+excluded from patch releases. An implementation-only patch keeps its existing
+assignments. Symbol versions also do not describe SSH wire protocol or algorithm
+negotiation versions.
+
+An exposed struct change cannot be handled merely by attaching a new label to
+one function. Review every entry point and callback that exchanges the affected
+representation before claiming that old and new ABIs can coexist.
 
 ### Platform and build scope
 
 | Build | Mechanism |
 | --- | --- |
 | ELF shared libraries, including Linux and FreeBSD | Apply the explicit version map through the actual linker driver. Versioning is required for these shared builds; an unsupported linker must produce a clear configuration failure rather than silently omit it. |
-| macOS shared libraries | Apply the same public ABI policy through the dylib identity, compatibility/current versions and controlled exports. Mach-O exports do not carry GNU ELF version nodes. |
-| Windows DLLs | Keep the public C export names and explicit export annotations. A future incompatible ABI major must use a distinct DLL/import-library identity. PE exports do not carry GNU ELF version nodes. |
+| macOS shared libraries | Use the dylib identity, compatibility/current versions and controlled exports. Mach-O exports do not carry GNU ELF version nodes; an incompatible replacement needs a distinct native ABI identity unless compatibility is retained another way. |
+| Windows DLLs | Keep the public C export names and explicit export annotations. PE exports do not carry GNU ELF version nodes; an incompatible replacement needs a distinct DLL/import-library identity unless compatibility is retained another way. |
 | Static libraries | Keep ordinary C symbol names. There is no dynamic-loader version table; applications and external modules must use compatible headers, library and provider ABIs. |
 
 This proposal does not add version suffixes to public C identifiers. The native
 mechanism differs by object format; ELF symbol versioning is not presented as
 available on every platform.
+
+### Consumer link contract
+
+Headers and the library used for the final link must describe the same current
+API. Consumers, including other DSOs, must link against DeuceSSH explicitly so
+the linker can record symbol-version requirements. Do not leave DeuceSSH calls
+unresolved in the expectation that a later load will establish their versions.
+Normal relocatable consumer objects acquire these requirements at final link;
+reusing objects compiled for an older API with a newer default definition is
+not a substitute for rebuilding against matching headers and libraries.
 
 ### Implementation and acceptance
 
@@ -166,10 +195,21 @@ available on every platform.
 3. Build and run a normal installed C17 consumer against the versioned shared
    library. Inspect its recorded DeuceSSH version requirements. Retain the
    existing static-consumer and applicable native export checks.
-4. Run the affected existing consumer tests on both crypto backends and the
+4. Check that a consumer DSO also records its DeuceSSH dependency and versioned
+   references. When first introducing a second version of an interface, verify
+   that an already-linked consumer keeps its original binding and a newly
+   compiled/linked consumer selects the new default. Versioned extensions must
+   also reject a provider that lacks the required interface version.
+5. Run the affected existing consumer tests on both crypto backends and the
    applicable Linux/FreeBSD builds. Keep native macOS/Windows export acceptance
    distinct from ELF version-table checks. Add later-node acceptance when a
    release first introduces such a node.
 
-The linker syntax and node-inheritance behavior follow the
-[GNU linker VERSION documentation](https://sourceware.org/binutils/docs/ld/VERSION.html).
+The primary design reference is Drepper's paper, sections 3.1–3.8 (pages 34–39),
+especially the compatible-extension and incompatible-interface examples in
+sections 3.5 and 3.7. Export maps supplement compiler visibility annotations as
+described in sections 2.2.2–2.2.5. The
+[GNU linker VERSION documentation](https://sourceware.org/binutils/docs/ld/VERSION.html)
+provides the linker syntax; it does not determine this project's compatibility
+policy. The paper's historical platform/compiler observations require checking
+against the toolchains actually supported when implementing the plan.

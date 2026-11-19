@@ -1,3 +1,4 @@
+#include "deucessh-algorithms.h"
 #include "hmac-openssl.h"
 
 #define HMAC_SHA2_512_DIGEST_SIZE 64

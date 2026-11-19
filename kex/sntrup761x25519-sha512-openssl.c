@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "deucessh-algorithms.h"
 #include "deucessh-crypto.h"
 #include "deucessh-kex.h"
 #include "deucessh.h"

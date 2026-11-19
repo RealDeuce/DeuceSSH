@@ -1,6 +1,7 @@
 /* RFC 8268 fixed RFC 3526 groups, with the RFC 4253 DH wire exchange. */
 #include <stdlib.h>
 #include <string.h>
+#include "deucessh-algorithms.h"
 #include "deucessh-kex.h"
 #include "deucessh.h"
 #include "dh-gex-groups.h"

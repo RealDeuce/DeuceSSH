@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "deucessh-algorithms.h"
 #include "deucessh-mac.h"
 #include "deucessh.h"
 #ifdef DSSH_TESTING

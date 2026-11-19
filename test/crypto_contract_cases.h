@@ -129,21 +129,28 @@ test_contract_hash_rejections(void)
 		for (unsigned repeat = 0; repeat < 4 && matched; repeat++) {
 			uint8_t out[96];
 			memset(out, 0xa5, sizeof(out));
+#ifdef DSSH_TEST_LAYOUT
+			/* Only the instrumented library redirects its allocations. */
 			dssh_test_alloc_fail_after(0);
+#endif
 			matched = dssh_hash_update(ctx, abc, sizeof(abc)) == 0
 			    && dssh_hash_update(ctx, NULL, 1) == DSSH_ERROR_INVALID
 			    && dssh_hash_final(ctx, out + 8, length - 1) == DSSH_ERROR_INVALID
 			    && crypto_filled(out, sizeof(out), 0xa5)
-			    && dssh_hash_final(ctx, out + 8, length) == 0
-			    && dssh_test_alloc_count() == 0;
+			    && dssh_hash_final(ctx, out + 8, length) == 0;
+#ifdef DSSH_TEST_LAYOUT
+			matched = matched && dssh_test_alloc_count() == 0;
 			dssh_test_alloc_reset();
+#endif
 			uint8_t expected[64];
 			matched = matched && dssh_hash_oneshot(crypto_answers[a].name, abc, sizeof(abc),
 			    expected, sizeof(expected)) == 0 && memcmp(out + 8, expected, length) == 0
 			    && crypto_filled(out, 8, 0xa5)
 			    && crypto_filled(out + 8 + length, sizeof(out) - 8 - length, 0xa5);
 		}
+#ifdef DSSH_TEST_LAYOUT
 		dssh_test_alloc_reset();
+#endif
 		dssh_hash_free(ctx);
 		valid = valid && matched;
 	}

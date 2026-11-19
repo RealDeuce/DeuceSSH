@@ -1,6 +1,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "deucessh-algorithms.h"
 #include "deucessh-comp.h"
 #include "deucessh.h"
 #ifdef DSSH_TESTING

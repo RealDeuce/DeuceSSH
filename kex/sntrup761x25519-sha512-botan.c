@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "deucessh-algorithms.h"
 #include "deucessh-kex.h"
 #include "hybrid-pq-kex-ops.h"
 #include "deucessh.h"

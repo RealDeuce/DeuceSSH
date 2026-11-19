@@ -422,6 +422,8 @@ target_compile_options(deucessh_test_lib PRIVATE
 
 # Mock I/O library
 add_library(dssh_mock_io STATIC mock_io.c)
+# Strict C17 hides SSIZE_MAX on glibc; retain the native socket extensions too.
+target_compile_definitions(dssh_mock_io PRIVATE _DEFAULT_SOURCE)
 set_property(TARGET dssh_mock_io PROPERTY C_STANDARD ${DEUCESSH_C_STANDARD})
 set_property(TARGET dssh_mock_io PROPERTY C_STANDARD_REQUIRED ON)
 target_include_directories(dssh_mock_io PUBLIC
@@ -792,6 +794,7 @@ if(UNIX)
 	get_target_property(mock_io_definitions dssh_test_mock_io COMPILE_DEFINITIONS)
 	list(FILTER mock_io_definitions EXCLUDE REGEX "_POSIX_C_SOURCE")
 	set_property(TARGET dssh_test_mock_io PROPERTY COMPILE_DEFINITIONS "${mock_io_definitions}")
+	target_compile_definitions(dssh_test_mock_io PRIVATE _DEFAULT_SOURCE)
 endif()
 dssh_add_test(framework test_framework.c)
 dssh_add_test(assertions test_assertions.c)

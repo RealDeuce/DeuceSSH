@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "deucessh-algorithms.h"
 #include "curve25519-sha256-ops.h"
 #include "deucessh-kex.h"
 #include "deucessh.h"

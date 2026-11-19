@@ -16,7 +16,7 @@
 #include "private-key-file.h"
 #include "key-context-openssl.h"
 #include "key-wire.h"
-#include "key-file-common.h"
+#include "key-file-openssl.h"
 #include "key-text.h"
 #define DSSH_RSA_CACHE_OPENSSL
 #include "key-rsa-cache.h"
@@ -354,7 +354,7 @@ dssh_rsa_sha2_256_load_key_file(const char *path, dssh_pem_password_cb pw_cb, vo
 	if (stream_ret < 0)
 		return stream_ret;
 	struct dssh_key_file_password_state password = {pw_cb, pw_cbdata, 0};
-	EVP_PKEY *pkey = PEM_read_PrivateKey(fp, NULL, dssh_key_file_password, &password);
+	EVP_PKEY *pkey = dssh_key_file_read_private(fp, &password);
 	int closed = dssh_key_file_stream_close(&stream, 0);
 	if (closed < 0 || pkey == NULL || password.status < 0) {
 		EVP_PKEY_free(pkey);
@@ -416,7 +416,7 @@ dssh_rsa_sha2_256_save_key_file(const char *path, dssh_pem_password_cb pw_cb, vo
 		}
 	}
 	struct dssh_key_file_password_state password = {pw_cb, pw_cbdata, 0};
-	int ok = PEM_write_PrivateKey(fp, pkey, cipher, NULL, 0, dssh_key_file_password, &password);
+	int ok = dssh_key_file_write_private(fp, pkey, cipher, &password);
 
 	EVP_CIPHER_free(cipher);
 	EVP_PKEY_free(pkey);

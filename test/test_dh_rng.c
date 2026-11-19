@@ -136,13 +136,18 @@ main(int argc, char **argv)
 #ifdef DSSH_DH_RNG_INJECT
 			struct dssh_test_bn_random_stats observed = dssh_test_ossl_bn_random_end(true);
 			watching = false;
-			CHECK(observed.calls == 1 && observed.strength == 256
-			    && observed.range_bits > 0 && observed.context_present && observed.constant_time
-			    && observed.native_called == (selected != 1)
-			    && observed.native_completed == (strength == 256 && selected != 1)
-			    && observed.in_range == observed.native_completed && observed.cleared);
-			unsigned int range_bits = (unsigned int)observed.range_bits;
-			CHECK(range_bits == group->bits - 1);
+			if (strength == 256) {
+				CHECK(observed.calls == 1 && observed.strength == 256
+				    && observed.range_bits > 0 && observed.context_present && observed.constant_time
+				    && observed.native_called == (selected != 1)
+				    && observed.native_completed == (selected != 1)
+				    && observed.in_range == observed.native_completed && observed.cleared);
+				unsigned int range_bits = (unsigned int)observed.range_bits;
+				CHECK(range_bits == group->bits - 1);
+			}
+			else {
+				CHECK(observed.calls == 0 && !observed.native_called && !observed.native_completed);
+			}
 #endif
 			/* Both failure and successful derivation retire readiness. */
 			memset(secret, 0xa5, sizeof(secret));

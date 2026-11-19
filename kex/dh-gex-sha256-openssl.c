@@ -1,5 +1,6 @@
 /* RFC 4419: retained native DH containers; fresh exponent for every exchange. */
 #include <openssl/bn.h>
+#include <openssl/rand.h>
 #include <stdlib.h>
 #include <string.h>
 #include "deucessh-algorithms.h"
@@ -146,6 +147,14 @@ ossl_keygen(void *opaque, const uint8_t *p, size_t plen, const uint8_t *g, size_
 	int ret = dhgex_validate_group(state->p, state->g, scratch, p, plen, g, glen);
 	if (ret < 0)
 		goto done;
+	/* OpenSSL 3.0 releases ignore the requested strength on one range-
+	 * sampling path. Check the same default private DRBG used by scratch
+	 * before accepting any exponent from BN_priv_rand_range_ex. */
+	EVP_RAND_CTX *random = RAND_get0_private(NULL);
+	if (random == NULL || EVP_RAND_get_strength(random) < 256) {
+		ret = DSSH_ERROR_INIT;
+		goto done;
+	}
 	if (BN_rshift1(state->range, state->p) != 1 || BN_sub_word(state->range, 2) != 1
 	    || BN_priv_rand_range_ex(state->exponent, state->range, 256, scratch) != 1
 	    || BN_add_word(state->exponent, 2) != 1) {

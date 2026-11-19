@@ -108,6 +108,10 @@ evaluate(const struct dssh_acvp_case *test, const struct dssh_acvp_decoded *byte
 			catch (const Botan::Decoding_Error&) {
 				return !test->valid;
 			}
+			catch (const Botan::Invalid_Argument&) {
+				/* Botan 3.13 uses this for an inconsistent stored public-key hash. */
+				return !test->valid;
+			}
 		}
 	}
 	catch (const std::exception& error) {

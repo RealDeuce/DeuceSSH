@@ -68,7 +68,7 @@ typedef struct dssh_comp_s {
  * Failed registration leaves the entry with its caller. */
 /* Application-serialized global setup; finish before the first session-init
  * attempt. Descriptor/name/code stay borrowed for process lifetime. */
-DSSH_PUBLIC int dssh_transport_register_comp(dssh_comp comp);
+DSSH_PUBLIC int dssh_transport_register_comp(dssh_comp comp) DSSH_ABI(dssh_transport_register_comp);
 
 #ifdef __cplusplus
 }

@@ -31,7 +31,7 @@ typedef struct dssh_channel_s *dssh_channel;
 /*
  * Start the demux thread.  Call after handshake and auth are complete.
  */
-DSSH_PUBLIC int dssh_session_start(dssh_session sess);
+DSSH_PUBLIC int dssh_session_start(dssh_session sess) DSSH_ABI(dssh_session_start);
 
 /*
  * Stop the demux thread and free all channel/demux resources.
@@ -43,7 +43,7 @@ DSSH_PUBLIC int dssh_session_start(dssh_session sess);
  * termination; call stop again outside that context to release resources.
  * Callback restrictions documented in deucessh.h still apply.
  */
-DSSH_PUBLIC void dssh_session_stop(dssh_session sess);
+DSSH_PUBLIC void dssh_session_stop(dssh_session sess) DSSH_ABI(dssh_session_stop);
 
 /* ================================================================
  * Channel types and builder functions.
@@ -117,19 +117,19 @@ struct dssh_chan_params {
 
 /* Params builder API.  All strings are copied in.
  * dssh_chan_params_free() releases heap storage. */
-DSSH_PUBLIC int  dssh_chan_params_init(struct dssh_chan_params *p, enum dssh_chan_type type);
-DSSH_PUBLIC void dssh_chan_params_free(struct dssh_chan_params *p);
-DSSH_PUBLIC int  dssh_chan_params_set_max_window(struct dssh_chan_params *p, uint32_t max_window);
-DSSH_PUBLIC int  dssh_chan_params_set_pty(struct dssh_chan_params *p, bool enable);
-DSSH_PUBLIC int  dssh_chan_params_set_accept_early_data(struct dssh_chan_params *p, bool enable);
-DSSH_PUBLIC int  dssh_chan_params_set_term(struct dssh_chan_params *p, const char *term);
+DSSH_PUBLIC int  dssh_chan_params_init(struct dssh_chan_params *p, enum dssh_chan_type type) DSSH_ABI(dssh_chan_params_init);
+DSSH_PUBLIC void dssh_chan_params_free(struct dssh_chan_params *p) DSSH_ABI(dssh_chan_params_free);
+DSSH_PUBLIC int  dssh_chan_params_set_max_window(struct dssh_chan_params *p, uint32_t max_window) DSSH_ABI(dssh_chan_params_set_max_window);
+DSSH_PUBLIC int  dssh_chan_params_set_pty(struct dssh_chan_params *p, bool enable) DSSH_ABI(dssh_chan_params_set_pty);
+DSSH_PUBLIC int  dssh_chan_params_set_accept_early_data(struct dssh_chan_params *p, bool enable) DSSH_ABI(dssh_chan_params_set_accept_early_data);
+DSSH_PUBLIC int  dssh_chan_params_set_term(struct dssh_chan_params *p, const char *term) DSSH_ABI(dssh_chan_params_set_term);
 DSSH_PUBLIC int  dssh_chan_params_set_size(struct dssh_chan_params *p, uint32_t cols, uint32_t rows, uint32_t wpx,
-     uint32_t hpx);
-DSSH_PUBLIC int  dssh_chan_params_set_mode(struct dssh_chan_params *p, uint8_t opcode, uint32_t value);
-DSSH_PUBLIC int  dssh_chan_params_set_command(struct dssh_chan_params *p, const char *command);
-DSSH_PUBLIC int  dssh_chan_params_set_subsystem(struct dssh_chan_params *p, const char *name);
+     uint32_t hpx) DSSH_ABI(dssh_chan_params_set_size);
+DSSH_PUBLIC int  dssh_chan_params_set_mode(struct dssh_chan_params *p, uint8_t opcode, uint32_t value) DSSH_ABI(dssh_chan_params_set_mode);
+DSSH_PUBLIC int  dssh_chan_params_set_command(struct dssh_chan_params *p, const char *command) DSSH_ABI(dssh_chan_params_set_command);
+DSSH_PUBLIC int  dssh_chan_params_set_subsystem(struct dssh_chan_params *p, const char *name) DSSH_ABI(dssh_chan_params_set_subsystem);
 /* Env requests are sent with want_reply=false; peer acceptance is not reported. */
-DSSH_PUBLIC int  dssh_chan_params_add_env(struct dssh_chan_params *p, const char *name, const char *value);
+DSSH_PUBLIC int  dssh_chan_params_add_env(struct dssh_chan_params *p, const char *name, const char *value) DSSH_ABI(dssh_chan_params_add_env);
 
 /* Event poll flag (in addition to DSSH_POLL_READ etc.) */
 #define DSSH_POLL_EVENT 0x10
@@ -241,7 +241,7 @@ struct dssh_chan_accept_result {
 /* Open a stream-mode channel.  Performs the full setup sequence:
  * CHANNEL_OPEN, env, pty-req, shell/exec/subsystem, WINDOW_ADJUST.
  * Returns the channel on success, NULL on failure. */
-DSSH_PUBLIC dssh_channel dssh_chan_open(dssh_session sess, const struct dssh_chan_params *params);
+DSSH_PUBLIC dssh_channel dssh_chan_open(dssh_session sess, const struct dssh_chan_params *params) DSSH_ABI(dssh_chan_open);
 
 /* Stream I/O.  stream: 0=stdout/stdin, 1=stderr.
  *
@@ -271,8 +271,8 @@ DSSH_PUBLIC dssh_channel dssh_chan_open(dssh_session sess, const struct dssh_cha
  *
  * Peek: dssh_chan_read(ch, stream, NULL, 0) returns available bytes
  * (always >= 0; never NOMORE). */
-DSSH_PUBLIC int64_t dssh_chan_read(dssh_channel ch, int stream, uint8_t *buf, size_t bufsz);
-DSSH_PUBLIC int64_t dssh_chan_write(dssh_channel ch, int stream, const uint8_t *buf, size_t bufsz);
+DSSH_PUBLIC int64_t dssh_chan_read(dssh_channel ch, int stream, uint8_t *buf, size_t bufsz) DSSH_ABI(dssh_chan_read);
+DSSH_PUBLIC int64_t dssh_chan_write(dssh_channel ch, int stream, const uint8_t *buf, size_t bufsz) DSSH_ABI(dssh_chan_write);
 /*
  * Wait until any of the requested events fire, or until timeout_ms
  * elapses (negative = wait forever, 0 = non-blocking peek).
@@ -292,16 +292,16 @@ DSSH_PUBLIC int64_t dssh_chan_write(dssh_channel ch, int stream, const uint8_t *
  *
  * Returns DSSH_ERROR_INVALID for a NULL or non-stream channel.
  */
-DSSH_PUBLIC int     dssh_chan_poll(dssh_channel ch, int events, int timeout_ms);
+DSSH_PUBLIC int     dssh_chan_poll(dssh_channel ch, int events, int timeout_ms) DSSH_ABI(dssh_chan_poll);
 
 /* Read the next frozen event (from the most recent poll with
  * DSSH_POLL_EVENT).  Returns 0 on success, DSSH_ERROR_NOMORE if
  * no event is frozen.  String pointers in the event are valid
  * until the next dssh_chan_read_event or dssh_chan_poll call. */
-DSSH_PUBLIC int dssh_chan_read_event(dssh_channel ch, struct dssh_chan_event *event);
+DSSH_PUBLIC int dssh_chan_read_event(dssh_channel ch, struct dssh_chan_event *event) DSSH_ABI(dssh_chan_read_event);
 
 /* Half-close: send EOF, keep reading. */
-DSSH_PUBLIC int dssh_chan_shutwr(dssh_channel ch);
+DSSH_PUBLIC int dssh_chan_shutwr(dssh_channel ch) DSSH_ABI(dssh_chan_shutwr);
 
 /* Close and consume the channel handle. On a server, exit_code in
  * [0, UINT32_MAX] selects an exit-status packet. Every other int64_t value
@@ -319,21 +319,21 @@ DSSH_PUBLIC int dssh_chan_shutwr(dssh_channel ch);
  * Zero does not acknowledge packet delivery, peer receipt or remote completion.
  * In a server setup callback this records cancellation and returns 0;
  * physical retirement is deferred until the callback returns. See below. */
-DSSH_PUBLIC int dssh_chan_close(dssh_channel ch, int64_t exit_code);
+DSSH_PUBLIC int dssh_chan_close(dssh_channel ch, int64_t exit_code) DSSH_ABI(dssh_chan_close);
 
 /* Control: signal, window-change, break (RFC 4335). */
-DSSH_PUBLIC int dssh_chan_send_signal(dssh_channel ch, const char *signal_name);
+DSSH_PUBLIC int dssh_chan_send_signal(dssh_channel ch, const char *signal_name) DSSH_ABI(dssh_chan_send_signal);
 DSSH_PUBLIC int dssh_chan_send_window_change(dssh_channel ch, uint32_t cols, uint32_t rows, uint32_t wpx,
-    uint32_t hpx);
-DSSH_PUBLIC int dssh_chan_send_break(dssh_channel ch, uint32_t length);
+    uint32_t hpx) DSSH_ABI(dssh_chan_send_window_change);
+DSSH_PUBLIC int dssh_chan_send_break(dssh_channel ch, uint32_t length) DSSH_ABI(dssh_chan_send_break);
 
 /* Getters -- valid after open or accept until close, and on the borrowed
  * handle during its server setup callback as described below. */
-DSSH_PUBLIC enum dssh_chan_type            dssh_chan_get_type(dssh_channel ch);
-DSSH_PUBLIC const char                    *dssh_chan_get_command(dssh_channel ch);
-DSSH_PUBLIC const char                    *dssh_chan_get_subsystem(dssh_channel ch);
-DSSH_PUBLIC bool                           dssh_chan_has_pty(dssh_channel ch);
-DSSH_PUBLIC const struct dssh_chan_params *dssh_chan_get_pty(dssh_channel ch);
+DSSH_PUBLIC enum dssh_chan_type            dssh_chan_get_type(dssh_channel ch) DSSH_ABI(dssh_chan_get_type);
+DSSH_PUBLIC const char                    *dssh_chan_get_command(dssh_channel ch) DSSH_ABI(dssh_chan_get_command);
+DSSH_PUBLIC const char                    *dssh_chan_get_subsystem(dssh_channel ch) DSSH_ABI(dssh_chan_get_subsystem);
+DSSH_PUBLIC bool                           dssh_chan_has_pty(dssh_channel ch) DSSH_ABI(dssh_chan_has_pty);
+DSSH_PUBLIC const struct dssh_chan_params *dssh_chan_get_pty(dssh_channel ch) DSSH_ABI(dssh_chan_get_pty);
 
 /* ---- Zero-copy API ---- */
 
@@ -341,45 +341,45 @@ DSSH_PUBLIC const struct dssh_chan_params *dssh_chan_get_pty(dssh_channel ch);
  * inbound CHANNEL_DATA/EXTENDED_DATA with a pointer directly into
  * rx_packet.  The callback MUST NOT call any TX function. */
 DSSH_PUBLIC dssh_channel dssh_chan_zc_open(dssh_session sess, const struct dssh_chan_params *params,
-    dssh_chan_zc_cb cb, void *cbdata);
+    dssh_chan_zc_cb cb, void *cbdata) DSSH_ABI(dssh_chan_zc_open);
 
 /* Get pointer into the packet-engine data area.  Reserves exclusive TX ownership
  * without retaining a mutex across the caller's fill interval.
  * Caller MUST call dssh_chan_zc_send or dssh_chan_zc_cancel promptly. */
-DSSH_PUBLIC int dssh_chan_zc_getbuf(dssh_channel ch, int stream, uint8_t **buf, size_t *max_len);
+DSSH_PUBLIC int dssh_chan_zc_getbuf(dssh_channel ch, int stream, uint8_t **buf, size_t *max_len) DSSH_ABI(dssh_chan_zc_getbuf);
 
 /* Fill channel header, MAC, encrypt, send.  Releases TX ownership. */
-DSSH_PUBLIC int dssh_chan_zc_send(dssh_channel ch, size_t len);
+DSSH_PUBLIC int dssh_chan_zc_send(dssh_channel ch, size_t len) DSSH_ABI(dssh_chan_zc_send);
 
 /* Release TX ownership without sending. */
-DSSH_PUBLIC int dssh_chan_zc_cancel(dssh_channel ch);
+DSSH_PUBLIC int dssh_chan_zc_cancel(dssh_channel ch) DSSH_ABI(dssh_chan_zc_cancel);
 
 /* ---- Event callbacks (optional, alternative to poll + read_event) ---- */
 /* Replaces the callback/cbdata pair used by future delivery snapshots. An
  * already snapshotted invocation may finish after this setter returns: keep
  * its code and cbdata alive until it finishes. Existing queued/frozen poll
  * events remain available; setting NULL routes future events to that queue. */
-DSSH_PUBLIC int dssh_chan_set_event_cb(dssh_channel ch, dssh_chan_event_cb cb, void *cbdata);
+DSSH_PUBLIC int dssh_chan_set_event_cb(dssh_channel ch, dssh_chan_event_cb cb, void *cbdata) DSSH_ABI(dssh_chan_set_event_cb);
 
 /* Must be set before dssh_session_start(); returns DSSH_ERROR_TOOLATE
  * after start.  Copied to each new channel at open/accept time. */
-DSSH_PUBLIC int dssh_session_set_event_cb(dssh_session sess, dssh_chan_event_cb cb, void *cbdata);
+DSSH_PUBLIC int dssh_session_set_event_cb(dssh_session sess, dssh_chan_event_cb cb, void *cbdata) DSSH_ABI(dssh_session_set_event_cb);
 
 /* BREAK handler replacement uses the same captured callback/data lifetime
  * rules as event callback replacement. A captured invocation may finish after
  * replacement returns; keep its code/data alive until it finishes. */
-DSSH_PUBLIC int dssh_chan_set_break_cb(dssh_channel ch, dssh_chan_break_cb cb, void *cbdata);
+DSSH_PUBLIC int dssh_chan_set_break_cb(dssh_channel ch, dssh_chan_break_cb cb, void *cbdata) DSSH_ABI(dssh_chan_set_break_cb);
 
 /* Set before session start; returns DSSH_ERROR_TOOLATE afterwards.
  * Copied to newly opened/accepted channels. */
-DSSH_PUBLIC int dssh_session_set_break_cb(dssh_session sess, dssh_chan_break_cb cb, void *cbdata);
+DSSH_PUBLIC int dssh_session_set_break_cb(dssh_session sess, dssh_chan_break_cb cb, void *cbdata) DSSH_ABI(dssh_session_set_break_cb);
 
 /* ---- Event queue limits ---- */
 
 /* Set the maximum number of queued events per channel (default 64).
  * Session-level: must be set before dssh_session_start(); applies to
  * all channels created after this call. */
-DSSH_PUBLIC int dssh_session_set_max_events(dssh_session sess, size_t max_events);
+DSSH_PUBLIC int dssh_session_set_max_events(dssh_session sess, size_t max_events) DSSH_ABI(dssh_session_set_max_events);
 
 /* Per-channel override.  Returns DSSH_ERROR_INVALID if max_events is
  * less than the current number of queued events (drain events first).
@@ -389,7 +389,7 @@ DSSH_PUBLIC int dssh_session_set_max_events(dssh_session sess, size_t max_events
  * slots, plus frozen/replacement storage and ring metadata. Exceeding this
  * envelope closes the channel as for count overflow. Lowering a limit does not
  * evict events or immediately discard reusable storage. */
-DSSH_PUBLIC int dssh_chan_set_max_events(dssh_channel ch, size_t max_events);
+DSSH_PUBLIC int dssh_chan_set_max_events(dssh_channel ch, size_t max_events) DSSH_ABI(dssh_chan_set_max_events);
 
 /* Server accept callbacks run on the thread calling dssh_chan_accept(),
  * with no library mutex held. ch and params are borrowed for the invocation;
@@ -423,7 +423,7 @@ struct dssh_chan_accept_cbs {
  * fully set up (terminal request accepted) or timeout/error.
  * Returns the channel on success, NULL on failure. */
 DSSH_PUBLIC dssh_channel dssh_chan_accept(dssh_session sess, const struct dssh_chan_accept_cbs *cbs,
-    int timeout_ms);
+    int timeout_ms) DSSH_ABI(dssh_chan_accept);
 
 #ifdef __cplusplus
 }

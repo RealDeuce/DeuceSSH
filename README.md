@@ -57,6 +57,14 @@ cmake --build build -j8
 
 Produces `libdeucessh.a` (static) and `libdeucessh.so` (shared).
 The v1.0 package version is 1.0.0 and the shared-library ABI major is 1.
+All public functions have interface version 1.0: ELF uses `DEUCESSH_1.0`;
+macOS and Windows bind to names ending in `_v1_0`. Ordinary C calls keep their
+existing spelling through the public headers. Install `deucessh-abi.h` with
+the other headers, and rebuild pre-1.0 consumers. Link DeuceSSH explicitly at
+the final consumer link so its ABI requirements are recorded. See the
+[ABI policy](docs/audit-dsohowto.md#symbol-versioning-plan).
+On MSVC the static archive is `deucessh-static.lib`; `deucessh.lib` is the DLL
+import library. The CMake static/shared target names remain unchanged.
 `cmake --install build --prefix <prefix>` installs headers, libraries, CMake/
 pkg-config metadata and the project/bundled-code notices in
 `share/licenses/deucessh/LICENSE.md` (using the configured install data directory).

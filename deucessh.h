@@ -220,10 +220,10 @@ typedef dssh_hostkey_decision (*dssh_hostkey_verify_cb)(const char *algo_name, u
  * DSSH_ERROR_* code on failure (DSSH_ERROR_INVALID if buf or
  * val is NULL, DSSH_ERROR_PARSE if bufsz < 4).
  */
-DSSH_PUBLIC int64_t dssh_parse_uint32(const uint8_t *buf, size_t bufsz, uint32_t *val);
+DSSH_PUBLIC int64_t dssh_parse_uint32(const uint8_t *buf, size_t bufsz, uint32_t *val) DSSH_ABI(dssh_parse_uint32);
 
 /* Generic, static-storage description of a DSSH_ERROR_* value. */
-DSSH_PUBLIC const char *dssh_strerror(int error_code);
+DSSH_PUBLIC const char *dssh_strerror(int error_code) DSSH_ABI(dssh_strerror);
 
 /*
  * Serialize val as a big-endian uint32 into buf at offset *pos.
@@ -233,7 +233,7 @@ DSSH_PUBLIC const char *dssh_strerror(int error_code);
  * DSSH_ERROR_TOOLONG if the buffer has fewer than 4 bytes remaining
  * at *pos). The buffer and position are unchanged on failure.
  */
-DSSH_PUBLIC int dssh_serialize_uint32(uint32_t val, uint8_t *buf, size_t bufsz, size_t *pos);
+DSSH_PUBLIC int dssh_serialize_uint32(uint32_t val, uint8_t *buf, size_t bufsz, size_t *pos) DSSH_ABI(dssh_serialize_uint32);
 
 /* Process-global setup is application-serialized: complete all registration,
  * global callback/version/context setters and builtin key replacement before
@@ -253,7 +253,7 @@ DSSH_PUBLIC int dssh_serialize_uint32(uint32_t val, uint8_t *buf, size_t bufsz, 
  * packet buffers sized to max_packet_size (pass 0 for the RFC
  * minimum of 33280 bytes).  Returns NULL on failure.
  */
-DSSH_PUBLIC dssh_session dssh_session_init(bool client, size_t max_packet_size);
+DSSH_PUBLIC dssh_session dssh_session_init(bool client, size_t max_packet_size) DSSH_ABI(dssh_session_init);
 
 /*
  * Signal a session to terminate.  Sets terminate flag and returns true
@@ -262,12 +262,12 @@ DSSH_PUBLIC dssh_session dssh_session_init(bool client, size_t max_packet_size);
  * condition-variable wakeups run synchronously on the calling thread.
  * Failure of a required internal termination wake calls abort().
  */
-DSSH_PUBLIC bool dssh_session_terminate(dssh_session sess);
+DSSH_PUBLIC bool dssh_session_terminate(dssh_session sess) DSSH_ABI(dssh_session_terminate);
 
 /*
  * Check whether a session has been terminated.
  */
-DSSH_PUBLIC bool dssh_session_is_terminated(dssh_session sess);
+DSSH_PUBLIC bool dssh_session_is_terminated(dssh_session sess) DSSH_ABI(dssh_session_is_terminated);
 
 /*
  * Clean up and free all session resources.  Calls terminate if needed.
@@ -283,7 +283,7 @@ DSSH_PUBLIC bool dssh_session_is_terminated(dssh_session sess);
  * call cleanup again after the callback/reservation ends. I/O callback and
  * other callback restrictions still apply.
  */
-DSSH_PUBLIC void dssh_session_cleanup(dssh_session sess);
+DSSH_PUBLIC void dssh_session_cleanup(dssh_session sess) DSSH_ABI(dssh_session_cleanup);
 
 /*
  * Securely scrub a memory buffer (e.g. a password).
@@ -291,7 +291,7 @@ DSSH_PUBLIC void dssh_session_cleanup(dssh_session sess);
  * to link against OpenSSL.  Do not realloc() password buffers --
  * the old allocation won't be scrubbed.
  */
-DSSH_PUBLIC void dssh_cleanse(void *buf, size_t len);
+DSSH_PUBLIC void dssh_cleanse(void *buf, size_t len) DSSH_ABI(dssh_cleanse);
 
 /*
  * Per-session I/O callback data (passed to the global I/O callbacks).
@@ -299,18 +299,18 @@ DSSH_PUBLIC void dssh_cleanse(void *buf, size_t len);
  * if the session has already started.
  */
 DSSH_PUBLIC int dssh_session_set_cbdata(dssh_session sess, void *tx_cbdata, void *rx_cbdata, void *rx_line_cbdata,
-    void *extra_line_cbdata);
+    void *extra_line_cbdata) DSSH_ABI(dssh_session_set_cbdata);
 
 /*
  * Optional notification callbacks.  Must be set before
  * dssh_session_start(); returns DSSH_ERROR_TOOLATE after start.
  */
-DSSH_PUBLIC int dssh_session_set_debug_cb(dssh_session sess, dssh_debug_cb cb, void *cbdata);
-DSSH_PUBLIC int dssh_session_set_unimplemented_cb(dssh_session sess, dssh_unimplemented_cb cb, void *cbdata);
-DSSH_PUBLIC int dssh_session_set_log_cb(dssh_session sess, dssh_log_cb cb, void *cbdata);
+DSSH_PUBLIC int dssh_session_set_debug_cb(dssh_session sess, dssh_debug_cb cb, void *cbdata) DSSH_ABI(dssh_session_set_debug_cb);
+DSSH_PUBLIC int dssh_session_set_unimplemented_cb(dssh_session sess, dssh_unimplemented_cb cb, void *cbdata) DSSH_ABI(dssh_session_set_unimplemented_cb);
+DSSH_PUBLIC int dssh_session_set_log_cb(dssh_session sess, dssh_log_cb cb, void *cbdata) DSSH_ABI(dssh_session_set_log_cb);
 
 /* May be changed at any time.  The default is DSSH_LOG_ERROR. */
-DSSH_PUBLIC int dssh_session_set_log_level(dssh_session sess, dssh_log_level level);
+DSSH_PUBLIC int dssh_session_set_log_level(dssh_session sess, dssh_log_level level) DSSH_ABI(dssh_session_set_log_level);
 
 /*
  * Optional callback for SSH_MSG_USERAUTH_BANNER (RFC 4252 s5.4).
@@ -329,9 +329,9 @@ typedef void (*dssh_auth_banner_cb)(const uint8_t *message, size_t message_len, 
  */
 typedef int (*dssh_global_request_cb)(const uint8_t *name, size_t name_len, bool want_reply, const uint8_t *data,
     size_t data_len, void *cbdata);
-DSSH_PUBLIC int dssh_session_set_banner_cb(dssh_session sess, dssh_auth_banner_cb cb, void *cbdata);
-DSSH_PUBLIC int dssh_session_set_global_request_cb(dssh_session sess, dssh_global_request_cb cb, void *cbdata);
-DSSH_PUBLIC int dssh_session_set_terminate_cb(dssh_session sess, dssh_terminate_cb cb, void *cbdata);
+DSSH_PUBLIC int dssh_session_set_banner_cb(dssh_session sess, dssh_auth_banner_cb cb, void *cbdata) DSSH_ABI(dssh_session_set_banner_cb);
+DSSH_PUBLIC int dssh_session_set_global_request_cb(dssh_session sess, dssh_global_request_cb cb, void *cbdata) DSSH_ABI(dssh_session_set_global_request_cb);
+DSSH_PUBLIC int dssh_session_set_terminate_cb(dssh_session sess, dssh_terminate_cb cb, void *cbdata) DSSH_ABI(dssh_session_set_terminate_cb);
 
 /*
  * Set the host key verification callback.  Mandatory for client sessions;
@@ -339,7 +339,7 @@ DSSH_PUBLIC int dssh_session_set_terminate_cb(dssh_session sess, dssh_terminate_
  * client session.  Ignored for server sessions.
  * Must be set before dssh_transport_handshake().
  */
-DSSH_PUBLIC int dssh_session_set_hostkey_verify_cb(dssh_session sess, dssh_hostkey_verify_cb cb, void *cbdata);
+DSSH_PUBLIC int dssh_session_set_hostkey_verify_cb(dssh_session sess, dssh_hostkey_verify_cb cb, void *cbdata) DSSH_ABI(dssh_session_set_hostkey_verify_cb);
 
 /*
  * Set the session inactivity timeout in milliseconds.
@@ -351,7 +351,7 @@ DSSH_PUBLIC int dssh_session_set_hostkey_verify_cb(dssh_session sess, dssh_hostk
  * Must be set before dssh_session_start(); returns
  * DSSH_ERROR_TOOLATE after start.
  */
-DSSH_PUBLIC int dssh_session_set_timeout(dssh_session sess, int timeout_ms);
+DSSH_PUBLIC int dssh_session_set_timeout(dssh_session sess, int timeout_ms) DSSH_ABI(dssh_session_set_timeout);
 
 /*
  * Set the time-based auto-rekey threshold in seconds.  Pass 0 to
@@ -371,7 +371,7 @@ DSSH_PUBLIC int dssh_session_set_timeout(dssh_session sess, int timeout_ms);
  *
  * May be called at any point in the session.
  */
-DSSH_PUBLIC int dssh_session_set_rekey_seconds(dssh_session sess, uint32_t seconds);
+DSSH_PUBLIC int dssh_session_set_rekey_seconds(dssh_session sess, uint32_t seconds) DSSH_ABI(dssh_session_set_rekey_seconds);
 
 /*
  * Per-session algorithm whitelist filters.  Each setter constrains
@@ -389,15 +389,15 @@ DSSH_PUBLIC int dssh_session_set_rekey_seconds(dssh_session sess, uint32_t secon
  * DSSH_ERROR_TOOLATE after start.
  */
 DSSH_PUBLIC int dssh_session_set_kex_filter(dssh_session sess,
-    const char * const *names, size_t count);
+    const char * const *names, size_t count) DSSH_ABI(dssh_session_set_kex_filter);
 DSSH_PUBLIC int dssh_session_set_key_algo_filter(dssh_session sess,
-    const char * const *names, size_t count);
+    const char * const *names, size_t count) DSSH_ABI(dssh_session_set_key_algo_filter);
 DSSH_PUBLIC int dssh_session_set_enc_filter(dssh_session sess,
-    const char * const *names, size_t count);
+    const char * const *names, size_t count) DSSH_ABI(dssh_session_set_enc_filter);
 DSSH_PUBLIC int dssh_session_set_mac_filter(dssh_session sess,
-    const char * const *names, size_t count);
+    const char * const *names, size_t count) DSSH_ABI(dssh_session_set_mac_filter);
 DSSH_PUBLIC int dssh_session_set_comp_filter(dssh_session sess,
-    const char * const *names, size_t count);
+    const char * const *names, size_t count) DSSH_ABI(dssh_session_set_comp_filter);
 
 /*
  * Set the SSH version identification strings (RFC 4253 s4.2).
@@ -423,7 +423,7 @@ DSSH_PUBLIC int dssh_session_set_comp_filter(dssh_session sess,
  * The strings are not copied -- caller must ensure they remain
  * valid and immutable for the lifetime of the global configuration.
  */
-DSSH_PUBLIC int dssh_transport_set_version(const char *software_version, const char *comment);
+DSSH_PUBLIC int dssh_transport_set_version(const char *software_version, const char *comment) DSSH_ABI(dssh_transport_set_version);
 
 /*
  * Set the global I/O callbacks and optional extra-line callback.
@@ -434,7 +434,7 @@ DSSH_PUBLIC int dssh_transport_set_version(const char *software_version, const c
  * via the rx callback is used.
  */
 DSSH_PUBLIC int dssh_transport_set_callbacks(dssh_transport_io_cb tx, dssh_transport_io_cb rx,
-    dssh_transport_rxline_cb rx_line, dssh_transport_extra_line_cb extra_line_cb);
+    dssh_transport_rxline_cb rx_line, dssh_transport_extra_line_cb extra_line_cb) DSSH_ABI(dssh_transport_set_callbacks);
 
 /*
  * Set an optional scatter/gather TX callback.  When set, the library
@@ -442,25 +442,25 @@ DSSH_PUBLIC int dssh_transport_set_callbacks(dssh_transport_io_cb tx, dssh_trans
  * calling the per-packet TX callback for each one.  Must be called
  * before dssh_session_init().  Pass NULL to disable (default).
  */
-DSSH_PUBLIC int dssh_transport_set_tx_gather(dssh_transport_tx_gather_cb cb);
+DSSH_PUBLIC int dssh_transport_set_tx_gather(dssh_transport_tx_gather_cb cb) DSSH_ABI(dssh_transport_set_tx_gather);
 
 /*
  * Perform the SSH transport handshake (version exchange, KEXINIT,
  * key exchange, NEWKEYS).  Single-threaded, call before session_start.
  */
-DSSH_PUBLIC int dssh_transport_handshake(dssh_session sess);
+DSSH_PUBLIC int dssh_transport_handshake(dssh_session sess) DSSH_ABI(dssh_transport_handshake);
 
 /*
  * Send SSH_MSG_DISCONNECT and set the terminate flag. reason_code must be
  * nonzero; future/private uint32_t reason values are accepted. A failed send
  * returns its error and still terminates the session.
  */
-DSSH_PUBLIC int dssh_transport_disconnect(dssh_session sess, uint32_t reason_code, const char *description);
+DSSH_PUBLIC int dssh_transport_disconnect(dssh_session sess, uint32_t reason_code, const char *description) DSSH_ABI(dssh_transport_disconnect);
 
 /* Query negotiated algorithm names (NULL if not yet negotiated). */
-DSSH_PUBLIC const char *dssh_transport_get_remote_version(dssh_session sess);
-DSSH_PUBLIC const char *dssh_transport_get_kex_name(dssh_session sess);
-DSSH_PUBLIC const char *dssh_transport_get_hostkey_name(dssh_session sess);
+DSSH_PUBLIC const char *dssh_transport_get_remote_version(dssh_session sess) DSSH_ABI(dssh_transport_get_remote_version);
+DSSH_PUBLIC const char *dssh_transport_get_kex_name(dssh_session sess) DSSH_ABI(dssh_transport_get_kex_name);
+DSSH_PUBLIC const char *dssh_transport_get_hostkey_name(dssh_session sess) DSSH_ABI(dssh_transport_get_hostkey_name);
 /* Snapshot the latest negotiated selection for this wire direction.
  * Return NULL for a NULL session, unknown direction, forbidden I/O callback
  * entry or an unavailable selection. During rekey, a new selection can be
@@ -468,11 +468,11 @@ DSSH_PUBLIC const char *dssh_transport_get_hostkey_name(dssh_session sess);
  * Names are borrowed from process-lifetime registered definitions; callers
  * must coordinate handle use with session cleanup. */
 DSSH_PUBLIC const char *dssh_transport_get_enc_name(dssh_session sess,
-    enum dssh_direction direction);
+    enum dssh_direction direction) DSSH_ABI(dssh_transport_get_enc_name);
 DSSH_PUBLIC const char *dssh_transport_get_mac_name(dssh_session sess,
-    enum dssh_direction direction);
+    enum dssh_direction direction) DSSH_ABI(dssh_transport_get_mac_name);
 DSSH_PUBLIC const char *dssh_transport_get_comp_name(dssh_session sess,
-    enum dssh_direction direction);
+    enum dssh_direction direction) DSSH_ABI(dssh_transport_get_comp_name);
 
 #ifdef __cplusplus
 }

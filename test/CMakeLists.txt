@@ -14,6 +14,8 @@ function(dssh_add_output_test name target required_output)
 		-P "${CMAKE_CURRENT_SOURCE_DIR}/check_output.cmake")
 endfunction()
 
+include("${CMAKE_CURRENT_SOURCE_DIR}/abi.cmake")
+
 add_test(NAME dssh_test_output_policy COMMAND "${CMAKE_COMMAND}"
 	-P "${CMAKE_CURRENT_SOURCE_DIR}/check_output_test.cmake")
 

@@ -36,12 +36,12 @@ typedef int (*dssh_pem_password_cb)(char *buf, int size, int rwflag, void *userd
  * See the process-global setup contract at dssh_session_init(). */
 
 /* Key exchange */
-DSSH_PUBLIC int dssh_register_curve25519_sha256(void);
-DSSH_PUBLIC int dssh_register_dh_gex_sha256(void);
-DSSH_PUBLIC int dssh_register_dh_group14_sha256(void);
-DSSH_PUBLIC int dssh_register_dh_group16_sha512(void);
-DSSH_PUBLIC int dssh_register_sntrup761x25519_sha512(void);
-DSSH_PUBLIC int dssh_register_mlkem768x25519_sha256(void);
+DSSH_PUBLIC int dssh_register_curve25519_sha256(void) DSSH_ABI(dssh_register_curve25519_sha256);
+DSSH_PUBLIC int dssh_register_dh_gex_sha256(void) DSSH_ABI(dssh_register_dh_gex_sha256);
+DSSH_PUBLIC int dssh_register_dh_group14_sha256(void) DSSH_ABI(dssh_register_dh_group14_sha256);
+DSSH_PUBLIC int dssh_register_dh_group16_sha512(void) DSSH_ABI(dssh_register_dh_group16_sha512);
+DSSH_PUBLIC int dssh_register_sntrup761x25519_sha512(void) DSSH_ABI(dssh_register_sntrup761x25519_sha512);
+DSSH_PUBLIC int dssh_register_mlkem768x25519_sha256(void) DSSH_ABI(dssh_register_mlkem768x25519_sha256);
 
 /* Private-key save contract (all three builtin key families):
  * Save PEM by opening and overwriting the selected file itself. Validate a
@@ -56,37 +56,37 @@ DSSH_PUBLIC int dssh_register_mlkem768x25519_sha256(void);
 /* Load or generate keys before the first dssh_session_init(). Subsequent
  * key replacement returns DSSH_ERROR_TOOLATE. Failed replacement preserves
  * the existing key. Public-key blobs are cached before key publication. */
-DSSH_PUBLIC int     dssh_register_ssh_ed25519(void);
-DSSH_PUBLIC int     dssh_ed25519_load_key_file(const char *path, dssh_pem_password_cb pw_cb, void *pw_cbdata);
-DSSH_PUBLIC int     dssh_ed25519_save_key_file(const char *path, dssh_pem_password_cb pw_cb, void *pw_cbdata);
-DSSH_PUBLIC int64_t dssh_ed25519_get_pub_str(char *buf, size_t bufsz);
-DSSH_PUBLIC int     dssh_ed25519_save_pub_file(const char *path);
-DSSH_PUBLIC int     dssh_ed25519_generate_key(void);
-DSSH_PUBLIC int     dssh_register_rsa_sha2_256(void);
-DSSH_PUBLIC int     dssh_rsa_sha2_256_load_key_file(const char *path, dssh_pem_password_cb pw_cb, void *pw_cbdata);
-DSSH_PUBLIC int     dssh_rsa_sha2_256_save_key_file(const char *path, dssh_pem_password_cb pw_cb, void *pw_cbdata);
-DSSH_PUBLIC int64_t dssh_rsa_sha2_256_get_pub_str(char *buf, size_t bufsz);
-DSSH_PUBLIC int     dssh_rsa_sha2_256_save_pub_file(const char *path);
-DSSH_PUBLIC int     dssh_rsa_sha2_256_generate_key(unsigned int bits);
-DSSH_PUBLIC int     dssh_register_rsa_sha2_512(void);
-DSSH_PUBLIC int     dssh_rsa_sha2_512_load_key_file(const char *path, dssh_pem_password_cb pw_cb, void *pw_cbdata);
-DSSH_PUBLIC int     dssh_rsa_sha2_512_save_key_file(const char *path, dssh_pem_password_cb pw_cb, void *pw_cbdata);
-DSSH_PUBLIC int64_t dssh_rsa_sha2_512_get_pub_str(char *buf, size_t bufsz);
-DSSH_PUBLIC int     dssh_rsa_sha2_512_save_pub_file(const char *path);
-DSSH_PUBLIC int     dssh_rsa_sha2_512_generate_key(unsigned int bits);
+DSSH_PUBLIC int     dssh_register_ssh_ed25519(void) DSSH_ABI(dssh_register_ssh_ed25519);
+DSSH_PUBLIC int     dssh_ed25519_load_key_file(const char *path, dssh_pem_password_cb pw_cb, void *pw_cbdata) DSSH_ABI(dssh_ed25519_load_key_file);
+DSSH_PUBLIC int     dssh_ed25519_save_key_file(const char *path, dssh_pem_password_cb pw_cb, void *pw_cbdata) DSSH_ABI(dssh_ed25519_save_key_file);
+DSSH_PUBLIC int64_t dssh_ed25519_get_pub_str(char *buf, size_t bufsz) DSSH_ABI(dssh_ed25519_get_pub_str);
+DSSH_PUBLIC int     dssh_ed25519_save_pub_file(const char *path) DSSH_ABI(dssh_ed25519_save_pub_file);
+DSSH_PUBLIC int     dssh_ed25519_generate_key(void) DSSH_ABI(dssh_ed25519_generate_key);
+DSSH_PUBLIC int     dssh_register_rsa_sha2_256(void) DSSH_ABI(dssh_register_rsa_sha2_256);
+DSSH_PUBLIC int     dssh_rsa_sha2_256_load_key_file(const char *path, dssh_pem_password_cb pw_cb, void *pw_cbdata) DSSH_ABI(dssh_rsa_sha2_256_load_key_file);
+DSSH_PUBLIC int     dssh_rsa_sha2_256_save_key_file(const char *path, dssh_pem_password_cb pw_cb, void *pw_cbdata) DSSH_ABI(dssh_rsa_sha2_256_save_key_file);
+DSSH_PUBLIC int64_t dssh_rsa_sha2_256_get_pub_str(char *buf, size_t bufsz) DSSH_ABI(dssh_rsa_sha2_256_get_pub_str);
+DSSH_PUBLIC int     dssh_rsa_sha2_256_save_pub_file(const char *path) DSSH_ABI(dssh_rsa_sha2_256_save_pub_file);
+DSSH_PUBLIC int     dssh_rsa_sha2_256_generate_key(unsigned int bits) DSSH_ABI(dssh_rsa_sha2_256_generate_key);
+DSSH_PUBLIC int     dssh_register_rsa_sha2_512(void) DSSH_ABI(dssh_register_rsa_sha2_512);
+DSSH_PUBLIC int     dssh_rsa_sha2_512_load_key_file(const char *path, dssh_pem_password_cb pw_cb, void *pw_cbdata) DSSH_ABI(dssh_rsa_sha2_512_load_key_file);
+DSSH_PUBLIC int     dssh_rsa_sha2_512_save_key_file(const char *path, dssh_pem_password_cb pw_cb, void *pw_cbdata) DSSH_ABI(dssh_rsa_sha2_512_save_key_file);
+DSSH_PUBLIC int64_t dssh_rsa_sha2_512_get_pub_str(char *buf, size_t bufsz) DSSH_ABI(dssh_rsa_sha2_512_get_pub_str);
+DSSH_PUBLIC int     dssh_rsa_sha2_512_save_pub_file(const char *path) DSSH_ABI(dssh_rsa_sha2_512_save_pub_file);
+DSSH_PUBLIC int     dssh_rsa_sha2_512_generate_key(unsigned int bits) DSSH_ABI(dssh_rsa_sha2_512_generate_key);
 
 /* Encryption */
-DSSH_PUBLIC int dssh_register_aes256_ctr(void);
-DSSH_PUBLIC int dssh_register_aes128_cbc(void);
-DSSH_PUBLIC int dssh_register_none_enc(void);
+DSSH_PUBLIC int dssh_register_aes256_ctr(void) DSSH_ABI(dssh_register_aes256_ctr);
+DSSH_PUBLIC int dssh_register_aes128_cbc(void) DSSH_ABI(dssh_register_aes128_cbc);
+DSSH_PUBLIC int dssh_register_none_enc(void) DSSH_ABI(dssh_register_none_enc);
 
 /* MAC */
-DSSH_PUBLIC int dssh_register_hmac_sha2_256(void);
-DSSH_PUBLIC int dssh_register_hmac_sha2_512(void);
-DSSH_PUBLIC int dssh_register_none_mac(void);
+DSSH_PUBLIC int dssh_register_hmac_sha2_256(void) DSSH_ABI(dssh_register_hmac_sha2_256);
+DSSH_PUBLIC int dssh_register_hmac_sha2_512(void) DSSH_ABI(dssh_register_hmac_sha2_512);
+DSSH_PUBLIC int dssh_register_none_mac(void) DSSH_ABI(dssh_register_none_mac);
 
 /* Compression */
-DSSH_PUBLIC int dssh_register_none_comp(void);
+DSSH_PUBLIC int dssh_register_none_comp(void) DSSH_ABI(dssh_register_none_comp);
 
 /*
  * Set the opaque context pointer for a registered key algorithm.
@@ -96,7 +96,7 @@ DSSH_PUBLIC int dssh_register_none_comp(void);
  * concurrently by active sessions during KEX).
  * Returns 0 on success, DSSH_ERROR_INIT if the algorithm is not registered.
  */
-DSSH_PUBLIC int dssh_key_algo_set_ctx(const char *name, void *ctx);
+DSSH_PUBLIC int dssh_key_algo_set_ctx(const char *name, void *ctx) DSSH_ABI(dssh_key_algo_set_ctx);
 
 /*
  * Set borrowed process-lifetime configuration for a registered KEX algorithm.
@@ -108,7 +108,7 @@ DSSH_PUBLIC int dssh_key_algo_set_ctx(const char *name, void *ctx);
  * concurrently by active sessions during KEX).
  * Returns 0 on success, DSSH_ERROR_INIT if the algorithm is not registered.
  */
-DSSH_PUBLIC int dssh_kex_set_ctx(const char *name, void *ctx);
+DSSH_PUBLIC int dssh_kex_set_ctx(const char *name, void *ctx) DSSH_ABI(dssh_kex_set_ctx);
 
 #ifdef __cplusplus
 }

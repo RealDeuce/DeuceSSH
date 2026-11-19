@@ -5,6 +5,17 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+#include "deucessh-abi.h"
+
+#define DSSH_ABI_STRING_INNER(value) #value
+#define DSSH_ABI_STRING(value) DSSH_ABI_STRING_INNER(value)
+#ifdef __APPLE__
+/* Mach-O declaration aliases also apply to definitions and function pointers. */
+#define DSSH_ABI(name) __asm("_" DSSH_ABI_STRING(DSSH_ABI_SYMBOL_ ## name))
+#else
+#define DSSH_ABI(name)
+#endif
+
 /* Overflow-safe bounds check for a field within a buffer. */
 static inline bool
 dssh_buffer_has(size_t buffer_len, size_t offset, size_t field_len)

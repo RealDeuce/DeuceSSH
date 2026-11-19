@@ -157,7 +157,7 @@ typedef struct dssh_kex_s {
 
 /* Application-serialized global setup; finish before the first session-init
  * attempt. Descriptor/name/code stay borrowed for process lifetime. */
-DSSH_PUBLIC int dssh_transport_register_kex(dssh_kex kex);
+DSSH_PUBLIC int dssh_transport_register_kex(dssh_kex kex) DSSH_ABI(dssh_transport_register_kex);
 
 #ifdef __cplusplus
 }

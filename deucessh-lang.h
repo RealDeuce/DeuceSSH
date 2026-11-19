@@ -20,7 +20,7 @@ extern "C" {
  * Return zero or a negative error. Failed replacement preserves the field.
  * Calls after termination return DSSH_ERROR_TERMINATED. */
 DSSH_PUBLIC int dssh_session_set_languages(dssh_session sess,
-    enum dssh_direction direction, const char * const *names, size_t count);
+    enum dssh_direction direction, const char * const *names, size_t count) DSSH_ABI(dssh_session_set_languages);
 
 /* Copy a complete comma-separated field as a NUL-terminated string. The
  * successful return is its required buffer size INCLUDING the NUL, matching
@@ -37,9 +37,9 @@ DSSH_PUBLIC int dssh_session_set_languages(dssh_session sess,
  * NULL sessions and unknown directions return DSSH_ERROR_INVALID.
  * The caller coordinates session cleanup with calls using the handle. */
 DSSH_PUBLIC int64_t dssh_session_get_languages(dssh_session sess,
-    enum dssh_direction direction, char *buf, size_t bufsz);
+    enum dssh_direction direction, char *buf, size_t bufsz) DSSH_ABI(dssh_session_get_languages);
 DSSH_PUBLIC int64_t dssh_session_get_peer_languages(dssh_session sess,
-    enum dssh_direction direction, char *buf, size_t bufsz);
+    enum dssh_direction direction, char *buf, size_t bufsz) DSSH_ABI(dssh_session_get_peer_languages);
 
 #ifdef __cplusplus
 }

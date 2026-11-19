@@ -42,7 +42,7 @@ typedef struct dssh_enc_s {
 
 /* Application-serialized global setup; finish before the first session-init
  * attempt. Descriptor/name/code stay borrowed for process lifetime. */
-DSSH_PUBLIC int dssh_transport_register_enc(dssh_enc enc);
+DSSH_PUBLIC int dssh_transport_register_enc(dssh_enc enc) DSSH_ABI(dssh_transport_register_enc);
 
 #ifdef __cplusplus
 }

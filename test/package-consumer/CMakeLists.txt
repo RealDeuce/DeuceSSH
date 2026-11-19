@@ -30,7 +30,7 @@ foreach(form IN ITEMS static shared)
 	endif()
 	list(APPEND forms "${form}")
 	add_executable(package_query_${form}
-		"${DSSH_PACKAGE_SOURCE}/docs/release-1.0-evidence/directional-consumer.c")
+		"${CMAKE_CURRENT_SOURCE_DIR}/consumer.c")
 	target_link_libraries(package_query_${form} PRIVATE deucessh::deucessh_${form})
 	add_test(NAME package_query_${form} COMMAND package_query_${form})
 	if(UNIX)

@@ -3,8 +3,8 @@
 This note lists consumer-facing changes since commit `e7487c6`, the last pushed
 revision before the v1.0 audit changes. Rebuild consumers against the new headers
 and library: public structures and callback signatures have changed, and the
-shared-library ABI major is now 1. Install `deucessh-result.h` along with the
-other public headers.
+shared-library ABI major is now 1. Install `deucessh-result.h` and
+`deucessh-abi.h` along with the other public headers.
 
 ## Application source changes
 
@@ -99,6 +99,19 @@ Registration definitions, names and callback code remain borrowed for process
 lifetime. Cipher and MAC callback signatures have not changed.
 
 ## Build, optional algorithms and examples
+
+All 131 public functions now use interface version 1.0. Rebuild and explicitly
+link consumers with the matching headers and library. Ordinary C function names
+stay the same. ELF references record `DEUCESSH_1.0`; macOS/Windows external names
+end in `_v1_0`, including static definitions on those platforms. Code using
+`dlsym`/`GetProcAddress` must request that qualified name on macOS/Windows
+(without the Mach-O object-file leading underscore). ELF current-default
+`dlsym` uses the ordinary name; version-aware lookup selects the required node.
+See the [ABI policy](audit-dsohowto.md#symbol-versioning-plan).
+
+On MSVC, manually linked static consumers now select `deucessh-static.lib`;
+`deucessh.lib` selects DLL imports. Installed CMake target names are unchanged,
+and the shared target supplies `DSSH_SHARED_IMPORT` for Windows consumers.
 
 Botan-backed binaries require an ABI-compatible Botan library, with no exact
 release-version pin in the installed CMake or pkg-config metadata. Compatible

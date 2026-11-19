@@ -1,5 +1,7 @@
 cmake_minimum_required(VERSION 3.22)
 project(deucessh VERSION 1.0.0 LANGUAGES C)
+# Independent of the package/API release major; retain while published ABIs remain.
+set(DEUCESSH_ABI_MAJOR 1)
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/DeuceSSHCStandard.cmake")
 
 # Default to Release for single-config generators when the user hasn't
@@ -342,12 +344,15 @@ set(DEUCESSH_PUBLIC_HEADERS
 	deucessh-algorithms.h deucessh-crypto.h deucessh-kex.h
 	deucessh-key-algo.h deucessh-enc.h deucessh-mac.h
 	deucessh-comp.h deucessh-lang.h deucessh-portable.h deucessh-result.h
+	deucessh-abi.h
 )
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/DeuceSSHOptions.cmake")
 dssh_configure_options()
 
 include(GNUInstallDirs)
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/DeuceSSHABI.cmake")
+dssh_prepare_abi()
 
 set(DEUCESSH_INSTALL_TARGETS "")
 
@@ -362,7 +367,12 @@ if(DEUCESSH_BUILD_STATIC)
 		set_property(TARGET deucessh_static PROPERTY CXX_STANDARD 20)
 		set_property(TARGET deucessh_static PROPERTY CXX_STANDARD_REQUIRED ON)
 	endif()
-	set_property(TARGET deucessh_static PROPERTY OUTPUT_NAME deucessh)
+	set(DSSH_STATIC_OUTPUT_NAME deucessh)
+	if(MSVC)
+		# The DLL import library also uses deucessh.lib.
+		set(DSSH_STATIC_OUTPUT_NAME deucessh-static)
+	endif()
+	set_property(TARGET deucessh_static PROPERTY OUTPUT_NAME ${DSSH_STATIC_OUTPUT_NAME})
 	set_property(TARGET deucessh_static PROPERTY POSITION_INDEPENDENT_CODE ON)
 	target_include_directories(deucessh_static
 		PUBLIC
@@ -403,7 +413,7 @@ if(DEUCESSH_BUILD_SHARED)
 	set_property(TARGET deucessh_shared PROPERTY POSITION_INDEPENDENT_CODE ON)
 	set_property(TARGET deucessh_shared PROPERTY WINDOWS_EXPORT_ALL_SYMBOLS OFF)
 	set_property(TARGET deucessh_shared PROPERTY VERSION ${PROJECT_VERSION})
-	set_property(TARGET deucessh_shared PROPERTY SOVERSION ${PROJECT_VERSION_MAJOR})
+	set_property(TARGET deucessh_shared PROPERTY SOVERSION ${DEUCESSH_ABI_MAJOR})
 	target_include_directories(deucessh_shared
 		PUBLIC
 			$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
@@ -432,6 +442,10 @@ if(DEUCESSH_BUILD_SHARED)
 	if(UNIX AND NOT APPLE)
 		target_link_options(deucessh_shared PRIVATE
 			${DEUCESSH_LINK_OPTIONS})
+	endif()
+	dssh_apply_abi(deucessh_shared)
+	if(WIN32)
+		target_compile_definitions(deucessh_shared INTERFACE DSSH_SHARED_IMPORT)
 	endif()
 	list(APPEND DEUCESSH_INSTALL_TARGETS deucessh_shared)
 endif()
@@ -499,7 +513,7 @@ endif()
 
 if(DEUCESSH_BUILD_STATIC)
 	set(DSSH_PC_STATIC_LIBRARY
-		"${CMAKE_STATIC_LIBRARY_PREFIX}deucessh${CMAKE_STATIC_LIBRARY_SUFFIX}")
+		"${CMAKE_STATIC_LIBRARY_PREFIX}${DSSH_STATIC_OUTPUT_NAME}${CMAKE_STATIC_LIBRARY_SUFFIX}")
 endif()
 
 if(DEUCESSH_BUILD_SHARED)

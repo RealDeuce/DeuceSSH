@@ -50,7 +50,7 @@ struct dssh_bytes_result {
  * Safe with NULL or an empty lease. Does not free the result record itself.
  * The caller must serialize access to the lease and hold no library mutex.
  */
-DSSH_PUBLIC void dssh_result_release(struct dssh_result_lease *lease);
+DSSH_PUBLIC void dssh_result_release(struct dssh_result_lease *lease) DSSH_ABI(dssh_result_release);
 
 #ifdef __cplusplus
 }

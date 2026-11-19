@@ -2,12 +2,13 @@
 
 Audit of the shared library build against Ulrich Drepper's
 [How To Write Shared Libraries](https://www.akkadia.org/drepper/dsohowto.pdf).
-The symbol-versioning draft below was revised after reading the complete
+The symbol-versioning policy below was revised after reading the complete
 47-page version 4.1.2, dated December 10, 2011.
 
 The audit below is a historical build snapshot. The
-[symbol-versioning plan](#symbol-versioning-plan) records the proposed v1.0
-policy; version-script implementation is still outstanding.
+[symbol-versioning plan](#symbol-versioning-plan) records the implemented v1.0
+policy. Native FreeBSD export/import and installed-consumer checks pass with
+both providers; native Linux, macOS and Windows execution remains for CI.
 
 ## 1. Export Control — EXCELLENT
 
@@ -101,13 +102,19 @@ Verify: `readelf -d libdeucessh.so | grep TEXTREL` (no output)
 
 ## Remaining
 
-1. Review and implement the symbol-versioning plan below before the v1.0 release.
+1. Run the committed ABI export/import and production-consumer tests in native
+   Linux, macOS and Windows CI before release.
 
 ## Symbol-versioning plan
 
-Status: **proposed for review; not implemented**. This section specifies the
-policy to implement. It does not authorize changing exports or public contracts
-before review.
+Status: **approved and implemented for the initial 1.0 interface**.
+`deucessh-abi.h` assigns all 131 public functions. CMake checks those assignments
+against installed declarations and generates explicit ELF, Mach-O and PE export
+controls; public declarations select matching native names. The ordinary C API
+spelling is unchanged. `dssh_abi_bindings` inspects production exports and
+executable/consumer-DSO imports, and `dssh_abi_static`, `dssh_abi_shared` and
+`dssh_abi_dso` exercise normal C17 calls. No later interface or compatibility
+wrapper is introduced in this initial release.
 
 ### Required effect on every shared-library platform
 
@@ -160,9 +167,8 @@ the requested entry is resolved.
 
 Retain ELF SONAME `libdeucessh.so.1` while the library continues to provide its
 published ABIs. A release/API version increase does not itself require a SONAME
-change. The current CMake coupling of SOVERSION to PROJECT_VERSION_MAJOR must
-therefore be separated when implementing this policy. The full library filename
-can continue to follow the package release version.
+change. CMake sets `DEUCESSH_ABI_MAJOR` separately from `PROJECT_VERSION_MAJOR`.
+The full library filename can continue to follow the package release version.
 
 For an existing function with two ABIs, the old entry has a nondefault version
 such as `function@DEUCESSH_1.0`; new links select the single default, such as
@@ -186,11 +192,11 @@ representation before claiming that old and new ABIs can coexist.
 | Build | Mechanism |
 | --- | --- |
 | ELF shared libraries, including Linux and FreeBSD | Apply the explicit version map through the actual linker driver. Versioning is required for these shared builds; an unsupported linker must produce a clear configuration failure rather than silently omit it. |
-| macOS shared libraries | Use ABI-qualified Mach-O symbol names and declaration aliases, following Apple's symbol-versioning approach. For example, the C spelling `dssh_example()` can bind to `_dssh_example$DSSH_1_0`. A later declaration selects a new qualified name while the dylib retains the old definition. Keep controlled exports and appropriate dylib identity/version metadata as well. |
+| macOS shared libraries | Use ABI-qualified Mach-O symbol names and declaration aliases, following Apple's symbol-versioning approach. For example, the C spelling `dssh_example()` can bind to `_dssh_example_v1_0`. A later declaration selects a new qualified name while the dylib retains the old definition. Keep controlled exports and appropriate dylib identity/version metadata as well. |
 | Windows DLLs | Use ABI-qualified PE export names, for example `dssh_example_v1_0`, with public-header aliases selecting the current declaration and its matching import-library symbol. A later header selects the new export while the same DLL retains the old export/adapter. A `.def` file controls export names and mappings; the import library records the selected name. UCRT compatibility and DLL version resources do not provide this binding themselves. |
 | Static libraries | There is no dynamic-loader version table. Any header-selected external name must match an archive definition; applications and external modules must use compatible headers, library and provider ABIs. |
 
-The proposed macOS/Windows bindings preserve source-level function spelling;
+The macOS/Windows bindings preserve source-level function spelling;
 binary export names are platform-specific. Compiler declaration aliases and
 ordinary C header aliases belong behind the public portability layer. They
 must not expose provider types or alter public C types. For static Windows
@@ -199,7 +205,8 @@ builds, any such header alias must match the archive's definitions as well.
 Apple's `__DARWIN_ALIAS` family deliberately selects alternate symbols while
 preserving source-level names, including suffixes such as `$UNIX2003` and
 `$INODE64`. This supplies the relevant macOS precedent; restricting the plan to
-dylib-wide version numbers would miss the required effect. See
+dylib-wide version numbers would miss the required effect. DeuceSSH uses the
+portable-identifier suffix `_v1_0` with the same declaration-alias mechanism. See
 [Apple's declarations and explanation](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/cdefs.h#L788).
 Windows named-export and import-library mapping is documented in Microsoft's
 [EXPORTS reference](https://learn.microsoft.com/en-us/cpp/build/reference/exports)

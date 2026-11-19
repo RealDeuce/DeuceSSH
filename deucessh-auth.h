@@ -95,7 +95,7 @@ typedef int (*dssh_auth_kbi_prompt_cb)(const uint8_t *name, size_t name_len, con
  * discover the methods needed to continue. Returns the common client outcomes
  * above, without attempting another method. Optional; applications may instead
  * start directly with password/publickey/KBI. */
-DSSH_PUBLIC int dssh_auth_begin(dssh_session sess, const char *username);
+DSSH_PUBLIC int dssh_auth_begin(dssh_session sess, const char *username) DSSH_ABI(dssh_auth_begin);
 
 /* Read the methods from the last complete authentication response. Pure
  * getter: no I/O and no change to authentication state. Returns required bytes
@@ -105,7 +105,7 @@ DSSH_PUBLIC int dssh_auth_begin(dssh_session sess, const char *username);
  * byte and does not itself imply completed authentication; use the action's
  * outcome. The snapshot belongs to the last completed exchange, not a failed
  * subsequent action. Normal callback/pre-start serialization rules apply. */
-DSSH_PUBLIC int64_t dssh_auth_get_methods(dssh_session sess, char *methods, size_t methods_sz);
+DSSH_PUBLIC int64_t dssh_auth_get_methods(dssh_session sess, char *methods, size_t methods_sz) DSSH_ABI(dssh_auth_get_methods);
 
 /*
  * Password change callback (RFC 4252 s8).
@@ -138,7 +138,7 @@ typedef int (*dssh_auth_passwd_change_cb)(const uint8_t *prompt, size_t prompt_l
  * attempt returns DSSH_AUTH_CONTINUE; operation errors are negative.
  */
 DSSH_PUBLIC int dssh_auth_password(dssh_session sess, const char *username, const char *password,
-    dssh_auth_passwd_change_cb passwd_change_cb, void *passwd_change_cbdata);
+    dssh_auth_passwd_change_cb passwd_change_cb, void *passwd_change_cbdata) DSSH_ABI(dssh_auth_password);
 
 /*
  * Authenticate via keyboard-interactive (RFC 4256).
@@ -148,7 +148,7 @@ DSSH_PUBLIC int dssh_auth_password(dssh_session sess, const char *username, cons
  * attempt returns DSSH_AUTH_CONTINUE; operation errors are negative.
  */
 DSSH_PUBLIC int dssh_auth_keyboard_interactive(dssh_session sess, const char *username,
-    dssh_auth_kbi_prompt_cb prompt_cb, void *cbdata);
+    dssh_auth_kbi_prompt_cb prompt_cb, void *cbdata) DSSH_ABI(dssh_auth_keyboard_interactive);
 
 /* ================================================================
  * Server-side authentication
@@ -323,7 +323,7 @@ struct dssh_auth_server_cbs {
  * Returns 0 on successful authentication.
  */
 DSSH_PUBLIC int dssh_auth_server(dssh_session sess, const struct dssh_auth_server_cbs *cbs, uint8_t *username_out,
-    size_t *username_out_len);
+    size_t *username_out_len) DSSH_ABI(dssh_auth_server);
 
 /*
  * Set a pending banner to be sent before the next auth response.
@@ -332,7 +332,7 @@ DSSH_PUBLIC int dssh_auth_server(dssh_session sess, const struct dssh_auth_serve
  * language may be NULL (defaults to empty string per RFC 4252 s5.4).
  * Can be called before dssh_auth_server() or from within auth callbacks.
  */
-DSSH_PUBLIC int dssh_auth_set_banner(dssh_session sess, const char *message, const char *language);
+DSSH_PUBLIC int dssh_auth_set_banner(dssh_session sess, const char *message, const char *language) DSSH_ABI(dssh_auth_set_banner);
 
 /* ================================================================
  * Client-side authentication
@@ -346,7 +346,7 @@ DSSH_PUBLIC int dssh_auth_set_banner(dssh_session sess, const char *message, con
  * Uses the common client authentication outcomes above. A refused credential
  * attempt returns DSSH_AUTH_CONTINUE; operation errors are negative.
  */
-DSSH_PUBLIC int dssh_auth_publickey(dssh_session sess, const char *username, const char *algo_name);
+DSSH_PUBLIC int dssh_auth_publickey(dssh_session sess, const char *username, const char *algo_name) DSSH_ABI(dssh_auth_publickey);
 
 #ifdef __cplusplus
 }

@@ -1212,15 +1212,22 @@ dssh_add_test(key_publication test_key_publication.c)
 if(DEUCESSH_CRYPTO_BACKEND STREQUAL "Botan")
 	target_sources(dssh_test_key_publication PRIVATE key_publication_cpp.cpp key_file_cpp_alloc.cpp)
 	set_target_properties(dssh_test_key_publication PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+	# Botan 3.13's mlock pool grows deque bookkeeping during noexcept
+	# deallocation and terminates if ordinary new fails there. Exercise
+	# recoverable C++ allocation failures with its optional pool disabled;
+	# ordinary key tests retain the provider's default allocator.
+	# Upstream: https://github.com/randombit/botan/issues/6149
+	set(DSSH_TEST_CPP_FAULT_ENV "${DSSH_TEST_KEY_ENV};BOTAN_MLOCK_POOL_SIZE=0")
 	add_test(NAME dssh_key_cpp_password_encrypted COMMAND dssh_test_key_publication --exact cpp_password_encrypted)
 	add_test(NAME dssh_key_cpp_counts_full_password COMMAND dssh_test_key_publication --exact cpp_counts_full_password)
-	set_tests_properties(dssh_key_cpp_password_encrypted dssh_key_cpp_counts_full_password PROPERTIES ENVIRONMENT "${DSSH_TEST_KEY_ENV}" TIMEOUT 300)
+	set_tests_properties(dssh_key_cpp_password_encrypted PROPERTIES ENVIRONMENT "${DSSH_TEST_CPP_FAULT_ENV}" TIMEOUT 300)
+	set_tests_properties(dssh_key_cpp_counts_full_password PROPERTIES ENVIRONMENT "${DSSH_TEST_KEY_ENV}" TIMEOUT 300)
 	foreach(part IN ITEMS generation plain encrypted)
 		add_test(NAME dssh_key_cpp_counts_${part} COMMAND dssh_test_key_publication --exact cpp_counts_${part})
 		set_tests_properties(dssh_key_cpp_counts_${part} PROPERTIES ENVIRONMENT "${DSSH_TEST_KEY_ENV}" TIMEOUT 300)
 		foreach(scope IN ITEMS prefix late context)
 			add_test(NAME dssh_key_cpp_${scope}_${part} COMMAND dssh_test_key_publication --exact cpp_${scope}_${part})
-			set_tests_properties(dssh_key_cpp_${scope}_${part} PROPERTIES ENVIRONMENT "${DSSH_TEST_KEY_ENV}" TIMEOUT 1200)
+			set_tests_properties(dssh_key_cpp_${scope}_${part} PROPERTIES ENVIRONMENT "${DSSH_TEST_CPP_FAULT_ENV}" TIMEOUT 1200)
 		endforeach()
 	endforeach()
 endif()
@@ -1523,9 +1530,9 @@ if(DEUCESSH_CRYPTO_BACKEND STREQUAL "Botan")
 	set_tests_properties(dssh_key_text_native_reuse PROPERTIES ENVIRONMENT "${DSSH_TEST_KEY_ENV}" TIMEOUT 180)
 	add_test(NAME dssh_key_file_import_cpp_oom COMMAND dssh_test_botan_algo_key --exact key_file_cpp_oom)
 	set_tests_properties(dssh_key_file_import_cpp_oom PROPERTIES
-		ENVIRONMENT "${DSSH_TEST_KEY_ENV}" TIMEOUT 180)
+		ENVIRONMENT "${DSSH_TEST_CPP_FAULT_ENV}" TIMEOUT 180)
 	set_tests_properties(dssh_unit_botan_algo_key PROPERTIES COST 20
-		ENVIRONMENT "${DSSH_TEST_KEY_ENV}")
+		ENVIRONMENT "${DSSH_TEST_CPP_FAULT_ENV}")
 
 	add_executable(dssh_test_botan_transport test_botan_transport.cpp)
 	set_property(TARGET dssh_test_botan_transport PROPERTY CXX_STANDARD 20)

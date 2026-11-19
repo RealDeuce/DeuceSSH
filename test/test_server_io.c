@@ -543,8 +543,12 @@ game_roundtrip(enum exchange_case which)
 			answer = (const uint8_t *)"> diediedie\r\ndying...\r\n";
 			answer_length = 23;
 		}
-		valid = example_channel_write(channel, 0, bytes, length) == 0
-		    && dssh_chan_shutwr(channel) == 0;
+		/* The injected poll error closes the channel before accepting input.
+		 * Sending commands here races that close and can fail legitimately;
+		 * this case checks the server's prompt, error status and EOF instead. */
+		if (which != SHELL_POLL_ERROR)
+			valid = example_channel_write(channel, 0, bytes, length) == 0
+			    && dssh_chan_shutwr(channel) == 0;
 		size_t used = 0;
 		bool eof = false;
 		for (unsigned attempt = 0; attempt < 32768 && valid && !eof; attempt++) {

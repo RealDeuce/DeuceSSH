@@ -21,6 +21,7 @@
 #include "deucessh-crypto.h"
 #include "deucessh.h"
 #include "private-key-file.h"
+#include "client-key.h"
 #include "key-context-botan.h"
 #include "key-wire.h"
 #include "key-file-common.h"
@@ -228,7 +229,7 @@ dssh_botan_ed25519_cleanup(dssh_key_algo_ctx *ctx)
 
 /* Finish construction and caching before the registry can expose the key. */
 static int
-install_key(std::unique_ptr<Botan::Private_Key> privkey)
+install_key(std::unique_ptr<Botan::Private_Key> privkey, struct dssh_botan_key_context **local)
 {
 	try {
 		std::unique_ptr<dssh_botan_key_context> replacement(new (std::nothrow) dssh_botan_key_context{});
@@ -244,12 +245,16 @@ install_key(std::unique_ptr<Botan::Private_Key> privkey)
 			replacement->kind = DSSH_BOTAN_KEY_ED25519;
 		if (ret == 0)
 			ret = dssh_signature_pool_create(&replacement->signatures);
-		if (ret == 0)
+		if (ret == 0 && local == NULL)
 			ret = dssh_key_algo_set_ctx(ED25519_NAME, replacement.get());
 		if (ret < 0) {
 			free(replacement->pub_blob);
 			dssh_signature_pool_destroy(replacement->signatures);
 			return ret;
+		}
+		if (local != NULL) {
+			*local = replacement.release();
+			return 0;
 		}
 		struct dssh_botan_key_context *old = ed25519_ctx;
 		dssh_key_algo_ctx *old_opaque = reinterpret_cast<dssh_key_algo_ctx *>(old);
@@ -267,14 +272,16 @@ install_key(std::unique_ptr<Botan::Private_Key> privkey)
 
 /* --- Public API functions --- */
 
-DSSH_PUBLIC int
-dssh_ed25519_load_key_file(const char *path, dssh_pem_password_cb pw_cb, void *pw_cbdata)
+static int
+load_key_file_inner(const char *path, dssh_pem_password_cb pw_cb, void *pw_cbdata, struct dssh_botan_key_context **local)
 {
 	if (path == NULL || path[0] == 0)
 		return DSSH_ERROR_INIT;
-	int config_ret = dssh_key_algo_setup_check(ED25519_NAME);
-	if (config_ret < 0)
-		return config_ret;
+	if (local == NULL) {
+		int config_ret = dssh_key_algo_setup_check(ED25519_NAME);
+		if (config_ret < 0)
+			return config_ret;
+	}
 	FILE *fp = dssh_key_file_open_read(path);
 	if (fp == NULL)
 		return DSSH_ERROR_INIT;
@@ -317,7 +324,7 @@ dssh_ed25519_load_key_file(const char *path, dssh_pem_password_cb pw_cb, void *p
 			return DSSH_ERROR_INVALID;
 		if (!privkey->check_key(Botan::system_rng(), true))
 			return DSSH_ERROR_INVALID;
-		return install_key(std::move(privkey));
+		return install_key(std::move(privkey), local);
 	}
 	catch (...) {
 		return password.status < 0 ? password.status : DSSH_ERROR_INIT;
@@ -330,15 +337,15 @@ write_pem_to_file(FILE *fp, const std::string& pem)
 	return fwrite(pem.data(), 1, pem.size(), fp) == pem.size();
 }
 
-DSSH_PUBLIC int
-dssh_ed25519_save_key_file(const char *path, dssh_pem_password_cb pw_cb, void *pw_cbdata)
+static int
+save_key_file_inner(const char *path, dssh_pem_password_cb pw_cb, void *pw_cbdata, struct dssh_botan_key_context *selected)
 {
 	if (path == NULL || path[0] == 0)
 		return DSSH_ERROR_INIT;
-	if (ed25519_ctx == NULL || ed25519_ctx->keys == nullptr || ed25519_ctx->kind != DSSH_BOTAN_KEY_ED25519)
+	if (selected == NULL || selected->keys == nullptr || selected->kind != DSSH_BOTAN_KEY_ED25519)
 		return DSSH_ERROR_INIT;
 	dssh_botan_key_guard key;
-	int acquired_key = key.acquire(ed25519_ctx->keys);
+	int acquired_key = key.acquire(selected->keys);
 	if (acquired_key < 0)
 		return acquired_key;
 	FILE *fp = dssh_private_key_open(path);
@@ -397,12 +404,14 @@ dssh_ed25519_save_pub_file(const char *path)
 	return dssh_key_text_write(path, blob, length, ED25519_NAME, ED25519_NAME_LEN);
 }
 
-DSSH_PUBLIC int
-dssh_ed25519_generate_key(void)
+static int
+generate_key_inner(struct dssh_botan_key_context **local)
 {
-	int config_ret = dssh_key_algo_setup_check(ED25519_NAME);
-	if (config_ret < 0)
-		return config_ret;
+	if (local == NULL) {
+		int config_ret = dssh_key_algo_setup_check(ED25519_NAME);
+		if (config_ret < 0)
+			return config_ret;
+	}
 	std::unique_ptr<Botan::Private_Key> privkey;
 
 	try {
@@ -412,5 +421,68 @@ dssh_ed25519_generate_key(void)
 		return DSSH_ERROR_INIT;
 	}
 
-	return install_key(std::move(privkey));
+	return install_key(std::move(privkey), local);
+}
+
+DSSH_PUBLIC int
+dssh_ed25519_load_key_file(const char *path, dssh_pem_password_cb cb, void *cbdata)
+{
+	return load_key_file_inner(path, cb, cbdata, NULL);
+}
+
+DSSH_PUBLIC int
+dssh_ed25519_generate_key(void)
+{
+	return generate_key_inner(NULL);
+}
+
+DSSH_PUBLIC int
+dssh_ed25519_save_key_file(const char *path, dssh_pem_password_cb cb, void *cbdata)
+{
+	return save_key_file_inner(path, cb, cbdata, ed25519_ctx);
+}
+
+static int
+client_load(void **out, const char *path, dssh_pem_password_cb cb, void *cbdata)
+{
+	struct dssh_botan_key_context *local = NULL;
+	int ret = load_key_file_inner(path, cb, cbdata, &local);
+	if (ret == 0)
+		*out = local;
+	return ret;
+}
+
+static int
+client_generate(void **out, unsigned int bits)
+{
+	if (bits != 256)
+		return DSSH_ERROR_INVALID;
+	struct dssh_botan_key_context *local = NULL;
+	int ret = generate_key_inner(&local);
+	if (ret == 0)
+		*out = local;
+	return ret;
+}
+
+static int
+client_save(void *ctx, const char *path, dssh_pem_password_cb cb, void *cbdata)
+{
+	struct dssh_botan_key_context *selected = static_cast<struct dssh_botan_key_context *>(ctx);
+	return save_key_file_inner(path, cb, cbdata, selected);
+}
+
+static void
+client_release(void *ctx)
+{
+	dssh_key_algo_ctx *opaque = reinterpret_cast<dssh_key_algo_ctx *>(ctx);
+	dssh_botan_ed25519_cleanup(opaque);
+}
+
+extern "C" DSSH_PRIVATE const struct dssh_client_key_ops *
+dssh_botan_ed25519_client_ops(void)
+{
+	static const struct dssh_client_key_ops ops = {
+		client_load, client_generate, client_save, client_release
+	};
+	return &ops;
 }

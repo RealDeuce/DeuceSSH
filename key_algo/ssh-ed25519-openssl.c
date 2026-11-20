@@ -8,6 +8,7 @@
 #include "deucessh-key-algo.h"
 #include "deucessh.h"
 #include "private-key-file.h"
+#include "client-key.h"
 #include "key-context-openssl.h"
 #include "key-wire.h"
 #include "key-file-openssl.h"
@@ -224,7 +225,7 @@ cleanup(dssh_key_algo_ctx *ctx)
 
 /* Build the immutable public-key cache before publishing the key. */
 static int
-install_key(EVP_PKEY *pkey)
+install_key(EVP_PKEY *pkey, struct dssh_openssl_key_context **local)
 {
 	struct dssh_openssl_key_context *replacement = malloc(sizeof(*replacement));
 
@@ -240,11 +241,15 @@ install_key(EVP_PKEY *pkey)
 
 	if (ret == 0)
 		ret = dssh_signature_pool_create(&replacement->signatures);
-	if (ret == 0)
+	if (ret == 0 && local == NULL)
 		ret = dssh_key_algo_set_ctx(ED25519_NAME, replacement);
 	if (ret < 0) {
 		cleanup(opaque);
 		return ret;
+	}
+	if (local != NULL) {
+		*local = replacement;
+		return 0;
 	}
 	struct dssh_openssl_key_context *old = ed25519_ctx;
 	dssh_key_algo_ctx *old_opaque = (dssh_key_algo_ctx *)old;
@@ -276,14 +281,16 @@ dssh_register_ssh_ed25519(void)
 	return ret;
 }
 
-DSSH_PUBLIC int
-dssh_ed25519_load_key_file(const char *path, dssh_pem_password_cb pw_cb, void *pw_cbdata)
+static int
+load_key_file_inner(const char *path, dssh_pem_password_cb pw_cb, void *pw_cbdata, struct dssh_openssl_key_context **local)
 {
 	if (path == NULL || path[0] == 0)
 		return DSSH_ERROR_INIT;
-	int config_ret = dssh_key_algo_setup_check(ED25519_NAME);
-	if (config_ret < 0)
-		return config_ret;
+	if (local == NULL) {
+		int config_ret = dssh_key_algo_setup_check(ED25519_NAME);
+		if (config_ret < 0)
+			return config_ret;
+	}
 	FILE *fp = dssh_key_file_open_read(path);
 	if (fp == NULL)
 		return DSSH_ERROR_INIT;
@@ -313,22 +320,22 @@ dssh_ed25519_load_key_file(const char *path, dssh_pem_password_cb pw_cb, void *p
 		EVP_PKEY_free(pkey);
 		return checked == 0 ? DSSH_ERROR_INVALID : DSSH_ERROR_INIT;
 	}
-	return install_key(pkey);
+	return install_key(pkey, local);
 }
 
-DSSH_PUBLIC int
-dssh_ed25519_save_key_file(const char *path, dssh_pem_password_cb pw_cb, void *pw_cbdata)
+static int
+save_key_file_inner(const char *path, dssh_pem_password_cb pw_cb, void *pw_cbdata, struct dssh_openssl_key_context *selected)
 {
 	if (path == NULL || path[0] == 0)
 		return DSSH_ERROR_INIT;
 #ifdef DSSH_TESTING
-	if (ed25519_ctx == NULL)
+	if (selected == NULL)
 #else
-	if (ed25519_ctx == NULL || ed25519_ctx->pkey == NULL)
+	if (selected == NULL || selected->pkey == NULL)
 #endif
 		return DSSH_ERROR_INIT;
 
-	EVP_PKEY *pkey = ed25519_ctx->pkey;
+	EVP_PKEY *pkey = selected->pkey;
 	if (EVP_PKEY_up_ref(pkey) != 1)
 		return DSSH_ERROR_INIT;
 	FILE *fp = dssh_private_key_open(path);
@@ -389,12 +396,14 @@ dssh_ed25519_save_pub_file(const char *path)
 	return dssh_key_text_write(path, blob, length, ED25519_NAME, ED25519_NAME_LEN);
 }
 
-DSSH_PUBLIC int
-dssh_ed25519_generate_key(void)
+static int
+generate_key_inner(struct dssh_openssl_key_context **local)
 {
-	int config_ret = dssh_key_algo_setup_check(ED25519_NAME);
-	if (config_ret < 0)
-		return config_ret;
+	if (local == NULL) {
+		int config_ret = dssh_key_algo_setup_check(ED25519_NAME);
+		if (config_ret < 0)
+			return config_ret;
+	}
 	EVP_PKEY     *pkey = NULL;
 	EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_from_name(NULL, "ED25519", NULL);
 
@@ -407,5 +416,70 @@ dssh_ed25519_generate_key(void)
 	}
 	EVP_PKEY_CTX_free(pctx);
 
-	return install_key(pkey);
+	return install_key(pkey, local);
+}
+
+DSSH_PUBLIC int
+dssh_ed25519_load_key_file(const char *path, dssh_pem_password_cb cb, void *cbdata)
+{
+	return load_key_file_inner(path, cb, cbdata, NULL);
+}
+
+DSSH_PUBLIC int
+dssh_ed25519_generate_key(void)
+{
+	return generate_key_inner(NULL);
+}
+
+DSSH_PUBLIC int
+dssh_ed25519_save_key_file(const char *path, dssh_pem_password_cb cb, void *cbdata)
+{
+	return save_key_file_inner(path, cb, cbdata, ed25519_ctx);
+}
+
+static int
+client_load(void **out, const char *path, dssh_pem_password_cb cb, void *cbdata)
+{
+	struct dssh_openssl_key_context *local = NULL;
+	int ret = load_key_file_inner(path, cb, cbdata, &local);
+	if (ret == 0)
+		*out = local;
+	return ret;
+}
+
+static int
+client_generate(void **out, unsigned int bits)
+{
+	if (bits != 256)
+		return DSSH_ERROR_INVALID;
+	struct dssh_openssl_key_context *local = NULL;
+	int ret = generate_key_inner(&local);
+	if (ret == 0)
+		*out = local;
+	return ret;
+}
+
+static int
+client_save(void *ctx, const char *path, dssh_pem_password_cb cb, void *cbdata)
+{
+	struct dssh_openssl_key_context *selected = (struct dssh_openssl_key_context *)ctx;
+	return save_key_file_inner(path, cb, cbdata, selected);
+}
+
+static void
+client_release(void *ctx)
+{
+	dssh_key_algo_ctx *opaque = (dssh_key_algo_ctx *)ctx;
+	cleanup(opaque);
+}
+
+DSSH_PRIVATE const struct dssh_client_key_ops *
+dssh_ed25519_client_ops(struct dssh_key_algo_s *module)
+{
+	static const struct dssh_client_key_ops ops = {
+		client_load, client_generate, client_save, client_release
+	};
+	if (module->sign != sign || module->pubkey != pubkey || module->haskey != haskey)
+		return NULL;
+	return &ops;
 }

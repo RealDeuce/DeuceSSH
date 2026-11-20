@@ -20,6 +20,7 @@
 #include "deucessh-crypto.h"
 #include "deucessh.h"
 #include "private-key-file.h"
+#include "client-key.h"
 #include "key-context-botan.h"
 #include "key-wire.h"
 #include "key-file-common.h"
@@ -236,7 +237,7 @@ dssh_botan_rsa512_cleanup(dssh_key_algo_ctx *ctx)
 
 /* Finish construction and caching before the registry can expose the key. */
 static int
-install_key(std::unique_ptr<Botan::Private_Key> privkey)
+install_key(std::unique_ptr<Botan::Private_Key> privkey, struct dssh_botan_key_context **local)
 {
 	try {
 		std::unique_ptr<dssh_botan_key_context> replacement(new (std::nothrow) dssh_botan_key_context{});
@@ -252,12 +253,16 @@ install_key(std::unique_ptr<Botan::Private_Key> privkey)
 			replacement->kind = DSSH_BOTAN_KEY_RSA;
 		if (ret == 0)
 			ret = dssh_signature_pool_create(&replacement->signatures);
-		if (ret == 0)
+		if (ret == 0 && local == NULL)
 			ret = dssh_key_algo_set_ctx(RSA_SHA2_512_NAME, replacement.get());
 		if (ret < 0) {
 			free(replacement->pub_blob);
 			dssh_signature_pool_destroy(replacement->signatures);
 			return ret;
+		}
+		if (local != NULL) {
+			*local = replacement.release();
+			return 0;
 		}
 		struct dssh_botan_key_context *old = rsa_ctx;
 		dssh_key_algo_ctx *old_opaque = reinterpret_cast<dssh_key_algo_ctx *>(old);
@@ -275,14 +280,16 @@ install_key(std::unique_ptr<Botan::Private_Key> privkey)
 
 /* --- Public API functions --- */
 
-DSSH_PUBLIC int
-dssh_rsa_sha2_512_load_key_file(const char *path, dssh_pem_password_cb pw_cb, void *pw_cbdata)
+static int
+load_key_file_inner(const char *path, dssh_pem_password_cb pw_cb, void *pw_cbdata, struct dssh_botan_key_context **local)
 {
 	if (path == NULL || path[0] == 0)
 		return DSSH_ERROR_INIT;
-	int config_ret = dssh_key_algo_setup_check(RSA_SHA2_512_NAME);
-	if (config_ret < 0)
-		return config_ret;
+	if (local == NULL) {
+		int config_ret = dssh_key_algo_setup_check(RSA_SHA2_512_NAME);
+		if (config_ret < 0)
+			return config_ret;
+	}
 	FILE *fp = dssh_key_file_open_read(path);
 	if (fp == NULL)
 		return DSSH_ERROR_INIT;
@@ -325,7 +332,7 @@ dssh_rsa_sha2_512_load_key_file(const char *path, dssh_pem_password_cb pw_cb, vo
 			return DSSH_ERROR_INVALID;
 		if (!privkey->check_key(Botan::system_rng(), true))
 			return DSSH_ERROR_INVALID;
-		return install_key(std::move(privkey));
+		return install_key(std::move(privkey), local);
 	}
 	catch (...) {
 		return password.status < 0 ? password.status : DSSH_ERROR_INIT;
@@ -338,15 +345,15 @@ write_pem_to_file(FILE *fp, const std::string& pem)
 	return fwrite(pem.data(), 1, pem.size(), fp) == pem.size();
 }
 
-DSSH_PUBLIC int
-dssh_rsa_sha2_512_save_key_file(const char *path, dssh_pem_password_cb pw_cb, void *pw_cbdata)
+static int
+save_key_file_inner(const char *path, dssh_pem_password_cb pw_cb, void *pw_cbdata, struct dssh_botan_key_context *selected)
 {
 	if (path == NULL || path[0] == 0)
 		return DSSH_ERROR_INIT;
-	if (rsa_ctx == NULL || rsa_ctx->keys == nullptr || rsa_ctx->kind != DSSH_BOTAN_KEY_RSA)
+	if (selected == NULL || selected->keys == nullptr || selected->kind != DSSH_BOTAN_KEY_RSA)
 		return DSSH_ERROR_INIT;
 	dssh_botan_key_guard key;
-	int acquired_key = key.acquire(rsa_ctx->keys);
+	int acquired_key = key.acquire(selected->keys);
 	if (acquired_key < 0)
 		return acquired_key;
 	FILE *fp = dssh_private_key_open(path);
@@ -405,12 +412,14 @@ dssh_rsa_sha2_512_save_pub_file(const char *path)
 	return dssh_key_text_write(path, blob, length, RSA_KEY_TYPE_NAME, RSA_KEY_TYPE_NAME_LEN);
 }
 
-DSSH_PUBLIC int
-dssh_rsa_sha2_512_generate_key(unsigned int bits)
+static int
+generate_key_inner(unsigned int bits, struct dssh_botan_key_context **local)
 {
-	int config_ret = dssh_key_algo_setup_check(RSA_SHA2_512_NAME);
-	if (config_ret < 0)
-		return config_ret;
+	if (local == NULL) {
+		int config_ret = dssh_key_algo_setup_check(RSA_SHA2_512_NAME);
+		if (config_ret < 0)
+			return config_ret;
+	}
 	std::unique_ptr<Botan::Private_Key> privkey;
 
 	try {
@@ -420,5 +429,66 @@ dssh_rsa_sha2_512_generate_key(unsigned int bits)
 		return DSSH_ERROR_INIT;
 	}
 
-	return install_key(std::move(privkey));
+	return install_key(std::move(privkey), local);
+}
+
+DSSH_PUBLIC int
+dssh_rsa_sha2_512_load_key_file(const char *path, dssh_pem_password_cb cb, void *cbdata)
+{
+	return load_key_file_inner(path, cb, cbdata, NULL);
+}
+
+DSSH_PUBLIC int
+dssh_rsa_sha2_512_generate_key(unsigned int bits)
+{
+	return generate_key_inner(bits, NULL);
+}
+
+DSSH_PUBLIC int
+dssh_rsa_sha2_512_save_key_file(const char *path, dssh_pem_password_cb cb, void *cbdata)
+{
+	return save_key_file_inner(path, cb, cbdata, rsa_ctx);
+}
+
+static int
+client_load(void **out, const char *path, dssh_pem_password_cb cb, void *cbdata)
+{
+	struct dssh_botan_key_context *local = NULL;
+	int ret = load_key_file_inner(path, cb, cbdata, &local);
+	if (ret == 0)
+		*out = local;
+	return ret;
+}
+
+static int
+client_generate(void **out, unsigned int bits)
+{
+	struct dssh_botan_key_context *local = NULL;
+	int ret = generate_key_inner(bits, &local);
+	if (ret == 0)
+		*out = local;
+	return ret;
+}
+
+static int
+client_save(void *ctx, const char *path, dssh_pem_password_cb cb, void *cbdata)
+{
+	struct dssh_botan_key_context *selected = static_cast<struct dssh_botan_key_context *>(ctx);
+	return save_key_file_inner(path, cb, cbdata, selected);
+}
+
+static void
+client_release(void *ctx)
+{
+	dssh_key_algo_ctx *opaque = reinterpret_cast<dssh_key_algo_ctx *>(ctx);
+	dssh_botan_rsa512_cleanup(opaque);
+}
+
+extern "C" DSSH_PRIVATE const struct dssh_client_key_ops *
+dssh_botan_rsa512_client_ops(void)
+{
+	static const struct dssh_client_key_ops ops = {
+		client_load, client_generate, client_save, client_release
+	};
+	return &ops;
 }

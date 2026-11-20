@@ -8,6 +8,7 @@
 #include "deucessh-key-algo.h"
 #include "deucessh.h"
 #include "key-wire.h"
+#include "client-key.h"
 #ifdef DSSH_TESTING
  #include "ssh-internal.h"
 #endif
@@ -58,4 +59,16 @@ dssh_register_rsa_sha2_256(void)
 	if (ret < 0)
 		free(ka);
 	return ret;
+}
+
+extern const struct dssh_client_key_ops *dssh_botan_rsa256_client_ops(void);
+
+DSSH_PRIVATE const struct dssh_client_key_ops *
+dssh_rsa256_client_ops(struct dssh_key_algo_s *module)
+{
+	if (module->sign != dssh_botan_rsa256_sign
+	    || module->pubkey != dssh_botan_rsa256_pubkey
+	    || module->haskey != dssh_botan_rsa256_haskey)
+		return NULL;
+	return dssh_botan_rsa256_client_ops();
 }

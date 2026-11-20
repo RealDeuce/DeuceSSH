@@ -1,10 +1,9 @@
 # RFC 4254 Conformance Audit — DeuceSSH
 
-> Release audit reconciliation is in progress. This historical report uses
-> earlier API names and architecture descriptions; its conformance totals
-> and completion statements are not current release evidence. See the
-> [current requirement ledger](release-1.0-evidence/rfc4254-ledger.md) for
-> traces, validation and outstanding verification.
+> Historical report with selected later corrections. Earlier API names,
+> architecture descriptions and conformance totals are retained as history.
+> Current contracts are in [deucessh-conn.h](../deucessh-conn.h), the
+> [connection API overview](api-design-4254.md) and the [README](../README.md).
 
 Systematic audit of every MUST, MUST NOT, REQUIRED, SHALL, SHALL NOT,
 SHOULD, SHOULD NOT, RECOMMENDED, MAY, and OPTIONAL keyword in RFC 4254
@@ -178,7 +177,9 @@ by adding bytes to `remote_window` and waking poll waiters.
 reaches the event callback. The application calls `dssh_chan_close()` to
 finish the exchange. The library handles the protocol response during setup
 cancellation and after detachment. A private record retains the channel
-number until both CLOSE directions are complete. See [identifier review](release-1.0-evidence/channel-identifier-review.md).
+number until both CLOSE directions are complete. See
+[ssh-conn.c](../ssh-conn.c) and the channel ownership regressions in
+[test_conn.c](../test/test_conn.c).
 
 ### 5.3-3
 > A party **MAY** send SSH_MSG_CHANNEL_CLOSE without having sent or
@@ -397,9 +398,10 @@ tcpip-forward.
 The historical N/A classification is withdrawn: the current library encodes
 and parses terminal modes through its parameter builder and PTY requests.
 Application-selected terminal values and device configuration remain application
-responsibilities. See the [current section 8 trace](release-1.0-evidence/rfc4254-ledger.md)
-and [terminal-mode review](release-1.0-evidence/terminal-mode-review.md); the
-historical totals below are not release acceptance.
+responsibilities. See [deucessh-conn.h](../deucessh-conn.h), the
+[connection API overview](api-design-4254.md) and the
+[terminal-mode regressions](../test/test_conn.c). The historical totals below
+are not release acceptance.
 
 ---
 

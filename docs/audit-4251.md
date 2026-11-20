@@ -1,9 +1,9 @@
 # RFC 4251 Conformance Audit — DeuceSSH
 
-> Historical report: its feature inventory, blanket conformance and APPLICATION
-> classifications are not current release evidence. See
-> [the architecture release ledger](release-1.0-evidence/rfc4251-ledger.md)
-> and [the release audit](release-1.0-audit.md) for current scope and open work.
+> Historical report with selected later corrections. Its feature inventory,
+> totals and APPLICATION classifications describe earlier revisions. Consult
+> the [README](../README.md), [public headers](../deucessh.h) and
+> [consumer migration note](consumer-migration.md) for current contracts.
 
 Systematic audit of every MUST, MUST NOT, REQUIRED, SHALL, SHALL NOT,
 SHOULD, SHOULD NOT, RECOMMENDED, MAY, and OPTIONAL keyword in RFC 4251

@@ -1,5 +1,11 @@
 # RFC 4253 Conformance Audit — DeuceSSH
 
+> Historical report with selected later corrections. Its totals and older
+> conformance classifications describe earlier revisions. Current algorithms,
+> transport contracts and application policy are documented in the
+> [README](../README.md), [deucessh.h](../deucessh.h) and
+> [deucessh-algorithms.h](../deucessh-algorithms.h).
+
 Systematic audit of every MUST, MUST NOT, REQUIRED, SHALL, SHALL NOT,
 SHOULD, SHOULD NOT, RECOMMENDED, MAY, and OPTIONAL keyword in RFC 4253
 (SSH Transport Layer Protocol) against the DeuceSSH library code.
@@ -345,9 +351,10 @@ register it by default.  The application must explicitly opt in.
 context per direction on OpenSSL and Botan. NIST F.2.1/F.2.2 checks cover all
 eight partitions of four consecutive blocks, with interleaved encrypt/decrypt
 contexts. Production client/OpenSSH exchanges verify CBC data and rekey for
-both library forms and backends. See the
-[CBC review](release-1.0-evidence/cbc-review.md) for commands, scope and remaining
-platform/module obligations.
+both library forms and backends. The regression cases remain in
+[test_algo_enc.c](../test/test_algo_enc.c) and the
+[OpenSSH fixture](../test/openssh_interop.py). CBC remains a client-only,
+application-selected compatibility option, as documented in the README.
 
 ---
 
@@ -431,9 +438,9 @@ fixed-group baseline with `diffie-hellman-group14-sha256` and recommends
 `diffie-hellman-group16-sha512`. Both are now implemented through application-
 controlled constructors, alongside the existing Curve25519, DH-GEX and hybrid
 methods. SHA-1 methods remain intentionally excluded under RULES.md. Current
-implementation and precisely scoped acceptance are tracked in
-[the fixed-group release decision](release-1.0-evidence/fixed-group-kex-design.md);
-whole-platform/conformance review is not inferred from registration alone.
+constructors are declared in [deucessh-algorithms.h](../deucessh-algorithms.h),
+with shared protocol code in [dh-fixed.c](../kex/dh-fixed.c) and registration
+examples in the [README](../README.md).
 
 ### 6.5-2
 > Additional methods **MAY** be defined as specified in [SSH-NUMBERS].
@@ -620,9 +627,9 @@ application.
 ### 7.1-14
 > Both parties **MAY** ignore this name-list [languages].
 
-**CONFORMS** — R032 exposes both peer lists to the application without
+**CONFORMS** — Both peer lists are exposed to the application without
 selecting a language. The application may ignore them. See
-[the selected contract](release-1.0-evidence/language-preference-design.md).
+[deucessh-lang.h](../deucessh-lang.h) for the directional field contract.
 
 ### 7.1-15
 > If there are no language preferences, this name-list **SHOULD** be

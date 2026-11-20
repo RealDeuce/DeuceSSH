@@ -7,8 +7,9 @@ The symbol-versioning policy below was revised after reading the complete
 
 The audit below is a historical build snapshot. The
 [symbol-versioning plan](#symbol-versioning-plan) records the implemented v1.0
-policy. Native FreeBSD export/import and installed-consumer checks pass with
-both providers; native Linux, macOS and Windows execution remains for CI.
+policy. Native export/import and consumer checks are part of the build's
+CTest suite; the [CI workflow](../.github/workflows/ci.yml) defines Linux,
+macOS and Windows execution. Local FreeBSD checks cover both providers.
 
 ## 1. Export Control — EXCELLENT
 
@@ -100,10 +101,14 @@ Verify: `readelf -d libdeucessh.so | grep TEXTREL` (no output)
 | Text relocations | NONE |
 | Dependency isolation | EXCELLENT |
 
-## Remaining
+## Native validation
 
-1. Run the committed ABI export/import and production-consumer tests in native
-   Linux, macOS and Windows CI before release.
+The current CTest suite checks actual production export tables, executable and
+consumer-DSO imports, and C17 static/shared calls. Installed-package consumers
+also exercise session-local keys through CMake and pkg-config. Native CI runs
+these checks on Linux with both providers and on macOS/Windows with OpenSSL;
+its results retain the compiler, runtime and configuration scope of each job.
+Cross-generated objects alone are not native runtime acceptance.
 
 ## Symbol-versioning plan
 

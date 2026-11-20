@@ -1,9 +1,11 @@
 # RULES.md Audit — Algorithm Modules
 
-> Release audit reconciliation is in progress. Module/backend interfaces
-> have changed since this report. Its conformance labels and vendor exclusions
-> are not adopted as current evidence or exemptions from RULES.md. The
-> [release audit](release-1.0-audit.md) includes both backends and all vendor code.
+> Historical module review. Its file count, interfaces and vendor exclusions
+> describe an earlier revision. The v1.0 production review includes both
+> cryptographic backends and bundled code; see the
+> [current vendor review](audit-portability-vendor.md), [README](../README.md)
+> and installed module headers. Historical exclusions below do not override
+> [RULES.md](../RULES.md).
 
 Audit of all algorithm module code against the 12 rules in `RULES.md`.
 

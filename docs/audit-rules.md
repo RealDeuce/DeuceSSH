@@ -1,5 +1,10 @@
 # RULES.md Audit — Library Core Code
 
+> Historical core review. The source locations and some API descriptions below
+> predate the completed v1.0 changes. Current requirements are in
+> [RULES.md](../RULES.md), the public headers and the [README](../README.md).
+> The resulting corrections and regression tests are retained in Git history.
+
 Audit of `ssh.c`, `ssh-trans.c`, `ssh-auth.c`, `ssh-conn.c`,
 `ssh-internal.h`, `ssh-trans.h`, and all public `deucessh-*.h` headers
 against the 12 rules in `RULES.md`.

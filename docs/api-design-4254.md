@@ -177,6 +177,6 @@ abstraction; the application still handles short I/O, errors and termination.
 
 X11 and TCP forwarding channels are outside the implemented channel set.
 Subsystem payload interpretation and terminal policy belong to the application.
-This overview does not establish complete protocol or release conformance;
-current evidence and remaining review are tracked in
-[the release audit](release-1.0-audit.md).
+This overview describes the public connection contract. Exact declarations and
+callback restrictions are in [deucessh-conn.h](../deucessh-conn.h); source and
+regression history remain in Git.

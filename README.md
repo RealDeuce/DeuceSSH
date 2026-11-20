@@ -11,7 +11,7 @@ A from-scratch SSH library in standard C17 implementing the core SSH protocol:
 - RFC 4419 — Diffie-Hellman Group Exchange
 - RFC 6668 — SHA-2 Data Integrity Verification
 - RFC 8160 — IUTF8 Terminal Mode
-- RFC 8308 — Base extension negotiation and `server-sig-algs` ([scope](docs/release-1.0-evidence/ext-info-implementation.md))
+- [RFC 8308](standards/rfc8308.txt) — Base extension negotiation and `server-sig-algs`
 - RFC 8332 — RSA SHA-256 and SHA-512 Signature Algorithms
 - RFC 8709 — Ed25519 Host Key Algorithm
 - RFC 8731 — curve25519-sha256 Key Exchange
@@ -2238,8 +2238,9 @@ configuration. Complete diagnostics and actual process exits remain in the
 build tree's `test/openssh-evidence/` directory; private keys are removed.
 
 Optional RFC 8308 delayed compression, flow-control and elevation extensions
-are not advertised. Current release requirements, validation scopes and residual
-limitations are in the [release checklist](docs/release-1.0-checklist.md).
+are not advertised. See the [connection API overview](docs/api-design-4254.md)
+for supported channel operations and the
+[ABI policy](docs/audit-dsohowto.md#symbol-versioning-plan) for linking constraints.
 
 ## Debugging
 

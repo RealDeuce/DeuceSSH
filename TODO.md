@@ -1,41 +1,27 @@
 # DeuceSSH — TODO / Known Issues
 <!-- Next item: 182 -->
 
-## Open
+## Optional policy improvements
 
-84. **DH-GEX group size vs cipher strength mismatch.**
-    The client's GEX_REQUEST parameters (`GEX_MIN 2048`, `GEX_N 4096`,
-    `GEX_MAX 8192`) are compile-time constants that don't account for the
-    negotiated cipher.  A 2048-bit group provides ~112 bits of security,
-    which is a poor match for AES-256 (256-bit).  OpenSSH has the same
-    mismatch, but we should investigate whether to:
-    - Bump `GEX_MIN` to 3072 (NIST 128-bit floor)
-    - Tie `GEX_N` (preferred) to the cipher's key size
-    - Consider that cipher negotiation happens in the same KEXINIT as KEX
-      negotiation, so the client doesn't know the cipher result before
-      sending GEX_REQUEST — the server could enforce a floor, but the
-      client can only guess
-    - Decide whether the built-in `default_select_group()` should enforce
-      a minimum based on cipher strength, and if so, how it learns the
-      cipher (it currently only sees min/preferred/max from the client)
-    This needs interactive discussion — there are compatibility and
-    protocol-ordering trade-offs that don't have obvious right answers.
-    **Not suitable for automatic planning.**
-
-122. **Full RFC conformance re-audit.**
-     The existing audit files (`docs/audit-4250.md` through
-     `docs/audit-4254.md`) were written early in development and only
-     cover RFCs 4250–4254.  Re-audit all code against every
-     implemented RFC/draft (4256, 4335, 4419, 6668, 8160, 8308, 8332,
-     8709, 8731, draft-ietf-sshm-ntruprime-ssh,
-     draft-ietf-sshm-mlkem-hybrid-kex), create new audit files where
-     missing, update existing audits to be backend-agnostic (current
-     ones reference only `*-openssl.c` paths), and verify all
-     MUST/SHOULD/MAY requirements against the current implementation.
+84. **DH-GEX group selection policy.** The builtin client requests
+    2048/4096/8192 bits (minimum/preferred/maximum), independently of the
+    selected cipher. This existing policy is documented in README.md.
+    Raising the floor or deriving a preference from negotiated algorithms
+    would change supported behavior and requires feature review. It is an
+    optional policy change, not an outstanding implementation fix for v1.0.
 
 ## Closed
 
 Items are listed newest-first.  Detailed write-ups are in git history.
+
+- 122: The v1.0 production/protocol review covers the core RFCs and implemented
+  keyboard-interactive, BREAK, DH-GEX, SHA-2 MAC, terminal-mode, extension,
+  RSA-SHA2, Ed25519, Curve25519, fixed-group SHA-2 and standardized hybrid KEX
+  requirements. Both cryptographic backends and bundled implementations are
+  included. Resulting fixes and regressions remain in Git history; the README,
+  current public headers and consumer migration note describe the release API.
+  Older per-RFC audit reports are explicitly historical. Native CI acceptance
+  is separate from completion of that source review.
 
 - 179: Botan 3.13.0 is required for system builds; the parent vendored source
   and checksum now match that release, and system/vendored builds pass the

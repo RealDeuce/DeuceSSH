@@ -1,10 +1,10 @@
 # RFC 4252 Conformance Audit — DeuceSSH
 
-> Historical report: its blanket conformance and APPLICATION classifications
-> are not current release evidence. The complete current review and outstanding
-> library/application requirements are tracked in
-> [the release ledger](release-1.0-evidence/rfc4252-ledger.md) and
-> [the release audit](release-1.0-audit.md).
+> Historical report with selected later corrections. The classifications
+> below describe earlier revisions. Current authentication behavior, callback
+> ownership and application responsibilities are specified in
+> [deucessh-auth.h](../deucessh-auth.h) and the [README](../README.md).
+> Subsequent fixes and their regressions are retained in Git history.
 
 Systematic audit of every MUST, MUST NOT, REQUIRED, SHALL, SHALL NOT,
 SHOULD, SHOULD NOT, RECOMMENDED, MAY, and OPTIONAL keyword in RFC 4252

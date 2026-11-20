@@ -1863,7 +1863,8 @@ auth_publickey_impl(struct dssh_session_s *sess, const char *username, const cha
 		return DSSH_ERROR_INIT;
 	if (ka->haskey == NULL)
 		return DSSH_ERROR_INIT;
-	int res = ka->haskey(ka->ctx);
+	dssh_key_algo_ctx *key_ctx = dssh_client_key_context(sess, ka);
+	int res = ka->haskey(key_ctx);
 	if (res < 0)
 		return res;
 	if (res == 0)
@@ -1872,7 +1873,7 @@ auth_publickey_impl(struct dssh_session_s *sess, const char *username, const cha
 	/* Get the public key blob */
 	const uint8_t *pubkey_buf = NULL;
 	size_t         pubkey_len = 0;
-	res = ka->pubkey(&pubkey_buf, &pubkey_len, ka->ctx);
+	res = ka->pubkey(&pubkey_buf, &pubkey_len, key_ctx);
 	if (res > 0)
 		res = DSSH_ERROR_INVALID;
 
@@ -1933,7 +1934,7 @@ auth_publickey_impl(struct dssh_session_s *sess, const char *username, const cha
 	const uint8_t *sig_buf = NULL;
 	size_t   sig_len = 0;
 
-	res = ka->sign(&signature, sign_data, sp, ka->ctx);
+	res = ka->sign(&signature, sign_data, sp, key_ctx);
 	if (res > 0)
 		res = DSSH_ERROR_INVALID;
 	if (res < 0) {

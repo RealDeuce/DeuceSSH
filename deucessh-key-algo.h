@@ -1,5 +1,5 @@
 /*
- * deucessh-key-algo.h -- Host key algorithm module interface.
+ * deucessh-key-algo.h -- Host key and client signing algorithm module interface.
  */
 
 #ifndef DSSH_KEY_ALGO_H
@@ -54,6 +54,10 @@ typedef struct dssh_key_algo_s {
 	dssh_key_algo_haskey    haskey;
 	dssh_key_algo_cleanup   cleanup;
 	dssh_key_algo_keybits   key_bits;
+	/* Global server/fallback key. Session-local contexts use the same signing,
+	 * public-key and availability callbacks, with a separate producer lease
+	 * installed by dssh_session_set_client_key_ctx(). That lease retires the
+	 * local context; the library does not also call cleanup on it. */
 	dssh_key_algo_ctx      *ctx;
 	uint32_t                flags;
 	char                    name[];

@@ -469,16 +469,49 @@ my_passwd_change_cb(const uint8_t *prompt, size_t prompt_len,
 ```c
 #include "deucessh-algorithms.h"
 
-/* Load the private key (stored on the algorithm entry) */
-dssh_ed25519_load_key_file("/path/to/id_ed25519", NULL, NULL);
-
-/* Authenticate */
-dssh_auth_publickey(sess, "user", "ssh-ed25519");
+/* Register ssh-ed25519 during global setup, checking its return there.
+ * After creating this client session and completing its handshake: */
+int ret = dssh_session_load_client_key_file(sess, "ssh-ed25519",
+    "/path/to/id_ed25519", NULL, NULL);
+if (ret == 0)
+    ret = dssh_auth_publickey(sess, "user", "ssh-ed25519");
+/* Handle ret using the client authentication outcomes described above. */
 ```
 
 The function signs the session-bound authentication data (session ID
 + request fields) per RFC 4252 s7 and sends the signed request.
-Works with any registered key algorithm that supports signing.
+Works with any registered key algorithm that supports signing. The application
+chooses the order of methods and keys through explicit authentication calls.
+
+Each client session can hold one local key per algorithm. When no local key is
+installed, authentication uses that algorithm's global key if one is present.
+A failed or refused local credential never triggers an automatic fallback.
+Global private keys are optional for client-only applications; server handshakes
+need an available host key. Algorithm registration remains global setup, and
+global keys freeze at the first session-init attempt.
+
+Load or replace a local key before authentication succeeds, including between
+unsuccessful attempts. `dssh_session_clear_client_key(sess, algo_name)` removes
+it and restores global fallback. Failed replacement preserves the old key.
+`dssh_session_generate_client_key()` generates a local key, using 256 bits for
+Ed25519 or the requested RSA modulus size. The session releases local keys on
+replacement, clearing or cleanup. Serialize key operations with authentication,
+handshake and lifecycle operations on that session; different sessions can run
+independently. Callback reentry on the same session is rejected.
+
+`dssh_session_get_client_key_pub_str()`, `dssh_session_save_client_pub_file()`
+and `dssh_session_save_client_key_file()` export the same local/global key
+selected for authentication. Exports also work after authentication. They use
+the existing public-text size, PEM password and private-file save conventions.
+Builtin loading, generation and private export support `ssh-ed25519`,
+`rsa-sha2-256` and `rsa-sha2-512`.
+
+Custom modules install a context with `dssh_session_set_client_key_ctx()`.
+Its descriptor and callbacks remain registered for process lifetime; each local
+context uses a producer-owned release lease. Successful installation moves and
+clears the caller's lease; failure leaves it with the caller. Release runs once
+on replacement, clearing or cleanup without library locks, with the usual
+result-release restrictions. Private allocation ownership stays with the module.
 
 ### Keyboard-Interactive
 

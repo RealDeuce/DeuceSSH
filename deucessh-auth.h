@@ -339,10 +339,14 @@ DSSH_PUBLIC int dssh_auth_set_banner(dssh_session sess, const char *message, con
  * ================================================================ */
 /*
  * Authenticate with a public key (RFC 4252 s7).
- * Uses the key loaded via dssh_ed25519_load_key_file(),
- * dssh_rsa_sha2_256_load_key_file(), etc., on the registered algorithm entry.
- * The algo_name must match a registered key algorithm that has a key
- * loaded (e.g., "ssh-ed25519", "rsa-sha2-256").
+ * Uses this session's key for algo_name, falling back to the registered global
+ * key only when no local key is installed. A rejected/failed local key does
+ * not cause an implicit global-key attempt. Load local credentials with
+ * dssh_session_load_client_key_file() or install a module context with
+ * dssh_session_set_client_key_ctx(). algo_name must match a registered signing
+ * algorithm (e.g., "ssh-ed25519", "rsa-sha2-256"). The application selects
+ * method/key order through explicit authentication calls; there is no implicit
+ * none probe. It can replace/clear a local key between unsuccessful attempts.
  * Uses the common client authentication outcomes above. A refused credential
  * attempt returns DSSH_AUTH_CONTINUE; operation errors are negative.
  */

@@ -468,7 +468,20 @@ struct dssh_language_field {
 	size_t capacity;
 };
 
+struct dssh_client_key_slot {
+	struct dssh_client_key_slot *next;
+	dssh_key_algo module;
+	dssh_key_algo_ctx *ctx;
+	struct dssh_result_lease lease;
+};
+
+/* Caller serializes client-key operations with synchronous session operations.
+ * A slot is retained after clearing for reuse; a present lease marks a key. */
+DSSH_PRIVATE dssh_key_algo_ctx *dssh_client_key_context(struct dssh_session_s *sess, dssh_key_algo module);
+DSSH_PRIVATE void dssh_client_keys_cleanup(struct dssh_session_s *sess);
+
 struct dssh_session_s {
+	struct dssh_client_key_slot *client_keys;
 	/* Language fields are protected by mtx. Peer fields share one allocation. */
 	struct dssh_language_field local_languages[2];
 	char *peer_languages;

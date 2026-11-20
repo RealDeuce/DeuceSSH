@@ -1,5 +1,6 @@
 #include <deucessh.h>
 #include <deucessh-crypto.h>
+#include <deucessh-algorithms.h>
 
 #include <string.h>
 
@@ -26,5 +27,14 @@ consumer_entry(void)
 	uint8_t digest[32];
 	if (dssh_hash_oneshot("SHA-256", input, sizeof(input), digest, sizeof(digest)) != 0)
 		return 1;
-	return memcmp(digest, expected, sizeof(expected)) != 0;
+	if (memcmp(digest, expected, sizeof(expected)) != 0 || dssh_register_ssh_ed25519() != 0)
+		return 1;
+	dssh_session sess = dssh_session_init(true, 0);
+	if (sess == NULL)
+		return 1;
+	int ret = dssh_session_generate_client_key(sess, "ssh-ed25519", 256);
+	if (ret == 0 && dssh_session_get_client_key_pub_str(sess, "ssh-ed25519", NULL, 0) <= 0)
+		ret = DSSH_ERROR_INIT;
+	dssh_session_cleanup(sess);
+	return ret != 0;
 }

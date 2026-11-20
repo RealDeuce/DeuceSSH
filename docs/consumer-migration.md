@@ -10,6 +10,7 @@ shared-library ABI major is now 1. Install `deucessh-result.h` and
 
 | Interface | Update required when used |
 | --- | --- |
+| Client signing keys | Load each connection's key with `dssh_session_load_client_key_file(sess, algo_name, path, pw_cb, cbdata)`; generate one with `dssh_session_generate_client_key()`. `dssh_auth_publickey()` keeps its signature and selects the local key first, then the global key when no local key exists. Global private keys are optional for clients. Replacement is allowed between unsuccessful attempts; clearing restores global fallback. No implicit retry changes credentials. |
 | Client authentication discovery | Use optional `dssh_auth_begin(sess, username)` to attempt authentication without credentials and discover continuation methods. It may complete authentication. Credential methods can instead be called directly, without an implicit discovery attempt. |
 | Authentication outcomes | Handle `DSSH_AUTH_SUCCESS`, `DSSH_AUTH_PARTIAL` and `DSSH_AUTH_CONTINUE`. Only SUCCESS completes authentication. The old `DSSH_AUTH_NONE_ACCEPTED`, `DSSH_AUTH_METHODS_AVAILABLE` and `DSSH_ERROR_AUTH_REJECTED` constants are removed. Negative results report operation errors. |
 | Authentication methods getter | The signature is now `int64_t dssh_auth_get_methods(dssh_session sess, char *methods, size_t methods_sz)`. It performs no I/O and returns the required size including NUL. Each completed authentication response updates the snapshot; a local/malformed/transport error preserves it. Before any completed response, the getter returns `DSSH_ERROR_INIT`. |
@@ -96,11 +97,18 @@ only for that invocation. Copy bytes needed beyond those intervals.
   All five callbacks are required. See [deucessh-comp.h](../deucessh-comp.h).
 
 Registration definitions, names and callback code remain borrowed for process
-lifetime. Cipher and MAC callback signatures have not changed.
+lifetime. Cipher and MAC callback signatures have not changed. Custom
+signing modules can install a session context with
+`dssh_session_set_client_key_ctx(sess, algo_name, ctx, &lease)`. Success moves and
+zeros the lease; failure preserves it. The producer releases its own storage
+when the session replaces, clears or cleans up the key. Global descriptor/key
+contexts remain the fallback and server host keys.
 
 ## Build, optional algorithms and examples
 
-All 131 public functions now use interface version 1.0. Rebuild and explicitly
+Builds that list library sources manually must add `key_algo/client-key.c`.
+
+All 138 public functions now use interface version 1.0. Rebuild and explicitly
 link consumers with the matching headers and library. Ordinary C function names
 stay the same. ELF references record `DEUCESSH_1.0`; macOS/Windows external names
 end in `_v1_0`, including static definitions on those platforms. Code using

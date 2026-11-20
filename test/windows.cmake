@@ -62,6 +62,8 @@ add_test(NAME dssh_test_keys COMMAND dssh_test_key_setup)
 set_tests_properties(dssh_test_keys PROPERTIES FIXTURES_SETUP dssh_cached_keys
 	ENVIRONMENT "${DSSH_TEST_KEY_ENV}")
 
+include("${CMAKE_CURRENT_SOURCE_DIR}/client-keys.cmake")
+
 # Generator expressions preserve the library DLL path in multi-config builds.
 # CI also adds the vcpkg provider runtime bin directory to PATH.
 get_property(windows_tests DIRECTORY PROPERTY TESTS)

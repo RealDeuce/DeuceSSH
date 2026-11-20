@@ -4609,6 +4609,7 @@ dssh_session_cleanup(struct dssh_session_s *sess)
 	dssh_session_terminate(sess);
 	session_stop_inner(sess);
 	dssh_log_cleanup(sess);
+	dssh_client_keys_cleanup(sess);
 	transport_cleanup(sess);
 	free(sess->pending_banner);
 	free(sess->pending_banner_lang);

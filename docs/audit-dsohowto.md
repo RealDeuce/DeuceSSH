@@ -108,7 +108,7 @@ Verify: `readelf -d libdeucessh.so | grep TEXTREL` (no output)
 ## Symbol-versioning plan
 
 Status: **approved and implemented for the initial 1.0 interface**.
-`deucessh-abi.h` assigns all 131 public functions. CMake checks those assignments
+`deucessh-abi.h` assigns all 138 public functions. CMake checks those assignments
 against installed declarations and generates explicit ELF, Mach-O and PE export
 controls; public declarations select matching native names. The ordinary C API
 spelling is unchanged. `dssh_abi_bindings` inspects production exports and

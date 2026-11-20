@@ -321,6 +321,7 @@ set(DEUCESSH_SOURCES
 	${DSSH_CRYPTO_IMPL}
 	${DSSH_PRIVATE_KEY_FILE_SOURCE}
 	key_algo/signature-result.c
+	key_algo/client-key.c
 	kex/workspace.c
 	kex/curve25519-sha256.c
 	kex/hybrid-pq-kex.c

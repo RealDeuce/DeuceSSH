@@ -666,7 +666,75 @@ cpp_counts_full_password(void)
 	return cpp_counts(3);
 }
 #endif
+static int
+client_context_faults(bool replacement)
+{
+	dssh_test_reset_global_config();
+	ASSERT_OK(dssh_register_ssh_ed25519());
+	unsigned modes = 1;
+#ifdef DSSH_CRYPTO_OPENSSL
+	/* The native countdown wraps OpenSSL calls. Botan does not use them. */
+	modes = 2;
+#endif
+	for (unsigned mode = 0; mode < modes; mode++) {
+		bool completed = false;
+		unsigned rejected = 0;
+		for (int allocation = 0; allocation < 64; allocation++) {
+			dssh_session sess = dssh_session_init(true, 0);
+			ASSERT_NOT_NULL(sess);
+			char before[512], after[512];
+			if (replacement) {
+				ASSERT_OK(dssh_session_generate_client_key(sess, "ssh-ed25519", 256));
+				ASSERT_TRUE(dssh_session_get_client_key_pub_str(sess, "ssh-ed25519", before, sizeof(before)) > 0);
+			}
+			if (mode == 0)
+				dssh_test_alloc_fail_after(allocation);
+			else
+				dssh_test_ossl_fail_after(allocation);
+			int ret = dssh_session_generate_client_key(sess, "ssh-ed25519", 256);
+			dssh_test_alloc_reset();
+			dssh_test_ossl_reset();
+			if (ret < 0) {
+				rejected++;
+				if (replacement) {
+					ASSERT_TRUE(dssh_session_get_client_key_pub_str(sess, "ssh-ed25519", after, sizeof(after)) > 0);
+					ASSERT_TRUE(strcmp(before, after) == 0);
+				}
+				else
+					ASSERT_EQ(dssh_session_get_client_key_pub_str(sess, "ssh-ed25519", after, sizeof(after)), DSSH_ERROR_INIT);
+			}
+			else {
+				ASSERT_EQ(ret, 0);
+				ASSERT_TRUE(dssh_session_get_client_key_pub_str(sess, "ssh-ed25519", after, sizeof(after)) > 0);
+				completed = true;
+			}
+			dssh_session_cleanup(sess);
+			if (completed)
+				break;
+		}
+		ASSERT_TRUE(completed);
+		ASSERT_TRUE(rejected > 0);
+		printf("client context publication: replacement=%d mode=%u rejected=%u completed=%d\n",
+		    replacement, mode, rejected, completed);
+	}
+	dssh_test_reset_global_config();
+	return TEST_PASS;
+}
+
+static int
+client_initial(void)
+{
+	return client_context_faults(false);
+}
+
+static int
+client_replacement(void)
+{
+	return client_context_faults(true);
+}
+
 static struct dssh_test_entry tests[] = {
+	{"client_initial", client_initial}, {"client_replacement", client_replacement},
 	{"generation", test_generation}, {"plain", test_plain}, {"encrypted", test_encrypted},
 	{"preflight", test_preflight},
 #ifdef DSSH_CRYPTO_BOTAN
